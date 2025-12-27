@@ -86,26 +86,53 @@ bool World::hasAdjacentRoad(int x, int y) const
   return false;
 }
 
-void World::bulldoze(int x, int y)
+std::uint8_t World::computeRoadMask(int x, int y) const
 {
-  if (!inBounds(x, y)) return;
-  Tile& t = at(x, y);
-  if (t.terrain == Terrain::Water) return;
+  if (!inBounds(x, y)) return 0;
+  if (at(x, y).overlay != Overlay::Road) return 0;
 
-  t.overlay = Overlay::None;
-  t.level = 1;
-  t.occupants = 0;
+  // Bit layout (tile-space):
+  //  bit0: (x, y-1)  (screen up-right)
+  //  bit1: (x+1, y)  (screen down-right)
+  //  bit2: (x, y+1)  (screen down-left)
+  //  bit3: (x-1, y)  (screen up-left)
+  std::uint8_t m = 0;
+  if (inBounds(x, y - 1) && at(x, y - 1).overlay == Overlay::Road) m |= 1u << 0;
+  if (inBounds(x + 1, y) && at(x + 1, y).overlay == Overlay::Road) m |= 1u << 1;
+  if (inBounds(x, y + 1) && at(x, y + 1).overlay == Overlay::Road) m |= 1u << 2;
+  if (inBounds(x - 1, y) && at(x - 1, y).overlay == Overlay::Road) m |= 1u << 3;
+  return m;
 }
 
-void World::setRoad(int x, int y)
+void World::applyRoadMask(int x, int y)
 {
   if (!inBounds(x, y)) return;
   Tile& t = at(x, y);
-  if (t.terrain == Terrain::Water) return;
+  if (t.overlay != Overlay::Road) return;
 
-  t.overlay = Overlay::Road;
-  t.level = 1;
-  t.occupants = 0;
+  const std::uint8_t mask = static_cast<std::uint8_t>(computeRoadMask(x, y) & 0x0Fu);
+
+  // Preserve upper bits of the per-tile variation so lighting still has some stable randomness.
+  t.variation = static_cast<std::uint8_t>((t.variation & 0xF0u) | mask);
+}
+
+void World::updateRoadMasksAround(int x, int y)
+{
+  applyRoadMask(x, y);
+  applyRoadMask(x, y - 1);
+  applyRoadMask(x + 1, y);
+  applyRoadMask(x, y + 1);
+  applyRoadMask(x - 1, y);
+}
+
+void World::recomputeRoadMasks()
+{
+  for (int y = 0; y < m_h; ++y) {
+    for (int x = 0; x < m_w; ++x) {
+      if (at(x, y).overlay != Overlay::Road) continue;
+      applyRoadMask(x, y);
+    }
+  }
 }
 
 void World::setOverlay(Overlay overlay, int x, int y)
@@ -114,6 +141,7 @@ void World::setOverlay(Overlay overlay, int x, int y)
   Tile& t = at(x, y);
   if (t.terrain == Terrain::Water) return;
 
+  const Overlay before = t.overlay;
   t.overlay = overlay;
 
   // Reset/initialize zone state.
@@ -126,7 +154,16 @@ void World::setOverlay(Overlay overlay, int x, int y)
     t.level = 1;
     t.occupants = 0;
   }
+
+  // If this edit adds/removes a road, update the local auto-tiling masks.
+  if (before == Overlay::Road || overlay == Overlay::Road) {
+    updateRoadMasksAround(x, y);
+  }
 }
+
+void World::bulldoze(int x, int y) { setOverlay(Overlay::None, x, y); }
+
+void World::setRoad(int x, int y) { setOverlay(Overlay::Road, x, y); }
 
 void World::applyTool(Tool tool, int x, int y)
 {
@@ -156,9 +193,7 @@ void World::applyTool(Tool tool, int x, int y)
   case Tool::Park: {
     if (t.overlay == Overlay::Park) return;
     if (!spend(3)) return;
-    t.overlay = Overlay::Park;
-    t.level = 1;
-    t.occupants = 0;
+    setOverlay(Overlay::Park, x, y);
   } break;
 
   case Tool::Residential:
@@ -180,9 +215,7 @@ void World::applyTool(Tool tool, int x, int y)
     if (t.overlay != Overlay::None) return; // Don't overwrite other overlays in this minimal template.
 
     if (!spend(5)) return;
-    t.overlay = zone;
-    t.level = 1;
-    t.occupants = 0;
+    setOverlay(zone, x, y);
   } break;
 
   case Tool::Bulldoze: {

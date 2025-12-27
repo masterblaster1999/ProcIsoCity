@@ -36,6 +36,10 @@ struct Tile {
   Overlay overlay = Overlay::None;
 
   float height = 0.0f; // 0..1-ish (procedural)
+
+  // Stable per-tile random bits for shading/variation.
+  // When overlay == Road, the low 4 bits are also used to store a road-connection mask
+  // so roads can auto-connect visually.
   std::uint8_t variation = 0;
 
   // Used for zoning overlays.
@@ -81,8 +85,8 @@ public:
   const Stats& stats() const { return m_stats; }
   Stats& stats() { return m_stats; }
 
-  bool isBuildable(int x, int y) const; // Terrain != Water
-  bool isEmptyLand(int x, int y) const; // buildable and overlay == None
+  bool isBuildable(int x, int y) const;  // Terrain != Water
+  bool isEmptyLand(int x, int y) const;  // buildable and overlay == None
   bool hasAdjacentRoad(int x, int y) const;
 
   // Player actions / tools.
@@ -93,7 +97,15 @@ public:
   void setRoad(int x, int y);
   void setOverlay(Overlay overlay, int x, int y);
 
+  // Recompute road connection masks for all road tiles.
+  // Useful after loading older saves or bulk edits.
+  void recomputeRoadMasks();
+
 private:
+  std::uint8_t computeRoadMask(int x, int y) const;
+  void applyRoadMask(int x, int y);
+  void updateRoadMasksAround(int x, int y);
+
   int m_w = 0;
   int m_h = 0;
   std::uint64_t m_seed = 0;

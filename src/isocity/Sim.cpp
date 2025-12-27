@@ -13,6 +13,43 @@ inline int JobsCommercialForLevel(int level) { return 8 * level; }
 inline int JobsIndustrialForLevel(int level) { return 12 * level; }
 
 inline float Clamp01(float v) { return std::clamp(v, 0.0f, 1.0f); }
+
+struct ScanResult {
+  int housingCap = 0;
+  int jobsCap = 0;
+  int roads = 0;
+  int parks = 0;
+  int zoneTiles = 0;
+  int population = 0;
+};
+
+ScanResult ScanWorld(const World& world)
+{
+  ScanResult r;
+
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      const Tile& t = world.at(x, y);
+
+      if (t.overlay == Overlay::Road) r.roads++;
+      if (t.overlay == Overlay::Park) r.parks++;
+
+      if (t.overlay == Overlay::Residential) {
+        r.zoneTiles++;
+        r.housingCap += HousingForLevel(t.level);
+        r.population += static_cast<int>(t.occupants);
+      } else if (t.overlay == Overlay::Commercial) {
+        r.zoneTiles++;
+        r.jobsCap += JobsCommercialForLevel(t.level);
+      } else if (t.overlay == Overlay::Industrial) {
+        r.zoneTiles++;
+        r.jobsCap += JobsIndustrialForLevel(t.level);
+      }
+    }
+  }
+
+  return r;
+}
 } // namespace
 
 void Simulator::update(World& world, float dt)
@@ -24,38 +61,45 @@ void Simulator::update(World& world, float dt)
   }
 }
 
+void Simulator::refreshDerivedStats(World& world) const
+{
+  Stats& s = world.stats();
+  const ScanResult scan = ScanWorld(world);
+
+  // Employment: fill jobs up to population.
+  const int employed = std::min(scan.population, scan.jobsCap);
+
+  // Happiness: parks help, unemployment hurts.
+  const float parkRatio = (scan.zoneTiles > 0) ? (static_cast<float>(scan.parks) / static_cast<float>(scan.zoneTiles))
+                                               : 0.0f;
+  const float parkBonus = std::min(0.25f, parkRatio * 0.35f);
+
+  const float unemployment = (scan.population > 0)
+                                 ? (1.0f - (static_cast<float>(employed) / static_cast<float>(scan.population)))
+                                 : 0.0f;
+
+  s.happiness = Clamp01(0.45f + parkBonus - unemployment * 0.35f);
+
+  s.population = scan.population;
+  s.housingCapacity = scan.housingCap;
+  s.jobsCapacity = scan.jobsCap;
+  s.employed = employed;
+  s.roads = scan.roads;
+  s.parks = scan.parks;
+}
+
 void Simulator::step(World& world)
 {
   Stats& s = world.stats();
   s.day++;
 
   // Pass 1: capacities and static counts.
-  int housingCap = 0;
-  int jobsCap = 0;
-  int roads = 0;
-  int parks = 0;
-
-  int zoneTiles = 0;
-
-  for (int y = 0; y < world.height(); ++y) {
-    for (int x = 0; x < world.width(); ++x) {
-      const Tile& t = world.at(x, y);
-
-      if (t.overlay == Overlay::Road) roads++;
-      if (t.overlay == Overlay::Park) parks++;
-
-      if (t.overlay == Overlay::Residential) {
-        zoneTiles++;
-        housingCap += HousingForLevel(t.level);
-      } else if (t.overlay == Overlay::Commercial) {
-        zoneTiles++;
-        jobsCap += JobsCommercialForLevel(t.level);
-      } else if (t.overlay == Overlay::Industrial) {
-        zoneTiles++;
-        jobsCap += JobsIndustrialForLevel(t.level);
-      }
-    }
-  }
+  const ScanResult scan = ScanWorld(world);
+  const int housingCap = scan.housingCap;
+  const int jobsCap = scan.jobsCap;
+  const int roads = scan.roads;
+  const int parks = scan.parks;
+  const int zoneTiles = scan.zoneTiles;
 
   // Demand model: housing grows if there are jobs + happiness.
   // Very simple, but good enough as a starter.

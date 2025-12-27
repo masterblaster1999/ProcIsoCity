@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.22)
 
 project(ProcIsoCity
-  VERSION 0.1.0
+  VERSION 0.2.0
   DESCRIPTION "Procedurally-generated, open-source isometric city-building simulation (no external art assets)."
   LANGUAGES C CXX
 )
@@ -64,6 +64,12 @@ add_executable(proc_isocity
 
   src/isocity/Sim.hpp
   src/isocity/Sim.cpp
+
+  src/isocity/SaveLoad.hpp
+  src/isocity/SaveLoad.cpp
+
+  src/isocity/EditHistory.hpp
+  src/isocity/EditHistory.cpp
 
   src/isocity/Renderer.hpp
   src/isocity/Renderer.cpp

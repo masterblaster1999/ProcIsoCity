@@ -67,6 +67,29 @@ Texture2D MakeDiamondTexture(int w, int h, Fn fn)
   return tex;
 }
 
+inline float Dot2(float ax, float ay, float bx, float by) { return ax * bx + ay * by; }
+
+// Returns distance from P(px,py) to segment AB. Also returns the projected t in [0,1].
+float DistPointSegment(float px, float py, float ax, float ay, float bx, float by, float& outT)
+{
+  const float vx = bx - ax;
+  const float vy = by - ay;
+  const float wx = px - ax;
+  const float wy = py - ay;
+
+  const float len2 = vx * vx + vy * vy;
+  float t = 0.0f;
+  if (len2 > 1.0e-6f) t = Dot2(wx, wy, vx, vy) / len2;
+  t = std::clamp(t, 0.0f, 1.0f);
+  outT = t;
+
+  const float cx = ax + t * vx;
+  const float cy = ay + t * vy;
+  const float dx = px - cx;
+  const float dy = py - cy;
+  return std::sqrt(dx * dx + dy * dy);
+}
+
 } // namespace
 
 Renderer::Renderer(int tileW, int tileH, std::uint64_t seed)
@@ -85,6 +108,10 @@ void Renderer::unloadTextures()
     t = Texture2D{};
   }
   for (auto& t : m_overlayTex) {
+    if (t.id != 0) UnloadTexture(t);
+    t = Texture2D{};
+  }
+  for (auto& t : m_roadTex) {
     if (t.id != 0) UnloadTexture(t);
     t = Texture2D{};
   }
@@ -116,6 +143,10 @@ static int OverlayIndex(Overlay o)
 Texture2D& Renderer::terrain(Terrain t) { return m_terrainTex[static_cast<std::size_t>(TerrainIndex(t))]; }
 
 Texture2D& Renderer::overlay(Overlay o) { return m_overlayTex[static_cast<std::size_t>(OverlayIndex(o))]; }
+
+Texture2D& Renderer::road(std::uint8_t mask) { return m_roadTex[static_cast<std::size_t>(mask & 0x0Fu)]; }
+
+Texture2D& Renderer::road(std::uint8_t mask) { return m_roadTex[static_cast<std::size_t>(mask & 0x0Fu)]; }
 
 Color Renderer::BrightnessTint(float b)
 {
@@ -182,27 +213,70 @@ void Renderer::rebuildTextures(std::uint64_t seed)
   // None: keep as an empty texture (id=0), we won't draw it.
   m_overlayTex[0] = Texture2D{};
 
-  // Road (slightly transparent + dashed centerline)
-  m_overlayTex[1] = MakeDiamondTexture(m_tileW, m_tileH, [&](int x, int y, const DiamondParams& d) -> Color {
-    const std::uint32_t h = HashCoords32(x, y, s ^ 0x0F0F0F0Fu);
-    const float n = (Frac01(h) - 0.5f) * 0.08f;
+  // Road: auto-tiling variants (mask stored in tile.variation low bits).
+  // We keep m_overlayTex[1] empty; roads are drawn from m_roadTex[0..15].
+  m_overlayTex[1] = Texture2D{};
 
-    // Asphalt base.
-    Color base = Color{90, 90, 95, 230};
-    base = Mul(base, 1.0f + n);
+  auto makeRoadVariant = [&](std::uint8_t mask) -> Texture2D {
+    return MakeDiamondTexture(m_tileW, m_tileH, [&](int x, int y, const DiamondParams& d) -> Color {
+      const std::uint32_t h = HashCoords32(x, y, s ^ 0x0F0F0F0Fu ^ (static_cast<std::uint32_t>(mask) * 0x9E3779B9u));
+      const float n = (Frac01(h) - 0.5f) * 0.08f;
 
-    // "Lane" stripe (horizontal band around vertical center).
-    const int mid = m_tileH / 2;
-    if (std::abs(y - mid) <= 1) {
-      // Dashed: every few pixels.
-      if ((x / 4) % 2 == 0) base = Color{220, 220, 210, 240};
-    }
+      const float px = d.nx;
+      const float py = d.ny;
 
-    // Fade edges strongly to show underlying terrain.
-    const float a = std::clamp(d.edge * 10.0f, 0.0f, 1.0f);
-    base.a = static_cast<unsigned char>(static_cast<float>(base.a) * a);
-    return base;
-  });
+      // Signed distance to a union of "capsule" segments from center to each connected edge.
+      const float roadW = 0.14f;
+      const float centerR = roadW * 1.10f;
+      float sd = std::sqrt(px * px + py * py) - centerR;
+
+      float bestSegDist = 1.0e9f;
+      float bestSegT = 0.0f;
+
+      auto consider = [&](bool enabled, float ex, float ey) {
+        if (!enabled) return;
+        float tproj = 0.0f;
+        const float dist = DistPointSegment(px, py, 0.0f, 0.0f, ex, ey, tproj);
+        sd = std::min(sd, dist - roadW);
+        if (dist < bestSegDist) {
+          bestSegDist = dist;
+          bestSegT = tproj;
+        }
+      };
+
+      // Bit layout matches World::computeRoadMask().
+      consider((mask & 0x01u) != 0u, 0.5f, -0.5f); // up-right
+      consider((mask & 0x02u) != 0u, 0.5f, 0.5f);  // down-right
+      consider((mask & 0x04u) != 0u, -0.5f, 0.5f); // down-left
+      consider((mask & 0x08u) != 0u, -0.5f, -0.5f); // up-left
+
+      // Outside the road shape.
+      if (sd > 0.0f) return Color{0, 0, 0, 0};
+
+      // Asphalt base.
+      Color base = Color{90, 90, 95, 230};
+      base = Mul(base, 1.0f + n);
+
+      // Dashed centerline on the closest segment (avoid the intersection blob).
+      const float centerDist = std::sqrt(px * px + py * py);
+      if (bestSegDist < (roadW * 0.25f) && centerDist > centerR * 0.6f) {
+        const int dash = static_cast<int>(std::floor(bestSegT * 10.0f + static_cast<float>(mask) * 0.15f));
+        if ((dash & 1) == 0) {
+          base = Color{220, 220, 210, 240};
+        }
+      }
+
+      // Soft edges.
+      const float edgeSoft = 0.05f;
+      const float a = std::clamp((-sd) / edgeSoft, 0.0f, 1.0f);
+      base.a = static_cast<unsigned char>(static_cast<float>(base.a) * a);
+      return base;
+    });
+  };
+
+  for (int i = 0; i < 16; ++i) {
+    m_roadTex[static_cast<std::size_t>(i)] = makeRoadVariant(static_cast<std::uint8_t>(i));
+  }
 
   // Residential
   m_overlayTex[2] = MakeDiamondTexture(m_tileW, m_tileH, [&](int x, int y, const DiamondParams& d) -> Color {
@@ -268,7 +342,7 @@ void Renderer::rebuildTextures(std::uint64_t seed)
 }
 
 void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeSec, std::optional<Point> hovered,
-                         bool drawGrid)
+                         bool drawGrid, int brushRadius)
 {
   (void)timeSec;
 
@@ -303,7 +377,10 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
       DrawTexturePro(terrain(t.terrain), src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
 
       // Draw overlay
-      if (t.overlay != Overlay::None) {
+      if (t.overlay == Overlay::Road) {
+        const std::uint8_t mask = static_cast<std::uint8_t>(t.variation & 0x0Fu);
+        DrawTexturePro(road(mask), src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
+      } else if (t.overlay != Overlay::None) {
         DrawTexturePro(overlay(t.overlay), src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
       }
 
@@ -319,37 +396,54 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
     }
   }
 
-  // Hover highlight
-  if (hovered) {
-    const int x = hovered->x;
-    const int y = hovered->y;
-    if (world.inBounds(x, y)) {
-      const Vector2 center = TileToWorldCenter(x, y, static_cast<float>(m_tileW), static_cast<float>(m_tileH));
+  // Hover highlight (and brush outline)
+  if (hovered && world.inBounds(hovered->x, hovered->y)) {
+    const float thickness = 2.0f / std::max(0.25f, camera.zoom);
+
+    auto drawOutline = [&](int tx, int ty, Color c) {
+      const Vector2 center = TileToWorldCenter(tx, ty, static_cast<float>(m_tileW), static_cast<float>(m_tileH));
       Vector2 corners[4];
       TileDiamondCorners(center, static_cast<float>(m_tileW), static_cast<float>(m_tileH), corners);
 
-      const float thickness = 2.0f / std::max(0.25f, camera.zoom);
-      const Color hc = Color{255, 255, 255, 180};
+      DrawLineEx(corners[0], corners[1], thickness, c);
+      DrawLineEx(corners[1], corners[2], thickness, c);
+      DrawLineEx(corners[2], corners[3], thickness, c);
+      DrawLineEx(corners[3], corners[0], thickness, c);
+    };
 
-      DrawLineEx(corners[0], corners[1], thickness, hc);
-      DrawLineEx(corners[1], corners[2], thickness, hc);
-      DrawLineEx(corners[2], corners[3], thickness, hc);
-      DrawLineEx(corners[3], corners[0], thickness, hc);
+    const int cx = hovered->x;
+    const int cy = hovered->y;
+
+    const int r = std::max(0, brushRadius);
+    if (r > 0) {
+      const Color bc = Color{255, 255, 255, 70};
+      for (int dy = -r; dy <= r; ++dy) {
+        for (int dx = -r; dx <= r; ++dx) {
+          if (std::abs(dx) + std::abs(dy) > r) continue; // diamond brush
+          const int tx = cx + dx;
+          const int ty = cy + dy;
+          if (!world.inBounds(tx, ty)) continue;
+          drawOutline(tx, ty, bc);
+        }
+      }
     }
+
+    // Center tile gets a brighter outline.
+    drawOutline(cx, cy, Color{255, 255, 255, 180});
   }
 
   EndMode2D();
 }
 
 void Renderer::drawHUD(const World& world, Tool tool, std::optional<Point> hovered, int screenW, int screenH,
-                       bool showHelp)
+                       bool showHelp, int brushRadius, int undoCount, int redoCount)
 {
   const Stats& s = world.stats();
 
   // HUD panel
   const int pad = 12;
   const int panelW = 420;
-  const int panelH = showHelp ? 220 : 140;
+  const int panelH = showHelp ? 294 : 162;
 
   DrawRectangle(pad, pad, panelW, panelH, Color{0, 0, 0, 150});
   DrawRectangleLines(pad, pad, panelW, panelH, Color{255, 255, 255, 70});
@@ -371,7 +465,10 @@ void Renderer::drawHUD(const World& world, Tool tool, std::optional<Point> hover
                 s.employed, s.jobsCapacity);
   line(buf);
 
-  std::snprintf(buf, sizeof(buf), "Roads: %d    Parks: %d    Tool: %s", s.roads, s.parks, ToString(tool));
+  std::snprintf(buf, sizeof(buf), "Roads: %d    Parks: %d    Tool: %s    Brush: %d", s.roads, s.parks, ToString(tool), brushRadius);
+  line(buf);
+
+  std::snprintf(buf, sizeof(buf), "Undo: %d    Redo: %d", undoCount, redoCount);
   line(buf);
 
   // Happiness bar
@@ -398,8 +495,12 @@ void Renderer::drawHUD(const World& world, Tool tool, std::optional<Point> hover
     DrawText("Right drag: pan | Wheel: zoom | R: regen | G: grid | H: help", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
     y += 22;
-    DrawText("1 Road | 2 Res | 3 Com | 4 Ind | 5 Park | 0 Bulldoze", pad + 10, y + 10, 16,
+    DrawText("1 Road | 2 Res | 3 Com | 4 Ind | 5 Park | 0 Doze | Q Inspect", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
+    y += 22;
+    DrawText("[/] brush | F5 save | F9 load", pad + 10, y + 10, 16, Color{220, 220, 220, 255});
+    y += 22;
+    DrawText("Ctrl+Z: undo | Ctrl+Y: redo", pad + 10, y + 10, 16, Color{220, 220, 220, 255});
     y += 22;
     DrawText("Tip: place the same zone again to upgrade (lvl 1->3).", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});

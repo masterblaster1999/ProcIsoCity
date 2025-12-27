@@ -1,0 +1,14 @@
+# Target labels
+ raylib-populate
+# Source files and their labels
+/mnt/data/work/current/build/_deps/raylib-subbuild/CMakeFiles/raylib-populate
+/mnt/data/work/current/build/_deps/raylib-subbuild/CMakeFiles/raylib-populate.rule
+/mnt/data/work/current/build/_deps/raylib-subbuild/CMakeFiles/raylib-populate-complete.rule
+/mnt/data/work/current/build/_deps/raylib-subbuild/raylib-populate-prefix/src/raylib-populate-stamp/raylib-populate-build.rule
+/mnt/data/work/current/build/_deps/raylib-subbuild/raylib-populate-prefix/src/raylib-populate-stamp/raylib-populate-configure.rule
+/mnt/data/work/current/build/_deps/raylib-subbuild/raylib-populate-prefix/src/raylib-populate-stamp/raylib-populate-download.rule
+/mnt/data/work/current/build/_deps/raylib-subbuild/raylib-populate-prefix/src/raylib-populate-stamp/raylib-populate-install.rule
+/mnt/data/work/current/build/_deps/raylib-subbuild/raylib-populate-prefix/src/raylib-populate-stamp/raylib-populate-mkdir.rule
+/mnt/data/work/current/build/_deps/raylib-subbuild/raylib-populate-prefix/src/raylib-populate-stamp/raylib-populate-patch.rule
+/mnt/data/work/current/build/_deps/raylib-subbuild/raylib-populate-prefix/src/raylib-populate-stamp/raylib-populate-test.rule
+/mnt/data/work/current/build/_deps/raylib-subbuild/raylib-populate-prefix/src/raylib-populate-stamp/raylib-populate-update.rule

@@ -14,6 +14,10 @@ public:
 
   void update(World& world, float dt);
 
+  // Recompute derived HUD stats (population/capacities/roads/parks/employment/happiness)
+  // without advancing time or modifying tiles.
+  void refreshDerivedStats(World& world) const;
+
 private:
   void step(World& world);
 
