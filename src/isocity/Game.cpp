@@ -11,6 +11,10 @@ namespace isocity {
 
 namespace {
 constexpr const char* kQuickSavePath = "isocity_save.bin";
+
+// Discrete sim speed presets (dt multiplier).
+constexpr float kSimSpeeds[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f, 16.0f};
+constexpr int kSimSpeedCount = static_cast<int>(sizeof(kSimSpeeds) / sizeof(kSimSpeeds[0]));
 } // namespace
 
 RaylibContext::RaylibContext(int w, int h, const char* title, bool vsync)
@@ -187,6 +191,43 @@ void Game::handleInput(float dt)
     doRedo();
   }
 
+  // Simulation controls
+  auto simSpeed = [&]() -> float {
+    const int si = std::clamp(m_simSpeedIndex, 0, kSimSpeedCount - 1);
+    return kSimSpeeds[static_cast<std::size_t>(si)];
+  };
+
+  if (IsKeyPressed(KEY_SPACE)) {
+    endPaintStroke();
+    m_simPaused = !m_simPaused;
+    m_sim.resetTimer();
+    showToast(m_simPaused ? "Sim paused" : "Sim running");
+  }
+
+  if (m_simPaused && IsKeyPressed(KEY_N)) {
+    endPaintStroke();
+    m_sim.stepOnce(m_world);
+    showToast("Sim step");
+  }
+
+  if (IsKeyPressed(KEY_KP_ADD) || (IsKeyPressed(KEY_EQUAL) && shift)) {
+    const int before = m_simSpeedIndex;
+    m_simSpeedIndex = std::clamp(m_simSpeedIndex + 1, 0, kSimSpeedCount - 1);
+    if (m_simSpeedIndex != before) {
+      m_sim.resetTimer();
+      showToast(TextFormat("Sim speed: x%.2f", static_cast<double>(simSpeed())));
+    }
+  }
+
+  if (IsKeyPressed(KEY_KP_SUBTRACT) || IsKeyPressed(KEY_MINUS)) {
+    const int before = m_simSpeedIndex;
+    m_simSpeedIndex = std::clamp(m_simSpeedIndex - 1, 0, kSimSpeedCount - 1);
+    if (m_simSpeedIndex != before) {
+      m_sim.resetTimer();
+      showToast(TextFormat("Sim speed: x%.2f", static_cast<double>(simSpeed())));
+    }
+  }
+
   // Toggle UI
   if (IsKeyPressed(KEY_H)) m_showHelp = !m_showHelp;
   if (IsKeyPressed(KEY_G)) m_drawGrid = !m_drawGrid;
@@ -204,7 +245,7 @@ void Game::handleInput(float dt)
   // Save / Load (quick save)
   if (IsKeyPressed(KEY_F5)) {
     std::string err;
-    if (SaveWorldBinary(m_world, kQuickSavePath, err)) {
+    if (SaveWorldBinary(m_world, m_procCfg, kQuickSavePath, err)) {
       showToast(std::string("Saved: ") + kQuickSavePath);
     } else {
       showToast(std::string("Save failed: ") + err, 4.0f);
@@ -215,8 +256,10 @@ void Game::handleInput(float dt)
     endPaintStroke();
     std::string err;
     World loaded;
-    if (LoadWorldBinary(loaded, kQuickSavePath, err)) {
+    ProcGenConfig loadedProcCfg{};
+    if (LoadWorldBinary(loaded, loadedProcCfg, kQuickSavePath, err)) {
       m_world = std::move(loaded);
+      m_procCfg = loadedProcCfg;
 
       // Loading invalidates history.
       m_history.clear();
@@ -322,8 +365,10 @@ void Game::update(float dt)
 {
   // Pause simulation while actively painting so an undoable "stroke" doesn't
   // accidentally include sim-driven money changes.
-  if (!m_painting) {
-    m_sim.update(m_world, dt);
+  if (!m_painting && !m_simPaused) {
+    const int si = std::clamp(m_simSpeedIndex, 0, kSimSpeedCount - 1);
+    const float speed = kSimSpeeds[static_cast<std::size_t>(si)];
+    m_sim.update(m_world, dt * speed);
   }
 
   if (m_toastTimer > 0.0f) {
@@ -339,7 +384,8 @@ void Game::draw()
 
   m_renderer.drawWorld(m_world, m_camera, m_timeSec, m_hovered, m_drawGrid, m_brushRadius);
   m_renderer.drawHUD(m_world, m_tool, m_hovered, GetScreenWidth(), GetScreenHeight(), m_showHelp, m_brushRadius,
-                     static_cast<int>(m_history.undoSize()), static_cast<int>(m_history.redoSize()));
+                     static_cast<int>(m_history.undoSize()), static_cast<int>(m_history.redoSize()), m_simPaused,
+                     kSimSpeeds[static_cast<std::size_t>(std::clamp(m_simSpeedIndex, 0, kSimSpeedCount - 1))]);
 
   // Toast / status message
   if (m_toastTimer > 0.0f && !m_toast.empty()) {

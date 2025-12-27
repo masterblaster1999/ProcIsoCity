@@ -52,6 +52,13 @@ ScanResult ScanWorld(const World& world)
 }
 } // namespace
 
+void Simulator::stepOnce(World& world)
+{
+  // Ensure manual stepping is deterministic and doesn't accidentally queue extra ticks.
+  m_accum = 0.0f;
+  step(world);
+}
+
 void Simulator::update(World& world, float dt)
 {
   m_accum += dt;

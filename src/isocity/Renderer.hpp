@@ -25,7 +25,7 @@ public:
                  bool drawGrid, int brushRadius);
 
   void drawHUD(const World& world, Tool tool, std::optional<Point> hovered, int screenW, int screenH, bool showHelp,
-               int brushRadius, int undoCount, int redoCount);
+               int brushRadius, int undoCount, int redoCount, bool simPaused, float simSpeed);
 
 private:
   int m_tileW = 64;

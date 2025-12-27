@@ -146,8 +146,6 @@ Texture2D& Renderer::overlay(Overlay o) { return m_overlayTex[static_cast<std::s
 
 Texture2D& Renderer::road(std::uint8_t mask) { return m_roadTex[static_cast<std::size_t>(mask & 0x0Fu)]; }
 
-Texture2D& Renderer::road(std::uint8_t mask) { return m_roadTex[static_cast<std::size_t>(mask & 0x0Fu)]; }
-
 Color Renderer::BrightnessTint(float b)
 {
   const int v = static_cast<int>(std::round(255.0f * std::clamp(b, 0.0f, 1.5f)));
@@ -436,14 +434,14 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
 }
 
 void Renderer::drawHUD(const World& world, Tool tool, std::optional<Point> hovered, int screenW, int screenH,
-                       bool showHelp, int brushRadius, int undoCount, int redoCount)
+                       bool showHelp, int brushRadius, int undoCount, int redoCount, bool simPaused, float simSpeed)
 {
   const Stats& s = world.stats();
 
   // HUD panel
   const int pad = 12;
   const int panelW = 420;
-  const int panelH = showHelp ? 294 : 162;
+  const int panelH = showHelp ? 316 : 184;
 
   DrawRectangle(pad, pad, panelW, panelH, Color{0, 0, 0, 150});
   DrawRectangleLines(pad, pad, panelW, panelH, Color{255, 255, 255, 70});
@@ -459,6 +457,9 @@ void Renderer::drawHUD(const World& world, Tool tool, std::optional<Point> hover
 
   std::snprintf(buf, sizeof(buf), "Day: %d    Money: %d    Happiness: %.0f%%", s.day, s.money,
                 static_cast<double>(s.happiness * 100.0f));
+  line(buf);
+
+  std::snprintf(buf, sizeof(buf), "Sim: %s    Speed: x%.2f", simPaused ? "PAUSED" : "RUNNING", static_cast<double>(simSpeed));
   line(buf);
 
   std::snprintf(buf, sizeof(buf), "Pop: %d / %d housing    Jobs: %d / %d cap", s.population, s.housingCapacity,
@@ -498,9 +499,9 @@ void Renderer::drawHUD(const World& world, Tool tool, std::optional<Point> hover
     DrawText("1 Road | 2 Res | 3 Com | 4 Ind | 5 Park | 0 Doze | Q Inspect", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
     y += 22;
-    DrawText("[/] brush | F5 save | F9 load", pad + 10, y + 10, 16, Color{220, 220, 220, 255});
+    DrawText("[/] brush | Space: pause | N: step | +/-: speed", pad + 10, y + 10, 16, Color{220, 220, 220, 255});
     y += 22;
-    DrawText("Ctrl+Z: undo | Ctrl+Y: redo", pad + 10, y + 10, 16, Color{220, 220, 220, 255});
+    DrawText("F5 save | F9 load | Ctrl+Z undo | Ctrl+Y redo", pad + 10, y + 10, 16, Color{220, 220, 220, 255});
     y += 22;
     DrawText("Tip: place the same zone again to upgrade (lvl 1->3).", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});

@@ -49,6 +49,9 @@ cmake --build build -j
 - **R**: regenerate a new world (new seed)
 - **G**: toggle grid overlay
 - **H**: toggle help overlay
+- **Space**: pause/resume simulation
+- **N**: step simulation by one tick (while paused)
+- **+ / -**: change simulation speed
 - **[ / ]**: brush size (diamond radius)
 - **F5**: quick save (writes `isocity_save.bin`)
 - **F9**: quick load
@@ -65,6 +68,7 @@ cmake --build build -j
 - On Linux you may need dev packages for X11/OpenGL/audio depending on distro.
 - No textures are loaded from disk; all tiles are created procedurally at runtime.
 - Roads now auto-connect visually (auto-tiling based on neighboring road tiles).
+- Save files are versioned; **v2** saves store seed + procgen config + tile deltas (smaller saves).
 
 ---
 
@@ -74,7 +78,7 @@ cmake --build build -j
 - Chunked world streaming + frustum culling
 - Proper road graphs (nodes/edges) + traffic visualization
 - Smarter undo/redo (optional: track only overlays + money, not sim state)
-- Save format upgrade: store seed + player diffs (smaller saves)
+- Save system: compression, multiple slots, and stronger cross-version stability
 - Buildings with multi-tile footprints + procedural silhouettes
 - Multi-layer rendering (terrain, decals, structures, overlays)
 

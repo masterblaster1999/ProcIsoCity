@@ -66,6 +66,10 @@ private:
   bool m_showHelp = true;
   bool m_drawGrid = false;
 
+  // Simulation controls (pause/step/speed) are handled at the game layer so the simulator stays simple.
+  bool m_simPaused = false;
+  int m_simSpeedIndex = 2; // 0.25x, 0.5x, 1x, 2x, ... (default = 1x)
+
   float m_timeSec = 0.0f;
   std::string m_toast;
   float m_toastTimer = 0.0f;

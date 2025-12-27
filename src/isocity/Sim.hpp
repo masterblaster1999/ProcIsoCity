@@ -14,6 +14,15 @@ public:
 
   void update(World& world, float dt);
 
+  // Advance the simulation by exactly one tick (increments day, updates economy, etc.).
+  // Resets the internal timer accumulator so stepping is deterministic.
+  void stepOnce(World& world);
+
+  // Clears the internal tick accumulator (useful when pausing/unpausing or changing sim speed).
+  void resetTimer() { m_accum = 0.0f; }
+
+  const SimConfig& config() const { return m_cfg; }
+
   // Recompute derived HUD stats (population/capacities/roads/parks/employment/happiness)
   // without advancing time or modifying tiles.
   void refreshDerivedStats(World& world) const;
