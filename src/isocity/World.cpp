@@ -186,6 +186,8 @@ ToolApplyResult World::applyTool(Tool tool, int x, int y)
   switch (tool) {
   case Tool::Road: {
     if (t.overlay == Overlay::Road) return ToolApplyResult::Noop;
+    // Don't overwrite other overlays (zones/parks). Use the bulldozer first.
+    if (t.overlay != Overlay::None) return ToolApplyResult::BlockedOccupied;
     if (!spend(1)) return ToolApplyResult::InsufficientFunds;
     setRoad(x, y);
     return ToolApplyResult::Applied;
@@ -193,6 +195,8 @@ ToolApplyResult World::applyTool(Tool tool, int x, int y)
 
   case Tool::Park: {
     if (t.overlay == Overlay::Park) return ToolApplyResult::Noop;
+    // Parks also shouldn't replace existing content; bulldoze first.
+    if (t.overlay != Overlay::None) return ToolApplyResult::BlockedOccupied;
     if (!spend(3)) return ToolApplyResult::InsufficientFunds;
     setOverlay(Overlay::Park, x, y);
     return ToolApplyResult::Applied;

@@ -12,6 +12,13 @@ struct SimConfig {
   //
   // Set to 0 to disable locality (parks behave like a global ratio again).
   int parkInfluenceRadius = 6;
+
+  // If true, residential/commercial/industrial tiles only function when their
+  // adjacent road network connects to the map edge (an \"outside\" connection).
+  //
+  // This is a classic city-builder rule: connect roads to the border to bring in
+  // citizens/jobs and keep zones from stagnating.
+  bool requireOutsideConnection = true;
 };
 
 class Simulator {

@@ -31,6 +31,43 @@ P RandomLand(RNG& rng, const World& world)
   return P{w / 2, h / 2};
 }
 
+P ClosestBuildableEdge(RNG& rng, const World& world, P from)
+{
+  const int w = world.width();
+  const int h = world.height();
+
+  // Scan the border for a buildable tile nearest to the given point.
+  // This gives the world at least one "outside" connection for road networks.
+  int bestDist = 1'000'000;
+  P best = from;
+
+  auto consider = [&](int x, int y) {
+    if (!world.inBounds(x, y)) return;
+    if (!world.isBuildable(x, y)) return;
+    const int d = std::abs(x - from.x) + std::abs(y - from.y);
+    if (d < bestDist) {
+      bestDist = d;
+      best = P{x, y};
+    } else if (d == bestDist && rng.chance(0.25f)) {
+      // Small random tie-break for variety (still deterministic for a given seed).
+      best = P{x, y};
+    }
+  };
+
+  // Top/bottom edges
+  for (int x = 0; x < w; ++x) {
+    consider(x, 0);
+    if (h > 1) consider(x, h - 1);
+  }
+  // Left/right edges (skip corners to avoid duplicates)
+  for (int y = 1; y < h - 1; ++y) {
+    consider(0, y);
+    if (w > 1) consider(w - 1, y);
+  }
+
+  return best;
+}
+
 void CarveRoad(World& world, RNG& rng, P a, P b)
 {
   P p = a;
@@ -157,6 +194,13 @@ World GenerateWorld(int width, int height, std::uint64_t seed, const ProcGenConf
     const int b = rng.rangeInt(0, hubs - 1);
     if (a == b) continue;
     CarveRoad(world, rng, hubPts[static_cast<std::size_t>(a)], hubPts[static_cast<std::size_t>(b)]);
+  }
+
+  // --- Ensure at least one road reaches the map edge ("outside connection") ---
+  // This supports the sim rule where disconnected road networks don't provide access for zones.
+  if (!hubPts.empty()) {
+    const P edge = ClosestBuildableEdge(rng, world, hubPts[0]);
+    CarveRoad(world, rng, hubPts[0], edge);
   }
 
   // --- Zone placement along roads ---

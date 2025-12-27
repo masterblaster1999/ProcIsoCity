@@ -3,6 +3,7 @@
 #include "isocity/Random.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <vector>
 
@@ -52,6 +53,97 @@ ScanResult ScanWorld(const World& world)
   return r;
 }
 
+// Compute which road tiles are connected to the map border ("outside connection").
+//
+// We treat the map edge as the entry point for citizens/jobs (classic city builder rule).
+// A road component that does not touch the edge is considered disconnected and won't provide access.
+void ComputeEdgeConnectedRoads(const World& world, std::vector<std::uint8_t>& outRoadToEdge)
+{
+  const int w = world.width();
+  const int h = world.height();
+
+  outRoadToEdge.clear();
+  if (w <= 0 || h <= 0) return;
+
+  const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+  outRoadToEdge.assign(n, 0);
+
+  std::vector<int> queue;
+  queue.reserve(n / 8);
+
+  auto push = [&](int x, int y) {
+    const int idx = y * w + x;
+    const std::size_t uidx = static_cast<std::size_t>(idx);
+    if (uidx >= outRoadToEdge.size()) return;
+    if (outRoadToEdge[uidx]) return;
+    outRoadToEdge[uidx] = 1;
+    queue.push_back(idx);
+  };
+
+  auto isRoad = [&](int x, int y) -> bool {
+    return world.inBounds(x, y) && world.at(x, y).overlay == Overlay::Road;
+  };
+
+  // Seed BFS with any road tile on the map border.
+  for (int x = 0; x < w; ++x) {
+    if (isRoad(x, 0)) push(x, 0);
+    if (h > 1 && isRoad(x, h - 1)) push(x, h - 1);
+  }
+  for (int y = 1; y < h - 1; ++y) {
+    if (isRoad(0, y)) push(0, y);
+    if (w > 1 && isRoad(w - 1, y)) push(w - 1, y);
+  }
+
+  // No border roads => no outside connection.
+  if (queue.empty()) return;
+
+  std::size_t qHead = 0;
+  while (qHead < queue.size()) {
+    const int idx = queue[qHead++];
+    const int x = idx % w;
+    const int y = idx / w;
+
+    constexpr int dirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+    for (const auto& d : dirs) {
+      const int nx = x + d[0];
+      const int ny = y + d[1];
+      if (!world.inBounds(nx, ny)) continue;
+      if (world.at(nx, ny).overlay != Overlay::Road) continue;
+
+      const int nidx = ny * w + nx;
+      const std::size_t unidx = static_cast<std::size_t>(nidx);
+      if (unidx >= outRoadToEdge.size()) continue;
+      if (outRoadToEdge[unidx]) continue;
+
+      outRoadToEdge[unidx] = 1;
+      queue.push_back(nidx);
+    }
+  }
+}
+
+bool HasAdjacentEdgeConnectedRoad(const World& world, const std::vector<std::uint8_t>& roadToEdge, int x, int y)
+{
+  if (!world.inBounds(x, y)) return false;
+
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return false;
+
+  const std::size_t expected = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+  if (roadToEdge.size() != expected) return false;
+
+  auto check = [&](int nx, int ny) -> bool {
+    if (!world.inBounds(nx, ny)) return false;
+    if (world.at(nx, ny).overlay != Overlay::Road) return false;
+    const int idx = ny * w + nx;
+    const std::size_t uidx = static_cast<std::size_t>(idx);
+    if (uidx >= roadToEdge.size()) return false;
+    return roadToEdge[uidx] != 0;
+  };
+
+  return check(x + 1, y) || check(x - 1, y) || check(x, y + 1) || check(x, y - 1);
+}
+
 // Parks are modeled as an *area of influence* rather than a global ratio.
 // We compute a simple "coverage" ratio: what fraction of zone tiles are within
 // a Manhattan distance <= radius of any park that is connected to a road.
@@ -59,7 +151,7 @@ ScanResult ScanWorld(const World& world)
 // Notes:
 // - We treat Water as a barrier so disconnected islands don't share park benefits.
 // - This is intentionally lightweight: a multi-source BFS on a 96x96 grid is cheap.
-float ParkCoverageRatio(const World& world, int radius)
+float ParkCoverageRatio(const World& world, int radius, const std::vector<std::uint8_t>* roadToEdge)
 {
   // Compatibility mode: treat parks as a global ratio (old behavior).
   if (radius <= 0) {
@@ -68,7 +160,13 @@ float ParkCoverageRatio(const World& world, int radius)
     for (int y = 0; y < world.height(); ++y) {
       for (int x = 0; x < world.width(); ++x) {
         const Tile& t = world.at(x, y);
-        if (t.overlay == Overlay::Park) parks++;
+
+        if (t.overlay == Overlay::Park) {
+          bool connected = world.hasAdjacentRoad(x, y);
+          if (roadToEdge) connected = HasAdjacentEdgeConnectedRoad(world, *roadToEdge, x, y);
+          if (connected) parks++;
+        }
+
         const bool isZone = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
                              t.overlay == Overlay::Industrial);
         if (isZone) zones++;
@@ -95,7 +193,9 @@ float ParkCoverageRatio(const World& world, int radius)
       const Tile& t = world.at(x, y);
       if (t.overlay != Overlay::Park) continue;
       if (t.terrain == Terrain::Water) continue;
-      if (!world.hasAdjacentRoad(x, y)) continue;
+      bool connected = world.hasAdjacentRoad(x, y);
+      if (roadToEdge) connected = HasAdjacentEdgeConnectedRoad(world, *roadToEdge, x, y);
+      if (!connected) continue;
       const int idx = idxOf(x, y);
       dist[static_cast<std::size_t>(idx)] = 0;
       queue.push_back(idx);
@@ -176,7 +276,13 @@ void Simulator::refreshDerivedStats(World& world) const
   const int employed = std::min(scan.population, scan.jobsCap);
 
   // Happiness: parks help (locally), unemployment hurts.
-  const float parkCoverage = ParkCoverageRatio(world, m_cfg.parkInfluenceRadius);
+  std::vector<std::uint8_t> roadToEdge;
+  if (m_cfg.requireOutsideConnection) {
+    ComputeEdgeConnectedRoads(world, roadToEdge);
+  }
+
+  const float parkCoverage = ParkCoverageRatio(world, m_cfg.parkInfluenceRadius,
+                                              m_cfg.requireOutsideConnection ? &roadToEdge : nullptr);
   const float parkBonus = std::min(0.25f, parkCoverage * 0.35f);
 
   const float unemployment = (scan.population > 0)
@@ -205,6 +311,20 @@ void Simulator::step(World& world)
   const int roads = scan.roads;
   const int parks = scan.parks;
 
+  // Precompute which roads are connected to the map border ("outside connection").
+  // When requireOutsideConnection is enabled, zones only function if they touch a road
+  // component that reaches the edge of the map.
+  std::vector<std::uint8_t> roadToEdge;
+  if (m_cfg.requireOutsideConnection) {
+    ComputeEdgeConnectedRoads(world, roadToEdge);
+  }
+
+  auto hasZoneAccess = [&](int x, int y) -> bool {
+    if (!world.hasAdjacentRoad(x, y)) return false;
+    if (!m_cfg.requireOutsideConnection) return true;
+    return HasAdjacentEdgeConnectedRoad(world, roadToEdge, x, y);
+  };
+
   // Demand model: housing grows if there are jobs + happiness.
   // Very simple, but good enough as a starter.
   const float jobPressure = (housingCap > 0) ? (static_cast<float>(jobsCap) / static_cast<float>(housingCap)) : 0.0f;
@@ -216,7 +336,7 @@ void Simulator::step(World& world)
       Tile& t = world.at(x, y);
       if (t.overlay != Overlay::Residential) continue;
 
-      const bool access = world.hasAdjacentRoad(x, y);
+      const bool access = hasZoneAccess(x, y);
       const int cap = HousingForLevel(t.level);
 
       if (!access) {
@@ -256,7 +376,7 @@ void Simulator::step(World& world)
       Tile& t = world.at(x, y);
       if (t.overlay != Overlay::Commercial && t.overlay != Overlay::Industrial) continue;
 
-      const bool access = world.hasAdjacentRoad(x, y);
+      const bool access = hasZoneAccess(x, y);
       if (!access) {
         t.occupants = static_cast<std::uint16_t>(std::max(0, static_cast<int>(t.occupants) - 1));
         continue;
@@ -278,7 +398,8 @@ void Simulator::step(World& world)
   s.money += income - maintenance;
 
   // Happiness: parks help (locally), unemployment hurts.
-  const float parkCoverage = ParkCoverageRatio(world, m_cfg.parkInfluenceRadius);
+  const float parkCoverage = ParkCoverageRatio(world, m_cfg.parkInfluenceRadius,
+                                               m_cfg.requireOutsideConnection ? &roadToEdge : nullptr);
   const float parkBonus = std::min(0.25f, parkCoverage * 0.35f);
 
   const float unemployment = (population > 0) ? (1.0f - (static_cast<float>(employed) / static_cast<float>(population)))
@@ -294,7 +415,7 @@ void Simulator::step(World& world)
         Tile& t = world.at(x, y);
         const bool isZone = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial || t.overlay == Overlay::Industrial);
         if (!isZone) continue;
-        if (!world.hasAdjacentRoad(x, y)) continue;
+        if (!hasZoneAccess(x, y)) continue;
         if (t.level >= 3) continue;
 
         // small chance per tick
@@ -317,5 +438,6 @@ void Simulator::step(World& world)
   s.roads = roads;
   s.parks = parks;
 }
+
 
 } // namespace isocity

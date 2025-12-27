@@ -34,6 +34,22 @@ cmake --build build -j
 ./build/proc_isocity
 ```
 
+### 4) Tests (headless, optional)
+
+You can build and run a small set of **headless** tests (no raylib dependency). This is handy for CI or for quickly validating core logic changes on machines without graphics/system deps.
+
+```bash
+cmake -S . -B build-tests -DPROCISOCITY_BUILD_APP=OFF -DPROCISOCITY_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-tests -j
+ctest --test-dir build-tests --output-on-failure
+```
+
+### CMake options
+
+- `PROCISOCITY_BUILD_APP` (default: ON) — build the interactive raylib app (`proc_isocity`).
+- `PROCISOCITY_BUILD_TESTS` (default: OFF) — build `proc_isocity_tests` and enable `ctest`.
+- `PROCISOCITY_USE_SYSTEM_RAYLIB` (default: OFF) — when building the app, use a system raylib instead of FetchContent.
+
 ---
 
 ## Controls
@@ -66,10 +82,11 @@ cmake --build build -j
 
 ## Notes
 
-- This project uses CMake **FetchContent** to download/build raylib automatically.
+- By default (when `PROCISOCITY_BUILD_APP=ON`), this project uses CMake **FetchContent** to download/build raylib automatically.
 - On Linux you may need dev packages for X11/OpenGL/audio depending on distro.
 - No textures are loaded from disk; all tiles are created procedurally at runtime.
 - Roads now auto-connect visually (auto-tiling based on neighboring road tiles).
+- Zones and job tiles only function when connected via roads to the **map edge** (an "outside" connection).
 - Zone tiles show 1–3 pips (level) and a tiny occupancy bar when zoomed in.
 - Parks now boost happiness based on **local coverage** (zones within a small radius of a road-connected park).
 - Save files are versioned; **v2** saves store seed + procgen config + tile deltas (smaller saves).
