@@ -165,15 +165,15 @@ void World::bulldoze(int x, int y) { setOverlay(Overlay::None, x, y); }
 
 void World::setRoad(int x, int y) { setOverlay(Overlay::Road, x, y); }
 
-void World::applyTool(Tool tool, int x, int y)
+ToolApplyResult World::applyTool(Tool tool, int x, int y)
 {
-  if (!inBounds(x, y)) return;
+  if (!inBounds(x, y)) return ToolApplyResult::OutOfBounds;
   Tile& t = at(x, y);
 
-  if (tool == Tool::Inspect) return;
+  if (tool == Tool::Inspect) return ToolApplyResult::Noop;
 
   // Can't build on water.
-  if (t.terrain == Terrain::Water) return;
+  if (t.terrain == Terrain::Water) return ToolApplyResult::BlockedWater;
 
   // Tool costs (tiny placeholder economy).
   auto spend = [&](int cost) -> bool {
@@ -185,22 +185,24 @@ void World::applyTool(Tool tool, int x, int y)
 
   switch (tool) {
   case Tool::Road: {
-    if (t.overlay == Overlay::Road) return;
-    if (!spend(1)) return;
+    if (t.overlay == Overlay::Road) return ToolApplyResult::Noop;
+    if (!spend(1)) return ToolApplyResult::InsufficientFunds;
     setRoad(x, y);
+    return ToolApplyResult::Applied;
   } break;
 
   case Tool::Park: {
-    if (t.overlay == Overlay::Park) return;
-    if (!spend(3)) return;
+    if (t.overlay == Overlay::Park) return ToolApplyResult::Noop;
+    if (!spend(3)) return ToolApplyResult::InsufficientFunds;
     setOverlay(Overlay::Park, x, y);
+    return ToolApplyResult::Applied;
   } break;
 
   case Tool::Residential:
   case Tool::Commercial:
   case Tool::Industrial: {
     // Zones require road access.
-    if (!hasAdjacentRoad(x, y)) return;
+    if (!hasAdjacentRoad(x, y)) return ToolApplyResult::BlockedNoRoad;
 
     Overlay zone = Overlay::Residential;
     if (tool == Tool::Commercial) zone = Overlay::Commercial;
@@ -208,22 +210,29 @@ void World::applyTool(Tool tool, int x, int y)
 
     if (t.overlay == zone) {
       // Upgrade with repeated placement.
-      if (t.level < 3 && spend(5)) t.level++;
-      return;
+      if (t.level >= 3) return ToolApplyResult::Noop;
+      if (!spend(5)) return ToolApplyResult::InsufficientFunds;
+      t.level++;
+      return ToolApplyResult::Applied;
     }
 
-    if (t.overlay != Overlay::None) return; // Don't overwrite other overlays in this minimal template.
+    if (t.overlay != Overlay::None) return ToolApplyResult::BlockedOccupied; // Don't overwrite other overlays.
 
-    if (!spend(5)) return;
+    if (!spend(5)) return ToolApplyResult::InsufficientFunds;
     setOverlay(zone, x, y);
+    return ToolApplyResult::Applied;
   } break;
 
   case Tool::Bulldoze: {
+    if (t.overlay == Overlay::None) return ToolApplyResult::Noop;
     bulldoze(x, y);
+    return ToolApplyResult::Applied;
   } break;
 
   default: break;
   }
+
+  return ToolApplyResult::Noop;
 }
 
 } // namespace isocity

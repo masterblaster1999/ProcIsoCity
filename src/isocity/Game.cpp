@@ -74,12 +74,27 @@ void Game::applyToolBrush(int centerX, int centerY)
       const int tx = centerX + dx;
       const int ty = centerY + dy;
 
+      // Skip out-of-bounds early.
+      if (!m_world.inBounds(tx, ty)) continue;
+
+      // Within a single paint stroke, apply at most once per tile. This avoids
+      // accidental "multi-upgrades" (zones) if the cursor is held still.
+      if (!m_strokeApplied.empty() && m_strokeApplyW == m_world.width() && m_strokeApplyH == m_world.height()) {
+        const int idx = ty * m_strokeApplyW + tx;
+        if (idx >= 0) {
+          const std::size_t uidx = static_cast<std::size_t>(idx);
+          if (uidx < m_strokeApplied.size()) {
+            if (m_strokeApplied[uidx]) continue;
+            m_strokeApplied[uidx] = 1;
+          }
+        }
+      }
+
       // Road edits update neighbor road masks for auto-tiling. Capture the neighborhood
       // so undo/redo can restore variations without global recompute.
       const bool affectsRoadMasks =
           (m_tool == Tool::Road) ||
-          ((m_tool == Tool::Bulldoze || m_tool == Tool::Park) && m_world.inBounds(tx, ty) &&
-           (m_world.at(tx, ty).overlay == Overlay::Road));
+          ((m_tool == Tool::Bulldoze || m_tool == Tool::Park) && (m_world.at(tx, ty).overlay == Overlay::Road));
 
       if (affectsRoadMasks) {
         noteRoadNeighborhood(tx, ty);
@@ -87,7 +102,14 @@ void Game::applyToolBrush(int centerX, int centerY)
         m_history.noteTilePreEdit(m_world, tx, ty);
       }
 
-      m_world.applyTool(m_tool, tx, ty);
+      const ToolApplyResult res = m_world.applyTool(m_tool, tx, ty);
+      switch (res) {
+      case ToolApplyResult::InsufficientFunds: m_strokeFeedback.noMoney = true; break;
+      case ToolApplyResult::BlockedNoRoad: m_strokeFeedback.noRoad = true; break;
+      case ToolApplyResult::BlockedWater: m_strokeFeedback.water = true; break;
+      case ToolApplyResult::BlockedOccupied: m_strokeFeedback.occupied = true; break;
+      default: break;
+      }
     }
   }
 }
@@ -96,7 +118,15 @@ void Game::beginPaintStroke()
 {
   if (m_painting) return;
   m_painting = true;
+  m_strokeFeedback.clear();
   m_history.beginStroke(m_world);
+
+  // Per-stroke applied tile mask.
+  m_strokeApplyW = m_world.width();
+  m_strokeApplyH = m_world.height();
+  const std::size_t n =
+      static_cast<std::size_t>(std::max(0, m_strokeApplyW) * std::max(0, m_strokeApplyH));
+  m_strokeApplied.assign(n, 0);
 }
 
 void Game::endPaintStroke()
@@ -105,8 +135,30 @@ void Game::endPaintStroke()
   m_painting = false;
   m_history.endStroke(m_world);
 
+  m_strokeApplied.clear();
+  m_strokeApplyW = 0;
+  m_strokeApplyH = 0;
+
   // Keep HUD numbers (roads/parks/capacities) responsive even before the next sim tick.
   m_sim.refreshDerivedStats(m_world);
+
+  // Provide one toast per stroke for common build failures (no money, no road access, etc.).
+  if (m_strokeFeedback.any()) {
+    std::string msg = "Some placements failed: ";
+    bool first = true;
+    auto add = [&](const char* s) {
+      if (!first) msg += ", ";
+      msg += s;
+      first = false;
+    };
+
+    if (m_strokeFeedback.noMoney) add("not enough money");
+    if (m_strokeFeedback.noRoad) add("need adjacent road");
+    if (m_strokeFeedback.water) add("can't build on water");
+    if (m_strokeFeedback.occupied) add("tile occupied");
+
+    showToast(msg, 3.0f);
+  }
 }
 
 void Game::doUndo()

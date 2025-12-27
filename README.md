@@ -53,6 +53,8 @@ cmake --build build -j
 - **N**: step simulation by one tick (while paused)
 - **+ / -**: change simulation speed
 - **[ / ]**: brush size (diamond radius)
+- Painting applies each tile at most once per stroke (prevents accidental multi-upgrades while holding the mouse still).
+- Failed placements (no money / no road access / water) show a toast when you release the mouse.
 - **F5**: quick save (writes `isocity_save.bin`)
 - **F9**: quick load
 - **Ctrl+Z**: undo last paint stroke
@@ -68,6 +70,8 @@ cmake --build build -j
 - On Linux you may need dev packages for X11/OpenGL/audio depending on distro.
 - No textures are loaded from disk; all tiles are created procedurally at runtime.
 - Roads now auto-connect visually (auto-tiling based on neighboring road tiles).
+- Zone tiles show 1–3 pips (level) and a tiny occupancy bar when zoomed in.
+- Parks now boost happiness based on **local coverage** (zones within a small radius of a road-connected park).
 - Save files are versioned; **v2** saves store seed + procgen config + tile deltas (smaller saves).
 
 ---

@@ -391,6 +391,58 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
         DrawLineV(corners[2], corners[3], gc);
         DrawLineV(corners[3], corners[0], gc);
       }
+      // Zone indicators: when zoomed in, draw small pips for building level (1..3)
+      // and a tiny occupancy bar (residents/workers vs capacity).
+      const bool isZone =
+          (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial || t.overlay == Overlay::Industrial);
+      const float tileScreenW = static_cast<float>(m_tileW) * camera.zoom;
+      if (isZone && tileScreenW >= 28.0f) {
+        const float invZoom = 1.0f / std::max(0.001f, camera.zoom);
+
+        const int lvl = std::clamp<int>(static_cast<int>(t.level), 0, 3);
+
+        int cap = 0;
+        if (t.overlay == Overlay::Residential) cap = 10 * lvl;
+        if (t.overlay == Overlay::Commercial) cap = 8 * lvl;
+        if (t.overlay == Overlay::Industrial) cap = 12 * lvl;
+
+        const float ratio = (cap > 0)
+                                ? std::clamp(static_cast<float>(t.occupants) / static_cast<float>(cap), 0.0f, 1.0f)
+                                : 0.0f;
+
+        // Anchor near the tile center.
+        const float y0 = center.y - static_cast<float>(m_tileH) * 0.06f;
+
+        // Pips: 3 small squares filled according to level.
+        const float pip = 5.0f * invZoom;
+        const float gap = 2.0f * invZoom;
+        const float groupW = pip * 3.0f + gap * 2.0f;
+        const float x0 = center.x - groupW * 0.5f;
+
+        for (int i = 0; i < 3; ++i) {
+          Rectangle r{x0 + static_cast<float>(i) * (pip + gap), y0, pip, pip};
+          DrawRectangleRec(r, Color{0, 0, 0, 120});
+          DrawRectangleLinesEx(r, 1.0f * invZoom, Color{255, 255, 255, 70});
+          if (i < lvl) {
+            Rectangle f{r.x + 1.0f * invZoom, r.y + 1.0f * invZoom, r.width - 2.0f * invZoom,
+                        r.height - 2.0f * invZoom};
+            DrawRectangleRec(f, Color{255, 255, 255, 170});
+          }
+        }
+
+        // Occupancy bar.
+        const float barW = 22.0f * invZoom;
+        const float barH = 3.0f * invZoom;
+        const float barX = center.x - barW * 0.5f;
+        const float barY = y0 + pip + 2.0f * invZoom;
+
+        Rectangle bg{barX, barY, barW, barH};
+        DrawRectangleRec(bg, Color{0, 0, 0, 120});
+
+        Rectangle fg{barX, barY, barW * ratio, barH};
+        DrawRectangleRec(fg, Color{255, 255, 255, 170});
+        DrawRectangleLinesEx(bg, 1.0f * invZoom, Color{255, 255, 255, 60});
+      }
     }
   }
 

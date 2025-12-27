@@ -6,6 +6,12 @@ namespace isocity {
 
 struct SimConfig {
   float tickSeconds = 0.5f; // how often the sim advances (in real seconds)
+
+  // Parks boost happiness for *nearby* zone tiles (a simple "coverage" model).
+  // Manhattan distance in tile space.
+  //
+  // Set to 0 to disable locality (parks behave like a global ratio again).
+  int parkInfluenceRadius = 6;
 };
 
 class Simulator {

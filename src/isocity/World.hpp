@@ -31,6 +31,17 @@ enum class Tool : std::uint8_t {
   Bulldoze,
 };
 
+// Return code for World::applyTool() so the game layer can provide feedback.
+enum class ToolApplyResult : std::uint8_t {
+  Applied = 0,
+  Noop,
+  OutOfBounds,
+  BlockedWater,
+  BlockedNoRoad,
+  BlockedOccupied,
+  InsufficientFunds,
+};
+
 struct Tile {
   Terrain terrain = Terrain::Grass;
   Overlay overlay = Overlay::None;
@@ -90,7 +101,7 @@ public:
   bool hasAdjacentRoad(int x, int y) const;
 
   // Player actions / tools.
-  void applyTool(Tool tool, int x, int y);
+  ToolApplyResult applyTool(Tool tool, int x, int y);
 
   // Utility editing operations.
   void bulldoze(int x, int y);

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 namespace isocity {
 
@@ -50,6 +51,104 @@ ScanResult ScanWorld(const World& world)
 
   return r;
 }
+
+// Parks are modeled as an *area of influence* rather than a global ratio.
+// We compute a simple "coverage" ratio: what fraction of zone tiles are within
+// a Manhattan distance <= radius of any park that is connected to a road.
+//
+// Notes:
+// - We treat Water as a barrier so disconnected islands don't share park benefits.
+// - This is intentionally lightweight: a multi-source BFS on a 96x96 grid is cheap.
+float ParkCoverageRatio(const World& world, int radius)
+{
+  // Compatibility mode: treat parks as a global ratio (old behavior).
+  if (radius <= 0) {
+    int zones = 0;
+    int parks = 0;
+    for (int y = 0; y < world.height(); ++y) {
+      for (int x = 0; x < world.width(); ++x) {
+        const Tile& t = world.at(x, y);
+        if (t.overlay == Overlay::Park) parks++;
+        const bool isZone = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
+                             t.overlay == Overlay::Industrial);
+        if (isZone) zones++;
+      }
+    }
+    if (zones <= 0) return 0.0f;
+    return static_cast<float>(parks) / static_cast<float>(zones);
+  }
+
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return 0.0f;
+
+  constexpr int kInf = 1'000'000;
+  std::vector<int> dist(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), kInf);
+  std::vector<int> queue;
+  queue.reserve(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) / 8);
+
+  auto idxOf = [&](int x, int y) -> int { return y * w + x; };
+
+  // Initialize BFS sources: parks that have a road neighbor.
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const Tile& t = world.at(x, y);
+      if (t.overlay != Overlay::Park) continue;
+      if (t.terrain == Terrain::Water) continue;
+      if (!world.hasAdjacentRoad(x, y)) continue;
+      const int idx = idxOf(x, y);
+      dist[static_cast<std::size_t>(idx)] = 0;
+      queue.push_back(idx);
+    }
+  }
+
+  // No connected parks => no coverage.
+  if (queue.empty()) return 0.0f;
+
+  // Multi-source BFS (4-neighborhood) limited to the configured radius.
+  std::size_t qHead = 0;
+  while (qHead < queue.size()) {
+    const int idx = queue[qHead++];
+    const int d = dist[static_cast<std::size_t>(idx)];
+    if (d >= radius) continue;
+
+    const int x = idx % w;
+    const int y = idx / w;
+
+    constexpr int dirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+    for (const auto& dir : dirs) {
+      const int nx = x + dir[0];
+      const int ny = y + dir[1];
+      if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+      if (world.at(nx, ny).terrain == Terrain::Water) continue;
+
+      const int nidx = idxOf(nx, ny);
+      int& nd = dist[static_cast<std::size_t>(nidx)];
+      if (nd <= d + 1) continue;
+      nd = d + 1;
+      queue.push_back(nidx);
+    }
+  }
+
+  int zones = 0;
+  int covered = 0;
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const Tile& t = world.at(x, y);
+      const bool isZone = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
+                           t.overlay == Overlay::Industrial);
+      if (!isZone) continue;
+
+      zones++;
+      const int idx = idxOf(x, y);
+      if (dist[static_cast<std::size_t>(idx)] <= radius) covered++;
+    }
+  }
+
+  if (zones <= 0) return 0.0f;
+  return static_cast<float>(covered) / static_cast<float>(zones);
+}
 } // namespace
 
 void Simulator::stepOnce(World& world)
@@ -76,10 +175,9 @@ void Simulator::refreshDerivedStats(World& world) const
   // Employment: fill jobs up to population.
   const int employed = std::min(scan.population, scan.jobsCap);
 
-  // Happiness: parks help, unemployment hurts.
-  const float parkRatio = (scan.zoneTiles > 0) ? (static_cast<float>(scan.parks) / static_cast<float>(scan.zoneTiles))
-                                               : 0.0f;
-  const float parkBonus = std::min(0.25f, parkRatio * 0.35f);
+  // Happiness: parks help (locally), unemployment hurts.
+  const float parkCoverage = ParkCoverageRatio(world, m_cfg.parkInfluenceRadius);
+  const float parkBonus = std::min(0.25f, parkCoverage * 0.35f);
 
   const float unemployment = (scan.population > 0)
                                  ? (1.0f - (static_cast<float>(employed) / static_cast<float>(scan.population)))
@@ -106,7 +204,6 @@ void Simulator::step(World& world)
   const int jobsCap = scan.jobsCap;
   const int roads = scan.roads;
   const int parks = scan.parks;
-  const int zoneTiles = scan.zoneTiles;
 
   // Demand model: housing grows if there are jobs + happiness.
   // Very simple, but good enough as a starter.
@@ -180,9 +277,9 @@ void Simulator::step(World& world)
   const int maintenance = roads * 1 + parks * 1;
   s.money += income - maintenance;
 
-  // Happiness: parks help, unemployment hurts.
-  const float parkRatio = (zoneTiles > 0) ? (static_cast<float>(parks) / static_cast<float>(zoneTiles)) : 0.0f;
-  const float parkBonus = std::min(0.25f, parkRatio * 0.35f);
+  // Happiness: parks help (locally), unemployment hurts.
+  const float parkCoverage = ParkCoverageRatio(world, m_cfg.parkInfluenceRadius);
+  const float parkBonus = std::min(0.25f, parkCoverage * 0.35f);
 
   const float unemployment = (population > 0) ? (1.0f - (static_cast<float>(employed) / static_cast<float>(population)))
                                               : 0.0f;
