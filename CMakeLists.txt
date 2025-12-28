@@ -29,8 +29,12 @@ add_library(isocity_core
   src/isocity/World.cpp
   src/isocity/ProcGen.cpp
   src/isocity/Sim.cpp
+  src/isocity/Traffic.cpp
+  src/isocity/Goods.cpp
   src/isocity/SaveLoad.cpp
   src/isocity/EditHistory.cpp
+  src/isocity/Pathfinding.cpp
+  src/isocity/RoadGraph.cpp
 )
 
 target_include_directories(isocity_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)

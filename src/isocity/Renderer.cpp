@@ -1,9 +1,12 @@
 #include "isocity/Renderer.hpp"
 
+#include "isocity/Pathfinding.hpp"
+
 #include "isocity/Random.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <string>
 
@@ -68,6 +71,69 @@ Texture2D MakeDiamondTexture(int w, int h, Fn fn)
 }
 
 inline float Dot2(float ax, float ay, float bx, float by) { return ax * bx + ay * by; }
+struct TileRect {
+  int minX = 0;
+  int maxX = 0;
+  int minY = 0;
+  int maxY = 0;
+};
+
+// Compute a conservative tile-coordinate rectangle that covers the current camera viewport.
+// This is used to avoid drawing off-screen tiles (big win when panning/zooming on larger maps).
+TileRect ComputeVisibleTileRect(const Camera2D& camera, int screenW, int screenH, int mapW, int mapH, float tileW,
+                                float tileH)
+{
+  // Viewport corners in world space.
+  const Vector2 s0{0.0f, 0.0f};
+  const Vector2 s1{static_cast<float>(screenW), 0.0f};
+  const Vector2 s2{0.0f, static_cast<float>(screenH)};
+  const Vector2 s3{static_cast<float>(screenW), static_cast<float>(screenH)};
+
+  const Vector2 w0 = GetScreenToWorld2D(s0, camera);
+  const Vector2 w1 = GetScreenToWorld2D(s1, camera);
+  const Vector2 w2 = GetScreenToWorld2D(s2, camera);
+  const Vector2 w3 = GetScreenToWorld2D(s3, camera);
+
+  float minWX = std::numeric_limits<float>::infinity();
+  float minWY = std::numeric_limits<float>::infinity();
+  float maxWX = -std::numeric_limits<float>::infinity();
+  float maxWY = -std::numeric_limits<float>::infinity();
+
+  const Vector2 ws[4] = {w0, w1, w2, w3};
+  for (const Vector2& wv : ws) {
+    minWX = std::min(minWX, wv.x);
+    minWY = std::min(minWY, wv.y);
+    maxWX = std::max(maxWX, wv.x);
+    maxWY = std::max(maxWY, wv.y);
+  }
+
+  // Expand by one tile to avoid edge pop-in (dst rect extends beyond the tile center).
+  minWX -= tileW;
+  maxWX += tileW;
+  minWY -= tileH;
+  maxWY += tileH;
+
+  const Point a = WorldToTileApprox(Vector2{minWX, minWY}, tileW, tileH);
+  const Point b = WorldToTileApprox(Vector2{maxWX, minWY}, tileW, tileH);
+  const Point c = WorldToTileApprox(Vector2{minWX, maxWY}, tileW, tileH);
+  const Point d = WorldToTileApprox(Vector2{maxWX, maxWY}, tileW, tileH);
+
+  const int minTX = std::min({a.x, b.x, c.x, d.x});
+  const int maxTX = std::max({a.x, b.x, c.x, d.x});
+  const int minTY = std::min({a.y, b.y, c.y, d.y});
+  const int maxTY = std::max({a.y, b.y, c.y, d.y});
+
+  // Extra safety margin in tile space (camera rotations / numerical edge cases).
+  const int margin = 3;
+
+  TileRect r;
+  r.minX = std::clamp(minTX - margin, 0, mapW - 1);
+  r.maxX = std::clamp(maxTX + margin, 0, mapW - 1);
+  r.minY = std::clamp(minTY - margin, 0, mapH - 1);
+  r.maxY = std::clamp(maxTY + margin, 0, mapH - 1);
+  return r;
+}
+
 
 // Returns distance from P(px,py) to segment AB. Also returns the projected t in [0,1].
 float DistPointSegment(float px, float py, float ax, float ay, float bx, float by, float& outT)
@@ -340,7 +406,11 @@ void Renderer::rebuildTextures(std::uint64_t seed)
 }
 
 void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeSec, std::optional<Point> hovered,
-                         bool drawGrid, int brushRadius)
+                         bool drawGrid, int brushRadius, std::optional<Point> selected,
+                         const std::vector<Point>* highlightPath, const std::vector<std::uint8_t>* roadToEdgeMask,
+                         const std::vector<std::uint16_t>* roadTraffic, int trafficMax,
+                         const std::vector<std::uint16_t>* roadGoodsTraffic, int goodsMax,
+                         const std::vector<std::uint8_t>* commercialGoodsFill)
 {
   (void)timeSec;
 
@@ -349,11 +419,35 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
   const int w = world.width();
   const int h = world.height();
 
+  const bool showOutside = (roadToEdgeMask && w > 0 && h > 0 &&
+                            roadToEdgeMask->size() ==
+                                static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
+
+  const bool showTraffic = (roadTraffic && trafficMax > 0 && w > 0 && h > 0 &&
+                            roadTraffic->size() ==
+                                static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
+
+  const bool showGoods = (roadGoodsTraffic && goodsMax > 0 && w > 0 && h > 0 &&
+                         roadGoodsTraffic->size() ==
+                             static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
+
+  const bool showCommercialGoods = (commercialGoodsFill && w > 0 && h > 0 &&
+                                  commercialGoodsFill->size() ==
+                                      static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
+
+  // Compute a conservative visible tile range based on the current camera view.
+  const TileRect vis = ComputeVisibleTileRect(camera, GetScreenWidth(), GetScreenHeight(), w, h,
+                                              static_cast<float>(m_tileW), static_cast<float>(m_tileH));
+
   // Draw order: diagonals by (x+y) so nearer tiles draw last.
-  for (int sum = 0; sum < (w + h - 1); ++sum) {
-    for (int x = 0; x < w; ++x) {
+  const int minSum = vis.minX + vis.minY;
+  const int maxSum = vis.maxX + vis.maxY;
+  for (int sum = minSum; sum <= maxSum; ++sum) {
+    const int x0 = std::max(vis.minX, sum - vis.maxY);
+    const int x1 = std::min(vis.maxX, sum - vis.minY);
+    for (int x = x0; x <= x1; ++x) {
       const int y = sum - x;
-      if (y < 0 || y >= h) continue;
+      if (y < vis.minY || y > vis.maxY) continue;
 
       const Tile& t = world.at(x, y);
 
@@ -377,9 +471,101 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
       // Draw overlay
       if (t.overlay == Overlay::Road) {
         const std::uint8_t mask = static_cast<std::uint8_t>(t.variation & 0x0Fu);
-        DrawTexturePro(road(mask), src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
+
+        Color tint = BrightnessTint(brightness);
+
+        bool disconnected = false;
+
+        if (showOutside) {
+          const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
+                                  static_cast<std::size_t>(x);
+          if (idx < roadToEdgeMask->size() && (*roadToEdgeMask)[idx] == 0) {
+            // Disconnected road component: tint red so it's obvious why zones may not function.
+            disconnected = true;
+            tint.g = ClampU8(static_cast<int>(std::round(static_cast<float>(tint.g) * 0.35f)));
+            tint.b = ClampU8(static_cast<int>(std::round(static_cast<float>(tint.b) * 0.35f)));
+            tint.r = ClampU8(static_cast<int>(
+                std::round(std::min(255.0f, static_cast<float>(tint.r) * 1.10f + 20.0f))));
+          }
+        }
+
+        if (!disconnected && showTraffic) {
+          const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
+                                  static_cast<std::size_t>(x);
+          if (idx < roadTraffic->size()) {
+            const int tv = static_cast<int>((*roadTraffic)[idx]);
+            if (tv > 0) {
+              const float tnorm = std::clamp(static_cast<float>(tv) / std::max(1.0f, static_cast<float>(trafficMax)),
+                                             0.0f, 1.0f);
+              // Emphasize low flows while keeping very busy roads distinct.
+              const float s = std::pow(tnorm, 0.35f);
+
+              const float rf = std::min(255.0f, static_cast<float>(tint.r) * (1.0f + 0.15f * s) + 85.0f * s);
+              const float gf = static_cast<float>(tint.g) * (1.0f - 0.70f * s);
+              const float bf = static_cast<float>(tint.b) * (1.0f - 0.70f * s);
+
+              tint.r = ClampU8(static_cast<int>(std::round(rf)));
+              tint.g = ClampU8(static_cast<int>(std::round(gf)));
+              tint.b = ClampU8(static_cast<int>(std::round(bf)));
+            }
+          }
+        }
+
+
+        if (!disconnected && showGoods) {
+          const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
+                                  static_cast<std::size_t>(x);
+          if (idx < roadGoodsTraffic->size()) {
+            const int gv = static_cast<int>((*roadGoodsTraffic)[idx]);
+            if (gv > 0) {
+              const float gnorm = std::clamp(static_cast<float>(gv) / std::max(1.0f, static_cast<float>(goodsMax)),
+                                            0.0f, 1.0f);
+              const float s = std::pow(gnorm, 0.35f);
+
+              const float bf = std::min(255.0f, static_cast<float>(tint.b) * (1.0f + 0.15f * s) + 85.0f * s);
+              const float gf = static_cast<float>(tint.g) * (1.0f - 0.70f * s);
+              const float rf = static_cast<float>(tint.r) * (1.0f - 0.70f * s);
+
+              tint.b = ClampU8(static_cast<int>(std::round(bf)));
+              tint.g = ClampU8(static_cast<int>(std::round(gf)));
+              tint.r = ClampU8(static_cast<int>(std::round(rf)));
+            }
+          }
+        }
+
+        DrawTexturePro(road(mask), src, dst, Vector2{0, 0}, 0.0f, tint);
       } else if (t.overlay != Overlay::None) {
-        DrawTexturePro(overlay(t.overlay), src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
+        Color tint = BrightnessTint(brightness);
+
+        if (showOutside) {
+          const bool isZoneOrPark = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
+                                     t.overlay == Overlay::Industrial || t.overlay == Overlay::Park);
+
+          if (isZoneOrPark && !HasAdjacentRoadConnectedToEdge(world, *roadToEdgeMask, x, y)) {
+            // Dim zones/parks that are not adjacent to an outside-connected road.
+            tint = Mul(tint, 0.55f);
+          }
+        }
+
+
+        if (showCommercialGoods && t.overlay == Overlay::Commercial) {
+          const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
+                                  static_cast<std::size_t>(x);
+          if (idx < commercialGoodsFill->size()) {
+            const float ratio = static_cast<float>((*commercialGoodsFill)[idx]) / 255.0f;
+            const float miss = std::clamp(1.0f - ratio, 0.0f, 1.0f);
+            if (miss > 0.01f) {
+              const float rf = std::min(255.0f, static_cast<float>(tint.r) * (1.0f + 0.10f * miss) + 70.0f * miss);
+              const float gf = static_cast<float>(tint.g) * (1.0f - 0.55f * miss);
+              const float bf = static_cast<float>(tint.b) * (1.0f - 0.55f * miss);
+              tint.r = ClampU8(static_cast<int>(std::round(rf)));
+              tint.g = ClampU8(static_cast<int>(std::round(gf)));
+              tint.b = ClampU8(static_cast<int>(std::round(bf)));
+            }
+          }
+        }
+
+        DrawTexturePro(overlay(t.overlay), src, dst, Vector2{0, 0}, 0.0f, tint);
       }
 
       if (drawGrid) {
@@ -446,21 +632,36 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
     }
   }
 
+  // Highlight helpers.
+  const float thickness = 2.0f / std::max(0.25f, camera.zoom);
+
+  auto drawOutline = [&](int tx, int ty, Color c) {
+    if (!world.inBounds(tx, ty)) return;
+    const Vector2 center = TileToWorldCenter(tx, ty, static_cast<float>(m_tileW), static_cast<float>(m_tileH));
+    Vector2 corners[4];
+    TileDiamondCorners(center, static_cast<float>(m_tileW), static_cast<float>(m_tileH), corners);
+
+    DrawLineEx(corners[0], corners[1], thickness, c);
+    DrawLineEx(corners[1], corners[2], thickness, c);
+    DrawLineEx(corners[2], corners[3], thickness, c);
+    DrawLineEx(corners[3], corners[0], thickness, c);
+  };
+
+  // Optional debug highlight: path to edge (inspect tool).
+  if (highlightPath && !highlightPath->empty()) {
+    const Color pc = Color{255, 215, 0, 110};
+    for (const Point& p : *highlightPath) {
+      drawOutline(p.x, p.y, pc);
+    }
+  }
+
+  // Selected tile highlight.
+  if (selected && world.inBounds(selected->x, selected->y)) {
+    drawOutline(selected->x, selected->y, Color{255, 215, 0, 220});
+  }
+
   // Hover highlight (and brush outline)
   if (hovered && world.inBounds(hovered->x, hovered->y)) {
-    const float thickness = 2.0f / std::max(0.25f, camera.zoom);
-
-    auto drawOutline = [&](int tx, int ty, Color c) {
-      const Vector2 center = TileToWorldCenter(tx, ty, static_cast<float>(m_tileW), static_cast<float>(m_tileH));
-      Vector2 corners[4];
-      TileDiamondCorners(center, static_cast<float>(m_tileW), static_cast<float>(m_tileH), corners);
-
-      DrawLineEx(corners[0], corners[1], thickness, c);
-      DrawLineEx(corners[1], corners[2], thickness, c);
-      DrawLineEx(corners[2], corners[3], thickness, c);
-      DrawLineEx(corners[3], corners[0], thickness, c);
-    };
-
     const int cx = hovered->x;
     const int cy = hovered->y;
 
@@ -472,7 +673,6 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
           if (std::abs(dx) + std::abs(dy) > r) continue; // diamond brush
           const int tx = cx + dx;
           const int ty = cy + dy;
-          if (!world.inBounds(tx, ty)) continue;
           drawOutline(tx, ty, bc);
         }
       }
@@ -486,14 +686,17 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
 }
 
 void Renderer::drawHUD(const World& world, Tool tool, std::optional<Point> hovered, int screenW, int screenH,
-                       bool showHelp, int brushRadius, int undoCount, int redoCount, bool simPaused, float simSpeed)
+                       bool showHelp, int brushRadius, int undoCount, int redoCount, bool simPaused, float simSpeed,
+                       int saveSlot, const char* inspectInfo)
 {
   const Stats& s = world.stats();
 
   // HUD panel
   const int pad = 12;
   const int panelW = 420;
-  const int panelH = showHelp ? 316 : 184;
+  const int extraLine = (inspectInfo && inspectInfo[0] != '\0') ? 1 : 0;
+  // +2 extra lines for traffic/commute + goods/logistics stats.
+  const int panelH = (showHelp ? 360 : 228) + extraLine * 22;
 
   DrawRectangle(pad, pad, panelW, panelH, Color{0, 0, 0, 150});
   DrawRectangleLines(pad, pad, panelW, panelH, Color{255, 255, 255, 70});
@@ -514,14 +717,52 @@ void Renderer::drawHUD(const World& world, Tool tool, std::optional<Point> hover
   std::snprintf(buf, sizeof(buf), "Sim: %s    Speed: x%.2f", simPaused ? "PAUSED" : "RUNNING", static_cast<double>(simSpeed));
   line(buf);
 
-  std::snprintf(buf, sizeof(buf), "Pop: %d / %d housing    Jobs: %d / %d cap", s.population, s.housingCapacity,
-                s.employed, s.jobsCapacity);
+  // JobsCapacity in the core sim counts *all* job tiles, but not all jobs are necessarily
+  // reachable if road networks are disconnected (outside connection rule).
+  if (s.jobsCapacityAccessible != s.jobsCapacity) {
+    std::snprintf(buf, sizeof(buf), "Pop: %d / %d housing    Jobs: %d / %d access (total %d)", s.population,
+                  s.housingCapacity, s.employed, s.jobsCapacityAccessible, s.jobsCapacity);
+  } else {
+    std::snprintf(buf, sizeof(buf), "Pop: %d / %d housing    Jobs: %d / %d cap", s.population, s.housingCapacity,
+                  s.employed, s.jobsCapacity);
+  }
   line(buf);
+
+  if (s.commuters > 0) {
+    if (s.commutersUnreachable > 0) {
+      std::snprintf(buf, sizeof(buf), "Traffic: %d commute (unreach %d)  avg %.1f  cong %.0f%%", s.commuters,
+                    s.commutersUnreachable, static_cast<double>(s.avgCommute),
+                    static_cast<double>(s.trafficCongestion * 100.0f));
+    } else {
+      std::snprintf(buf, sizeof(buf), "Traffic: %d commute  avg %.1f  cong %.0f%%", s.commuters,
+                    static_cast<double>(s.avgCommute), static_cast<double>(s.trafficCongestion * 100.0f));
+    }
+    line(buf);
+  } else {
+    line("Traffic: (no commuters)");
+  }
+
+
+  if (s.goodsDemand > 0) {
+    if (s.goodsUnreachableDemand > 0) {
+      std::snprintf(buf, sizeof(buf), "Goods: prod %d  deliv %d/%d (%.0f%%)  unr %d  imp %d  exp %d",
+                    s.goodsProduced, s.goodsDelivered, s.goodsDemand,
+                    static_cast<double>(s.goodsSatisfaction * 100.0f), s.goodsUnreachableDemand,
+                    s.goodsImported, s.goodsExported);
+    } else {
+      std::snprintf(buf, sizeof(buf), "Goods: prod %d  deliv %d/%d (%.0f%%)  imp %d  exp %d",
+                    s.goodsProduced, s.goodsDelivered, s.goodsDemand,
+                    static_cast<double>(s.goodsSatisfaction * 100.0f), s.goodsImported, s.goodsExported);
+    }
+    line(buf);
+  } else {
+    line("Goods: (no commercial demand)");
+  }
 
   std::snprintf(buf, sizeof(buf), "Roads: %d    Parks: %d    Tool: %s    Brush: %d", s.roads, s.parks, ToString(tool), brushRadius);
   line(buf);
 
-  std::snprintf(buf, sizeof(buf), "Undo: %d    Redo: %d", undoCount, redoCount);
+  std::snprintf(buf, sizeof(buf), "Undo: %d    Redo: %d    Slot: %d", undoCount, redoCount, saveSlot);
   line(buf);
 
   // Happiness bar
@@ -544,8 +785,13 @@ void Renderer::drawHUD(const World& world, Tool tool, std::optional<Point> hover
     y += 26;
   }
 
+  if (inspectInfo && inspectInfo[0] != '\0') {
+    DrawText(inspectInfo, pad + 10, y + 6, 16, Color{230, 230, 230, 255});
+    y += 26;
+  }
+
   if (showHelp) {
-    DrawText("Right drag: pan | Wheel: zoom | R: regen | G: grid | H: help", pad + 10, y + 10, 16,
+    DrawText("Right drag: pan | Wheel: zoom | R regen | G grid | H help | O outside | T graph | V traffic | B goods", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
     y += 22;
     DrawText("1 Road | 2 Res | 3 Com | 4 Ind | 5 Park | 0 Doze | Q Inspect", pad + 10, y + 10, 16,
@@ -553,9 +799,10 @@ void Renderer::drawHUD(const World& world, Tool tool, std::optional<Point> hover
     y += 22;
     DrawText("[/] brush | Space: pause | N: step | +/-: speed", pad + 10, y + 10, 16, Color{220, 220, 220, 255});
     y += 22;
-    DrawText("F5 save | F9 load | Ctrl+Z undo | Ctrl+Y redo", pad + 10, y + 10, 16, Color{220, 220, 220, 255});
+    DrawText("F5 save | F9 load | F6 slot | Ctrl+Z undo | Ctrl+Y redo", pad + 10, y + 10, 16,
+             Color{220, 220, 220, 255});
     y += 22;
-    DrawText("Tip: place the same zone again to upgrade (lvl 1->3).", pad + 10, y + 10, 16,
+    DrawText("Tip: re-place a zone to upgrade. Road: Shift+drag path.", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
   }
 

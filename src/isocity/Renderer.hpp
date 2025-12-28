@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 #include "raylib.h"
 
@@ -22,10 +23,15 @@ public:
   void rebuildTextures(std::uint64_t seed);
 
   void drawWorld(const World& world, const Camera2D& camera, float timeSec, std::optional<Point> hovered,
-                 bool drawGrid, int brushRadius);
+                 bool drawGrid, int brushRadius, std::optional<Point> selected, const std::vector<Point>* highlightPath,
+                 const std::vector<std::uint8_t>* roadToEdgeMask = nullptr,
+                 const std::vector<std::uint16_t>* roadTraffic = nullptr, int trafficMax = 0,
+                 const std::vector<std::uint16_t>* roadGoodsTraffic = nullptr, int goodsMax = 0,
+                 const std::vector<std::uint8_t>* commercialGoodsFill = nullptr);
 
   void drawHUD(const World& world, Tool tool, std::optional<Point> hovered, int screenW, int screenH, bool showHelp,
-               int brushRadius, int undoCount, int redoCount, bool simPaused, float simSpeed);
+               int brushRadius, int undoCount, int redoCount, bool simPaused, float simSpeed, int saveSlot,
+               const char* inspectInfo);
 
 private:
   int m_tileW = 64;

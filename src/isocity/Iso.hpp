@@ -3,14 +3,11 @@
 #include <cmath>
 #include <optional>
 
+#include "isocity/Types.hpp"
+
 #include "raylib.h"
 
 namespace isocity {
-
-struct Point {
-  int x = 0;
-  int y = 0;
-};
 
 inline Vector2 TileToWorldCenter(int tx, int ty, float tileW, float tileH)
 {

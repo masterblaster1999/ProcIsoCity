@@ -13,6 +13,11 @@ namespace isocity {
 // Captures per-stroke tile diffs (before/after) plus the money delta caused
 // by tool costs. It does not rewind simulation time; it simply applies tile
 // edits and refunds/spends the recorded money delta.
+//
+// Notes:
+// - Undo/redo performs a small local fixup for road auto-tiling masks (stored in
+//   the low bits of Tile::variation) around any tiles that touched roads in the
+//   command. This avoids an O(map) full recompute per undo/redo.
 class EditHistory {
 public:
   struct TileChange {

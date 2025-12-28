@@ -1,11 +1,17 @@
 #include "isocity/EditHistory.hpp"
+#include "isocity/Pathfinding.hpp"
+#include "isocity/RoadGraph.hpp"
 #include "isocity/ProcGen.hpp"
 #include "isocity/SaveLoad.hpp"
 #include "isocity/Sim.hpp"
+#include "isocity/Traffic.hpp"
+#include "isocity/Goods.hpp"
 #include "isocity/World.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -119,6 +125,47 @@ void TestEditHistoryUndoRedo()
   EXPECT_EQ(w.stats().money, 99);
 }
 
+void TestEditHistoryUndoRedoFixesRoadMasksLocally()
+{
+  using namespace isocity;
+
+  World w(6, 6, 123u);
+  w.stats().money = 1000;
+
+  // Build an initial horizontal road segment: (2,2)-(3,2).
+  w.setRoad(2, 2);
+  w.setRoad(3, 2);
+
+  // Sanity-check initial masks.
+  // (2,2) has an east neighbor => bit1.
+  EXPECT_EQ(static_cast<int>(w.at(2, 2).variation & 0x0F), 2);
+  // (3,2) has a west neighbor => bit3.
+  EXPECT_EQ(static_cast<int>(w.at(3, 2).variation & 0x0F), 8);
+
+  EditHistory hist;
+
+  // Place a new road at (3,1) adjacent to the existing road tile at (3,2).
+  // Intentionally record ONLY the edited tile (not its neighbors) to ensure
+  // undo/redo can still keep road masks correct via local fixup.
+  hist.beginStroke(w);
+  hist.noteTilePreEdit(w, 3, 1);
+  EXPECT_EQ(w.applyTool(Tool::Road, 3, 1), ToolApplyResult::Applied);
+  hist.endStroke(w);
+
+  // Now (3,2) should have west + north connections => bit3 + bit0 = 9.
+  EXPECT_EQ(static_cast<int>(w.at(3, 2).variation & 0x0F), 9);
+
+  // Undo should remove the new road and restore the neighbor's mask.
+  EXPECT_TRUE(hist.undo(w));
+  EXPECT_EQ(w.at(3, 1).overlay, Overlay::None);
+  EXPECT_EQ(static_cast<int>(w.at(3, 2).variation & 0x0F), 8);
+
+  // Redo should re-add it and re-apply the correct mask.
+  EXPECT_TRUE(hist.redo(w));
+  EXPECT_EQ(w.at(3, 1).overlay, Overlay::Road);
+  EXPECT_EQ(static_cast<int>(w.at(3, 2).variation & 0x0F), 9);
+}
+
 
 void TestToolsDoNotOverwriteOccupiedTiles()
 {
@@ -188,6 +235,22 @@ void TestSaveLoadRoundTrip()
 
   std::string err;
   EXPECT_TRUE(SaveWorldBinary(w, cfg, savePath.string(), err));
+
+  // Sanity-check that we're writing the newest save version.
+  // (We don't parse the whole file here; we just validate the header fields are present.)
+  {
+    std::ifstream in(savePath, std::ios::binary);
+    EXPECT_TRUE(static_cast<bool>(in));
+
+    char magic[8] = {};
+    std::uint32_t version = 0;
+    in.read(magic, 8);
+    in.read(reinterpret_cast<char*>(&version), static_cast<std::streamsize>(sizeof(version)));
+
+    EXPECT_TRUE(in.good());
+    EXPECT_TRUE(std::memcmp(magic, "ISOCITY\0", 8) == 0);
+    EXPECT_EQ(version, static_cast<std::uint32_t>(4));
+  }
 
   World loaded;
   ProcGenConfig loadedCfg{};
@@ -299,8 +362,44 @@ void TestSimulatorStepInvariants()
   EXPECT_TRUE(w.stats().population <= w.stats().housingCapacity);
   EXPECT_TRUE(w.stats().employed <= w.stats().jobsCapacity);
   EXPECT_TRUE(w.stats().employed <= w.stats().population);
+  EXPECT_TRUE(w.stats().employed <= w.stats().jobsCapacityAccessible);
 }
 
+
+
+void TestEmploymentCountsOnlyAccessibleJobs()
+{
+  using namespace isocity;
+
+  World w(8, 8, 777u);
+  w.stats().money = 10000;
+
+  // Build an edge-connected road strip and a residential tile with outside access.
+  EXPECT_EQ(w.applyTool(Tool::Road, 0, 3), ToolApplyResult::Applied);
+  EXPECT_EQ(w.applyTool(Tool::Road, 1, 3), ToolApplyResult::Applied);
+  EXPECT_EQ(w.applyTool(Tool::Road, 2, 3), ToolApplyResult::Applied);
+  EXPECT_EQ(w.applyTool(Tool::Road, 3, 3), ToolApplyResult::Applied);
+  EXPECT_EQ(w.applyTool(Tool::Residential, 4, 3), ToolApplyResult::Applied);
+
+  // Create a *disconnected* job zone: adjacent to a road, but that road component
+  // does not touch the map edge.
+  EXPECT_EQ(w.applyTool(Tool::Road, 6, 6), ToolApplyResult::Applied);
+  EXPECT_EQ(w.applyTool(Tool::Commercial, 6, 5), ToolApplyResult::Applied);
+
+  Simulator sim;
+  sim.refreshDerivedStats(w);
+
+  // Run a few ticks so some residents move in (demand is non-zero even with 0 jobs).
+  for (int i = 0; i < 12; ++i) sim.stepOnce(w);
+
+  EXPECT_TRUE(w.stats().population > 0);
+
+  // Total jobs exist, but they are not reachable via an outside-connected road component,
+  // so they should not count toward employment or income.
+  EXPECT_EQ(w.stats().jobsCapacity, 8);
+  EXPECT_EQ(w.stats().jobsCapacityAccessible, 0);
+  EXPECT_EQ(w.stats().employed, 0);
+}
 
 
 void TestOutsideConnectionAffectsZoneAccess()
@@ -332,17 +431,492 @@ void TestOutsideConnectionAffectsZoneAccess()
   EXPECT_TRUE(w.at(4, 3).occupants > 0);
 }
 
+void TestRoadPathfindingToEdge()
+{
+  using namespace isocity;
+
+  World w(6, 6, 123u);
+
+  // Build a road segment not connected to any edge.
+  w.setRoad(3, 3);
+  {
+    std::vector<Point> path;
+    int cost = 0;
+    EXPECT_TRUE(!FindRoadPathToEdge(w, Point{3, 3}, path, &cost));
+    EXPECT_TRUE(path.empty());
+  }
+
+  // Connect it to the left edge.
+  w.setRoad(2, 3);
+  w.setRoad(1, 3);
+  w.setRoad(0, 3);
+
+  std::vector<Point> path;
+  int cost = 0;
+  EXPECT_TRUE(FindRoadPathToEdge(w, Point{3, 3}, path, &cost));
+  EXPECT_EQ(cost, 3);
+  EXPECT_EQ(static_cast<int>(path.size()), 4);
+  EXPECT_EQ(path.front().x, 3);
+  EXPECT_EQ(path.front().y, 3);
+  EXPECT_EQ(path.back().x, 0);
+  EXPECT_EQ(path.back().y, 3);
+}
+
+
+void TestRoadToEdgeMask()
+{
+  using namespace isocity;
+
+  World w(6, 6, 123u);
+
+  // A single interior road tile should not be marked as outside-connected.
+  w.setRoad(3, 3);
+
+  std::vector<std::uint8_t> mask;
+  ComputeRoadsConnectedToEdge(w, mask);
+
+  EXPECT_EQ(mask.size(),
+            static_cast<std::size_t>(w.width()) * static_cast<std::size_t>(w.height()));
+
+  const std::size_t idx = static_cast<std::size_t>(3) * static_cast<std::size_t>(w.width()) + 3u;
+  EXPECT_EQ(mask[idx], static_cast<std::uint8_t>(0));
+  EXPECT_TRUE(!HasAdjacentRoadConnectedToEdge(w, mask, 4, 3));
+
+  // Connect that road component to the left edge and recompute.
+  w.setRoad(2, 3);
+  w.setRoad(1, 3);
+  w.setRoad(0, 3);
+
+  ComputeRoadsConnectedToEdge(w, mask);
+  EXPECT_EQ(mask[idx], static_cast<std::uint8_t>(1));
+  EXPECT_TRUE(HasAdjacentRoadConnectedToEdge(w, mask, 4, 3));
+
+  // A separate isolated interior road remains disconnected.
+  w.setRoad(4, 4);
+  ComputeRoadsConnectedToEdge(w, mask);
+  const std::size_t idx2 = static_cast<std::size_t>(4) * static_cast<std::size_t>(w.width()) + 4u;
+  EXPECT_EQ(mask[idx2], static_cast<std::uint8_t>(0));
+}
+
+
+void TestRoadGraphPlusIntersection()
+{
+  using namespace isocity;
+
+  World w(5, 5, 123u);
+
+  // Plus sign: a 4-way intersection at (2,2) connecting 4 endpoints.
+  for (int y = 0; y < w.height(); ++y) {
+    w.setRoad(2, y);
+  }
+  for (int x = 0; x < w.width(); ++x) {
+    w.setRoad(x, 2);
+  }
+
+  const RoadGraph g = BuildRoadGraph(w);
+
+  EXPECT_EQ(static_cast<int>(g.nodes.size()), 5);
+  EXPECT_EQ(static_cast<int>(g.edges.size()), 4);
+
+  auto findNode = [&](int x, int y) -> int {
+    for (int i = 0; i < static_cast<int>(g.nodes.size()); ++i) {
+      if (g.nodes[static_cast<std::size_t>(i)].pos.x == x && g.nodes[static_cast<std::size_t>(i)].pos.y == y) return i;
+    }
+    return -1;
+  };
+
+  const int center = findNode(2, 2);
+  EXPECT_TRUE(center >= 0);
+
+  struct EP {
+    int x;
+    int y;
+  };
+  const EP endpoints[] = {{2, 0}, {2, 4}, {0, 2}, {4, 2}};
+
+  for (const auto& ep : endpoints) {
+    const int endId = findNode(ep.x, ep.y);
+    EXPECT_TRUE(endId >= 0);
+
+    bool found = false;
+    for (const int ei : g.nodes[static_cast<std::size_t>(center)].edges) {
+      if (ei < 0 || static_cast<std::size_t>(ei) >= g.edges.size()) continue;
+      const RoadGraphEdge& e = g.edges[static_cast<std::size_t>(ei)];
+
+      const int other = (e.a == center) ? e.b : (e.b == center ? e.a : -1);
+      if (other != endId) continue;
+
+      found = true;
+      EXPECT_EQ(e.length, 2);
+      EXPECT_EQ(static_cast<int>(e.tiles.size()), 3);
+
+      for (std::size_t i = 0; i < e.tiles.size(); ++i) {
+        const Point& p = e.tiles[i];
+        EXPECT_TRUE(w.inBounds(p.x, p.y));
+        EXPECT_EQ(w.at(p.x, p.y).overlay, Overlay::Road);
+
+        if (i > 0) {
+          const Point& prev = e.tiles[i - 1];
+          const int dx = std::abs(p.x - prev.x);
+          const int dy = std::abs(p.y - prev.y);
+          EXPECT_EQ(dx + dy, 1);
+        }
+      }
+      break;
+    }
+
+    EXPECT_TRUE(found);
+  }
+}
+
+void TestRoadGraphCornerCreatesNode()
+{
+  using namespace isocity;
+
+  World w(4, 4, 123u);
+
+  // L-shape:
+  //   (1,1)-(2,1)
+  //           |
+  //         (2,3)
+  w.setRoad(1, 1);
+  w.setRoad(2, 1);
+  w.setRoad(2, 2);
+  w.setRoad(2, 3);
+
+  const RoadGraph g = BuildRoadGraph(w);
+
+  // Endpoints (1,1) and (2,3) plus the corner (2,1).
+  EXPECT_EQ(static_cast<int>(g.nodes.size()), 3);
+  EXPECT_EQ(static_cast<int>(g.edges.size()), 2);
+
+  auto findNode = [&](int x, int y) -> int {
+    for (int i = 0; i < static_cast<int>(g.nodes.size()); ++i) {
+      if (g.nodes[static_cast<std::size_t>(i)].pos.x == x && g.nodes[static_cast<std::size_t>(i)].pos.y == y) return i;
+    }
+    return -1;
+  };
+
+  const int corner = findNode(2, 1);
+  EXPECT_TRUE(corner >= 0);
+  const int endA = findNode(1, 1);
+  const int endB = findNode(2, 3);
+  EXPECT_TRUE(endA >= 0);
+  EXPECT_TRUE(endB >= 0);
+
+  // Ensure we have an edge from the corner to each endpoint, with expected lengths.
+  bool foundA = false;
+  bool foundB = false;
+  for (const int ei : g.nodes[static_cast<std::size_t>(corner)].edges) {
+    if (ei < 0 || static_cast<std::size_t>(ei) >= g.edges.size()) continue;
+    const RoadGraphEdge& e = g.edges[static_cast<std::size_t>(ei)];
+    const int other = (e.a == corner) ? e.b : (e.b == corner ? e.a : -1);
+
+    if (other == endA) {
+      foundA = true;
+      EXPECT_EQ(e.length, 1);
+    } else if (other == endB) {
+      foundB = true;
+      EXPECT_EQ(e.length, 2);
+    }
+  }
+
+  EXPECT_TRUE(foundA);
+  EXPECT_TRUE(foundB);
+}
+
+
+void TestRoadPathfindingAStar()
+{
+  using namespace isocity;
+
+  World w(6, 6, 999u);
+  for (int x = 0; x < w.width(); ++x) {
+    w.setRoad(x, 2);
+  }
+
+  std::vector<Point> path;
+  int cost = 0;
+  EXPECT_TRUE(FindRoadPathAStar(w, Point{0, 2}, Point{5, 2}, path, &cost));
+  EXPECT_EQ(cost, 5);
+  EXPECT_EQ(static_cast<int>(path.size()), 6);
+  EXPECT_EQ(path.front().x, 0);
+  EXPECT_EQ(path.back().x, 5);
+}
+
+void TestLandPathfindingAStarAvoidsWater()
+{
+  using namespace isocity;
+
+  World w(7, 7, 1u);
+
+  // Create a vertical water barrier at x=3, leaving a single land gap at (3,3).
+  for (int y = 0; y < w.height(); ++y) {
+    if (y == 3) continue;
+    w.at(3, y).terrain = Terrain::Water;
+  }
+
+  std::vector<Point> path;
+  int cost = 0;
+  EXPECT_TRUE(FindLandPathAStar(w, Point{1, 3}, Point{5, 3}, path, &cost));
+
+  // Only route is through the gap; ensure the path uses it and never steps on water.
+  bool usedGap = false;
+  for (const Point& p : path) {
+    EXPECT_TRUE(w.at(p.x, p.y).terrain != Terrain::Water);
+    if (p.x == 3 && p.y == 3) usedGap = true;
+  }
+  EXPECT_TRUE(usedGap);
+  EXPECT_EQ(cost, 4);
+  EXPECT_EQ(static_cast<int>(path.size()), 5);
+}
+
+void TestRoadBuildPathPrefersExistingRoads()
+{
+  using namespace isocity;
+
+  World w(7, 7, 123u);
+
+  // Start and goal are roads, but the direct row between them is empty land.
+  // We'll also build a longer (but already-built) road detour.
+  //
+  // Expected behavior: FindRoadBuildPath should prefer the 0-build-cost detour
+  // even though it has more steps.
+  //
+  //  (1,1)---(5,1)
+  //    |       |
+  //    |       |
+  //  (1,3)---(5,3)
+  for (int y = 1; y <= 3; ++y) {
+    w.setRoad(1, y);
+    w.setRoad(5, y);
+  }
+  for (int x = 1; x <= 5; ++x) {
+    w.setRoad(x, 3);
+  }
+
+  std::vector<Point> path;
+  int buildCost = 0;
+  EXPECT_TRUE(FindRoadBuildPath(w, Point{1, 1}, Point{5, 1}, path, &buildCost));
+
+  EXPECT_EQ(buildCost, 0);
+  EXPECT_EQ(static_cast<int>(path.size()), 9); // 8 steps detour
+  EXPECT_EQ(path.front().x, 1);
+  EXPECT_EQ(path.front().y, 1);
+  EXPECT_EQ(path.back().x, 5);
+  EXPECT_EQ(path.back().y, 1);
+
+  // Ensure we actually went down to y=3 at some point (took the detour).
+  bool visitedY3 = false;
+  for (const Point& p : path) {
+    if (p.y == 3) visitedY3 = true;
+    EXPECT_EQ(w.at(p.x, p.y).overlay, Overlay::Road);
+  }
+  EXPECT_TRUE(visitedY3);
+}
+
+void TestTrafficCommuteHeatmapSimple()
+{
+  using namespace isocity;
+
+  // Simple horizontal road touching both edges.
+  // Res zone at (2,0) commutes to Ind jobs at (6,0) via the road row y=1.
+  World w(9, 3, 1u);
+  for (int x = 0; x < 9; ++x) {
+    w.setRoad(x, 1);
+  }
+
+  w.setOverlay(Overlay::Residential, 2, 0);
+  w.at(2, 0).occupants = 10;
+
+  w.setOverlay(Overlay::Industrial, 6, 0);
+
+  TrafficConfig cfg;
+  cfg.requireOutsideConnection = true;
+  cfg.roadTileCapacity = 28;
+
+  const TrafficResult tr = ComputeCommuteTraffic(w, cfg, 1.0f);
+
+  EXPECT_EQ(tr.totalCommuters, 10);
+  EXPECT_EQ(tr.reachableCommuters, 10);
+  EXPECT_EQ(tr.unreachableCommuters, 0);
+  EXPECT_TRUE(tr.avgCommute > 3.9f && tr.avgCommute < 4.1f);
+  EXPECT_EQ(tr.maxTraffic, 10);
+  EXPECT_TRUE(tr.congestion >= 0.0f && tr.congestion <= 0.001f);
+
+  // Path includes x=2..6 along y=1 (origin road -> job access road).
+  for (int x = 2; x <= 6; ++x) {
+    const std::size_t idx = static_cast<std::size_t>(1) * static_cast<std::size_t>(w.width()) +
+                            static_cast<std::size_t>(x);
+    EXPECT_EQ(static_cast<int>(tr.roadTraffic[idx]), 10);
+  }
+}
+
+void TestTrafficUnreachableAcrossDisconnectedEdgeComponents()
+{
+  using namespace isocity;
+
+  // Two separate edge-connected road components with a gap.
+  World w(9, 3, 2u);
+  for (int x = 0; x <= 3; ++x) {
+    w.setRoad(x, 1); // touches left edge
+  }
+  for (int x = 5; x <= 8; ++x) {
+    w.setRoad(x, 1); // touches right edge
+  }
+
+  w.setOverlay(Overlay::Residential, 2, 0);
+  w.at(2, 0).occupants = 10;
+
+  w.setOverlay(Overlay::Industrial, 6, 0);
+
+  TrafficConfig cfg;
+  cfg.requireOutsideConnection = true;
+
+  const TrafficResult tr = ComputeCommuteTraffic(w, cfg, 1.0f);
+
+  EXPECT_EQ(tr.totalCommuters, 10);
+  EXPECT_EQ(tr.reachableCommuters, 0);
+  EXPECT_EQ(tr.unreachableCommuters, 10);
+  EXPECT_EQ(tr.maxTraffic, 0);
+}
+
+void TestGoodsIndustrySuppliesCommercial()
+{
+  using namespace isocity;
+
+  // Simple edge-connected road row.
+  // Industrial at (2,2) supplies Commercial at (6,2) via roads on y=3.
+  World w(9, 5, 1u);
+  for (int x = 0; x < 9; ++x) {
+    w.setRoad(x, 3);
+  }
+
+  w.setOverlay(Overlay::Industrial, 2, 2);
+  w.at(2, 2).level = 1;
+
+  w.setOverlay(Overlay::Commercial, 6, 2);
+  w.at(6, 2).level = 1;
+
+  GoodsConfig cfg;
+  cfg.requireOutsideConnection = true;
+  cfg.allowImports = false;
+  cfg.allowExports = false;
+
+  const GoodsResult gr = ComputeGoodsFlow(w, cfg);
+
+  EXPECT_EQ(gr.goodsProduced, 12);
+  EXPECT_EQ(gr.goodsDemand, 8);
+  EXPECT_EQ(gr.goodsDelivered, 8);
+  EXPECT_EQ(gr.goodsImported, 0);
+  EXPECT_EQ(gr.goodsExported, 0);
+  EXPECT_EQ(gr.unreachableDemand, 0);
+  EXPECT_TRUE(gr.satisfaction > 0.999f);
+
+  // Path includes x=2..6 along y=3.
+  for (int x = 2; x <= 6; ++x) {
+    const std::size_t idx = static_cast<std::size_t>(3) * static_cast<std::size_t>(w.width()) +
+                            static_cast<std::size_t>(x);
+    EXPECT_EQ(static_cast<int>(gr.roadGoodsTraffic[idx]), 8);
+  }
+
+  // Commercial tile should show full supply.
+  const std::size_t commIdx = static_cast<std::size_t>(2) * static_cast<std::size_t>(w.width()) +
+                              static_cast<std::size_t>(6);
+  EXPECT_TRUE(gr.commercialFill[commIdx] >= 250);
+}
+
+void TestGoodsImportsWhenNoIndustry()
+{
+  using namespace isocity;
+
+  // A vertical edge-connected road line; commercial has no local industry,
+  // so it must import.
+  World w(5, 5, 2u);
+  for (int y = 0; y < 5; ++y) {
+    w.setRoad(2, y);
+  }
+
+  w.setOverlay(Overlay::Commercial, 3, 2);
+  w.at(3, 2).level = 1;
+
+  GoodsConfig cfg;
+  cfg.requireOutsideConnection = true;
+  cfg.allowImports = true;
+  cfg.allowExports = true;
+
+  const GoodsResult gr = ComputeGoodsFlow(w, cfg);
+
+  EXPECT_EQ(gr.goodsProduced, 0);
+  EXPECT_EQ(gr.goodsDemand, 8);
+  EXPECT_EQ(gr.goodsDelivered, 8);
+  EXPECT_EQ(gr.goodsImported, 8);
+  EXPECT_EQ(gr.unreachableDemand, 0);
+  EXPECT_TRUE(gr.satisfaction > 0.999f);
+
+  // Adjacent road tile to the commercial zone should carry the imported goods.
+  const std::size_t ridx = static_cast<std::size_t>(2) * static_cast<std::size_t>(w.width()) +
+                           static_cast<std::size_t>(2);
+  EXPECT_EQ(static_cast<int>(gr.roadGoodsTraffic[ridx]), 8);
+}
+
+void TestGoodsUnreachableDemandWhenNoImports()
+{
+  using namespace isocity;
+
+  // Small isolated road component; no industry and imports disabled => unreachable demand.
+  World w(5, 5, 3u);
+  w.setRoad(2, 2);
+
+  w.setOverlay(Overlay::Commercial, 3, 2);
+  w.at(3, 2).level = 1;
+
+  GoodsConfig cfg;
+  cfg.requireOutsideConnection = false;
+  cfg.allowImports = false;
+  cfg.allowExports = false;
+
+  const GoodsResult gr = ComputeGoodsFlow(w, cfg);
+
+  EXPECT_EQ(gr.goodsProduced, 0);
+  EXPECT_EQ(gr.goodsDemand, 8);
+  EXPECT_EQ(gr.goodsDelivered, 0);
+  EXPECT_EQ(gr.goodsImported, 0);
+  EXPECT_EQ(gr.unreachableDemand, 8);
+  EXPECT_TRUE(gr.satisfaction < 0.001f);
+
+  const std::size_t commIdx = static_cast<std::size_t>(2) * static_cast<std::size_t>(w.width()) +
+                              static_cast<std::size_t>(3);
+  EXPECT_EQ(static_cast<int>(gr.commercialFill[commIdx]), 0);
+}
+
 } // namespace
 
 int main()
 {
   TestRoadAutoTilingMasks();
   TestEditHistoryUndoRedo();
+  TestEditHistoryUndoRedoFixesRoadMasksLocally();
   TestToolsDoNotOverwriteOccupiedTiles();
   TestSaveLoadRoundTrip();
   TestSaveLoadDetectsCorruption();
   TestOutsideConnectionAffectsZoneAccess();
   TestSimulatorStepInvariants();
+  TestEmploymentCountsOnlyAccessibleJobs();
+  TestRoadPathfindingToEdge();
+  TestRoadToEdgeMask();
+  TestRoadGraphPlusIntersection();
+  TestRoadGraphCornerCreatesNode();
+  TestTrafficCommuteHeatmapSimple();
+  TestTrafficUnreachableAcrossDisconnectedEdgeComponents();
+  TestGoodsIndustrySuppliesCommercial();
+  TestGoodsImportsWhenNoIndustry();
+  TestGoodsUnreachableDemandWhenNoImports();
+
+
+  TestRoadPathfindingAStar();
+  TestLandPathfindingAStarAvoidsWater();
+  TestRoadBuildPathPrefersExistingRoads();
 
   if (g_failures == 0) {
     std::cout << "proc_isocity_tests: OK\n";

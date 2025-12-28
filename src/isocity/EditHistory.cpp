@@ -1,7 +1,52 @@
 #include "isocity/EditHistory.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <utility>
+
+namespace {
+
+// Local road auto-tiling fixup.
+//
+// World stores the road connection mask in the low 4 bits of Tile::variation.
+// Historically EditHistory called World::recomputeRoadMasks() after undo/redo.
+// That is correct but O(map) per command.
+//
+// To keep undo/redo fast, we update masks only around tiles that changed in a
+// way that could affect road connectivity.
+inline void ApplyRoadMaskLocal(isocity::World& world, int x, int y)
+{
+  using namespace isocity;
+  if (!world.inBounds(x, y)) return;
+
+  Tile& t = world.at(x, y);
+  if (t.overlay != Overlay::Road) return;
+
+  // Bit layout matches World::computeRoadMask():
+  //  bit0: (x, y-1)
+  //  bit1: (x+1, y)
+  //  bit2: (x, y+1)
+  //  bit3: (x-1, y)
+  std::uint8_t m = 0;
+  if (world.inBounds(x, y - 1) && world.at(x, y - 1).overlay == Overlay::Road) m |= 1u << 0;
+  if (world.inBounds(x + 1, y) && world.at(x + 1, y).overlay == Overlay::Road) m |= 1u << 1;
+  if (world.inBounds(x, y + 1) && world.at(x, y + 1).overlay == Overlay::Road) m |= 1u << 2;
+  if (world.inBounds(x - 1, y) && world.at(x - 1, y).overlay == Overlay::Road) m |= 1u << 3;
+
+  // Preserve upper bits for stable per-tile lighting variation.
+  t.variation = static_cast<std::uint8_t>((t.variation & 0xF0u) | (m & 0x0Fu));
+}
+
+inline void UpdateRoadMasksAroundLocal(isocity::World& world, int x, int y)
+{
+  ApplyRoadMaskLocal(world, x, y);
+  ApplyRoadMaskLocal(world, x, y - 1);
+  ApplyRoadMaskLocal(world, x + 1, y);
+  ApplyRoadMaskLocal(world, x, y + 1);
+  ApplyRoadMaskLocal(world, x - 1, y);
+}
+
+} // namespace
 
 namespace isocity {
 
@@ -107,13 +152,24 @@ bool EditHistory::undo(World& world)
   Command cmd = std::move(m_undo.back());
   m_undo.pop_back();
 
+  // Track which locations might affect road auto-tiling.
+  std::vector<std::pair<int, int>> roadTouches;
+  roadTouches.reserve(cmd.tiles.size());
+  for (const TileChange& c : cmd.tiles) {
+    if (c.before.overlay == Overlay::Road || c.after.overlay == Overlay::Road) {
+      roadTouches.emplace_back(c.x, c.y);
+    }
+  }
+
   for (const TileChange& c : cmd.tiles) {
     if (!world.inBounds(c.x, c.y)) continue;
     world.at(c.x, c.y) = c.before;
   }
 
-  // Road auto-tiling masks depend on local connectivity; keep them consistent.
-  world.recomputeRoadMasks();
+  // Keep road auto-tiling masks consistent without a full recompute.
+  for (const auto& p : roadTouches) {
+    UpdateRoadMasksAroundLocal(world, p.first, p.second);
+  }
 
   world.stats().money -= cmd.moneyDelta; // reverse
 
@@ -128,12 +184,22 @@ bool EditHistory::redo(World& world)
   Command cmd = std::move(m_redo.back());
   m_redo.pop_back();
 
+  std::vector<std::pair<int, int>> roadTouches;
+  roadTouches.reserve(cmd.tiles.size());
+  for (const TileChange& c : cmd.tiles) {
+    if (c.before.overlay == Overlay::Road || c.after.overlay == Overlay::Road) {
+      roadTouches.emplace_back(c.x, c.y);
+    }
+  }
+
   for (const TileChange& c : cmd.tiles) {
     if (!world.inBounds(c.x, c.y)) continue;
     world.at(c.x, c.y) = c.after;
   }
 
-  world.recomputeRoadMasks();
+  for (const auto& p : roadTouches) {
+    UpdateRoadMasksAroundLocal(world, p.first, p.second);
+  }
 
   world.stats().money += cmd.moneyDelta;
 

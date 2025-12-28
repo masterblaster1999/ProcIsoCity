@@ -5,6 +5,9 @@
 #include "isocity/Iso.hpp"
 #include "isocity/ProcGen.hpp"
 #include "isocity/Renderer.hpp"
+#include "isocity/RoadGraph.hpp"
+#include "isocity/Traffic.hpp"
+#include "isocity/Goods.hpp"
 #include "isocity/Sim.hpp"
 #include "isocity/World.hpp"
 
@@ -37,6 +40,11 @@ private:
   void resetWorld(std::uint64_t newSeed);
   void applyToolBrush(int centerX, int centerY);
   void showToast(const std::string& msg, float seconds = 2.5f);
+
+  // Quick save/load supports multiple slots (UI convenience).
+  // Slot 1 intentionally uses the legacy filename so existing quick-saves keep working.
+  std::string savePathForSlot(int slot) const;
+  void cycleSaveSlot(int delta);
 
   void beginPaintStroke();
   void endPaintStroke();
@@ -93,6 +101,30 @@ private:
   bool m_showHelp = true;
   bool m_drawGrid = false;
 
+  // Quick save slot (1..kMaxSaveSlot). Slot 1 == legacy isocity_save.bin.
+  int m_saveSlot = 1;
+
+
+  // Debug overlay: show which roads (and adjacent zones) are connected to the map edge
+  // (an "outside connection"). This helps explain why a road network is disconnected.
+  bool m_showOutsideOverlay = false;
+  std::vector<std::uint8_t> m_outsideOverlayRoadToEdge;
+
+  // Debug overlay: show extracted road graph (nodes/edges) for the current road network.
+  bool m_showRoadGraphOverlay = false;
+  bool m_roadGraphDirty = true;
+  RoadGraph m_roadGraph;
+
+  // Debug overlay: traffic heatmap (derived commute model).
+  bool m_showTrafficOverlay = false;
+  bool m_trafficDirty = true;
+  TrafficResult m_traffic;
+
+  // Debug overlay: goods logistics heatmap (derived supply chain model).
+  bool m_showGoodsOverlay = false;
+  bool m_goodsDirty = true;
+  GoodsResult m_goods;
+
   // Simulation controls (pause/step/speed) are handled at the game layer so the simulator stays simple.
   bool m_simPaused = false;
   int m_simSpeedIndex = 2; // 0.25x, 0.5x, 1x, 2x, ... (default = 1x)
@@ -102,6 +134,21 @@ private:
   float m_toastTimer = 0.0f;
 
   std::optional<Point> m_hovered;
+
+  // Inspect tool: optional tile selection + debug path to the map edge.
+  std::optional<Point> m_inspectSelected;
+  std::vector<Point> m_inspectPath;
+  int m_inspectPathCost = 0;
+  std::string m_inspectInfo;
+
+  // Road tool: Shift+drag builds a cheapest path (preferring existing roads) from
+  // a start tile to the current hovered tile.
+  bool m_roadDragActive = false;
+  std::optional<Point> m_roadDragStart;
+  std::optional<Point> m_roadDragEnd;
+  std::vector<Point> m_roadDragPath;
+  int m_roadDragBuildCost = 0; // number of tiles in the path that are not already roads
+  bool m_roadDragValid = false;
 };
 
 } // namespace isocity

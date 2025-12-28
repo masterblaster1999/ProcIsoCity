@@ -1,5 +1,11 @@
 #include "isocity/Sim.hpp"
 
+#include "isocity/Pathfinding.hpp"
+
+#include "isocity/Traffic.hpp"
+
+#include "isocity/Goods.hpp"
+
 #include "isocity/Random.hpp"
 
 #include <algorithm>
@@ -14,7 +20,21 @@ inline int HousingForLevel(int level) { return 10 * level; }
 inline int JobsCommercialForLevel(int level) { return 8 * level; }
 inline int JobsIndustrialForLevel(int level) { return 12 * level; }
 
+inline int JobsForTile(const Tile& t)
+{
+  if (t.overlay == Overlay::Commercial) return JobsCommercialForLevel(t.level);
+  if (t.overlay == Overlay::Industrial) return JobsIndustrialForLevel(t.level);
+  return 0;
+}
+
 inline float Clamp01(float v) { return std::clamp(v, 0.0f, 1.0f); }
+
+// Traffic/commute parameters.
+// Tuned to be noticeable but not dominate the early-game economy.
+constexpr float kCommuteTarget = 24.0f; // avg road-steps where the penalty reaches its cap
+constexpr float kCommutePenaltyCap = 0.18f;
+constexpr float kCongestionPenaltyCap = 0.18f;
+constexpr float kGoodsPenaltyCap = 0.16f;
 
 struct ScanResult {
   int housingCap = 0;
@@ -59,89 +79,14 @@ ScanResult ScanWorld(const World& world)
 // A road component that does not touch the edge is considered disconnected and won't provide access.
 void ComputeEdgeConnectedRoads(const World& world, std::vector<std::uint8_t>& outRoadToEdge)
 {
-  const int w = world.width();
-  const int h = world.height();
-
-  outRoadToEdge.clear();
-  if (w <= 0 || h <= 0) return;
-
-  const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
-  outRoadToEdge.assign(n, 0);
-
-  std::vector<int> queue;
-  queue.reserve(n / 8);
-
-  auto push = [&](int x, int y) {
-    const int idx = y * w + x;
-    const std::size_t uidx = static_cast<std::size_t>(idx);
-    if (uidx >= outRoadToEdge.size()) return;
-    if (outRoadToEdge[uidx]) return;
-    outRoadToEdge[uidx] = 1;
-    queue.push_back(idx);
-  };
-
-  auto isRoad = [&](int x, int y) -> bool {
-    return world.inBounds(x, y) && world.at(x, y).overlay == Overlay::Road;
-  };
-
-  // Seed BFS with any road tile on the map border.
-  for (int x = 0; x < w; ++x) {
-    if (isRoad(x, 0)) push(x, 0);
-    if (h > 1 && isRoad(x, h - 1)) push(x, h - 1);
-  }
-  for (int y = 1; y < h - 1; ++y) {
-    if (isRoad(0, y)) push(0, y);
-    if (w > 1 && isRoad(w - 1, y)) push(w - 1, y);
-  }
-
-  // No border roads => no outside connection.
-  if (queue.empty()) return;
-
-  std::size_t qHead = 0;
-  while (qHead < queue.size()) {
-    const int idx = queue[qHead++];
-    const int x = idx % w;
-    const int y = idx / w;
-
-    constexpr int dirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
-    for (const auto& d : dirs) {
-      const int nx = x + d[0];
-      const int ny = y + d[1];
-      if (!world.inBounds(nx, ny)) continue;
-      if (world.at(nx, ny).overlay != Overlay::Road) continue;
-
-      const int nidx = ny * w + nx;
-      const std::size_t unidx = static_cast<std::size_t>(nidx);
-      if (unidx >= outRoadToEdge.size()) continue;
-      if (outRoadToEdge[unidx]) continue;
-
-      outRoadToEdge[unidx] = 1;
-      queue.push_back(nidx);
-    }
-  }
+  // Implementation lives in the core pathfinding/utility module so it can be reused by
+  // the simulation, renderer debug overlays, and future systems.
+  ComputeRoadsConnectedToEdge(world, outRoadToEdge);
 }
 
 bool HasAdjacentEdgeConnectedRoad(const World& world, const std::vector<std::uint8_t>& roadToEdge, int x, int y)
 {
-  if (!world.inBounds(x, y)) return false;
-
-  const int w = world.width();
-  const int h = world.height();
-  if (w <= 0 || h <= 0) return false;
-
-  const std::size_t expected = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
-  if (roadToEdge.size() != expected) return false;
-
-  auto check = [&](int nx, int ny) -> bool {
-    if (!world.inBounds(nx, ny)) return false;
-    if (world.at(nx, ny).overlay != Overlay::Road) return false;
-    const int idx = ny * w + nx;
-    const std::size_t uidx = static_cast<std::size_t>(idx);
-    if (uidx >= roadToEdge.size()) return false;
-    return roadToEdge[uidx] != 0;
-  };
-
-  return check(x + 1, y) || check(x - 1, y) || check(x, y + 1) || check(x, y - 1);
+  return HasAdjacentRoadConnectedToEdge(world, roadToEdge, x, y);
 }
 
 // Parks are modeled as an *area of influence* rather than a global ratio.
@@ -272,15 +217,69 @@ void Simulator::refreshDerivedStats(World& world) const
   Stats& s = world.stats();
   const ScanResult scan = ScanWorld(world);
 
-  // Employment: fill jobs up to population.
-  const int employed = std::min(scan.population, scan.jobsCap);
-
-  // Happiness: parks help (locally), unemployment hurts.
+  // Precompute which roads are connected to the map border ("outside connection").
   std::vector<std::uint8_t> roadToEdge;
   if (m_cfg.requireOutsideConnection) {
     ComputeEdgeConnectedRoads(world, roadToEdge);
   }
 
+  auto hasZoneAccess = [&] (int x, int y) -> bool {
+    if (!world.hasAdjacentRoad(x, y)) return false;
+    if (!m_cfg.requireOutsideConnection) return true;
+    return HasAdjacentEdgeConnectedRoad(world, roadToEdge, x, y);
+  };
+
+
+  // Only job tiles that are actually reachable should count as capacity.
+  // Otherwise the sim can incorrectly show "employment" (and income) even when all jobs
+  // are on disconnected road components.
+  int jobsCapAccessible = 0;
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      const Tile& t = world.at(x, y);
+      if (t.overlay != Overlay::Commercial && t.overlay != Overlay::Industrial) continue;
+      if (!hasZoneAccess(x, y)) continue;
+      jobsCapAccessible += JobsForTile(t);
+    }
+  }
+
+  // Employment: fill accessible jobs up to population.
+  const int employed = std::min(scan.population, jobsCapAccessible);
+
+  // Traffic/commute model: estimate how far (and how congested) the average commute is.
+  // This is a derived system (no agents yet): we run a multi-source BFS from job access points
+  // over the road network and route commuters along parent pointers back to the jobs.
+  const float employedShare = (scan.population > 0)
+                                 ? (static_cast<float>(employed) / static_cast<float>(scan.population))
+                                 : 0.0f;
+
+  TrafficConfig tc;
+  tc.requireOutsideConnection = m_cfg.requireOutsideConnection;
+  const TrafficResult traffic = ComputeCommuteTraffic(
+      world, tc, employedShare, m_cfg.requireOutsideConnection ? &roadToEdge : nullptr);
+
+  s.commuters = traffic.totalCommuters;
+  s.commutersUnreachable = traffic.unreachableCommuters;
+  s.avgCommute = traffic.avgCommute;
+  s.p95Commute = traffic.p95Commute;
+  s.trafficCongestion = traffic.congestion;
+  s.congestedRoadTiles = traffic.congestedRoadTiles;
+  s.maxRoadTraffic = traffic.maxTraffic;
+
+  // Goods/logistics model: route industrial output to commercial demand along roads.
+  GoodsConfig gc;
+  gc.requireOutsideConnection = m_cfg.requireOutsideConnection;
+  const GoodsResult goods = ComputeGoodsFlow(world, gc, m_cfg.requireOutsideConnection ? &roadToEdge : nullptr);
+  s.goodsProduced = goods.goodsProduced;
+  s.goodsDemand = goods.goodsDemand;
+  s.goodsDelivered = goods.goodsDelivered;
+  s.goodsImported = goods.goodsImported;
+  s.goodsExported = goods.goodsExported;
+  s.goodsUnreachableDemand = goods.unreachableDemand;
+  s.goodsSatisfaction = goods.satisfaction;
+  s.maxRoadGoodsTraffic = goods.maxRoadGoodsTraffic;
+
+  // Happiness: parks help (locally), unemployment hurts, and commutes/congestion add friction.
   const float parkCoverage = ParkCoverageRatio(world, m_cfg.parkInfluenceRadius,
                                               m_cfg.requireOutsideConnection ? &roadToEdge : nullptr);
   const float parkBonus = std::min(0.25f, parkCoverage * 0.35f);
@@ -289,11 +288,20 @@ void Simulator::refreshDerivedStats(World& world) const
                                  ? (1.0f - (static_cast<float>(employed) / static_cast<float>(scan.population)))
                                  : 0.0f;
 
-  s.happiness = Clamp01(0.45f + parkBonus - unemployment * 0.35f);
+  const float commuteNorm = (traffic.reachableCommuters > 0)
+                                ? std::clamp(traffic.avgCommute / kCommuteTarget, 0.0f, 2.0f)
+                                : 0.0f;
+  const float commutePenalty = std::min(kCommutePenaltyCap, commuteNorm * kCommutePenaltyCap);
+  const float congestionPenalty = std::min(kCongestionPenaltyCap, traffic.congestion * (kCongestionPenaltyCap * 1.35f));
+
+  const float goodsPenalty = std::min(kGoodsPenaltyCap, (1.0f - goods.satisfaction) * kGoodsPenaltyCap);
+
+  s.happiness = Clamp01(0.45f + parkBonus - unemployment * 0.35f - commutePenalty - congestionPenalty - goodsPenalty);
 
   s.population = scan.population;
   s.housingCapacity = scan.housingCap;
   s.jobsCapacity = scan.jobsCap;
+  s.jobsCapacityAccessible = jobsCapAccessible;
   s.employed = employed;
   s.roads = scan.roads;
   s.parks = scan.parks;
@@ -319,15 +327,26 @@ void Simulator::step(World& world)
     ComputeEdgeConnectedRoads(world, roadToEdge);
   }
 
-  auto hasZoneAccess = [&](int x, int y) -> bool {
+  auto hasZoneAccess = [&] (int x, int y) -> bool {
     if (!world.hasAdjacentRoad(x, y)) return false;
     if (!m_cfg.requireOutsideConnection) return true;
     return HasAdjacentEdgeConnectedRoad(world, roadToEdge, x, y);
   };
 
+  // Jobs that are reachable this tick (by road, and optionally via an outside-connected component).
+  int jobsCapAccessible = 0;
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      const Tile& t = world.at(x, y);
+      if (t.overlay != Overlay::Commercial && t.overlay != Overlay::Industrial) continue;
+      if (!hasZoneAccess(x, y)) continue;
+      jobsCapAccessible += JobsForTile(t);
+    }
+  }
+
   // Demand model: housing grows if there are jobs + happiness.
   // Very simple, but good enough as a starter.
-  const float jobPressure = (housingCap > 0) ? (static_cast<float>(jobsCap) / static_cast<float>(housingCap)) : 0.0f;
+  const float jobPressure = (housingCap > 0) ? (static_cast<float>(jobsCapAccessible) / static_cast<float>(housingCap)) : 0.0f;
   const float demand = Clamp01(0.15f + 0.70f * std::min(jobPressure, 1.0f) + 0.25f * s.happiness);
 
   // Pass 2: residential update (population moves toward target occupancy).
@@ -367,7 +386,7 @@ void Simulator::step(World& world)
   }
 
   // Employment: fill jobs up to population.
-  const int employed = std::min(population, jobsCap);
+  const int employed = std::min(population, jobsCapAccessible);
 
   // Pass 3: distribute employment across job tiles.
   int remainingWorkers = employed;
@@ -392,12 +411,47 @@ void Simulator::step(World& world)
     }
   }
 
+  // Goods/logistics model: route industrial output to commercial demand along roads.
+  GoodsConfig gc;
+  gc.requireOutsideConnection = m_cfg.requireOutsideConnection;
+  const GoodsResult goods = ComputeGoodsFlow(world, gc, m_cfg.requireOutsideConnection ? &roadToEdge : nullptr);
+  s.goodsProduced = goods.goodsProduced;
+  s.goodsDemand = goods.goodsDemand;
+  s.goodsDelivered = goods.goodsDelivered;
+  s.goodsImported = goods.goodsImported;
+  s.goodsExported = goods.goodsExported;
+  s.goodsUnreachableDemand = goods.unreachableDemand;
+  s.goodsSatisfaction = goods.satisfaction;
+  s.maxRoadGoodsTraffic = goods.maxRoadGoodsTraffic;
+
   // Economy: tiny placeholder model.
   const int income = employed * 2;
   const int maintenance = roads * 1 + parks * 1;
-  s.money += income - maintenance;
 
-  // Happiness: parks help (locally), unemployment hurts.
+  // Trade: imports cost money, exports earn money. Keep the exchange rate mild so it
+  // doesn't dominate the early game.
+  const int importCost = goods.goodsImported / 20;
+  const int exportRevenue = goods.goodsExported / 25;
+
+  s.money += income - maintenance + exportRevenue - importCost;
+
+  // Traffic/commute model (derived, no agents): compute a road-tile traffic heatmap
+  // and aggregate commute metrics.
+  const float employedShare = (population > 0) ? (static_cast<float>(employed) / static_cast<float>(population)) : 0.0f;
+  TrafficConfig tc;
+  tc.requireOutsideConnection = m_cfg.requireOutsideConnection;
+  const TrafficResult traffic = ComputeCommuteTraffic(
+      world, tc, employedShare, m_cfg.requireOutsideConnection ? &roadToEdge : nullptr);
+
+  s.commuters = traffic.totalCommuters;
+  s.commutersUnreachable = traffic.unreachableCommuters;
+  s.avgCommute = traffic.avgCommute;
+  s.p95Commute = traffic.p95Commute;
+  s.trafficCongestion = traffic.congestion;
+  s.congestedRoadTiles = traffic.congestedRoadTiles;
+  s.maxRoadTraffic = traffic.maxTraffic;
+
+  // Happiness: parks help (locally), unemployment hurts, and commutes/congestion add friction.
   const float parkCoverage = ParkCoverageRatio(world, m_cfg.parkInfluenceRadius,
                                                m_cfg.requireOutsideConnection ? &roadToEdge : nullptr);
   const float parkBonus = std::min(0.25f, parkCoverage * 0.35f);
@@ -405,7 +459,15 @@ void Simulator::step(World& world)
   const float unemployment = (population > 0) ? (1.0f - (static_cast<float>(employed) / static_cast<float>(population)))
                                               : 0.0f;
 
-  s.happiness = Clamp01(0.45f + parkBonus - unemployment * 0.35f);
+  const float commuteNorm = (traffic.reachableCommuters > 0)
+                                ? std::clamp(traffic.avgCommute / kCommuteTarget, 0.0f, 2.0f)
+                                : 0.0f;
+  const float commutePenalty = std::min(kCommutePenaltyCap, commuteNorm * kCommutePenaltyCap);
+  const float congestionPenalty = std::min(kCongestionPenaltyCap, traffic.congestion * (kCongestionPenaltyCap * 1.35f));
+
+  const float goodsPenalty = std::min(kGoodsPenaltyCap, (1.0f - goods.satisfaction) * kGoodsPenaltyCap);
+
+  s.happiness = Clamp01(0.45f + parkBonus - unemployment * 0.35f - commutePenalty - congestionPenalty - goodsPenalty);
 
   // Optional auto-upgrades: if the city is doing well, some buildings level up.
   RNG rng(world.seed() ^ (static_cast<std::uint64_t>(s.day) * 0x9E3779B97F4A7C15ULL));
@@ -434,6 +496,7 @@ void Simulator::step(World& world)
   s.population = population;
   s.housingCapacity = housingCap;
   s.jobsCapacity = jobsCap;
+  s.jobsCapacityAccessible = jobsCapAccessible;
   s.employed = employed;
   s.roads = roads;
   s.parks = parks;

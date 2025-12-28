@@ -14,6 +14,7 @@ struct ProcGenConfig;
 // v1: full tile serialization
 // v2: delta serialization (seed + ProcGenConfig + only tiles that differ from a regenerated baseline)
 // v3: v2 + CRC32 checksum (detects corrupted / truncated save files)
+// v4: v3 + varint/delta encoding for tile diffs (smaller saves, faster IO)
 
 // Save using an explicit ProcGenConfig (recommended for v2 delta saves).
 bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const std::string& path, std::string& outError);

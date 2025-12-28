@@ -20,10 +20,11 @@ constexpr char kMagic[8] = {'I', 'S', 'O', 'C', 'I', 'T', 'Y', '\0'};
 constexpr std::uint32_t kVersionV1 = 1; // full tiles
 constexpr std::uint32_t kVersionV2 = 2; // seed + ProcGenConfig + tile deltas
 constexpr std::uint32_t kVersionV3 = 3; // v2 + CRC32 checksum
-constexpr std::uint32_t kVersionCurrent = kVersionV3;
+constexpr std::uint32_t kVersionV4 = 4; // v3 + varint/delta encoding for tile diffs
+constexpr std::uint32_t kVersionCurrent = kVersionV4;
 
 // --- CRC32 ---
-// Used by v3 saves to detect corruption/truncation.
+// Used by v3+ saves to detect corruption/truncation.
 //
 // Notes:
 // - We compute CRC32 over the entire file contents *excluding* the final CRC field.
@@ -111,6 +112,45 @@ bool ReadBytes(std::istream& is, void* data, std::size_t size)
 {
   is.read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(size));
   return is.good();
+}
+
+// --- Varint (unsigned LEB128) ---
+// Used by v4 to compress monotonically-increasing tile diff indices (delta-encoded)
+// and small integers like occupants.
+bool WriteVarU32(Crc32OStreamWriter& cw, std::uint32_t v)
+{
+  std::uint8_t buf[5];
+  std::size_t n = 0;
+
+  while (v >= 0x80u) {
+    buf[n++] = static_cast<std::uint8_t>((v & 0x7Fu) | 0x80u);
+    v >>= 7;
+  }
+  buf[n++] = static_cast<std::uint8_t>(v & 0x7Fu);
+
+  return cw.writeBytes(buf, n);
+}
+
+bool ReadVarU32(std::istream& is, std::uint32_t& out)
+{
+  out = 0;
+  std::uint32_t shift = 0;
+
+  for (int i = 0; i < 5; ++i) {
+    std::uint8_t byte = 0;
+    if (!Read(is, byte)) return false;
+
+    out |= static_cast<std::uint32_t>(byte & 0x7Fu) << shift;
+
+    if ((byte & 0x80u) == 0) {
+      return true;
+    }
+
+    shift += 7;
+  }
+
+  // Too many bytes for a 32-bit varint (corrupt file).
+  return false;
 }
 
 struct StatsBin {
@@ -391,6 +431,117 @@ bool LoadBodyV2(std::istream& is, std::uint32_t w, std::uint32_t h, std::uint64_
   return true;
 }
 
+bool LoadBodyV4(std::istream& is, std::uint32_t w, std::uint32_t h, std::uint64_t seed, World& outWorld,
+                ProcGenConfig& outProcCfg, std::string& outError)
+{
+  // v4: same semantic payload as v2/v3 (seed + ProcGenConfig + tile diffs), but
+  // the diff list is stored more compactly:
+  //   varint(diffCount)
+  //   repeated diffCount times:
+  //     varint(idxDelta), u8 overlay, u8 level, varint(occupants)
+  // Where idxDelta is delta-encoded from the previous idx (monotonically increasing).
+
+  ProcGenConfigBin pcb{};
+  if (!Read(is, pcb)) {
+    outError = "Read failed (procgen config)";
+    return false;
+  }
+  FromBin(outProcCfg, pcb);
+
+  StatsBin sb{};
+  if (!Read(is, sb)) {
+    outError = "Read failed (stats)";
+    return false;
+  }
+
+  World loaded = GenerateWorld(static_cast<int>(w), static_cast<int>(h), seed, outProcCfg);
+
+  std::uint32_t diffCount = 0;
+  if (!ReadVarU32(is, diffCount)) {
+    outError = "Read failed (diff count)";
+    return false;
+  }
+
+  const std::uint64_t maxDiffs = static_cast<std::uint64_t>(w) * static_cast<std::uint64_t>(h);
+  if (static_cast<std::uint64_t>(diffCount) > maxDiffs) {
+    outError = "Invalid diff count in save file";
+    return false;
+  }
+
+  std::uint32_t prevIdx = 0;
+  for (std::uint32_t i = 0; i < diffCount; ++i) {
+    std::uint32_t delta = 0;
+    if (!ReadVarU32(is, delta)) {
+      outError = "Read failed (diff idx delta)";
+      return false;
+    }
+
+    if (i > 0 && delta == 0) {
+      outError = "Invalid diff idx delta (non-increasing)";
+      return false;
+    }
+
+    const std::uint64_t idx64 = static_cast<std::uint64_t>(prevIdx) + static_cast<std::uint64_t>(delta);
+    if (idx64 >= maxDiffs || idx64 > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
+      outError = "Invalid tile index in diff list";
+      return false;
+    }
+    const std::uint32_t idx = static_cast<std::uint32_t>(idx64);
+    prevIdx = idx;
+
+    std::uint8_t overlayU8 = 0;
+    std::uint8_t level = 1;
+    if (!Read(is, overlayU8) || !Read(is, level)) {
+      outError = "Read failed (diff tile header)";
+      return false;
+    }
+
+    std::uint32_t occ32 = 0;
+    if (!ReadVarU32(is, occ32)) {
+      outError = "Read failed (diff occupants)";
+      return false;
+    }
+    if (occ32 > static_cast<std::uint32_t>(std::numeric_limits<std::uint16_t>::max())) {
+      outError = "Invalid occupants value in save file";
+      return false;
+    }
+    const std::uint16_t occ = static_cast<std::uint16_t>(occ32);
+
+    // Basic enum validation (avoid UB on corrupted saves).
+    if (overlayU8 > static_cast<std::uint8_t>(Overlay::Park)) {
+      outError = "Invalid overlay value in save file";
+      return false;
+    }
+
+    const int x = static_cast<int>(idx % w);
+    const int y = static_cast<int>(idx / w);
+
+    Tile& t = loaded.at(x, y);
+    t.overlay = static_cast<Overlay>(overlayU8);
+
+    const bool isZone =
+      (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial || t.overlay == Overlay::Industrial);
+
+    if (isZone) {
+      t.level = static_cast<std::uint8_t>(std::clamp<int>(static_cast<int>(level), 1, 3));
+      t.occupants = occ;
+    } else {
+      // Keep non-zone tiles sane even if the file had garbage values.
+      t.level = 1;
+      t.occupants = 0;
+    }
+  }
+
+  // Road auto-tiling uses per-tile masks stored in Tile::variation low bits.
+  // Deltas do not store those; we recompute after all overlays are applied.
+  loaded.recomputeRoadMasks();
+
+  FromBin(loaded.stats(), sb);
+
+  outWorld = std::move(loaded);
+  return true;
+}
+
 } // namespace
 
 bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const std::string& path, std::string& outError)
@@ -469,21 +620,37 @@ bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const std
     }
   }
 
+  // v4: write varint(diffCount) then each diff as:
+  //   varint(idxDelta), u8 overlay, u8 level, varint(occupants)
+  // idx is delta-encoded to shrink typical edits (roads/zones tend to cluster).
   const std::uint32_t diffCount = static_cast<std::uint32_t>(diffs.size());
-  if (!cw.write(diffCount)) {
+  if (!WriteVarU32(cw, diffCount)) {
     outError = "Write failed (diff count)";
     return false;
   }
 
+  std::uint32_t prevIdx = 0;
   for (const Diff& d : diffs) {
-    if (!cw.write(d.idx)) {
-      outError = "Write failed (diff idx)";
+    if (d.idx < prevIdx) {
+      outError = "Internal error: diff list not sorted";
       return false;
     }
 
-    // Write in the same order we read.
-    if (!cw.write(d.overlay) || !cw.write(d.level) || !cw.write(d.occupants)) {
-      outError = "Write failed (diff tile)";
+    const std::uint32_t delta = d.idx - prevIdx;
+    prevIdx = d.idx;
+
+    if (!WriteVarU32(cw, delta)) {
+      outError = "Write failed (diff idx delta)";
+      return false;
+    }
+
+    if (!cw.write(d.overlay) || !cw.write(d.level)) {
+      outError = "Write failed (diff tile header)";
+      return false;
+    }
+
+    if (!WriteVarU32(cw, static_cast<std::uint32_t>(d.occupants))) {
+      outError = "Write failed (diff occupants)";
       return false;
     }
   }
@@ -531,8 +698,8 @@ bool LoadWorldBinary(World& outWorld, ProcGenConfig& outProcCfg, const std::stri
     return LoadBodyV2(f, w, h, seed, outWorld, outProcCfg, outError);
   }
 
-  if (version == kVersionV3) {
-    // v3: same payload as v2, but with a CRC32 appended at the end of the file.
+  if (version == kVersionV3 || version == kVersionV4) {
+    // v3/v4: CRC32 is appended at the end of the file.
     // We validate the CRC before parsing to detect corruption/truncation.
 
     // Read the whole file into memory to verify CRC.
@@ -583,17 +750,20 @@ bool LoadWorldBinary(World& outWorld, ProcGenConfig& outProcCfg, const std::stri
     if (!ReadAndValidateHeader(is, v2, w2, h2, seed2, outError)) {
       return false;
     }
-    if (v2 != kVersionV3) {
+    if (v2 != version) {
       outError = "Save file version mismatch after CRC validation";
       return false;
     }
 
-    return LoadBodyV2(is, w2, h2, seed2, outWorld, outProcCfg, outError);
+    if (version == kVersionV3) {
+      return LoadBodyV2(is, w2, h2, seed2, outWorld, outProcCfg, outError);
+    }
+    return LoadBodyV4(is, w2, h2, seed2, outWorld, outProcCfg, outError);
   }
 
   std::ostringstream oss;
   oss << "Unsupported save version: " << version << " (supported: " << kVersionV1 << ", " << kVersionV2 << ", "
-      << kVersionV3 << ")";
+      << kVersionV3 << ", " << kVersionV4 << ")";
   outError = oss.str();
   return false;
 }

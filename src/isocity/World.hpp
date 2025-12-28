@@ -65,6 +65,11 @@ struct Stats {
   int housingCapacity = 0;
 
   int jobsCapacity = 0;
+
+  // Jobs that are currently reachable via roads (and optionally connected to the map edge).
+  // This is a derived stat recomputed by the simulator; it is not persisted in the save file.
+  int jobsCapacityAccessible = 0;
+
   int employed = 0;
 
   float happiness = 0.5f; // 0..1
@@ -73,6 +78,27 @@ struct Stats {
 
   int roads = 0;
   int parks = 0;
+
+  // --- Derived traffic/commute stats (recomputed by the simulator; not persisted in saves) ---
+  int commuters = 0;            // modeled commuting workers (usually ~= employed)
+  int commutersUnreachable = 0; // commuters that couldn't reach any job access point
+
+  float avgCommute = 0.0f;      // road steps (edges)
+  float p95Commute = 0.0f;      // road steps (edges)
+  float trafficCongestion = 0.0f; // 0..1 (excess traffic ratio)
+
+  int congestedRoadTiles = 0;
+  int maxRoadTraffic = 0; // max commuters on any road tile (for heatmap scaling)
+
+  // --- Derived goods/logistics stats (recomputed by the simulator; not persisted in saves) ---
+  int goodsProduced = 0;
+  int goodsDemand = 0;
+  int goodsDelivered = 0;
+  int goodsImported = 0;
+  int goodsExported = 0;
+  int goodsUnreachableDemand = 0;
+  float goodsSatisfaction = 1.0f; // delivered/demand, clamped to [0,1]
+  int maxRoadGoodsTraffic = 0;
 };
 
 const char* ToString(Terrain t);

@@ -1,6 +1,7 @@
 #include "isocity/ProcGen.hpp"
 
 #include "isocity/Noise.hpp"
+#include "isocity/Pathfinding.hpp"
 #include "isocity/Random.hpp"
 
 #include <algorithm>
@@ -68,7 +69,7 @@ P ClosestBuildableEdge(RNG& rng, const World& world, P from)
   return best;
 }
 
-void CarveRoad(World& world, RNG& rng, P a, P b)
+void CarveRoadWiggle(World& world, RNG& rng, P a, P b)
 {
   P p = a;
   const int maxSteps = world.width() * world.height() * 2;
@@ -136,6 +137,22 @@ void CarveRoad(World& world, RNG& rng, P a, P b)
 
     if (!moved) break; // give up
   }
+}
+
+void CarveRoad(World& world, RNG& rng, P a, P b)
+{
+  // Prefer an A* route over buildable tiles so roads reliably go *around* water
+  // instead of randomly getting stuck.
+  std::vector<Point> path;
+  if (FindLandPathAStar(world, Point{a.x, a.y}, Point{b.x, b.y}, path)) {
+    for (const Point& p : path) {
+      world.setRoad(p.x, p.y);
+    }
+    return;
+  }
+
+  // Fallback: legacy "wiggly" carver (kept for robustness if land is disconnected).
+  CarveRoadWiggle(world, rng, a, b);
 }
 
 } // namespace
