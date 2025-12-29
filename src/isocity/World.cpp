@@ -155,10 +155,10 @@ void World::setOverlay(Overlay overlay, int x, int y)
   // Reset/initialize per-overlay state.
   if (overlay == Overlay::Residential || overlay == Overlay::Commercial || overlay == Overlay::Industrial) {
     // Zone tiles use level 1..3 to represent density / building level.
-    t.level = std::clamp<int>(t.level, 1, 3);
-    if (t.level < 1) t.level = 1;
-    if (t.level > 3) t.level = 3;
-    if (t.occupants > 0) t.occupants = 0;
+    // Keep the narrowing explicit to avoid MSVC conversion warnings on uint8_t.
+    const int level = std::clamp(static_cast<int>(t.level), 1, 3);
+    t.level = static_cast<std::uint8_t>(level);
+    t.occupants = 0;
   } else if (overlay == Overlay::Road) {
     // Road tiles use level 1..3 for Street/Avenue/Highway.
     // Preserve the level when the overlay remains Road; otherwise default to Street.

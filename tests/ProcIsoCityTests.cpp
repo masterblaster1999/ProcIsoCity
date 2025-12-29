@@ -7,6 +7,7 @@
 #include "isocity/Traffic.hpp"
 #include "isocity/Goods.hpp"
 #include "isocity/LandValue.hpp"
+#include "isocity/Hash.hpp"
 #include "isocity/Road.hpp"
 #include "isocity/World.hpp"
 
@@ -1388,6 +1389,63 @@ void TestJobAssignmentPrefersHighLandValueCommercial()
   EXPECT_TRUE(highJobs > lowJobs);
 }
 
+void TestWorldHashDeterministicForSameSeed()
+{
+  using namespace isocity;
+
+  ProcGenConfig pc;
+  const std::uint64_t seed = 1337;
+
+  World a = GenerateWorld(48, 48, seed, pc);
+  World b = GenerateWorld(48, 48, seed, pc);
+
+  Simulator sim;
+  sim.refreshDerivedStats(a);
+  sim.refreshDerivedStats(b);
+
+  const std::uint64_t ha = HashWorld(a);
+  const std::uint64_t hb = HashWorld(b);
+  EXPECT_EQ(ha, hb);
+
+  World c = GenerateWorld(48, 48, seed + 1, pc);
+  sim.refreshDerivedStats(c);
+  const std::uint64_t hc = HashWorld(c);
+
+  EXPECT_TRUE(hc != ha);
+}
+
+void TestSimulationDeterministicHashAfterTicks()
+{
+  using namespace isocity;
+
+  ProcGenConfig pc;
+  const std::uint64_t seed = 424242;
+
+  World a = GenerateWorld(48, 48, seed, pc);
+  World b = GenerateWorld(48, 48, seed, pc);
+
+  SimConfig cfg;
+  cfg.requireOutsideConnection = true;
+  cfg.taxResidential = 12;
+  cfg.taxCommercial = 14;
+  cfg.taxIndustrial = 10;
+
+  Simulator sa(cfg);
+  Simulator sb(cfg);
+
+  sa.refreshDerivedStats(a);
+  sb.refreshDerivedStats(b);
+
+  for (int i = 0; i < 25; ++i) {
+    sa.stepOnce(a);
+    sb.stepOnce(b);
+  }
+
+  const std::uint64_t ha = HashWorld(a);
+  const std::uint64_t hb = HashWorld(b);
+  EXPECT_EQ(ha, hb);
+}
+
 } // namespace
 
 int main()
@@ -1422,6 +1480,9 @@ int main()
 
   TestResidentialDesirabilityPrefersHighLandValue();
   TestJobAssignmentPrefersHighLandValueCommercial();
+
+  TestWorldHashDeterministicForSameSeed();
+  TestSimulationDeterministicHashAfterTicks();
 
 
   TestRoadPathfindingAStar();

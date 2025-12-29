@@ -7,10 +7,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <ctime>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 
 namespace isocity {
@@ -33,6 +35,29 @@ constexpr int kCommutersPerCar = 40; // how many commuters one visible car repre
 constexpr int kGoodsPerTruck = 80;   // goods units represented by one visible truck
 constexpr int kMaxSpawnPerFrame = 2;
 
+std::string FileTimestamp()
+{
+  using namespace std::chrono;
+
+  const auto now = system_clock::now();
+  const auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
+
+  std::time_t tt = system_clock::to_time_t(now);
+  std::tm tm{};
+#ifdef _WIN32
+  localtime_s(&tm, &tt);
+#else
+  localtime_r(&tt, &tm);
+#endif
+
+  char base[32]{};
+  std::strftime(base, sizeof(base), "%Y%m%d_%H%M%S", &tm);
+
+  char out[40]{};
+  std::snprintf(out, sizeof(out), "%s_%03d", base, static_cast<int>(ms.count()));
+  return std::string(out);
+}
+
 inline float Rand01(std::uint64_t& state)
 {
   // 24-bit mantissa float in [0,1)
@@ -48,6 +73,14 @@ inline float RandRange(std::uint64_t& state, float a, float b)
 // Discrete sim speed presets (dt multiplier).
 constexpr float kSimSpeeds[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f, 16.0f};
 constexpr int kSimSpeedCount = static_cast<int>(sizeof(kSimSpeeds) / sizeof(kSimSpeeds[0]));
+
+// World render scaling (resolution scale) helpers.
+constexpr float kWorldRenderScaleStep = 0.05f;
+constexpr float kWorldRenderScaleAbsMin = 0.25f;
+constexpr float kWorldRenderScaleAbsMax = 2.0f;
+constexpr float kWorldRenderAutoAdjustInterval = 0.35f; // seconds
+constexpr float kWorldRenderDtSmoothing = 0.10f;        // EMA factor
+constexpr int kWorldRenderRTMaxDim = 8192;              // safety guard
 } // namespace
 
 std::string Game::savePathForSlot(int slot) const
@@ -196,29 +229,80 @@ bool Game::loadFromPath(const std::string& path, const char* toastLabel)
   return true;
 }
 
-RaylibContext::RaylibContext(int w, int h, const char* title, bool vsync)
+RaylibContext::RaylibContext(const Config& cfg, const char* title)
 {
-  if (vsync) SetConfigFlags(FLAG_VSYNC_HINT);
-  InitWindow(w, h, title);
+  unsigned int flags = 0;
+  if (cfg.vsync) flags |= FLAG_VSYNC_HINT;
+  if (cfg.windowResizable) flags |= FLAG_WINDOW_RESIZABLE;
+  if (cfg.windowHighDPI) flags |= FLAG_WINDOW_HIGHDPI;
+  SetConfigFlags(flags);
+
+  InitWindow(cfg.windowWidth, cfg.windowHeight, title);
+
+  if (cfg.windowResizable) {
+    SetWindowMinSize(std::max(1, cfg.windowMinWidth), std::max(1, cfg.windowMinHeight));
+  }
 
   // You can tune this later or expose it as a config.
   SetTargetFPS(60);
+
+  // Ensure vsync state matches config at runtime.
+  if (cfg.vsync) {
+    SetWindowState(FLAG_VSYNC_HINT);
+  } else {
+    ClearWindowState(FLAG_VSYNC_HINT);
+  }
 }
 
 RaylibContext::~RaylibContext() { CloseWindow(); }
 
 Game::~Game()
 {
+  unloadWorldRenderTarget();
   unloadSaveMenuThumbnails();
 }
 
 Game::Game(Config cfg)
     : m_cfg(cfg)
-    , m_rl(cfg.windowWidth, cfg.windowHeight, "ProcIsoCity", cfg.vsync)
+    , m_rl(cfg, "ProcIsoCity")
     , m_world()
     , m_sim(SimConfig{})
     , m_renderer(cfg.tileWidth, cfg.tileHeight, cfg.seed)
 {
+  // Prevent accidental Alt+F4 style exits while testing.
+  SetExitKey(KEY_NULL);
+
+  // Track the initial window geometry so fullscreen/borderless toggles can
+  // restore back to the original windowed size/position.
+  {
+    const Vector2 pos = GetWindowPosition();
+    m_windowedX = static_cast<int>(pos.x);
+    m_windowedY = static_cast<int>(pos.y);
+    m_windowedW = GetScreenWidth();
+    m_windowedH = GetScreenHeight();
+  }
+
+  // Initialize UI scaling.
+  if (m_uiScaleAuto) {
+    m_uiScale = computeAutoUiScale(m_windowedW, m_windowedH);
+  }
+
+  // Initialize world render scaling (resolution scale) from config.
+  m_worldRenderScaleAuto = m_cfg.worldRenderScaleAuto;
+  m_worldRenderScale = clampWorldRenderScale(m_cfg.worldRenderScale);
+  m_worldRenderScaleMin = clampWorldRenderScale(m_cfg.worldRenderScaleMin);
+  m_worldRenderScaleMax = clampWorldRenderScale(m_cfg.worldRenderScaleMax);
+  if (m_worldRenderScaleMin > m_worldRenderScaleMax) {
+    std::swap(m_worldRenderScaleMin, m_worldRenderScaleMax);
+  }
+  m_worldRenderTargetFps = std::max(15, m_cfg.worldRenderTargetFps);
+  m_worldRenderFilterPoint = m_cfg.worldRenderFilterPoint;
+  if (m_worldRenderScaleAuto) {
+    // Prefer best quality first; let the auto-scaler reduce resolution only
+    // if we can't hit the target FPS.
+    m_worldRenderScale = m_worldRenderScaleMax;
+  }
+
   // Elevation settings derived from config.
   m_elevDefault.maxPixels = static_cast<float>(m_cfg.tileHeight) * std::max(0.0f, m_cfg.elevationScale);
   m_elevDefault.quantizeSteps = std::max(0, m_cfg.elevationSteps);
@@ -231,18 +315,1157 @@ Game::Game(Config cfg)
   // Camera
   m_camera.zoom = 1.0f;
   m_camera.rotation = 0.0f;
-  m_camera.offset = Vector2{m_cfg.windowWidth * 0.5f, m_cfg.windowHeight * 0.5f};
+  m_camera.offset = Vector2{m_windowedW * 0.5f, m_windowedH * 0.5f};
 
   const Vector2 center = TileToWorldCenterElevated(
       m_world, m_cfg.mapWidth / 2, m_cfg.mapHeight / 2, static_cast<float>(m_cfg.tileWidth),
       static_cast<float>(m_cfg.tileHeight), m_elev);
   m_camera.target = center;
+
+  setupDevConsole();
+}
+
+void Game::setupDevConsole()
+{
+  // Keep the console usable in Release builds: it is primarily a dev/debug
+  // productivity tool, but also enables power-users to script common actions.
+  m_console.clearLog();
+  m_console.print("ProcIsoCity dev console (F4). Type 'help' for commands.");
+
+  auto toLower = [](std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    return s;
+  };
+
+  auto joinArgs = [](const DevConsole::Args& args, std::size_t start) {
+    std::string out;
+    for (std::size_t i = start; i < args.size(); ++i) {
+      if (!out.empty()) out.push_back(' ');
+      out += args[i];
+    }
+    return out;
+  };
+
+  auto parseI64 = [](const std::string& s, long long& out) -> bool {
+    try {
+      std::size_t idx = 0;
+      out = std::stoll(s, &idx, 10);
+      return idx == s.size();
+    } catch (...) {
+      return false;
+    }
+  };
+
+  auto parseU64 = [](const std::string& s, std::uint64_t& out) -> bool {
+    try {
+      std::size_t idx = 0;
+      const unsigned long long v = std::stoull(s, &idx, 10);
+      if (idx != s.size()) return false;
+      out = static_cast<std::uint64_t>(v);
+      return true;
+    } catch (...) {
+      return false;
+    }
+  };
+
+  auto parseF32 = [](const std::string& s, float& out) -> bool {
+    try {
+      std::size_t idx = 0;
+      out = std::stof(s, &idx);
+      return idx == s.size();
+    } catch (...) {
+      return false;
+    }
+  };
+
+  // --- help/utility ---
+  m_console.registerCommand(
+      "help", "help [cmd]  - list commands or show help for one command",
+      [toLower](DevConsole& c, const DevConsole::Args& args) {
+        if (!args.empty()) {
+          const std::string key = toLower(args[0]);
+          const auto it = c.commands().find(key);
+          if (it == c.commands().end()) {
+            c.print("Unknown command: " + args[0]);
+            return;
+          }
+          c.print(it->first + "  - " + it->second.help);
+          return;
+        }
+
+        c.print("Commands:");
+        for (const std::string& name : c.commandOrder()) {
+          const std::string key = toLower(name);
+          const auto it = c.commands().find(key);
+          if (it != c.commands().end()) {
+            c.print("  " + name + "  - " + it->second.help);
+          }
+        }
+      });
+
+  m_console.registerCommand("clear", "clear      - clear the console output",
+                            [](DevConsole& c, const DevConsole::Args&) { c.clearLog(); });
+
+  m_console.registerCommand(
+      "echo", "echo <text...>  - print text", [joinArgs](DevConsole& c, const DevConsole::Args& args) {
+        if (args.empty()) return;
+        c.print(joinArgs(args, 0));
+      });
+
+  // --- world/simulation ---
+  m_console.registerCommand(
+      "seed", "seed <uint64>  - regenerate the world with a specific seed",
+      [this, parseU64](DevConsole& c, const DevConsole::Args& args) {
+        if (args.size() != 1) {
+          c.print("Usage: seed <uint64>");
+          return;
+        }
+        std::uint64_t s = 0;
+        if (!parseU64(args[0], s)) {
+          c.print("Invalid seed: " + args[0]);
+          return;
+        }
+        endPaintStroke();
+        resetWorld(s);
+        showToast(TextFormat("Seed: %llu", static_cast<unsigned long long>(s)));
+        c.print(TextFormat("World regenerated with seed %llu", static_cast<unsigned long long>(s)));
+      });
+
+  m_console.registerCommand("regen", "regen        - regenerate the world with a time-based seed",
+                            [this](DevConsole& c, const DevConsole::Args&) {
+                              endPaintStroke();
+                              resetWorld(0);
+                              c.print("World regenerated.");
+                            });
+
+  m_console.registerCommand(
+      "pause", "pause        - toggle simulation pause", [this](DevConsole& c, const DevConsole::Args&) {
+        endPaintStroke();
+        m_simPaused = !m_simPaused;
+        m_sim.resetTimer();
+        showToast(m_simPaused ? "Sim paused" : "Sim running");
+        c.print(m_simPaused ? "paused" : "running");
+      });
+
+  m_console.registerCommand(
+      "step", "step         - advance the simulation by one day (like 'N' while paused)",
+      [this](DevConsole& c, const DevConsole::Args&) {
+        endPaintStroke();
+        m_sim.stepOnce(m_world);
+        recordHistorySample(m_world.stats());
+        m_trafficDirty = true;
+        m_goodsDirty = true;
+        m_landValueDirty = true;
+        m_vehiclesDirty = true;
+        showToast("Sim step");
+        c.print("stepped");
+      });
+
+  m_console.registerCommand(
+      "speed", "speed <multiplier>  - set sim speed (e.g. 0.5, 1, 2, 4, 8)",
+      [this, parseF32](DevConsole& c, const DevConsole::Args& args) {
+        if (args.size() != 1) {
+          c.print("Usage: speed <multiplier>");
+          return;
+        }
+        float sp = 1.0f;
+        if (!parseF32(args[0], sp)) {
+          c.print("Invalid speed: " + args[0]);
+          return;
+        }
+
+        // Pick nearest pre-defined speed.
+        int best = 0;
+        float bestDist = std::abs(kSimSpeeds[0] - sp);
+        for (int i = 1; i < kSimSpeedCount; ++i) {
+          const float d = std::abs(kSimSpeeds[i] - sp);
+          if (d < bestDist) {
+            bestDist = d;
+            best = i;
+          }
+        }
+        m_simSpeedIndex = best;
+        showToast(TextFormat("Sim speed: x%.2f", static_cast<double>(kSimSpeeds[best])));
+        c.print(TextFormat("sim speed set to x%.2f", static_cast<double>(kSimSpeeds[best])));
+      });
+
+  m_console.registerCommand(
+      "money", "money <amount>  - set current money", [this, parseI64](DevConsole& c, const DevConsole::Args& args) {
+        if (args.size() != 1) {
+          c.print("Usage: money <amount>");
+          return;
+        }
+        long long v = 0;
+        if (!parseI64(args[0], v)) {
+          c.print("Invalid amount: " + args[0]);
+          return;
+        }
+        m_world.stats().money = static_cast<int>(v);
+        showToast(TextFormat("Money: %d", m_world.stats().money));
+        c.print(TextFormat("money = %d", m_world.stats().money));
+      });
+
+  m_console.registerCommand(
+      "give", "give <amount>   - add money", [this, parseI64](DevConsole& c, const DevConsole::Args& args) {
+        if (args.size() != 1) {
+          c.print("Usage: give <amount>");
+          return;
+        }
+        long long v = 0;
+        if (!parseI64(args[0], v)) {
+          c.print("Invalid amount: " + args[0]);
+          return;
+        }
+        m_world.stats().money += static_cast<int>(v);
+        showToast(TextFormat("Money: %d", m_world.stats().money));
+        c.print(TextFormat("money = %d", m_world.stats().money));
+      });
+
+  // --- tools/rendering ---
+  m_console.registerCommand(
+      "tool",
+      "tool <road|res|com|ind|park|bulldoze|inspect|raise|lower|smooth|district>  - select tool",
+      [this, toLower](DevConsole& c, const DevConsole::Args& args) {
+        if (args.size() != 1) {
+          c.print("Usage: tool <name>");
+          return;
+        }
+        const std::string t = toLower(args[0]);
+        Tool newTool = m_tool;
+        if (t == "road") newTool = Tool::Road;
+        else if (t == "res" || t == "residential") newTool = Tool::Residential;
+        else if (t == "com" || t == "commercial") newTool = Tool::Commercial;
+        else if (t == "ind" || t == "industrial") newTool = Tool::Industrial;
+        else if (t == "park") newTool = Tool::Park;
+        else if (t == "bulldoze" || t == "doze" || t == "delete") newTool = Tool::Bulldoze;
+        else if (t == "inspect") newTool = Tool::Inspect;
+        else if (t == "raise") newTool = Tool::RaiseTerrain;
+        else if (t == "lower") newTool = Tool::LowerTerrain;
+        else if (t == "smooth") newTool = Tool::SmoothTerrain;
+        else if (t == "district") newTool = Tool::District;
+        else {
+          c.print("Unknown tool: " + args[0]);
+          return;
+        }
+
+        endPaintStroke();
+        m_tool = newTool;
+        // Cancel any road drag preview if we changed tools.
+        if (m_tool != Tool::Road) {
+          m_roadDragActive = false;
+          m_roadDragStart.reset();
+          m_roadDragEnd.reset();
+          m_roadDragPath.clear();
+          m_roadDragBuildCost = 0;
+          m_roadDragUpgradeTiles = 0;
+          m_roadDragMoneyCost = 0;
+          m_roadDragValid = false;
+        }
+        showToast(TextFormat("Tool: %s", ToolName(m_tool)));
+        c.print(TextFormat("tool = %s", ToolName(m_tool)));
+      });
+
+  m_console.registerCommand(
+      "brush", "brush <0..8>   - set brush radius (diamond)",
+      [this, parseI64](DevConsole& c, const DevConsole::Args& args) {
+        if (args.size() != 1) {
+          c.print("Usage: brush <0..8>");
+          return;
+        }
+        long long r = 0;
+        if (!parseI64(args[0], r)) {
+          c.print("Invalid radius: " + args[0]);
+          return;
+        }
+        m_brushRadius = std::clamp(static_cast<int>(r), 0, 8);
+        showToast(TextFormat("Brush radius: %d", m_brushRadius));
+        c.print(TextFormat("brush = %d", m_brushRadius));
+      });
+
+  m_console.registerCommand(
+      "roadlevel", "roadlevel <1..3> - set road build level", [this, parseI64](DevConsole& c, const DevConsole::Args& args) {
+        if (args.size() != 1) {
+          c.print("Usage: roadlevel <1..3>");
+          return;
+        }
+        long long lv = 0;
+        if (!parseI64(args[0], lv)) {
+          c.print("Invalid level: " + args[0]);
+          return;
+        }
+        m_roadBuildLevel = std::clamp(static_cast<int>(lv), 1, 3);
+        showToast(TextFormat("Road type: %s", RoadClassName(m_roadBuildLevel)));
+        c.print(TextFormat("roadlevel = %d", m_roadBuildLevel));
+      });
+
+  m_console.registerCommand(
+      "heatmap", "heatmap <off|land|park|water|pollution|traffic> - set heatmap overlay",
+      [this, toLower](DevConsole& c, const DevConsole::Args& args) {
+        if (args.size() != 1) {
+          c.print("Usage: heatmap <off|land|park|water|pollution|traffic>");
+          return;
+        }
+        const std::string h = toLower(args[0]);
+        if (h == "off") m_heatmapOverlay = HeatmapOverlay::Off;
+        else if (h == "land") m_heatmapOverlay = HeatmapOverlay::LandValue;
+        else if (h == "park") m_heatmapOverlay = HeatmapOverlay::Park; // legacy alias
+        else if (h == "water") m_heatmapOverlay = HeatmapOverlay::Water;
+        else if (h == "pollution") m_heatmapOverlay = HeatmapOverlay::Pollution;
+        else if (h == "traffic") m_heatmapOverlay = HeatmapOverlay::Traffic;
+        else {
+          c.print("Unknown heatmap: " + args[0]);
+          return;
+        }
+        m_landValueDirty = true;
+        showToast(TextFormat("Heatmap: %s", HeatmapName(m_heatmapOverlay)));
+        c.print(TextFormat("heatmap = %s", HeatmapName(m_heatmapOverlay)));
+      });
+
+  m_console.registerCommand(
+      "overlay",
+      "overlay <minimap|vehicles|traffic|goods|outside|help|policy|report|cache|traffic_model> [on|off|toggle]",
+      [this, toLower](DevConsole& c, const DevConsole::Args& args) {
+        if (args.empty()) {
+          c.print("Usage: overlay <name> [on|off|toggle]");
+          return;
+        }
+
+        const std::string name = toLower(args[0]);
+        const std::string mode = (args.size() >= 2) ? toLower(args[1]) : "toggle";
+
+        auto want = [&](bool current) {
+          if (mode == "on" || mode == "1" || mode == "true") return true;
+          if (mode == "off" || mode == "0" || mode == "false") return false;
+          return !current;
+        };
+
+        if (name == "minimap") {
+          m_showMinimap = want(m_showMinimap);
+          showToast(m_showMinimap ? "Minimap: ON" : "Minimap: OFF");
+        } else if (name == "vehicles") {
+          m_showVehicles = want(m_showVehicles);
+          showToast(m_showVehicles ? "Vehicles: ON" : "Vehicles: OFF");
+        } else if (name == "traffic") {
+          m_showTrafficOverlay = want(m_showTrafficOverlay);
+          showToast(m_showTrafficOverlay ? "Traffic overlay: ON" : "Traffic overlay: OFF");
+        } else if (name == "goods") {
+          m_showGoodsOverlay = want(m_showGoodsOverlay);
+          showToast(m_showGoodsOverlay ? "Goods overlay: ON" : "Goods overlay: OFF");
+        } else if (name == "outside") {
+          m_showOutsideOverlay = want(m_showOutsideOverlay);
+          showToast(m_showOutsideOverlay ? "Outside overlay: ON" : "Outside overlay: OFF");
+        } else if (name == "help") {
+          m_showHelp = want(m_showHelp);
+          showToast(m_showHelp ? "Help: ON" : "Help: OFF");
+        } else if (name == "policy" || name == "policies") {
+          m_showPolicies = want(m_showPolicies);
+          showToast(m_showPolicies ? "Policies: ON" : "Policies: OFF");
+        } else if (name == "report") {
+          m_showReport = want(m_showReport);
+          showToast(m_showReport ? "City report: ON" : "City report: OFF");
+        } else if (name == "traffic_model") {
+          m_showTrafficModel = want(m_showTrafficModel);
+          showToast(m_showTrafficModel ? "Traffic model: ON" : "Traffic model: OFF");
+        } else if (name == "cache") {
+          const bool enabled = want(m_renderer.baseCacheEnabled());
+          m_renderer.setBaseCacheEnabled(enabled);
+          m_renderer.markBaseCacheDirtyAll();
+          showToast(enabled ? "Render cache: ON" : "Render cache: OFF");
+        } else {
+          c.print("Unknown overlay: " + args[0]);
+          return;
+        }
+        c.print("ok");
+      });
+
+  // --- file export ---
+  m_console.registerCommand(
+      "shot", "shot          - capture a screenshot to captures/ (same as F12)",
+      [this](DevConsole& c, const DevConsole::Args&) {
+        namespace fs = std::filesystem;
+        fs::create_directories("captures");
+        const std::string path =
+            TextFormat("captures/screenshot_seed%llu_%s.png", static_cast<unsigned long long>(m_cfg.seed),
+                       FileTimestamp().c_str());
+        m_pendingScreenshot = true;
+        m_pendingScreenshotPath = path;
+        showToast(TextFormat("Queued screenshot: %s", path.c_str()), 2.0f);
+        c.print("queued: " + path);
+      });
+
+  m_console.registerCommand(
+      "map", "map           - export a world overview PNG to captures/",
+      [this](DevConsole& c, const DevConsole::Args&) {
+        namespace fs = std::filesystem;
+        fs::create_directories("captures");
+        const std::string path =
+            TextFormat("captures/map_seed%llu_%s.png", static_cast<unsigned long long>(m_cfg.seed),
+                       FileTimestamp().c_str());
+        m_pendingMapExport = true;
+        m_pendingMapExportPath = path;
+        showToast(TextFormat("Queued map export: %s", path.c_str()), 2.0f);
+        c.print("queued: " + path);
+      });
+
+  m_console.registerCommand(
+      "report_csv", "report_csv [path] - export city history samples to CSV",
+      [this, joinArgs](DevConsole& c, const DevConsole::Args& args) {
+        namespace fs = std::filesystem;
+        fs::create_directories("captures");
+
+        const std::string path = args.empty()
+                                    ? TextFormat("captures/report_seed%llu_%s.csv",
+                                                 static_cast<unsigned long long>(m_cfg.seed),
+                                                 FileTimestamp().c_str())
+                                    : joinArgs(args, 0);
+
+        std::ofstream out(path, std::ios::out | std::ios::trunc);
+        if (!out) {
+          c.print("Failed to write: " + path);
+          return;
+        }
+
+        out << "day,population,money,happiness,demandResidential,avgLandValue,avgTaxPerCapita,income,expenses,taxRevenue,maintenanceCost,commuters,avgCommute,avgCommuteTime,trafficCongestion,goodsSatisfaction\n";
+        for (const CityHistorySample& s : m_cityHistory) {
+          out << s.day << ',' << s.population << ',' << s.money << ',' << s.happiness << ','
+              << s.demandResidential << ',' << s.avgLandValue << ',' << s.avgTaxPerCapita << ',' << s.income << ','
+              << s.expenses << ',' << s.taxRevenue << ',' << s.maintenanceCost << ',' << s.commuters << ','
+              << s.avgCommute << ',' << s.avgCommuteTime << ',' << s.trafficCongestion << ','
+              << s.goodsSatisfaction << '\n';
+        }
+        out.close();
+
+        showToast(TextFormat("Exported report CSV: %s", path.c_str()), 2.0f);
+        c.print("wrote: " + path);
+      });
+
+  // --- camera ---
+  m_console.registerCommand(
+      "goto", "goto <x> <y>   - center camera on tile coordinates",
+      [this, parseI64](DevConsole& c, const DevConsole::Args& args) {
+        if (args.size() != 2) {
+          c.print("Usage: goto <x> <y>");
+          return;
+        }
+        long long x = 0;
+        long long y = 0;
+        if (!parseI64(args[0], x) || !parseI64(args[1], y)) {
+          c.print("Invalid coordinates");
+          return;
+        }
+        const int tx = std::clamp(static_cast<int>(x), 0, m_cfg.mapWidth - 1);
+        const int ty = std::clamp(static_cast<int>(y), 0, m_cfg.mapHeight - 1);
+        m_camera.target = TileToWorldCenterElevated(m_world, tx, ty, static_cast<float>(m_cfg.tileWidth),
+                                                    static_cast<float>(m_cfg.tileHeight), m_elev);
+        showToast(TextFormat("Camera -> (%d,%d)", tx, ty), 1.5f);
+        c.print(TextFormat("camera centered on (%d,%d)", tx, ty));
+      });
+
+  m_console.registerCommand(
+      "zoom", "zoom <0.25..4.0> - set camera zoom",
+      [this, parseF32](DevConsole& c, const DevConsole::Args& args) {
+        if (args.size() != 1) {
+          c.print("Usage: zoom <value>");
+          return;
+        }
+        float z = 1.0f;
+        if (!parseF32(args[0], z)) {
+          c.print("Invalid zoom: " + args[0]);
+          return;
+        }
+        m_camera.zoom = std::clamp(z, 0.25f, 4.0f);
+        showToast(TextFormat("Zoom: %.2f", static_cast<double>(m_camera.zoom)), 1.5f);
+        c.print(TextFormat("zoom = %.2f", static_cast<double>(m_camera.zoom)));
+      });
+
+  // --- video/ui ---
+  m_console.registerCommand(
+      "ui_scale", "ui_scale [auto|value] - set UI scale (0.5..3.0)",
+      [this, parseF32](DevConsole& c, const DevConsole::Args& args) {
+        if (args.empty()) {
+          c.print(TextFormat("ui_scale = %.2f (%s)", static_cast<double>(m_uiScale), m_uiScaleAuto ? "auto" : "manual"));
+          return;
+        }
+
+        if (args.size() != 1) {
+          c.print("Usage: ui_scale [auto|value]");
+          return;
+        }
+
+        if (args[0] == "auto") {
+          m_uiScaleAuto = true;
+          m_uiScale = computeAutoUiScale(GetScreenWidth(), GetScreenHeight());
+          showToast(TextFormat("UI scale: auto (%.2f)", static_cast<double>(m_uiScale)), 1.5f);
+          c.print("ui_scale -> auto");
+          return;
+        }
+
+        float s = 1.0f;
+        if (!parseF32(args[0], s)) {
+          c.print("Invalid scale: " + args[0]);
+          return;
+        }
+
+        m_uiScaleAuto = false;
+        m_uiScale = std::clamp(s, 0.5f, 3.0f);
+        showToast(TextFormat("UI scale: %.2f", static_cast<double>(m_uiScale)), 1.5f);
+        c.print(TextFormat("ui_scale -> %.2f", static_cast<double>(m_uiScale)));
+      });
+
+  m_console.registerCommand(
+      "fullscreen", "fullscreen - toggle exclusive fullscreen (F11)",
+      [this](DevConsole& c, const DevConsole::Args& args) {
+        if (!args.empty()) {
+          c.print("Usage: fullscreen");
+          return;
+        }
+        toggleFullscreen();
+        c.print("toggled fullscreen");
+      });
+
+  m_console.registerCommand(
+      "borderless", "borderless - toggle borderless windowed fullscreen (Alt+Enter)",
+      [this](DevConsole& c, const DevConsole::Args& args) {
+        if (!args.empty()) {
+          c.print("Usage: borderless");
+          return;
+        }
+        toggleBorderlessWindowed();
+        c.print("toggled borderless windowed");
+      });
+
+  m_console.registerCommand(
+      "resolution", "resolution [w h] - print or set window resolution",
+      [this, parseI64](DevConsole& c, const DevConsole::Args& args) {
+        if (args.empty()) {
+          c.print(TextFormat("window %dx%d", GetScreenWidth(), GetScreenHeight()));
+          return;
+        }
+
+        if (args.size() != 2) {
+          c.print("Usage: resolution <w> <h>");
+          return;
+        }
+
+        if (IsWindowFullscreen()) {
+          c.print("Exit fullscreen first (F11)");
+          return;
+        }
+
+        long long w = 0;
+        long long h = 0;
+        if (!parseI64(args[0], w) || !parseI64(args[1], h)) {
+          c.print("Invalid size");
+          return;
+        }
+
+        const int minW = std::max(320, m_cfg.windowMinWidth);
+        const int minH = std::max(240, m_cfg.windowMinHeight);
+        const int ww = std::max(minW, static_cast<int>(w));
+        const int hh = std::max(minH, static_cast<int>(h));
+        SetWindowSize(ww, hh);
+        showToast(TextFormat("Window: %dx%d", ww, hh), 1.5f);
+        c.print(TextFormat("window -> %dx%d", ww, hh));
+      });
+
+  m_console.registerCommand(
+      "vsync", "vsync - toggle VSync hint",
+      [this](DevConsole& c, const DevConsole::Args& args) {
+        if (!args.empty()) {
+          c.print("Usage: vsync");
+          return;
+        }
+        toggleVsync();
+        c.print(TextFormat("vsync -> %s", m_cfg.vsync ? "on" : "off"));
+      });
+
+  m_console.registerCommand(
+      "render_scale", "render_scale [auto|value] - set world render resolution scale",
+      [this, parseF32](DevConsole& c, const DevConsole::Args& args) {
+        if (args.empty()) {
+          c.print(TextFormat("render_scale = %.0f%% (%s)", m_worldRenderScale * 100.0f,
+                             m_worldRenderScaleAuto ? "auto" : "manual"));
+          if (m_worldRenderScaleAuto) {
+            c.print(TextFormat("range: %.0f%%..%.0f%%  target: %dfps", m_worldRenderScaleMin * 100.0f,
+                               m_worldRenderScaleMax * 100.0f, m_worldRenderTargetFps));
+          }
+          c.print(TextFormat("filter: %s", m_worldRenderFilterPoint ? "point" : "bilinear"));
+          return;
+        }
+
+        if (args.size() != 1) {
+          c.print("Usage: render_scale [auto|value]");
+          return;
+        }
+
+        if (args[0] == "auto") {
+          m_worldRenderScaleAuto = true;
+          m_cfg.worldRenderScaleAuto = true;
+          if (m_worldRenderScaleMin > m_worldRenderScaleMax) {
+            std::swap(m_worldRenderScaleMin, m_worldRenderScaleMax);
+          }
+          m_worldRenderScale = std::clamp(m_worldRenderScaleMax, m_worldRenderScaleMin, m_worldRenderScaleMax);
+          m_cfg.worldRenderScale = m_worldRenderScale;
+          showToast(TextFormat("World render: auto (%.0f%%)", m_worldRenderScale * 100.0f), 1.5f);
+          c.print("render_scale -> auto");
+          return;
+        }
+
+        float s = 1.0f;
+        if (!parseF32(args[0], s)) {
+          c.print("Invalid scale: " + args[0]);
+          return;
+        }
+
+        m_worldRenderScaleAuto = false;
+        m_cfg.worldRenderScaleAuto = false;
+        m_worldRenderScale = clampWorldRenderScale(s);
+        m_cfg.worldRenderScale = m_worldRenderScale;
+        showToast(TextFormat("World render scale: %.0f%%", m_worldRenderScale * 100.0f), 1.5f);
+        c.print(TextFormat("render_scale -> %.0f%%", m_worldRenderScale * 100.0f));
+
+        if (!wantsWorldRenderTarget()) {
+          unloadWorldRenderTarget();
+        }
+      });
+
+  m_console.registerCommand(
+      "render_range", "render_range <min> <max> - set auto render-scale range",
+      [this, parseF32](DevConsole& c, const DevConsole::Args& args) {
+        if (args.size() != 2) {
+          c.print("Usage: render_range <min> <max>");
+          return;
+        }
+
+        float mn = 0.7f;
+        float mx = 1.0f;
+        if (!parseF32(args[0], mn) || !parseF32(args[1], mx)) {
+          c.print("Invalid range");
+          return;
+        }
+
+        mn = clampWorldRenderScale(mn);
+        mx = clampWorldRenderScale(mx);
+        if (mn > mx) std::swap(mn, mx);
+
+        m_worldRenderScaleMin = mn;
+        m_worldRenderScaleMax = mx;
+        m_cfg.worldRenderScaleMin = mn;
+        m_cfg.worldRenderScaleMax = mx;
+
+        if (m_worldRenderScaleAuto) {
+          m_worldRenderScale = std::clamp(m_worldRenderScale, m_worldRenderScaleMin, m_worldRenderScaleMax);
+          m_cfg.worldRenderScale = m_worldRenderScale;
+        }
+
+        showToast(TextFormat("Render range: %.0f%%..%.0f%%", mn * 100.0f, mx * 100.0f), 1.5f);
+        c.print(TextFormat("render_range -> %.0f%%..%.0f%%", mn * 100.0f, mx * 100.0f));
+      });
+
+  m_console.registerCommand(
+      "render_targetfps", "render_targetfps <fps> - set auto render-scale target fps",
+      [this, parseI64](DevConsole& c, const DevConsole::Args& args) {
+        if (args.size() != 1) {
+          c.print("Usage: render_targetfps <fps>");
+          return;
+        }
+
+        long long fps = 60;
+        if (!parseI64(args[0], fps)) {
+          c.print("Invalid fps");
+          return;
+        }
+
+        m_worldRenderTargetFps = std::clamp(static_cast<int>(fps), 15, 240);
+        m_cfg.worldRenderTargetFps = m_worldRenderTargetFps;
+        showToast(TextFormat("Render target: %dfps", m_worldRenderTargetFps), 1.5f);
+        c.print(TextFormat("render_targetfps -> %d", m_worldRenderTargetFps));
+      });
+
+  m_console.registerCommand(
+      "render_filter", "render_filter <bilinear|point> - set world RT scaling filter",
+      [this](DevConsole& c, const DevConsole::Args& args) {
+        if (args.size() != 1) {
+          c.print("Usage: render_filter <bilinear|point>");
+          return;
+        }
+
+        const std::string mode = args[0];
+        if (mode == "point") {
+          m_worldRenderFilterPoint = true;
+        } else if (mode == "bilinear") {
+          m_worldRenderFilterPoint = false;
+        } else {
+          c.print("Unknown filter: " + mode);
+          return;
+        }
+
+        m_cfg.worldRenderFilterPoint = m_worldRenderFilterPoint;
+
+        if (m_worldRenderRTValid) {
+          SetTextureFilter(m_worldRenderRT.texture,
+                           m_worldRenderFilterPoint ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
+        }
+
+        showToast(TextFormat("Render filter: %s", m_worldRenderFilterPoint ? "point" : "bilinear"), 1.5f);
+        c.print(TextFormat("render_filter -> %s", m_worldRenderFilterPoint ? "point" : "bilinear"));
+      });
 }
 
 void Game::showToast(const std::string& msg, float seconds)
 {
   m_toast = msg;
   m_toastTimer = std::max(0.0f, seconds);
+}
+
+float Game::computeAutoUiScale(int /*screenW*/, int screenH) const
+{
+  // Use screen height as a good proxy for overall UI readability and merge it
+  // with any OS-reported DPI scaling.
+  const float base = static_cast<float>(screenH) / 1080.0f;
+  const Vector2 dpi = GetWindowScaleDPI();
+  const float dpiScale = std::max(dpi.x, dpi.y);
+
+  float scale = std::max(base, dpiScale);
+
+  // Snap to a sensible step to avoid jitter while resizing.
+  const float step = 0.25f;
+  scale = std::round(scale / step) * step;
+  scale = std::clamp(scale, 0.75f, 3.0f);
+  return scale;
+}
+
+Vector2 Game::mouseUiPosition(float uiScale) const
+{
+  const Vector2 mp = GetMousePosition();
+  if (uiScale <= 0.0f) return mp;
+  return Vector2{mp.x / uiScale, mp.y / uiScale};
+}
+
+void Game::updateUiScaleHotkeys()
+{
+  const int screenW = GetScreenWidth();
+  const int screenH = GetScreenHeight();
+  const float autoScale = computeAutoUiScale(screenW, screenH);
+
+  // Keep scale up-to-date when in auto mode (no toast spam).
+  if (m_uiScaleAuto) {
+    m_uiScale = autoScale;
+  }
+
+  const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+  if (!ctrl) return;
+
+  // Reserve Ctrl+Alt combinations for other display hotkeys.
+  const bool alt = IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT);
+  if (alt) return;
+
+  bool userChanged = false;
+
+  // Ctrl+0 => back to auto scaling.
+  if (IsKeyPressed(KEY_ZERO)) {
+    m_uiScaleAuto = true;
+    m_uiScale = autoScale;
+    userChanged = true;
+  }
+
+  // Ctrl+=' / Ctrl+'-' => manual adjustment.
+  // NOTE: raylib maps both '=' and '+' to KEY_EQUAL.
+  if (IsKeyPressed(KEY_EQUAL)) {
+    if (m_uiScaleAuto) {
+      m_uiScale = autoScale;
+      m_uiScaleAuto = false;
+    }
+    m_uiScale = std::clamp(m_uiScale + 0.10f, 0.50f, 4.00f);
+    userChanged = true;
+  }
+  if (IsKeyPressed(KEY_MINUS)) {
+    if (m_uiScaleAuto) {
+      m_uiScale = autoScale;
+      m_uiScaleAuto = false;
+    }
+    m_uiScale = std::clamp(m_uiScale - 0.10f, 0.50f, 4.00f);
+    userChanged = true;
+  }
+
+  if (userChanged) {
+    char buf[128];
+    if (m_uiScaleAuto) {
+      std::snprintf(buf, sizeof(buf), "UI scale: auto (%.2fx)", m_uiScale);
+    } else {
+      std::snprintf(buf, sizeof(buf), "UI scale: %.2fx (Ctrl+0 for auto)", m_uiScale);
+    }
+    showToast(buf, 2.0f);
+  }
+}
+
+float Game::clampWorldRenderScale(float scale) const
+{
+  if (!std::isfinite(scale)) {
+    return 1.0f;
+  }
+
+  return std::clamp(scale, kWorldRenderScaleAbsMin, kWorldRenderScaleAbsMax);
+}
+
+bool Game::wantsWorldRenderTarget() const
+{
+  if (m_worldRenderScaleAuto) return true;
+  return std::fabs(m_worldRenderScale - 1.0f) > 0.001f;
+}
+
+void Game::unloadWorldRenderTarget()
+{
+  if (!m_worldRenderRTValid) return;
+  UnloadRenderTexture(m_worldRenderRT);
+  m_worldRenderRT = {};
+  m_worldRenderRTValid = false;
+  m_worldRenderRTWidth = 0;
+  m_worldRenderRTHeight = 0;
+}
+
+void Game::ensureWorldRenderTarget(int screenW, int screenH)
+{
+  if (!wantsWorldRenderTarget()) {
+    unloadWorldRenderTarget();
+    return;
+  }
+
+  float scale = clampWorldRenderScale(m_worldRenderScale);
+  if (m_worldRenderScaleAuto) {
+    const float lo = clampWorldRenderScale(m_worldRenderScaleMin);
+    const float hi = clampWorldRenderScale(m_worldRenderScaleMax);
+    scale = std::clamp(scale, std::min(lo, hi), std::max(lo, hi));
+  }
+
+  // Prevent absurdly large render targets on extreme resolutions.
+  if (screenW > 0 && screenH > 0) {
+    const float maxScaleByDim = std::min(kWorldRenderRTMaxDim / static_cast<float>(screenW),
+                                        kWorldRenderRTMaxDim / static_cast<float>(screenH));
+    scale = std::min(scale, maxScaleByDim);
+  }
+
+  // If we had to clamp the effective scale (for example due to max RT size),
+  // keep the runtime value consistent so camera mapping stays correct.
+  if (std::fabs(scale - m_worldRenderScale) > 0.0005f) {
+    m_worldRenderScale = scale;
+    m_cfg.worldRenderScale = scale;
+  }
+
+  const int desiredW = std::max(1, static_cast<int>(std::lround(screenW * scale)));
+  const int desiredH = std::max(1, static_cast<int>(std::lround(screenH * scale)));
+
+  if (m_worldRenderRTValid && (desiredW == m_worldRenderRTWidth) && (desiredH == m_worldRenderRTHeight)) {
+    // Keep filter in sync (users can toggle it at runtime).
+    SetTextureFilter(m_worldRenderRT.texture,
+                     m_worldRenderFilterPoint ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
+    return;
+  }
+
+  unloadWorldRenderTarget();
+  m_worldRenderRT = LoadRenderTexture(desiredW, desiredH);
+  m_worldRenderRTValid = (m_worldRenderRT.texture.id != 0);
+  m_worldRenderRTWidth = desiredW;
+  m_worldRenderRTHeight = desiredH;
+
+  if (m_worldRenderRTValid) {
+    SetTextureFilter(m_worldRenderRT.texture,
+                     m_worldRenderFilterPoint ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
+  }
+}
+
+void Game::toggleVsync()
+{
+  m_cfg.vsync = !m_cfg.vsync;
+  if (m_cfg.vsync) {
+    SetWindowState(FLAG_VSYNC_HINT);
+  } else {
+    ClearWindowState(FLAG_VSYNC_HINT);
+  }
+}
+
+void Game::updateWorldRenderHotkeys()
+{
+  // Ctrl+Alt combinations are reserved for world render scaling, so they don't
+  // clash with Ctrl +/- UI scaling.
+  const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+  const bool alt = IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT);
+  if (!ctrl || !alt) return;
+  if (m_console.isOpen()) return;
+
+  auto setManualScale = [&](float newScale) {
+    m_worldRenderScaleAuto = false;
+    m_worldRenderScale = clampWorldRenderScale(newScale);
+    m_cfg.worldRenderScaleAuto = false;
+    m_cfg.worldRenderScale = m_worldRenderScale;
+    if (!wantsWorldRenderTarget()) {
+      unloadWorldRenderTarget();
+    }
+    showToast(TextFormat("World scale: %.2fx", static_cast<double>(m_worldRenderScale)));
+  };
+
+  if (IsKeyPressed(KEY_EQUAL)) {
+    setManualScale(m_worldRenderScale + kWorldRenderScaleStep);
+  }
+  if (IsKeyPressed(KEY_MINUS)) {
+    setManualScale(m_worldRenderScale - kWorldRenderScaleStep);
+  }
+  if (IsKeyPressed(KEY_ZERO)) {
+    setManualScale(1.0f);
+  }
+  if (IsKeyPressed(KEY_F)) {
+    m_worldRenderFilterPoint = !m_worldRenderFilterPoint;
+    m_cfg.worldRenderFilterPoint = m_worldRenderFilterPoint;
+    if (m_worldRenderRTValid) {
+      SetTextureFilter(m_worldRenderRT.texture,
+                       m_worldRenderFilterPoint ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
+    }
+    showToast(m_worldRenderFilterPoint ? "World filter: POINT" : "World filter: BILINEAR");
+  }
+  if (IsKeyPressed(KEY_A)) {
+    m_worldRenderScaleAuto = !m_worldRenderScaleAuto;
+    m_cfg.worldRenderScaleAuto = m_worldRenderScaleAuto;
+    if (m_worldRenderScaleAuto) {
+      m_worldRenderScaleMin = clampWorldRenderScale(m_worldRenderScaleMin);
+      m_worldRenderScaleMax = clampWorldRenderScale(m_worldRenderScaleMax);
+      if (m_worldRenderScaleMin > m_worldRenderScaleMax) {
+        std::swap(m_worldRenderScaleMin, m_worldRenderScaleMax);
+      }
+      m_worldRenderScale = std::clamp(m_worldRenderScaleMax, m_worldRenderScaleMin, m_worldRenderScaleMax);
+      m_cfg.worldRenderScale = m_worldRenderScale;
+      showToast("World scale: AUTO");
+    } else {
+      showToast("World scale: MANUAL");
+      if (!wantsWorldRenderTarget()) {
+        unloadWorldRenderTarget();
+      }
+    }
+  }
+}
+
+void Game::updateDynamicWorldRenderScale(float dt)
+{
+  // Exponential smoothing for stability.
+  m_frameTimeSmoothed = m_frameTimeSmoothed * (1.0f - kWorldRenderDtSmoothing) + dt * kWorldRenderDtSmoothing;
+
+  if (!m_worldRenderScaleAuto) return;
+
+  m_worldRenderAutoTimer += dt;
+  if (m_worldRenderAutoTimer < kWorldRenderAutoAdjustInterval) return;
+  m_worldRenderAutoTimer = 0.0f;
+
+  float lo = clampWorldRenderScale(m_worldRenderScaleMin);
+  float hi = clampWorldRenderScale(m_worldRenderScaleMax);
+  if (lo > hi) std::swap(lo, hi);
+  m_worldRenderScaleMin = lo;
+  m_worldRenderScaleMax = hi;
+
+  const int targetFps = std::max(15, m_worldRenderTargetFps);
+  const float targetDt = 1.0f / static_cast<float>(targetFps);
+
+  // Hysteresis bands to prevent oscillation.
+  const float tooSlow = targetDt * 1.08f;  // 8% slower than target
+  const float tooFast = targetDt * 0.92f;  // 8% faster than target
+
+  float scale = std::clamp(m_worldRenderScale, lo, hi);
+  if (m_frameTimeSmoothed > tooSlow && scale > lo + 0.001f) {
+    scale = std::max(lo, scale - kWorldRenderScaleStep);
+  } else if (m_frameTimeSmoothed < tooFast && scale < hi - 0.001f) {
+    scale = std::min(hi, scale + kWorldRenderScaleStep);
+  }
+
+  // Quantize to our step to avoid constant reallocations.
+  scale = std::round(scale / kWorldRenderScaleStep) * kWorldRenderScaleStep;
+  scale = std::clamp(scale, lo, hi);
+
+  if (std::fabs(scale - m_worldRenderScale) > 0.0001f) {
+    m_worldRenderScale = scale;
+    m_cfg.worldRenderScale = m_worldRenderScale;
+    // No toast here: it would spam while auto-scaling.
+  }
+}
+
+void Game::adjustVideoSettings(int dir)
+{
+  const int d = (dir < 0) ? -1 : 1;
+
+  auto toastScale = [&](float scale) {
+    showToast(TextFormat("World render scale: %.0f%%", scale * 100.0f));
+  };
+
+  switch (m_videoSelection) {
+    case 0: {
+      toggleFullscreen();
+      showToast(m_fullscreen ? "Fullscreen: ON" : "Fullscreen: OFF");
+      break;
+    }
+    case 1: {
+      toggleBorderlessWindowed();
+      showToast(m_borderlessWindowed ? "Borderless: ON" : "Borderless: OFF");
+      break;
+    }
+    case 2: {
+      toggleVsync();
+      showToast(m_cfg.vsync ? "VSync: ON" : "VSync: OFF");
+      break;
+    }
+    case 3: {
+      // UI scale mode: toggle auto/manual.
+      m_uiScaleAuto = !m_uiScaleAuto;
+      if (m_uiScaleAuto) {
+        m_uiScale = computeAutoUiScale(GetScreenWidth(), GetScreenHeight());
+        showToast(TextFormat("UI scale: AUTO (%.2fx)", m_uiScale));
+      } else {
+        m_uiScale = m_uiScaleManual;
+        showToast(TextFormat("UI scale: %.2fx", m_uiScale));
+      }
+      break;
+    }
+    case 4: {
+      // UI scale value (manual only).
+      if (!m_uiScaleAuto) {
+        m_uiScaleManual = std::clamp(m_uiScaleManual + d * 0.25f, 0.5f, 4.0f);
+        m_uiScale = m_uiScaleManual;
+        showToast(TextFormat("UI scale: %.2fx", m_uiScale));
+      }
+      break;
+    }
+    case 5: {
+      // World render auto/manual.
+      m_worldRenderScaleAuto = !m_worldRenderScaleAuto;
+      if (m_worldRenderScaleMin > m_worldRenderScaleMax) {
+        std::swap(m_worldRenderScaleMin, m_worldRenderScaleMax);
+      }
+      if (m_worldRenderScaleAuto) {
+        m_worldRenderScale = std::clamp(m_worldRenderScaleMax, m_worldRenderScaleMin, m_worldRenderScaleMax);
+        showToast("World render scale: AUTO");
+      } else {
+        showToast("World render scale: MANUAL");
+      }
+      break;
+    }
+    case 6: {
+      // World render scale (manual).
+      m_worldRenderScaleAuto = false;
+      m_worldRenderScale = clampWorldRenderScale(m_worldRenderScale + d * kWorldRenderScaleStep);
+      toastScale(m_worldRenderScale);
+      break;
+    }
+    case 7: {
+      // Auto min.
+      m_worldRenderScaleMin = clampWorldRenderScale(m_worldRenderScaleMin + d * kWorldRenderScaleStep);
+      m_worldRenderScaleMin = std::min(m_worldRenderScaleMin, m_worldRenderScaleMax);
+      showToast(TextFormat("World render min: %.0f%%", m_worldRenderScaleMin * 100.0f));
+      break;
+    }
+    case 8: {
+      // Auto max.
+      m_worldRenderScaleMax = clampWorldRenderScale(m_worldRenderScaleMax + d * kWorldRenderScaleStep);
+      m_worldRenderScaleMax = std::max(m_worldRenderScaleMax, m_worldRenderScaleMin);
+      showToast(TextFormat("World render max: %.0f%%", m_worldRenderScaleMax * 100.0f));
+      break;
+    }
+    case 9: {
+      // Auto target FPS.
+      m_worldRenderTargetFps = std::clamp(m_worldRenderTargetFps + d * 5, 30, 240);
+      showToast(TextFormat("World render target: %d FPS", m_worldRenderTargetFps));
+      break;
+    }
+    case 10: {
+      // Upscale filter.
+      m_worldRenderFilterPoint = !m_worldRenderFilterPoint;
+      if (m_worldRenderRTValid) {
+        SetTextureFilter(m_worldRenderRT.texture,
+                         m_worldRenderFilterPoint ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
+      }
+      showToast(m_worldRenderFilterPoint ? "World filter: POINT" : "World filter: BILINEAR");
+      break;
+    }
+    default:
+      break;
+  }
+
+  // Keep runtime settings mirrored in config for consistency.
+  m_cfg.worldRenderScaleAuto = m_worldRenderScaleAuto;
+  m_cfg.worldRenderScale = m_worldRenderScale;
+  m_cfg.worldRenderScaleMin = m_worldRenderScaleMin;
+  m_cfg.worldRenderScaleMax = m_worldRenderScaleMax;
+  m_cfg.worldRenderTargetFps = m_worldRenderTargetFps;
+  m_cfg.worldRenderFilterPoint = m_worldRenderFilterPoint;
+}
+
+void Game::toggleFullscreen()
+{
+  // If we are in borderless-windowed mode, disable it first.
+  if (m_borderlessWindowed) {
+    toggleBorderlessWindowed();
+  }
+
+  if (!IsWindowFullscreen()) {
+    // Store current windowed geometry before entering fullscreen.
+    const Vector2 pos = GetWindowPosition();
+    m_windowedX = static_cast<int>(pos.x);
+    m_windowedY = static_cast<int>(pos.y);
+    m_windowedW = GetScreenWidth();
+    m_windowedH = GetScreenHeight();
+  }
+
+  ToggleFullscreen();
+
+  if (!IsWindowFullscreen()) {
+    // Restore the previous windowed geometry.
+    SetWindowSize(m_windowedW, m_windowedH);
+    SetWindowPosition(m_windowedX, m_windowedY);
+  }
+
+  showToast(IsWindowFullscreen() ? "Fullscreen: on (F11)" : "Fullscreen: off (F11)", 2.0f);
+}
+
+void Game::toggleBorderlessWindowed()
+{
+  // Borderless windowed mode is implemented by making the window undecorated
+  // and sizing it to the current monitor.
+  if (IsWindowFullscreen()) {
+    ToggleFullscreen();
+  }
+
+  if (!m_borderlessWindowed) {
+    const Vector2 pos = GetWindowPosition();
+    m_windowedX = static_cast<int>(pos.x);
+    m_windowedY = static_cast<int>(pos.y);
+    m_windowedW = GetScreenWidth();
+    m_windowedH = GetScreenHeight();
+
+    SetWindowState(FLAG_WINDOW_UNDECORATED);
+    const int monitor = GetCurrentMonitor();
+    const int mw = GetMonitorWidth(monitor);
+    const int mh = GetMonitorHeight(monitor);
+    SetWindowPosition(0, 0);
+    SetWindowSize(mw, mh);
+    m_borderlessWindowed = true;
+    showToast("Borderless fullscreen: on (Alt+Enter)", 2.0f);
+  } else {
+    ClearWindowState(FLAG_WINDOW_UNDECORATED);
+    SetWindowSize(m_windowedW, m_windowedH);
+    SetWindowPosition(m_windowedX, m_windowedY);
+    m_borderlessWindowed = false;
+    showToast("Borderless fullscreen: off (Alt+Enter)", 2.0f);
+  }
+}
+
+void Game::toggleVsync()
+{
+  m_cfg.vsync = !m_cfg.vsync;
+
+  if (m_cfg.vsync) {
+    SetWindowState(FLAG_VSYNC_HINT);
+    showToast("VSync: on", 1.5f);
+  } else {
+    ClearWindowState(FLAG_VSYNC_HINT);
+    showToast("VSync: off", 1.5f);
+  }
 }
 
 
@@ -377,17 +1600,19 @@ void Game::refreshSaveMenu()
   }
 }
 
-void Game::drawSaveMenuPanel()
+void Game::drawSaveMenuPanel(int screenW, int screenH)
 {
   if (!m_showSaveMenu) return;
 
-  const int screenW = GetScreenWidth();
-  const int screenH = GetScreenHeight();
+  const bool showDistrictOverlay = m_showDistrictOverlay || m_showDistrictPanel || (m_tool == Tool::District);
+  const int highlightDistrict = showDistrictOverlay ? (m_activeDistrict % kDistrictCount) : -1;
+  const bool showDistrictBorders = showDistrictOverlay && m_showDistrictBorders;
 
   const int panelW = 760;
   const int panelH = 420;
   const int x0 = (screenW - panelW) / 2;
-  const int y0 = 96;
+  // Center vertically so the panel looks reasonable across different window sizes.
+  const int y0 = std::max(24, (screenH - panelH) / 2);
 
   DrawRectangle(x0, y0, panelW, panelH, Color{0, 0, 0, 200});
   DrawRectangleLines(x0, y0, panelW, panelH, Color{255, 255, 255, 80});
@@ -509,9 +1734,12 @@ inline float U32ToUnitFloat(std::uint32_t u)
   return static_cast<float>(u) / 4294967296.0f;
 }
 
-template <typename Item>
+// NOTE: Weight callback is a generic callable so we can pass lambdas directly.
+// A function-pointer parameter would force callers to explicitly convert lambdas
+// (MSVC/GCC do not consider that conversion during template argument deduction).
+template <typename Item, typename GetWeight>
 int PickWeightedIndex(std::uint64_t& rngState, const std::vector<Item>& items, std::uint64_t totalWeight,
-                      int (*getWeight)(const Item&))
+                      GetWeight&& getWeight)
 {
   if (items.empty()) return -1;
   if (totalWeight == 0) return -1;
@@ -519,7 +1747,7 @@ int PickWeightedIndex(std::uint64_t& rngState, const std::vector<Item>& items, s
   const std::uint64_t r = SplitMix64Next(rngState) % totalWeight;
   std::uint64_t acc = 0;
   for (int i = 0; i < static_cast<int>(items.size()); ++i) {
-    const int w = std::max(0, getWeight(items[static_cast<std::size_t>(i)]));
+    const int w = std::max(0, static_cast<int>(getWeight(items[static_cast<std::size_t>(i)])));
     acc += static_cast<std::uint64_t>(w);
     if (r < acc) return i;
   }
@@ -1057,6 +2285,14 @@ void Game::applyToolBrush(int centerX, int centerY)
   const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
   const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
 
+  // Display toggles
+  if (IsKeyPressed(KEY_F11)) {
+    toggleFullscreen();
+  }
+  if ((IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT)) && IsKeyPressed(KEY_ENTER)) {
+    toggleBorderlessWindowed();
+  }
+
   const int r = std::max(0, m_brushRadius);
   for (int dy = -r; dy <= r; ++dy) {
     for (int dx = -r; dx <= r; ++dx) {
@@ -1186,35 +2422,44 @@ void Game::applyToolBrush(int centerX, int centerY)
           m_roadGraphDirty = true;
         }
       } else {
-        // --- Regular tools go through World::applyTool (economy + rules). ---
-        res = (m_tool == Tool::Road) ? m_world.applyRoad(tx, ty, m_roadBuildLevel)
-                                     : m_world.applyTool(m_tool, tx, ty);
-        switch (res) {
-        case ToolApplyResult::InsufficientFunds: m_strokeFeedback.noMoney = true; break;
-        case ToolApplyResult::BlockedNoRoad: m_strokeFeedback.noRoad = true; break;
-        case ToolApplyResult::BlockedWater: m_strokeFeedback.water = true; break;
-        case ToolApplyResult::BlockedOccupied: m_strokeFeedback.occupied = true; break;
-        default: break;
-        }
+        if (m_tool == Tool::District) {
+          // Districts are a lightweight label layer; they do not run through the economy rules.
+          res = m_world.applyDistrict(tx, ty, m_activeDistrict);
+          applied = (res == ToolApplyResult::Applied);
+        } else {
+          // --- Regular tools go through World::applyTool (economy + rules). ---
+          res = (m_tool == Tool::Road) ? m_world.applyRoad(tx, ty, m_roadBuildLevel)
+                                       : m_world.applyTool(m_tool, tx, ty);
+          switch (res) {
+          case ToolApplyResult::InsufficientFunds: m_strokeFeedback.noMoney = true; break;
+          case ToolApplyResult::BlockedNoRoad: m_strokeFeedback.noRoad = true; break;
+          case ToolApplyResult::BlockedWater: m_strokeFeedback.water = true; break;
+          case ToolApplyResult::BlockedOccupied: m_strokeFeedback.occupied = true; break;
+          default: break;
+          }
 
-        applied = (res == ToolApplyResult::Applied);
-        if (applied) {
-          m_landValueDirty = true;
-          // Traffic depends on roads + zones + occupancy.
-          m_trafficDirty = true;
-          // Goods logistics depend on roads + industrial/commercial zoning.
-          m_goodsDirty = true;
-          // Moving vehicles (visualization) also depend on roads + zones + occupancy.
-          m_vehiclesDirty = true;
+          applied = (res == ToolApplyResult::Applied);
+          if (applied) {
+            m_landValueDirty = true;
+            // Traffic depends on roads + zones + occupancy.
+            m_trafficDirty = true;
+            // Goods logistics depend on roads + industrial/commercial zoning.
+            m_goodsDirty = true;
+            // Moving vehicles (visualization) also depend on roads + zones + occupancy.
+            m_vehiclesDirty = true;
 
-          if (m_tool == Tool::Road || (m_tool == Tool::Bulldoze && beforeOverlay == Overlay::Road)) {
-            m_roadGraphDirty = true;
+            if (m_tool == Tool::Road || (m_tool == Tool::Bulldoze && beforeOverlay == Overlay::Road)) {
+              m_roadGraphDirty = true;
+            }
           }
         }
       }
 
       if (applied) {
-        m_tilesEditedThisStroke.push_back(Point{tx, ty});
+        // District edits do not affect cached terrain/overlays, so avoid base-cache rebuild churn.
+        if (m_tool != Tool::District) {
+          m_tilesEditedThisStroke.push_back(Point{tx, ty});
+        }
       }
     }
   }
@@ -1402,14 +2647,55 @@ void Game::run()
 
 void Game::handleInput(float dt)
 {
+  // Keep UI scaling in sync with monitor DPI and any window resizes.
+  updateUiScaleHotkeys();
+  updateWorldRenderHotkeys();
+
+  const int screenW = GetScreenWidth();
+  const int screenH = GetScreenHeight();
+  const float uiScale = m_uiScale;
+  const int uiW = static_cast<int>(std::round(static_cast<float>(screenW) / uiScale));
+  const int uiH = static_cast<int>(std::round(static_cast<float>(screenH) / uiScale));
+
+  const Vector2 mouse = GetMousePosition();
+  const Vector2 mouseUi = mouseUiPosition(uiScale);
+
   // Update hovered tile from mouse.
-  const Vector2 mouseWorld = GetScreenToWorld2D(GetMousePosition(), m_camera);
+  const Vector2 mouseWorld = GetScreenToWorld2D(mouse, m_camera);
   m_hovered = WorldToTileElevated(mouseWorld, m_world, static_cast<float>(m_cfg.tileWidth),
                                  static_cast<float>(m_cfg.tileHeight), m_elev);
 
   // Undo/redo
   const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
   const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+
+  // Fullscreen/borderless toggles (common PC shortcuts).
+  if (IsKeyPressed(KEY_F11)) {
+    toggleFullscreen();
+  }
+  if ((IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT)) && IsKeyPressed(KEY_ENTER)) {
+    toggleBorderlessWindowed();
+  }
+
+  // Developer console (toggle with F4). When open it captures keyboard input.
+  if (IsKeyPressed(KEY_F4)) {
+    endPaintStroke();
+
+    // Avoid overlapping input-capturing UIs.
+    if (!m_console.isOpen() && m_showSaveMenu) {
+      unloadSaveMenuThumbnails();
+      m_showSaveMenu = false;
+      m_saveMenuDeleteArmed = false;
+    }
+
+    m_console.toggle();
+    showToast(m_console.isOpen() ? "Console: ON" : "Console: OFF");
+  }
+
+  if (m_console.isOpen()) {
+    (void)m_console.update(dt, uiW, uiH, mouseUi.x, mouseUi.y);
+    return;
+  }
 
   if (ctrl && shift && IsKeyPressed(KEY_Z)) {
     doRedo();
@@ -1432,6 +2718,37 @@ void Game::handleInput(float dt)
       unloadSaveMenuThumbnails();
       m_saveMenuDeleteArmed = false;
       showToast("Save menu: OFF");
+    }
+  }
+
+  // Capture controls
+  // - F12: window screenshot
+  // - Ctrl+F12: full city overview export (off-screen render)
+  if (IsKeyPressed(KEY_F12)) {
+    endPaintStroke();
+
+    std::error_code ec;
+    const std::filesystem::path outDir = std::filesystem::path("captures");
+    std::filesystem::create_directories(outDir, ec);
+
+    const std::string stamp = FileTimestamp();
+    const unsigned long long seed = static_cast<unsigned long long>(m_world.seed());
+    const int day = m_world.stats().day;
+
+    auto makeFileName = [&](const char* prefix) {
+      char buf[256];
+      std::snprintf(buf, sizeof(buf), "%s_seed%llu_day%d_%s.png", prefix, seed, day, stamp.c_str());
+      return outDir / buf;
+    };
+
+    if (ctrl) {
+      const std::filesystem::path outPath = makeFileName("map");
+      const bool ok = m_renderer.exportWorldOverview(m_world, outPath.string().c_str(), 4096);
+      showToast(ok ? (std::string("Map exported: ") + outPath.string()) : "Map export failed", 3.0f);
+    } else {
+      // Queue the screenshot so it's captured after the frame is drawn.
+      m_pendingScreenshotPath = makeFileName("screenshot").string();
+      m_pendingScreenshot = true;
     }
   }
 
@@ -1559,6 +2876,19 @@ void Game::handleInput(float dt)
   if (IsKeyPressed(KEY_F3)) {
     m_showTrafficModel = !m_showTrafficModel;
     showToast(m_showTrafficModel ? "Traffic model: ON" : "Traffic model: OFF");
+    endPaintStroke();
+  }
+
+  if (IsKeyPressed(KEY_F7)) {
+    m_showDistrictPanel = !m_showDistrictPanel;
+    showToast(m_showDistrictPanel ? "Districts panel: ON" : "Districts panel: OFF");
+    endPaintStroke();
+  }
+
+  if (IsKeyPressed(KEY_F8)) {
+    m_showVideoSettings = !m_showVideoSettings;
+    showToast(m_showVideoSettings ? "Video settings: ON" : "Video settings: OFF");
+    endPaintStroke();
   }
 
   if (IsKeyPressed(KEY_P)) {
@@ -1580,6 +2910,12 @@ void Game::handleInput(float dt)
     } else if (m_showTrafficModel) {
       const int count = 6;
       m_trafficModelSelection = (m_trafficModelSelection + delta + count) % count;
+    } else if (m_showDistrictPanel) {
+      const int count = 9;
+      m_districtSelection = (m_districtSelection + delta + count) % count;
+    } else if (m_showVideoSettings) {
+      const int count = 11;
+      m_videoSelection = (m_videoSelection + delta + count) % count;
     }
   }
 
@@ -1801,6 +3137,60 @@ void Game::handleInput(float dt)
       m_goodsDirty = true;
       m_landValueDirty = true;
       m_vehiclesDirty = true;
+    } else if (m_showDistrictPanel) {
+      const int deltaI = shift ? -2 : -1;
+      const float deltaF = shift ? -0.25f : -0.05f;
+      SimConfig& cfg = m_sim.config();
+
+      auto clampF = [](float v, float lo, float hi) -> float { return std::clamp(v, lo, hi); };
+
+      const int d = std::clamp(m_activeDistrict, 0, kDistrictCount - 1);
+      DistrictPolicy& pol = cfg.districtPolicies[d];
+
+      switch (m_districtSelection) {
+      case 0:
+        cfg.districtPoliciesEnabled = !cfg.districtPoliciesEnabled;
+        showToast(cfg.districtPoliciesEnabled ? "District policies: ON" : "District policies: OFF");
+        break;
+      case 1:
+        m_activeDistrict = (m_activeDistrict + deltaI + kDistrictCount) % kDistrictCount;
+        showToast(TextFormat("Active district: %d", m_activeDistrict));
+        break;
+      case 2:
+        m_showDistrictOverlay = !m_showDistrictOverlay;
+        showToast(m_showDistrictOverlay ? "District overlay: ON" : "District overlay: OFF");
+        break;
+      case 3:
+        m_showDistrictBorders = !m_showDistrictBorders;
+        showToast(m_showDistrictBorders ? "District borders: ON" : "District borders: OFF");
+        break;
+      case 4:
+        pol.taxMultRes = clampF(pol.taxMultRes + deltaF, 0.0f, 3.0f);
+        showToast(TextFormat("District %d res tax mult: %.2f", d, pol.taxMultRes));
+        break;
+      case 5:
+        pol.taxMultCom = clampF(pol.taxMultCom + deltaF, 0.0f, 3.0f);
+        showToast(TextFormat("District %d com tax mult: %.2f", d, pol.taxMultCom));
+        break;
+      case 6:
+        pol.taxMultInd = clampF(pol.taxMultInd + deltaF, 0.0f, 3.0f);
+        showToast(TextFormat("District %d ind tax mult: %.2f", d, pol.taxMultInd));
+        break;
+      case 7:
+        pol.roadMaintMult = clampF(pol.roadMaintMult + deltaF, 0.0f, 3.0f);
+        showToast(TextFormat("District %d road maint mult: %.2f", d, pol.roadMaintMult));
+        break;
+      case 8:
+        pol.parkMaintMult = clampF(pol.parkMaintMult + deltaF, 0.0f, 3.0f);
+        showToast(TextFormat("District %d park maint mult: %.2f", d, pol.parkMaintMult));
+        break;
+      default: break;
+      }
+
+      // Policies affect derived stats and budget.
+      m_sim.refreshDerivedStats(m_world);
+    } else if (m_showVideoSettings) {
+      adjustVideoSettings(-1);
     } else {
       m_brushRadius = std::max(0, m_brushRadius - 1);
       showToast(TextFormat("Brush radius: %d", m_brushRadius));
@@ -1855,6 +3245,58 @@ void Game::handleInput(float dt)
       m_goodsDirty = true;
       m_landValueDirty = true;
       m_vehiclesDirty = true;
+    } else if (m_showDistrictPanel) {
+      const int deltaI = shift ? 2 : 1;
+      const float deltaF = shift ? 0.25f : 0.05f;
+      SimConfig& cfg = m_sim.config();
+
+      const int d = ((m_activeDistrict % kDistrictCount) + kDistrictCount) % kDistrictCount;
+      DistrictPolicy& pol = cfg.districtPolicies[d];
+      auto clampF = [](float v, float lo, float hi) -> float { return std::clamp(v, lo, hi); };
+
+      switch (m_districtSelection) {
+      case 0:
+        cfg.districtPoliciesEnabled = !cfg.districtPoliciesEnabled;
+        showToast(cfg.districtPoliciesEnabled ? "District policies: ON" : "District policies: OFF");
+        break;
+      case 1:
+        m_activeDistrict = (m_activeDistrict + deltaI) % kDistrictCount;
+        showToast(TextFormat("Active district: %d", m_activeDistrict));
+        break;
+      case 2:
+        m_showDistrictOverlay = !m_showDistrictOverlay;
+        showToast(m_showDistrictOverlay ? "District overlay: ON" : "District overlay: OFF");
+        break;
+      case 3:
+        m_showDistrictBorders = !m_showDistrictBorders;
+        showToast(m_showDistrictBorders ? "District borders: ON" : "District borders: OFF");
+        break;
+      case 4:
+        pol.taxMultRes = clampF(pol.taxMultRes + deltaF, 0.0f, 3.0f);
+        showToast(TextFormat("District %d res tax mult: %.2f", d, pol.taxMultRes));
+        break;
+      case 5:
+        pol.taxMultCom = clampF(pol.taxMultCom + deltaF, 0.0f, 3.0f);
+        showToast(TextFormat("District %d com tax mult: %.2f", d, pol.taxMultCom));
+        break;
+      case 6:
+        pol.taxMultInd = clampF(pol.taxMultInd + deltaF, 0.0f, 3.0f);
+        showToast(TextFormat("District %d ind tax mult: %.2f", d, pol.taxMultInd));
+        break;
+      case 7:
+        pol.roadMaintMult = clampF(pol.roadMaintMult + deltaF, 0.0f, 3.0f);
+        showToast(TextFormat("District %d road maint mult: %.2f", d, pol.roadMaintMult));
+        break;
+      case 8:
+        pol.parkMaintMult = clampF(pol.parkMaintMult + deltaF, 0.0f, 3.0f);
+        showToast(TextFormat("District %d park maint mult: %.2f", d, pol.parkMaintMult));
+        break;
+      default: break;
+      }
+
+      m_sim.refreshDerivedStats(m_world);
+    } else if (m_showVideoSettings) {
+      adjustVideoSettings(+1);
     } else {
       m_brushRadius = std::min(8, m_brushRadius + 1);
       showToast(TextFormat("Brush radius: %d", m_brushRadius));
@@ -1928,6 +3370,18 @@ void Game::handleInput(float dt)
   if (IsKeyPressed(KEY_SIX)) setTool(Tool::RaiseTerrain);
   if (IsKeyPressed(KEY_SEVEN)) setTool(Tool::LowerTerrain);
   if (IsKeyPressed(KEY_EIGHT)) setTool(Tool::SmoothTerrain);
+  if (IsKeyPressed(KEY_NINE)) setTool(Tool::District);
+
+  if (m_tool == Tool::District) {
+    if (IsKeyPressed(KEY_COMMA)) {
+      m_activeDistrict = (m_activeDistrict + kDistrictCount - 1) % kDistrictCount;
+      showToast(TextFormat("Active district: %d", m_activeDistrict));
+    }
+    if (IsKeyPressed(KEY_PERIOD)) {
+      m_activeDistrict = (m_activeDistrict + 1) % kDistrictCount;
+      showToast(TextFormat("Active district: %d", m_activeDistrict));
+    }
+  }
 
   // Camera pan: right mouse drag (raylib example style).
   if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
@@ -1966,8 +3420,8 @@ void Game::handleInput(float dt)
   // --- Minimap interaction (UI consumes left mouse so we don't accidentally paint the world). ---
   bool consumeLeft = false;
   if (m_showMinimap && m_world.width() > 0 && m_world.height() > 0) {
-    const Renderer::MinimapLayout mini = m_renderer.minimapLayout(m_world, GetScreenWidth(), GetScreenHeight());
-    const Vector2 mp = GetMousePosition();
+    const Renderer::MinimapLayout mini = m_renderer.minimapLayout(m_world, uiW, uiH);
+    const Vector2 mp = mouseUi;
     const bool over = CheckCollisionPointRec(mp, mini.rect);
 
     if (leftPressed && over) {
@@ -2164,6 +3618,15 @@ void Game::handleInput(float dt)
     }
   }
 
+  // District tool: Alt+click to pick the hovered tile's district ID (avoids accidental repainting).
+  if (!consumeLeft && !roadDragMode && leftPressed && m_hovered && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && m_tool == Tool::District
+      && (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT))) {
+    const Tile& t = m_world.at(m_hovered->x, m_hovered->y);
+    m_activeDistrict = static_cast<int>(t.district) % kDistrictCount;
+    showToast(TextFormat("Picked district: %d", m_activeDistrict));
+    consumeLeft = true;
+  }
+
   if (!consumeLeft && !roadDragMode && leftPressed && m_hovered && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && m_tool != Tool::Inspect) {
     beginPaintStroke();
   }
@@ -2282,6 +3745,9 @@ void Game::update(float dt)
   } else {
     m_saveMenuRefreshTimer = 0.0f;
   }
+
+  // Optional dynamic resolution scaling for the world layer.
+  updateDynamicWorldRenderScale(dt);
 }
 
 
@@ -2389,7 +3855,7 @@ const char* ReportPageName(int page)
 
 } // namespace
 
-void Game::drawReportPanel()
+void Game::drawReportPanel(int /*screenW*/, int /*screenH*/)
 {
   if (!m_showReport) return;
 
@@ -2462,11 +3928,89 @@ void Game::drawReportPanel()
   }
 }
 
+void Game::drawVideoSettingsPanel(float uiW, float uiH)
+{
+  if (!m_showVideoSettings) return;
+
+  const int panelW = 520;
+  const int rowH = 22;
+  const int rows = 11;
+  const int panelH = 10 + 24 + 24 + rows * rowH + 28;
+
+  const int x0 = 12;
+  int y0 = 96;
+
+  // Avoid overlapping the report panel (which also lives on the left).
+  if (m_showReport) {
+    y0 += 420 + 12;
+  }
+
+  // Clamp to screen height.
+  if (y0 + panelH > static_cast<int>(uiH) - 12) {
+    y0 = std::max(12, static_cast<int>(uiH) - panelH - 12);
+  }
+
+  DrawRectangle(x0, y0, panelW, panelH, Color{0, 0, 0, 180});
+  DrawRectangleLines(x0, y0, panelW, panelH, Color{255, 255, 255, 70});
+
+  int x = x0 + 12;
+  int y = y0 + 10;
+
+  DrawText("Video / Display", x, y, 20, RAYWHITE);
+  y += 24;
+  DrawText("Tab: select    [ / ]: adjust/toggle    Ctrl+Alt +/-: world scale    F8: toggle", x, y, 16,
+           Color{220, 220, 220, 255});
+  y += 24;
+
+  auto drawRow = [&](int idx, const char* label, const std::string& value, bool dim = false) {
+    const bool selected = (m_videoSelection == idx);
+    if (selected) {
+      DrawRectangle(x0 + 6, y - 2, panelW - 12, rowH, Color{255, 255, 255, 28});
+    }
+
+    Color c = dim ? Color{170, 170, 170, 255} : Color{220, 220, 220, 255};
+    if (selected) {
+      c = RAYWHITE;
+    }
+
+    DrawText(label, x, y, 16, c);
+    const int valW = MeasureText(value.c_str(), 16);
+    DrawText(value.c_str(), x0 + panelW - 12 - valW, y, 16, c);
+    y += rowH;
+  };
+
+  // 0..10 must match adjustVideoSettings() and Tab cycling.
+  drawRow(0, "Fullscreen", m_fullscreen ? "On" : "Off");
+  drawRow(1, "Borderless windowed", m_borderlessWindowed ? "On" : "Off");
+  drawRow(2, "VSync", m_cfg.vsync ? "On" : "Off");
+  drawRow(3, "UI scale mode", m_uiScaleAuto ? "Auto" : "Manual");
+  drawRow(4, "UI scale", TextFormat("%.2fx", m_uiScale), !m_uiScaleAuto);
+
+  drawRow(5, "World render mode", m_worldRenderScaleAuto ? "Auto" : "Manual");
+  drawRow(6, "World render scale", TextFormat("%.0f%%", m_worldRenderScale * 100.0f), m_worldRenderScaleAuto);
+  drawRow(7, "World scale min", TextFormat("%.0f%%", m_worldRenderScaleMin * 100.0f), !m_worldRenderScaleAuto);
+  drawRow(8, "World scale max", TextFormat("%.0f%%", m_worldRenderScaleMax * 100.0f), !m_worldRenderScaleAuto);
+  drawRow(9, "World target FPS", TextFormat("%d", m_worldRenderTargetFps), !m_worldRenderScaleAuto);
+  drawRow(10, "World filter", m_worldRenderFilterPoint ? "Point" : "Bilinear");
+
+  // Footer: show current effective world RT size and smoothed FPS.
+  const float fps = 1.0f / std::max(0.0001f, m_frameTimeSmoothed);
+  const char* rtStr = wantsWorldRenderTarget() ? TextFormat("%dx%d", m_worldRenderRTWidth, m_worldRenderRTHeight) : "native";
+  DrawText(TextFormat("Smoothed FPS: %.1f    World RT: %s", fps, rtStr), x0 + 12, y0 + panelH - 22, 14,
+           Color{220, 220, 220, 255});
+}
+
 
 void Game::draw()
 {
   BeginDrawing();
   ClearBackground(Color{30, 32, 38, 255});
+
+  const int screenW = GetScreenWidth();
+  const int screenH = GetScreenHeight();
+  const float uiScale = m_uiScale;
+  const int uiW = static_cast<int>(std::round(static_cast<float>(screenW) / uiScale));
+  const int uiH = static_cast<int>(std::round(static_cast<float>(screenH) / uiScale));
 
   // World highlights: either the inspect path OR the road-drag preview (if active).
   std::optional<Point> selected = m_inspectSelected;
@@ -2592,11 +4136,48 @@ void Game::draw()
     }
   }
 
-  m_renderer.drawWorld(m_world, m_camera, m_timeSec, m_hovered, m_drawGrid, worldBrush, selected, pathPtr, outsideMask,
-                       trafficMask, trafficMax,
-                       goodsTrafficMask, goodsMax,
-                       commercialGoodsFill,
-                       heatmap, heatmapRamp);
+  // World pass: optionally render to an offscreen target for resolution scaling.
+  if (wantsWorldRenderTarget()) {
+    ensureWorldRenderTarget(screenW, screenH);
+  }
+
+  auto drawWorldDirect = [&]() {
+    m_renderer.drawWorld(m_world, m_camera, screenW, screenH, m_timeSec, m_hovered, m_drawGrid, worldBrush, selected,
+                         pathPtr, outsideMask,
+                         trafficMask, trafficMax,
+                         goodsTrafficMask, goodsMax,
+                         commercialGoodsFill,
+                         heatmap, heatmapRamp,
+                         showDistrictOverlay, highlightDistrict, showDistrictBorders);
+  };
+
+  if (!wantsWorldRenderTarget() || !m_worldRenderRTValid) {
+    drawWorldDirect();
+  } else {
+    Camera2D camRT = m_camera;
+    camRT.zoom = m_camera.zoom * m_worldRenderScale;
+    camRT.offset.x = m_camera.offset.x * m_worldRenderScale;
+    camRT.offset.y = m_camera.offset.y * m_worldRenderScale;
+
+    BeginTextureMode(m_worldRenderRT);
+    ClearBackground(Color{30, 32, 38, 255});
+
+    m_renderer.drawWorld(m_world, camRT, m_worldRenderRTWidth, m_worldRenderRTHeight, m_timeSec, m_hovered,
+                         m_drawGrid, worldBrush, selected,
+                         pathPtr, outsideMask,
+                         trafficMask, trafficMax,
+                         goodsTrafficMask, goodsMax,
+                         commercialGoodsFill,
+                         heatmap, heatmapRamp,
+                         showDistrictOverlay, highlightDistrict, showDistrictBorders);
+
+    EndTextureMode();
+
+    const Rectangle src = {0.0f, 0.0f, static_cast<float>(m_worldRenderRTWidth),
+                           -static_cast<float>(m_worldRenderRTHeight)};
+    const Rectangle dst = {0.0f, 0.0f, static_cast<float>(screenW), static_cast<float>(screenH)};
+    DrawTexturePro(m_worldRenderRT.texture, src, dst, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+  }
 
   // Vehicle micro-sim overlay (commuters + goods trucks).
   drawVehicles();
@@ -2682,7 +4263,17 @@ void Game::draw()
 
   const char* heatmapInfoC = (!heatmapInfo.empty()) ? heatmapInfo.c_str() : nullptr;
 
-  m_renderer.drawHUD(m_world, m_camera, m_tool, m_roadBuildLevel, m_hovered, GetScreenWidth(), GetScreenHeight(), m_showHelp,
+  // ---------------------------------------------------------------------
+  // UI (scaled)
+  // ---------------------------------------------------------------------
+  // The world is rendered at full resolution, but the UI is rendered in a
+  // "virtual" coordinate system and scaled up/down. This keeps UI text
+  // readable and panels sized consistently across resolutions and DPI.
+  Camera2D uiCam{};
+  uiCam.zoom = uiScale;
+  BeginMode2D(uiCam);
+
+  m_renderer.drawHUD(m_world, m_camera, m_tool, m_roadBuildLevel, m_hovered, uiW, uiH, m_showHelp,
                      m_brushRadius, static_cast<int>(m_history.undoSize()), static_cast<int>(m_history.redoSize()),
                      m_simPaused, simSpeed, m_saveSlot, m_showMinimap, inspectInfo, heatmapInfoC);
 
@@ -2693,7 +4284,7 @@ void Game::draw()
 
     const int panelW = 420;
     const int panelH = 280;
-    const int x0 = GetScreenWidth() - panelW - 12;
+    const int x0 = uiW - panelW - 12;
     const int y0 = 96;
 
     DrawRectangle(x0, y0, panelW, panelH, Color{0, 0, 0, 180});
@@ -2747,7 +4338,7 @@ void Game::draw()
 
     const int panelW = 420;
     const int panelH = 248;
-    const int x0 = GetScreenWidth() - panelW - 12;
+    const int x0 = uiW - panelW - 12;
     // Stack below policy if both are visible.
     const int y0 = m_showPolicy ? (96 + 280 + 12) : 96;
 
@@ -2786,10 +4377,69 @@ void Game::draw()
              x, y, 18, Color{220, 220, 220, 255});
   }
 
-  drawReportPanel();
+  // Districts panel (district paint + per-district policy multipliers; saved in v7+).
+  if (m_showDistrictPanel) {
+    const SimConfig& cfg = m_sim.config();
+    const int district = std::clamp(m_activeDistrict, 0, kDistrictCount - 1);
+    const DistrictPolicy& dp = cfg.districtPolicies[static_cast<std::size_t>(district)];
+
+    const int panelW = 420;
+    const int panelH = 308;
+    const int x0 = uiW - panelW - 12;
+    int y0 = 96;
+    if (m_showPolicy) y0 += 280 + 12;
+    if (m_showTrafficModel) y0 += 248 + 12;
+
+    DrawRectangle(x0, y0, panelW, panelH, Color{0, 0, 0, 180});
+    DrawRectangleLines(x0, y0, panelW, panelH, Color{255, 255, 255, 70});
+
+    int x = x0 + 12;
+    int y = y0 + 10;
+    DrawText("Districts", x, y, 20, RAYWHITE);
+    y += 24;
+    DrawText("Tab: select   [ / ]: adjust   Shift: bigger steps", x, y, 16, Color{220, 220, 220, 255});
+    y += 22;
+
+    auto row = [&](int idx, const char* label, const char* value) {
+      const bool sel = (m_districtSelection == idx);
+      if (sel) {
+        DrawRectangle(x - 6, y - 2, panelW - 24, 20, Color{255, 255, 255, 40});
+      }
+      DrawText(TextFormat("%s: %s", label, value), x, y, 18,
+               sel ? Color{255, 255, 255, 255} : Color{210, 210, 210, 255});
+      y += 22;
+    };
+
+    row(0, "Policies enabled", cfg.districtPoliciesEnabled ? "ON" : "OFF");
+    row(1, "Active district", (district == 0) ? "0 (Default)" : TextFormat("%d", district));
+    row(2, "Overlay", m_showDistrictOverlay ? "ON" : ((m_tool == Tool::District) ? "AUTO (tool)" : "OFF"));
+    row(3, "Borders", m_showDistrictBorders ? "ON" : "OFF");
+
+    const int effResTax = static_cast<int>(std::lround(static_cast<double>(cfg.taxResidential) * dp.taxMultRes));
+    const int effComTax = static_cast<int>(std::lround(static_cast<double>(cfg.taxCommercial) * dp.taxMultCom));
+    const int effIndTax = static_cast<int>(std::lround(static_cast<double>(cfg.taxIndustrial) * dp.taxMultInd));
+    const int effRoadMaint = static_cast<int>(std::lround(static_cast<double>(cfg.maintenanceRoad) * dp.maintenanceMultRoad));
+    const int effParkMaint = static_cast<int>(std::lround(static_cast<double>(cfg.maintenancePark) * dp.maintenanceMultPark));
+
+    row(4, "Res tax mult", TextFormat("x%.2f (eff %d)", static_cast<double>(dp.taxMultRes), effResTax));
+    row(5, "Com tax mult", TextFormat("x%.2f (eff %d)", static_cast<double>(dp.taxMultCom), effComTax));
+    row(6, "Ind tax mult", TextFormat("x%.2f (eff %d)", static_cast<double>(dp.taxMultInd), effIndTax));
+    row(7, "Road maint mult", TextFormat("x%.2f (eff %d)", static_cast<double>(dp.maintenanceMultRoad), effRoadMaint));
+    row(8, "Park maint mult", TextFormat("x%.2f (eff %d)", static_cast<double>(dp.maintenanceMultPark), effParkMaint));
+
+    y += 4;
+    DrawLine(x, y, x0 + panelW - 12, y, Color{255, 255, 255, 70});
+    y += 10;
+    DrawText("Paint: tool 9.  ,/. change id.  Alt+Click picks hovered id.", x, y, 16,
+             Color{220, 220, 220, 255});
+  }
+
+  drawVideoSettingsPanel(uiW, uiH);
+
+  drawReportPanel(uiW, uiH);
 
   // Save manager panel draws on top of the HUD.
-  drawSaveMenuPanel();
+  drawSaveMenuPanel(uiW, uiH);
 
   // Road-drag overlay: show preview metrics without touching the HUD layout.
   if (m_roadDragActive) {
@@ -2817,7 +4467,7 @@ void Game::draw()
     const int boxW = std::max(w1, w2) + pad * 2;
     const int boxH = fontSize * 2 + pad * 3;
 
-    const int x = GetScreenWidth() - boxW - 12;
+    const int x = uiW - boxW - 12;
     const int y = 44;
 
     DrawRectangle(x, y, boxW, boxH, Color{0, 0, 0, 160});
@@ -2825,6 +4475,19 @@ void Game::draw()
 
     DrawText(line1, x + pad, y + pad, fontSize, RAYWHITE);
     DrawText(line2, x + pad, y + pad + fontSize + 6, fontSize, Color{220, 220, 220, 255});
+  }
+
+  // Developer console draws above the HUD/panels but below transient toasts.
+  if (m_console.isOpen()) {
+    m_console.draw(uiW, uiH);
+  }
+
+  // Screenshot capture (queued from input so we can capture the freshly rendered frame)
+  if (m_pendingScreenshot) {
+    TakeScreenshot(m_pendingScreenshotPath.c_str());
+    showToast(std::string("Screenshot saved: ") + m_pendingScreenshotPath, 3.0f);
+    m_pendingScreenshot = false;
+    m_pendingScreenshotPath.clear();
   }
 
   // Toast / status message
@@ -2835,14 +4498,15 @@ void Game::draw()
     const int boxW = textW + pad * 2;
     const int boxH = fontSize + pad * 2;
 
-    const int x = (GetScreenWidth() - boxW) / 2;
-    const int y = GetScreenHeight() - boxH - 18;
+    const int x = (uiW - boxW) / 2;
+    const int y = uiH - boxH - 18;
 
     DrawRectangle(x, y, boxW, boxH, Color{0, 0, 0, 170});
     DrawRectangleLines(x, y, boxW, boxH, Color{255, 255, 255, 60});
     DrawText(m_toast.c_str(), x + pad, y + pad, fontSize, RAYWHITE);
   }
 
+  EndMode2D();
   EndDrawing();
 }
 

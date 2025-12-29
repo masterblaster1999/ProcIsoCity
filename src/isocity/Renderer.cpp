@@ -36,7 +36,40 @@ inline Color Lerp(Color a, Color b, float t)
   return Color{ClampU8(r), ClampU8(g), ClampU8(bl), ClampU8(al)};
 }
 
+inline Color DistrictBaseColor(std::uint8_t d)
+{
+  switch (d & 7u) {
+  case 1: return Color{50, 140, 255, 255};   // blue
+  case 2: return Color{255, 170, 60, 255};   // orange
+  case 3: return Color{80, 200, 120, 255};   // green
+  case 4: return Color{190, 90, 255, 255};   // purple
+  case 5: return Color{255, 80, 80, 255};    // red
+  case 6: return Color{60, 220, 220, 255};   // cyan
+  case 7: return Color{255, 230, 70, 255};   // yellow
+  default: return Color{0, 0, 0, 0};         // district 0 (unassigned): transparent
+  }
+}
+
+inline Color DistrictFillColor(std::uint8_t d, unsigned char alpha)
+{
+  Color c = DistrictBaseColor(d);
+  c.a = alpha;
+  return c;
+}
+
 inline float Frac01(std::uint32_t u) { return static_cast<float>(u) / 4294967295.0f; }
+
+// Forward declarations (Renderer.cpp is a single TU with many helpers; keep things declared
+// before first use so MSVC doesn't fail with "identifier not found" errors).
+static Color TerrainCliffBaseColor(Terrain t);
+
+inline bool IsImageReadyCompat(const Image& img)
+{
+  // raylib has gained helper "Is*Ready" functions over time, but some versions used
+  // by FetchContent don't include IsImageReady. This local check keeps builds working
+  // across raylib versions.
+  return (img.data != nullptr) && (img.width > 0) && (img.height > 0);
+}
 
 struct DiamondParams {
   float nx = 0;
@@ -702,7 +735,7 @@ bool Renderer::exportMinimapThumbnail(const World& world, const char* fileName, 
   base.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
 
   Image img = ImageCopy(base);
-  if (!IsImageReady(img)) return false;
+  if (!IsImageReadyCompat(img)) return false;
 
   const int ms = std::max(1, maxSize);
   const int w = img.width;
@@ -718,6 +751,103 @@ bool Renderer::exportMinimapThumbnail(const World& world, const char* fileName, 
 
   const bool ok = ExportImage(img, fileName);
   UnloadImage(img);
+  return ok;
+}
+
+bool Renderer::exportWorldOverview(const World& world, const char* fileName, int maxSize)
+{
+  if (fileName == nullptr || fileName[0] == '\0') return false;
+
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return false;
+
+  // Compute a conservative bounding box for the full isometric map in *world space*.
+  //
+  // Notes:
+  // - This is based on the diamond tile geometry and the maximum configured elevation.
+  // - We add a small extra margin at the top to avoid clipping tall zone "buildings".
+  const float tileW = static_cast<float>(m_tileW);
+  const float tileH = static_cast<float>(m_tileH);
+  const float halfW = tileW * 0.5f;
+  const float halfH = tileH * 0.5f;
+
+  const float maxElev = std::max(0.0f, m_elev.maxPixels);
+  const float extraTop = tileH * 5.0f; // safety margin for extruded zone buildings
+
+  const float left = -static_cast<float>(h) * halfW;
+  const float right = static_cast<float>(w) * halfW;
+  const float top = -halfH - maxElev - extraTop;
+  const float bottom = static_cast<float>(w + h - 1) * halfH;
+
+  const float worldW = std::max(1.0f, right - left);
+  const float worldH = std::max(1.0f, bottom - top);
+  const float maxDim = std::max(worldW, worldH);
+
+  int ms = std::max(64, maxSize);
+
+  // Try to allocate a render texture; if this fails (GPU limits), fall back to smaller sizes.
+  RenderTexture2D rt{};
+  float zoom = 1.0f;
+  int texW = 0;
+  int texH = 0;
+
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    zoom = (maxDim > static_cast<float>(ms)) ? (static_cast<float>(ms) / maxDim) : 1.0f;
+    texW = std::max(1, static_cast<int>(std::lround(worldW * zoom)));
+    texH = std::max(1, static_cast<int>(std::lround(worldH * zoom)));
+
+    rt = LoadRenderTexture(texW, texH);
+    if (rt.id != 0) break;
+
+    ms = std::max(64, ms / 2);
+  }
+
+  if (rt.id == 0) return false;
+
+  Camera2D cam{};
+  cam.target = Vector2{(left + right) * 0.5f, (top + bottom) * 0.5f};
+  cam.offset = Vector2{static_cast<float>(texW) * 0.5f, static_cast<float>(texH) * 0.5f};
+  cam.zoom = zoom;
+  cam.rotation = 0.0f;
+
+  // Render the full map without the band cache to avoid nested BeginTextureMode calls.
+  const bool prevCache = m_useBandCache;
+  m_useBandCache = false;
+
+  BeginTextureMode(rt);
+  ClearBackground(BLANK);
+  drawWorld(world, cam, texW, texH,
+            /*timeSec=*/0.0f,
+            /*hovered=*/std::nullopt,
+            /*drawGrid=*/false,
+            /*brushRadius=*/0,
+            /*selected=*/std::nullopt,
+            /*highlightPath=*/nullptr,
+            /*roadToEdgeMask=*/nullptr,
+            /*roadTraffic=*/nullptr,
+            /*trafficMax=*/0,
+            /*roadGoodsTraffic=*/nullptr,
+            /*goodsMax=*/0,
+            /*commercialGoodsFill=*/nullptr,
+            /*heatmap=*/nullptr,
+            /*heatmapRamp=*/HeatmapRamp::Good);
+  EndTextureMode();
+
+  m_useBandCache = prevCache;
+
+  Image img = LoadImageFromTexture(rt.texture);
+  if (!IsImageReadyCompat(img)) {
+    UnloadRenderTexture(rt);
+    return false;
+  }
+
+  // Render textures are flipped vertically when read back.
+  ImageFlipVertical(&img);
+
+  const bool ok = ExportImage(img, fileName);
+  UnloadImage(img);
+  UnloadRenderTexture(rt);
   return ok;
 }
 
@@ -989,14 +1119,18 @@ Color HeatmapColor(float v, Renderer::HeatmapRamp ramp) {
 
 } // namespace
 
-void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeSec, std::optional<Point> hovered,
+void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW, int screenH, float timeSec,
+                         std::optional<Point> hovered,
                          bool drawGrid, int brushRadius, std::optional<Point> selected,
                          const std::vector<Point>* highlightPath, const std::vector<std::uint8_t>* roadToEdgeMask,
                          const std::vector<std::uint16_t>* roadTraffic, int trafficMax,
                          const std::vector<std::uint16_t>* roadGoodsTraffic, int goodsMax,
                          const std::vector<std::uint8_t>* commercialGoodsFill,
                          const std::vector<float>* heatmap,
-                         HeatmapRamp heatmapRamp)
+                         HeatmapRamp heatmapRamp,
+                         bool showDistrictOverlay,
+                         int highlightDistrict,
+                         bool showDistrictBorders)
 {
   const int w = world.width();
   const int h = world.height();
@@ -1037,7 +1171,7 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
   }
 
   // Compute a conservative visible tile range based on the current camera view.
-  const TileRect vis = ComputeVisibleTileRect(camera, GetScreenWidth(), GetScreenHeight(), w, h,
+  const TileRect vis = ComputeVisibleTileRect(camera, screenW, screenH, w, h,
                                              static_cast<float>(m_tileW), static_cast<float>(m_tileH),
                                              std::max(0.0f, m_elev.maxPixels));
 
@@ -1077,15 +1211,57 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
         const float v = (static_cast<float>(t.variation) / 255.0f - 0.5f) * 0.10f;
         const float brightness = 0.85f + t.height * 0.30f + v;
 
+        Vector2 corners[4];
+        bool haveCorners = false;
+        auto ensureCorners = [&]() {
+          if (!haveCorners) {
+            TileDiamondCorners(center, tileW, tileH, corners);
+            haveCorners = true;
+          }
+        };
+
+        // District overlay (fill). District 0 is treated as "unassigned" and is left transparent.
+        if (showDistrictOverlay) {
+          const std::uint8_t d = static_cast<std::uint8_t>(t.district) & 7u;
+          if (d != 0u) {
+            unsigned char alpha = 65;
+            if (highlightDistrict >= 0) {
+              alpha = (d == static_cast<std::uint8_t>(highlightDistrict & 7)) ? 95 : 22;
+            }
+
+            if (alpha > 0) {
+              ensureCorners();
+              const Color c = DistrictFillColor(d, alpha);
+              DrawTriangle(corners[0], corners[1], corners[2], c);
+              DrawTriangle(corners[0], corners[2], corners[3], c);
+            }
+          }
+        }
+
         // Optional grid overlay.
         if (drawGrid) {
-          Vector2 corners[4];
-          TileDiamondCorners(center, tileW, tileH, corners);
+          ensureCorners();
           const Color c = Color{255, 255, 255, 35};
           DrawLineV(corners[0], corners[1], c);
           DrawLineV(corners[1], corners[2], c);
           DrawLineV(corners[2], corners[3], c);
           DrawLineV(corners[3], corners[0], c);
+        }
+
+        // District borders (draw after grid so they stay visible).
+        if (showDistrictBorders) {
+          ensureCorners();
+          const Color border = Color{0, 0, 0, 170};
+          const float thick = 2.0f / std::max(0.001f, camera.zoom);
+          const std::uint8_t d = static_cast<std::uint8_t>(t.district) & 7u;
+          if (x + 1 < w) {
+            const std::uint8_t dn = static_cast<std::uint8_t>(world.at(x + 1, y).district) & 7u;
+            if (dn != d) DrawLineEx(corners[1], corners[2], thick, border);
+          }
+          if (y + 1 < h) {
+            const std::uint8_t dn = static_cast<std::uint8_t>(world.at(x, y + 1).district) & 7u;
+            if (dn != d) DrawLineEx(corners[2], corners[3], thick, border);
+          }
         }
 
         // Draw building above tile (for zones only).
@@ -1147,10 +1323,10 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
             const float pip = 4.0f * invZoom;
             const float gap = 1.5f * invZoom;
             const float groupW = pip * 3.0f + gap * 2.0f;
-            const float x0 = center.x - groupW * 0.5f;
+            const float groupX0 = center.x - groupW * 0.5f;
 
             for (int i = 0; i < 3; ++i) {
-              Rectangle r{x0 + static_cast<float>(i) * (pip + gap), y0, pip, pip};
+              Rectangle r{groupX0 + static_cast<float>(i) * (pip + gap), y0, pip, pip};
               DrawRectangleRec(r, Color{0, 0, 0, 110});
               DrawRectangleLinesEx(r, 1.0f * invZoom, Color{255, 255, 255, 55});
               if (i < lvl) {
@@ -1350,6 +1526,24 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
         DrawTexturePro(overlay(t.overlay), src, dst, Vector2{0, 0}, 0.0f, tint);
       }
 
+      // District overlay (fill). District 0 is treated as "unassigned" and is left transparent.
+      if (showDistrictOverlay) {
+        const std::uint8_t d = static_cast<std::uint8_t>(t.district) & 7u;
+        if (d != 0u) {
+          unsigned char alpha = 65;
+          if (highlightDistrict >= 0) {
+            alpha = (d == static_cast<std::uint8_t>(highlightDistrict & 7)) ? 95 : 22;
+          }
+          if (alpha > 0) {
+            const Color c = DistrictFillColor(d, alpha);
+            Vector2 corners[4];
+            TileDiamondCorners(center, tileW, tileH, corners);
+            DrawTriangle(corners[0], corners[1], corners[2], c);
+            DrawTriangle(corners[0], corners[2], corners[3], c);
+          }
+        }
+      }
+
       // Heatmap overlay (drawn after tile overlays so it can tint zones/roads).
       if (showHeatmap) {
         const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
@@ -1372,6 +1566,29 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
         DrawLineV(corners[1], corners[2], gc);
         DrawLineV(corners[2], corners[3], gc);
         DrawLineV(corners[3], corners[0], gc);
+      }
+
+      // District borders (drawn after grid/heatmap so boundaries stay readable).
+      if (showDistrictBorders) {
+        Vector2 corners[4];
+        TileDiamondCorners(center, tileW, tileH, corners);
+        const Color border = Color{0, 0, 0, 170};
+        const float thick = 2.0f / std::max(0.001f, camera.zoom);
+        const std::uint8_t d = static_cast<std::uint8_t>(t.district) & 7u;
+
+        if (x + 1 < w) {
+          const std::uint8_t dn = static_cast<std::uint8_t>(world.at(x + 1, y).district) & 7u;
+          if (dn != d) {
+            DrawLineEx(corners[1], corners[2], thick, border);
+          }
+        }
+
+        if (y + 1 < h) {
+          const std::uint8_t dn = static_cast<std::uint8_t>(world.at(x, y + 1).district) & 7u;
+          if (dn != d) {
+            DrawLineEx(corners[2], corners[3], thick, border);
+          }
+        }
       }
 
       // Procedural 3D-ish buildings for zone tiles.
@@ -1403,10 +1620,10 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
         const float pip = 5.0f * invZoom;
         const float gap = 2.0f * invZoom;
         const float groupW = pip * 3.0f + gap * 2.0f;
-        const float x0 = center.x - groupW * 0.5f;
+        const float groupX0 = center.x - groupW * 0.5f;
 
         for (int i = 0; i < 3; ++i) {
-          Rectangle r{x0 + static_cast<float>(i) * (pip + gap), y0, pip, pip};
+          Rectangle r{groupX0 + static_cast<float>(i) * (pip + gap), y0, pip, pip};
           DrawRectangleRec(r, Color{0, 0, 0, 120});
           DrawRectangleLinesEx(r, 1.0f * invZoom, Color{255, 255, 255, 70});
           if (i < lvl) {
@@ -1440,10 +1657,10 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
           const float pip = 4.0f * invZoom;
           const float gap = 1.5f * invZoom;
           const float groupW = pip * 3.0f + gap * 2.0f;
-          const float x0 = center.x - groupW * 0.5f;
+        const float groupX0 = center.x - groupW * 0.5f;
 
           for (int i = 0; i < 3; ++i) {
-            Rectangle r{x0 + static_cast<float>(i) * (pip + gap), y0, pip, pip};
+          Rectangle r{groupX0 + static_cast<float>(i) * (pip + gap), y0, pip, pip};
             DrawRectangleRec(r, Color{0, 0, 0, 110});
             DrawRectangleLinesEx(r, 1.0f * invZoom, Color{255, 255, 255, 55});
             if (i < lvl) {
@@ -1645,9 +1862,10 @@ void Renderer::drawHUD(const World& world, const Camera2D& camera, Tool tool, in
 
   if (hovered && world.inBounds(hovered->x, hovered->y)) {
     const Tile& t = world.at(hovered->x, hovered->y);
-    std::snprintf(buf, sizeof(buf), "Hover: (%d,%d)  %s + %s  h=%.2f  elev=%.0fpx  lvl=%d  occ=%d", hovered->x,
-                  hovered->y, ToString(t.terrain), ToString(t.overlay), static_cast<double>(t.height),
-                  static_cast<double>(TileElevationPx(t, m_elev)), t.level, t.occupants);
+    std::snprintf(buf, sizeof(buf), "Hover: (%d,%d)  %s + %s  dist=%d  h=%.2f  elev=%.0fpx  lvl=%d  occ=%d", hovered->x,
+                  hovered->y, ToString(t.terrain), ToString(t.overlay), static_cast<int>(t.district & 7u),
+                  static_cast<double>(t.height), static_cast<double>(TileElevationPx(t, m_elev)), t.level,
+                  t.occupants);
     DrawText(buf, pad + 10, y + 6, 16, Color{220, 220, 220, 255});
     y += 26;
   }
@@ -1663,19 +1881,22 @@ void Renderer::drawHUD(const World& world, const Camera2D& camera, Tool tool, in
   }
 
   if (showHelp) {
-    DrawText("Right drag: pan | Wheel: zoom | R regen | G grid | H help | M minimap | E elev | O outside | L heatmap | C vehicles | P policy | F1 report | F2 cache | F3 model | T graph | V traffic | B goods", pad + 10, y + 10, 16,
+    DrawText("Right drag: pan | Wheel: zoom | R regen | G grid | H help | M minimap | E elev | O outside | L heatmap | C vehicles | P policy | F1 report | F2 cache | F3 model | F7 districts | T graph | V traffic | B goods", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
     y += 22;
-    DrawText("1 Road | 2 Res | 3 Com | 4 Ind | 5 Park | 0 Doze | 6 Raise | 7 Lower | 8 Smooth | Q Inspect", pad + 10, y + 10, 16,
+    DrawText("1 Road | 2 Res | 3 Com | 4 Ind | 5 Park | 0 Doze | 6 Raise | 7 Lower | 8 Smooth | 9 District | Q Inspect", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
     y += 22;
-    DrawText("[/] brush | Space: pause | N: step | +/-: speed | U: road type", pad + 10, y + 10, 16,
+    DrawText("[/] brush | ,/. district | Space: pause | N: step | +/-: speed | U: road type", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
     y += 22;
-    DrawText("F5 save | F9 load | F6 slot | F10 saves | Ctrl+Z undo | Ctrl+Y redo", pad + 10, y + 10, 16,
+    DrawText("F4 console | F5 save | F9 load | F6 slot | F10 saves | F12 shot | Ctrl+F12 map | Ctrl+Z undo | Ctrl+Y redo", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
     y += 22;
-    DrawText("Tip: re-place a zone to upgrade. Road: U selects class (paint to upgrade), Shift+drag builds path. Terraform: Shift=strong, Ctrl=fine.", pad + 10, y + 10, 16,
+    DrawText("F8 video | F11 fullscreen | Alt+Enter borderless | Ctrl+=/- UI scale | Ctrl+0 UI auto | Ctrl+Alt+=/- world scale", pad + 10, y + 10, 16,
+             Color{220, 220, 220, 255});
+    y += 22;
+    DrawText("Tip: re-place a zone to upgrade. Road: U selects class (paint to upgrade), Shift+drag builds path. Terraform: Shift=strong, Ctrl=fine. District: Alt+click to pick.", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
   }
 
@@ -1698,12 +1919,12 @@ void Renderer::drawHUD(const World& world, const Camera2D& camera, Tool tool, in
       const TileRect vis = ComputeVisibleTileRect(camera, screenW, screenH, world.width(), world.height(),
                                                   static_cast<float>(m_tileW), static_cast<float>(m_tileH),
                                                   m_elev.maxPixels);
-      const float s = std::max(1.0e-3f, mini.pixelsPerTile);
+      const float pixelsPerTile = std::max(1.0e-3f, mini.pixelsPerTile);
 
-      const float vx = mini.rect.x + static_cast<float>(vis.minX) * s;
-      const float vy = mini.rect.y + static_cast<float>(vis.minY) * s;
-      const float vw = static_cast<float>(vis.maxX - vis.minX + 1) * s;
-      const float vh = static_cast<float>(vis.maxY - vis.minY + 1) * s;
+      const float vx = mini.rect.x + static_cast<float>(vis.minX) * pixelsPerTile;
+      const float vy = mini.rect.y + static_cast<float>(vis.minY) * pixelsPerTile;
+      const float vw = static_cast<float>(vis.maxX - vis.minX + 1) * pixelsPerTile;
+      const float vh = static_cast<float>(vis.maxY - vis.minY + 1) * pixelsPerTile;
 
       const int ivx = static_cast<int>(std::floor(vx));
       const int ivy = static_cast<int>(std::floor(vy));

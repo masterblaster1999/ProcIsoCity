@@ -63,14 +63,26 @@ public:
   // Returns true on success.
   bool exportMinimapThumbnail(const World& world, const char* fileName, int maxSize = 256);
 
-  void drawWorld(const World& world, const Camera2D& camera, float timeSec, std::optional<Point> hovered,
+  // Export a full-city overview render to an image file.
+  //
+  // This renders the entire world to an off-screen render texture sized to fit the map.
+  // If the resulting image would be large, it is scaled down so its max dimension is <= maxSize.
+  //
+  // Returns true on success.
+  bool exportWorldOverview(const World& world, const char* fileName, int maxSize = 4096);
+
+  void drawWorld(const World& world, const Camera2D& camera, int screenW, int screenH, float timeSec,
+                 std::optional<Point> hovered,
                  bool drawGrid, int brushRadius, std::optional<Point> selected, const std::vector<Point>* highlightPath,
                  const std::vector<std::uint8_t>* roadToEdgeMask = nullptr,
                  const std::vector<std::uint16_t>* roadTraffic = nullptr, int trafficMax = 0,
                  const std::vector<std::uint16_t>* roadGoodsTraffic = nullptr, int goodsMax = 0,
                  const std::vector<std::uint8_t>* commercialGoodsFill = nullptr,
                  const std::vector<float>* heatmap = nullptr,
-                 HeatmapRamp heatmapRamp = HeatmapRamp::Good);
+                 HeatmapRamp heatmapRamp = HeatmapRamp::Good,
+                 bool showDistrictOverlay = false,
+                 int highlightDistrict = -1,
+                 bool showDistrictBorders = false);
 
   void drawHUD(const World& world, const Camera2D& camera, Tool tool, int roadBuildLevel,
                std::optional<Point> hovered, int screenW, int screenH, bool showHelp, int brushRadius,
