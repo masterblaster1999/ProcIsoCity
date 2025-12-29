@@ -1,10 +1,14 @@
 #include "isocity/Sim.hpp"
 
+#include "isocity/Road.hpp"
+
 #include "isocity/Pathfinding.hpp"
 
 #include "isocity/Traffic.hpp"
 
 #include "isocity/Goods.hpp"
+
+#include "isocity/LandValue.hpp"
 
 #include "isocity/Random.hpp"
 
@@ -29,6 +33,39 @@ inline int JobsForTile(const Tile& t)
 
 inline float Clamp01(float v) { return std::clamp(v, 0.0f, 1.0f); }
 
+float ResidentialDemand(float jobPressure, float happiness, float avgLandValue)
+{
+  // A tiny, stable "meter" that avoids runaway population early.
+  // The intention is that jobs are the main driver, happiness matters, and
+  // overall land value nudges demand upward in nice cities.
+  const float jp = std::min(jobPressure, 1.0f);
+  float d = 0.12f + 0.65f * jp + 0.25f * happiness + 0.10f * avgLandValue;
+  return Clamp01(d);
+}
+
+float AvgLandValueNonWater(const World& world, const LandValueResult& lv)
+{
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return 0.0f;
+  const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+  if (lv.value.size() != n) return 0.0f;
+
+  double sum = 0.0;
+  int count = 0;
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      if (world.at(x, y).terrain == Terrain::Water) continue;
+      const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
+                              static_cast<std::size_t>(x);
+      sum += static_cast<double>(lv.value[idx]);
+      count++;
+    }
+  }
+  if (count <= 0) return 0.0f;
+  return static_cast<float>(sum / static_cast<double>(count));
+}
+
 // Traffic/commute parameters.
 // Tuned to be noticeable but not dominate the early-game economy.
 constexpr float kCommuteTarget = 24.0f; // avg road-steps where the penalty reaches its cap
@@ -40,6 +77,7 @@ struct ScanResult {
   int housingCap = 0;
   int jobsCap = 0;
   int roads = 0;
+  int roadMaintenanceUnits = 0;
   int parks = 0;
   int zoneTiles = 0;
   int population = 0;
@@ -53,7 +91,10 @@ ScanResult ScanWorld(const World& world)
     for (int x = 0; x < world.width(); ++x) {
       const Tile& t = world.at(x, y);
 
-      if (t.overlay == Overlay::Road) r.roads++;
+      if (t.overlay == Overlay::Road) {
+        r.roads++;
+        r.roadMaintenanceUnits += RoadMaintenanceUnitsForLevel(static_cast<int>(t.level));
+      }
       if (t.overlay == Overlay::Park) r.parks++;
 
       if (t.overlay == Overlay::Residential) {
@@ -205,11 +246,23 @@ void Simulator::stepOnce(World& world)
 
 void Simulator::update(World& world, float dt)
 {
+  (void)update(world, dt, nullptr);
+}
+
+int Simulator::update(World& world, float dt, std::vector<Stats>* outTickStats)
+{
   m_accum += dt;
+  int ticks = 0;
+
   while (m_accum >= m_cfg.tickSeconds) {
     m_accum -= m_cfg.tickSeconds;
     step(world);
+    ++ticks;
+
+    if (outTickStats) outTickStats->push_back(world.stats());
   }
+
+  return ticks;
 }
 
 void Simulator::refreshDerivedStats(World& world) const
@@ -247,7 +300,7 @@ void Simulator::refreshDerivedStats(World& world) const
   const int employed = std::min(scan.population, jobsCapAccessible);
 
   // Traffic/commute model: estimate how far (and how congested) the average commute is.
-  // This is a derived system (no agents yet): we run a multi-source BFS from job access points
+  // This is a derived system (no agents yet): we run a multi-source road search from job access points
   // over the road network and route commuters along parent pointers back to the jobs.
   const float employedShare = (scan.population > 0)
                                  ? (static_cast<float>(employed) / static_cast<float>(scan.population))
@@ -255,6 +308,13 @@ void Simulator::refreshDerivedStats(World& world) const
 
   TrafficConfig tc;
   tc.requireOutsideConnection = m_cfg.requireOutsideConnection;
+  // Runtime traffic model tuning (not persisted in saves).
+  tc.congestionAwareRouting = m_trafficModel.congestionAwareRouting;
+  tc.congestionIterations = m_trafficModel.congestionIterations;
+  tc.congestionAlpha = m_trafficModel.congestionAlpha;
+  tc.congestionBeta = m_trafficModel.congestionBeta;
+  tc.congestionCapacityScale = m_trafficModel.congestionCapacityScale;
+  tc.congestionRatioClamp = m_trafficModel.congestionRatioClamp;
   const TrafficResult traffic = ComputeCommuteTraffic(
       world, tc, employedShare, m_cfg.requireOutsideConnection ? &roadToEdge : nullptr);
 
@@ -262,6 +322,8 @@ void Simulator::refreshDerivedStats(World& world) const
   s.commutersUnreachable = traffic.unreachableCommuters;
   s.avgCommute = traffic.avgCommute;
   s.p95Commute = traffic.p95Commute;
+  s.avgCommuteTime = traffic.avgCommuteTime;
+  s.p95CommuteTime = traffic.p95CommuteTime;
   s.trafficCongestion = traffic.congestion;
   s.congestedRoadTiles = traffic.congestedRoadTiles;
   s.maxRoadTraffic = traffic.maxTraffic;
@@ -279,6 +341,108 @@ void Simulator::refreshDerivedStats(World& world) const
   s.goodsSatisfaction = goods.satisfaction;
   s.maxRoadGoodsTraffic = goods.maxRoadGoodsTraffic;
 
+  // Land value (amenities + pollution + optional traffic spill). Used both for
+  // display and for the simple tax model.
+  LandValueConfig lvc;
+  lvc.requireOutsideConnection = m_cfg.requireOutsideConnection;
+  const LandValueResult lv = ComputeLandValue(world, lvc, &traffic,
+                                              m_cfg.requireOutsideConnection ? &roadToEdge : nullptr);
+  s.avgLandValue = AvgLandValueNonWater(world, lv);
+
+  // Economy snapshot (does NOT mutate money here; that's handled in step()).
+  // Taxes scale by land value so attractive areas generate more revenue.
+  const float lvBase = 0.75f;
+  const float lvScale = 0.75f;
+
+  const bool useDistrictPolicies = m_cfg.districtPoliciesEnabled;
+
+  auto clampDistrict = [](int d) -> int { return std::clamp(d, 0, kDistrictCount - 1); };
+
+  auto policyForTile = [&](const Tile& t) -> const DistrictPolicy& {
+    const int d = clampDistrict(static_cast<int>(t.district));
+    return m_cfg.districtPolicies[static_cast<std::size_t>(d)];
+  };
+
+  auto taxMultFor = [&](const Tile& t) -> float {
+    if (!useDistrictPolicies) return 1.0f;
+    const DistrictPolicy& p = policyForTile(t);
+    if (t.overlay == Overlay::Residential) return std::max(0.0f, p.taxResidentialMult);
+    if (t.overlay == Overlay::Commercial) return std::max(0.0f, p.taxCommercialMult);
+    if (t.overlay == Overlay::Industrial) return std::max(0.0f, p.taxIndustrialMult);
+    return 1.0f;
+  };
+
+  auto roadMaintMultFor = [&](const Tile& t) -> float {
+    if (!useDistrictPolicies) return 1.0f;
+    return std::max(0.0f, policyForTile(t).roadMaintenanceMult);
+  };
+
+  auto parkMaintMultFor = [&](const Tile& t) -> float {
+    if (!useDistrictPolicies) return 1.0f;
+    return std::max(0.0f, policyForTile(t).parkMaintenanceMult);
+  };
+
+  int taxRevenue = 0;
+  int roadMaint = 0;
+  int parkMaint = 0;
+
+  const bool lvOk =
+    (lv.value.size() == static_cast<std::size_t>(world.width()) * static_cast<std::size_t>(world.height()));
+
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      const Tile& t = world.at(x, y);
+
+      // Maintenance is per-tile and may be scaled by district policy.
+      if (t.overlay == Overlay::Road) {
+        const int units = RoadMaintenanceUnitsForLevel(static_cast<int>(t.level));
+        const float mult = roadMaintMultFor(t);
+        const float raw = static_cast<float>(units * std::max(0, m_cfg.maintenanceRoad)) * mult;
+        roadMaint += std::max(0, static_cast<int>(std::lround(raw)));
+      } else if (t.overlay == Overlay::Park) {
+        const float mult = parkMaintMultFor(t);
+        const float raw = static_cast<float>(std::max(0, m_cfg.maintenancePark)) * mult;
+        parkMaint += std::max(0, static_cast<int>(std::lround(raw)));
+      }
+
+      // Taxes apply only to occupied zones.
+      if (t.overlay != Overlay::Residential && t.overlay != Overlay::Commercial && t.overlay != Overlay::Industrial) continue;
+      if (t.occupants == 0) continue;
+      if (!lvOk) continue;
+
+      const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(world.width()) +
+                              static_cast<std::size_t>(x);
+      const float lvMult = lvBase + lvScale * lv.value[idx];
+
+      int taxPerOcc = 0;
+      if (t.overlay == Overlay::Residential) taxPerOcc = m_cfg.taxResidential;
+      else if (t.overlay == Overlay::Commercial) taxPerOcc = m_cfg.taxCommercial;
+      else if (t.overlay == Overlay::Industrial) taxPerOcc = m_cfg.taxIndustrial;
+
+      const float taxMult = taxMultFor(t);
+      const float raw = static_cast<float>(t.occupants) * static_cast<float>(taxPerOcc) * lvMult * taxMult;
+      const int add = std::max(0, static_cast<int>(std::lround(raw)));
+      taxRevenue += add;
+    }
+  }
+
+  const int maintenance = roadMaint + parkMaint;
+
+  // Trade: imports cost money, exports earn money. Keep the exchange rate mild so it
+  // doesn't dominate the early game.
+  const int importCost = goods.goodsImported / 20;
+  const int exportRevenue = goods.goodsExported / 25;
+
+  s.taxRevenue = taxRevenue;
+  s.maintenanceCost = maintenance;
+  s.upgradeCost = 0;
+  s.importCost = importCost;
+  s.exportRevenue = exportRevenue;
+  s.income = taxRevenue + exportRevenue;
+  s.expenses = maintenance + importCost;
+  s.avgTaxPerCapita =
+    (scan.population > 0) ? (static_cast<float>(taxRevenue) / static_cast<float>(scan.population)) : 0.0f;
+
   // Happiness: parks help (locally), unemployment hurts, and commutes/congestion add friction.
   const float parkCoverage = ParkCoverageRatio(world, m_cfg.parkInfluenceRadius,
                                               m_cfg.requireOutsideConnection ? &roadToEdge : nullptr);
@@ -289,14 +453,23 @@ void Simulator::refreshDerivedStats(World& world) const
                                  : 0.0f;
 
   const float commuteNorm = (traffic.reachableCommuters > 0)
-                                ? std::clamp(traffic.avgCommute / kCommuteTarget, 0.0f, 2.0f)
+                                ? std::clamp(traffic.avgCommuteTime / kCommuteTarget, 0.0f, 2.0f)
                                 : 0.0f;
   const float commutePenalty = std::min(kCommutePenaltyCap, commuteNorm * kCommutePenaltyCap);
   const float congestionPenalty = std::min(kCongestionPenaltyCap, traffic.congestion * (kCongestionPenaltyCap * 1.35f));
 
   const float goodsPenalty = std::min(kGoodsPenaltyCap, (1.0f - goods.satisfaction) * kGoodsPenaltyCap);
 
-  s.happiness = Clamp01(0.45f + parkBonus - unemployment * 0.35f - commutePenalty - congestionPenalty - goodsPenalty);
+  const float taxPenalty = std::min(0.20f, s.avgTaxPerCapita * std::max(0.0f, m_cfg.taxHappinessPerCapita));
+  const float lvBonus = std::clamp((s.avgLandValue - 0.50f) * 0.10f, -0.05f, 0.05f);
+
+  s.happiness = Clamp01(0.45f + parkBonus + lvBonus - unemployment * 0.35f - commutePenalty - congestionPenalty - goodsPenalty - taxPenalty);
+
+  // Demand meter (for UI/debug): recompute using the newly derived happiness.
+  const float jobPressure = (scan.housingCap > 0)
+                                ? (static_cast<float>(jobsCapAccessible) / static_cast<float>(scan.housingCap))
+                                : 0.0f;
+  s.demandResidential = ResidentialDemand(jobPressure, s.happiness, s.avgLandValue);
 
   s.population = scan.population;
   s.housingCapacity = scan.housingCap;
@@ -312,13 +485,6 @@ void Simulator::step(World& world)
   Stats& s = world.stats();
   s.day++;
 
-  // Pass 1: capacities and static counts.
-  const ScanResult scan = ScanWorld(world);
-  const int housingCap = scan.housingCap;
-  const int jobsCap = scan.jobsCap;
-  const int roads = scan.roads;
-  const int parks = scan.parks;
-
   // Precompute which roads are connected to the map border ("outside connection").
   // When requireOutsideConnection is enabled, zones only function if they touch a road
   // component that reaches the edge of the map.
@@ -327,11 +493,63 @@ void Simulator::step(World& world)
     ComputeEdgeConnectedRoads(world, roadToEdge);
   }
 
-  auto hasZoneAccess = [&] (int x, int y) -> bool {
+  auto hasZoneAccess = [&](int x, int y) -> bool {
     if (!world.hasAdjacentRoad(x, y)) return false;
     if (!m_cfg.requireOutsideConnection) return true;
     return HasAdjacentEdgeConnectedRoad(world, roadToEdge, x, y);
   };
+
+  // Land value field (no traffic spill for the simulation growth step).
+  LandValueConfig lvc;
+  lvc.requireOutsideConnection = m_cfg.requireOutsideConnection;
+  const LandValueResult lv = ComputeLandValue(world, lvc, nullptr,
+                                              m_cfg.requireOutsideConnection ? &roadToEdge : nullptr);
+  const float avgLv = AvgLandValueNonWater(world, lv);
+
+  // Optional auto-development: use *previous* happiness and current land value.
+  // This keeps the system deterministic and avoids circular dependencies.
+  int upgradeCost = 0;
+  RNG rng(world.seed() ^ (static_cast<std::uint64_t>(s.day) * 0x9E3779B97F4A7C15ULL));
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      Tile& t = world.at(x, y);
+      const bool isZone = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial || t.overlay == Overlay::Industrial);
+      if (!isZone) continue;
+      if (!hasZoneAccess(x, y)) continue;
+
+      const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(world.width()) +
+                              static_cast<std::size_t>(x);
+      const float lvVal = (idx < lv.value.size()) ? lv.value[idx] : 0.0f;
+
+      const int cap = (t.overlay == Overlay::Residential) ? HousingForLevel(t.level) : JobsForTile(t);
+      const float occFrac = (cap > 0) ? (static_cast<float>(t.occupants) / static_cast<float>(cap)) : 0.0f;
+
+      // Upgrade: happy + high land value + mostly full.
+      if (t.level < 3 && s.happiness > 0.58f && lvVal > 0.45f && occFrac > 0.70f && s.money > 80) {
+        const float p = 0.0010f + 0.0040f * s.happiness * (0.6f + 0.4f * lvVal) * occFrac;
+        if (rng.chance(p)) {
+          t.level++;
+          // Some disruption during construction.
+          t.occupants = static_cast<std::uint16_t>(static_cast<int>(t.occupants) * 0.85f);
+          upgradeCost += 15 + 20 * t.level;
+        }
+      }
+
+      // Downgrade: unhappy + low land value + mostly empty.
+      if (t.level > 1 && s.happiness < 0.42f && lvVal < 0.25f && occFrac < 0.35f) {
+        const float p = 0.0008f + 0.0030f * (0.42f - s.happiness) * (0.25f - lvVal) * (1.0f - occFrac);
+        if (rng.chance(p)) {
+          t.level--;
+          const int newCap = (t.overlay == Overlay::Residential) ? HousingForLevel(t.level) : JobsForTile(t);
+          t.occupants = static_cast<std::uint16_t>(std::min<int>(static_cast<int>(t.occupants), newCap));
+        }
+      }
+    }
+  }
+
+  // Pass 1: capacities and static counts.
+  const ScanResult scan = ScanWorld(world);
+  const int housingCap = scan.housingCap;
 
   // Jobs that are reachable this tick (by road, and optionally via an outside-connected component).
   int jobsCapAccessible = 0;
@@ -344,10 +562,11 @@ void Simulator::step(World& world)
     }
   }
 
-  // Demand model: housing grows if there are jobs + happiness.
-  // Very simple, but good enough as a starter.
-  const float jobPressure = (housingCap > 0) ? (static_cast<float>(jobsCapAccessible) / static_cast<float>(housingCap)) : 0.0f;
-  const float demand = Clamp01(0.15f + 0.70f * std::min(jobPressure, 1.0f) + 0.25f * s.happiness);
+  // Demand model (global): housing grows if there are jobs + happiness + overall land value.
+  const float jobPressure = (housingCap > 0)
+                                ? (static_cast<float>(jobsCapAccessible) / static_cast<float>(housingCap))
+                                : 0.0f;
+  const float demand = ResidentialDemand(jobPressure, s.happiness, avgLv);
 
   // Pass 2: residential update (population moves toward target occupancy).
   for (int y = 0; y < world.height(); ++y) {
@@ -364,7 +583,14 @@ void Simulator::step(World& world)
         continue;
       }
 
-      const int target = static_cast<int>(std::round(static_cast<float>(cap) * demand));
+      const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(world.width()) +
+                              static_cast<std::size_t>(x);
+      const float lvVal = (idx < lv.value.size()) ? lv.value[idx] : 0.0f;
+
+      const float desir = std::clamp(1.0f + m_cfg.residentialDesirabilityWeight * (lvVal - 0.5f), 0.40f, 1.60f);
+      const float tileDemand = Clamp01(demand * desir);
+
+      const int target = std::clamp(static_cast<int>(std::lround(static_cast<float>(cap) * tileDemand)), 0, cap);
       const int cur = static_cast<int>(t.occupants);
 
       if (cur < target) {
@@ -388,8 +614,18 @@ void Simulator::step(World& world)
   // Employment: fill jobs up to population.
   const int employed = std::min(population, jobsCapAccessible);
 
-  // Pass 3: distribute employment across job tiles.
-  int remainingWorkers = employed;
+  // Pass 3: distribute employment across job tiles with desirability weighting.
+  struct JobSite {
+    int x = 0;
+    int y = 0;
+    int cap = 0;
+    Overlay type = Overlay::None;
+    float weight = 1.0f;
+  };
+
+  std::vector<JobSite> sites;
+  sites.reserve(static_cast<std::size_t>(world.width()) * static_cast<std::size_t>(world.height()) / 8u);
+
   for (int y = 0; y < world.height(); ++y) {
     for (int x = 0; x < world.width(); ++x) {
       Tile& t = world.at(x, y);
@@ -401,105 +637,50 @@ void Simulator::step(World& world)
         continue;
       }
 
-      int cap = 0;
-      if (t.overlay == Overlay::Commercial) cap = JobsCommercialForLevel(t.level);
-      if (t.overlay == Overlay::Industrial) cap = JobsIndustrialForLevel(t.level);
+      const int cap = JobsForTile(t);
+      const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(world.width()) +
+                              static_cast<std::size_t>(x);
+      const float lvVal = (idx < lv.value.size()) ? lv.value[idx] : 0.0f;
 
-      const int assigned = std::min(cap, remainingWorkers);
-      t.occupants = static_cast<std::uint16_t>(assigned);
-      remainingWorkers -= assigned;
+      const float w = (t.overlay == Overlay::Commercial) ? m_cfg.commercialDesirabilityWeight
+                                                         : m_cfg.industrialDesirabilityWeight;
+      const float desirBase = (t.overlay == Overlay::Commercial) ? lvVal : (1.0f - lvVal);
+      const float weight = std::clamp(1.0f + w * (desirBase - 0.5f), 0.25f, 2.0f);
+
+      sites.push_back(JobSite{x, y, cap, t.overlay, weight});
     }
   }
 
-  // Goods/logistics model: route industrial output to commercial demand along roads.
-  GoodsConfig gc;
-  gc.requireOutsideConnection = m_cfg.requireOutsideConnection;
-  const GoodsResult goods = ComputeGoodsFlow(world, gc, m_cfg.requireOutsideConnection ? &roadToEdge : nullptr);
-  s.goodsProduced = goods.goodsProduced;
-  s.goodsDemand = goods.goodsDemand;
-  s.goodsDelivered = goods.goodsDelivered;
-  s.goodsImported = goods.goodsImported;
-  s.goodsExported = goods.goodsExported;
-  s.goodsUnreachableDemand = goods.unreachableDemand;
-  s.goodsSatisfaction = goods.satisfaction;
-  s.maxRoadGoodsTraffic = goods.maxRoadGoodsTraffic;
+  std::sort(sites.begin(), sites.end(), [&](const JobSite& a, const JobSite& b) {
+    if (a.weight != b.weight) return a.weight > b.weight;
+    if (a.y != b.y) return a.y < b.y;
+    return a.x < b.x;
+  });
 
-  // Economy: tiny placeholder model.
-  const int income = employed * 2;
-  const int maintenance = roads * 1 + parks * 1;
+  int remainingWorkers = employed;
+  for (const JobSite& s0 : sites) {
+    Tile& t = world.at(s0.x, s0.y);
+    const int assigned = std::min(s0.cap, remainingWorkers);
+    t.occupants = static_cast<std::uint16_t>(assigned);
+    remainingWorkers -= assigned;
+  }
 
-  // Trade: imports cost money, exports earn money. Keep the exchange rate mild so it
-  // doesn't dominate the early game.
-  const int importCost = goods.goodsImported / 20;
-  const int exportRevenue = goods.goodsExported / 25;
-
-  s.money += income - maintenance + exportRevenue - importCost;
-
-  // Traffic/commute model (derived, no agents): compute a road-tile traffic heatmap
-  // and aggregate commute metrics.
-  const float employedShare = (population > 0) ? (static_cast<float>(employed) / static_cast<float>(population)) : 0.0f;
-  TrafficConfig tc;
-  tc.requireOutsideConnection = m_cfg.requireOutsideConnection;
-  const TrafficResult traffic = ComputeCommuteTraffic(
-      world, tc, employedShare, m_cfg.requireOutsideConnection ? &roadToEdge : nullptr);
-
-  s.commuters = traffic.totalCommuters;
-  s.commutersUnreachable = traffic.unreachableCommuters;
-  s.avgCommute = traffic.avgCommute;
-  s.p95Commute = traffic.p95Commute;
-  s.trafficCongestion = traffic.congestion;
-  s.congestedRoadTiles = traffic.congestedRoadTiles;
-  s.maxRoadTraffic = traffic.maxTraffic;
-
-  // Happiness: parks help (locally), unemployment hurts, and commutes/congestion add friction.
-  const float parkCoverage = ParkCoverageRatio(world, m_cfg.parkInfluenceRadius,
-                                               m_cfg.requireOutsideConnection ? &roadToEdge : nullptr);
-  const float parkBonus = std::min(0.25f, parkCoverage * 0.35f);
-
-  const float unemployment = (population > 0) ? (1.0f - (static_cast<float>(employed) / static_cast<float>(population)))
-                                              : 0.0f;
-
-  const float commuteNorm = (traffic.reachableCommuters > 0)
-                                ? std::clamp(traffic.avgCommute / kCommuteTarget, 0.0f, 2.0f)
-                                : 0.0f;
-  const float commutePenalty = std::min(kCommutePenaltyCap, commuteNorm * kCommutePenaltyCap);
-  const float congestionPenalty = std::min(kCongestionPenaltyCap, traffic.congestion * (kCongestionPenaltyCap * 1.35f));
-
-  const float goodsPenalty = std::min(kGoodsPenaltyCap, (1.0f - goods.satisfaction) * kGoodsPenaltyCap);
-
-  s.happiness = Clamp01(0.45f + parkBonus - unemployment * 0.35f - commutePenalty - congestionPenalty - goodsPenalty);
-
-  // Optional auto-upgrades: if the city is doing well, some buildings level up.
-  RNG rng(world.seed() ^ (static_cast<std::uint64_t>(s.day) * 0x9E3779B97F4A7C15ULL));
-  if (s.happiness > 0.62f && s.money > 100) {
-    for (int y = 0; y < world.height(); ++y) {
-      for (int x = 0; x < world.width(); ++x) {
-        Tile& t = world.at(x, y);
-        const bool isZone = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial || t.overlay == Overlay::Industrial);
-        if (!isZone) continue;
-        if (!hasZoneAccess(x, y)) continue;
-        if (t.level >= 3) continue;
-
-        // small chance per tick
-        const float p = 0.0025f + 0.0035f * s.happiness;
-        if (rng.chance(p)) {
-          t.level++;
-          // Cosmetic: some eviction during construction
-          t.occupants = static_cast<std::uint16_t>(static_cast<int>(t.occupants) * 0.8f);
-          s.money -= 25;
-        }
-      }
+  // Any remaining accessible job tiles not assigned above should be emptied.
+  if (remainingWorkers <= 0) {
+    for (const JobSite& s0 : sites) {
+      if (s0.cap <= 0) continue;
+      // Already assigned in the loop above.
     }
   }
 
-  // Update stats snapshot.
-  s.population = population;
-  s.housingCapacity = housingCap;
-  s.jobsCapacity = jobsCap;
-  s.jobsCapacityAccessible = jobsCapAccessible;
-  s.employed = employed;
-  s.roads = roads;
-  s.parks = parks;
+  // Recompute derived stats (traffic, goods, happiness, budget metrics) for the new state.
+  refreshDerivedStats(world);
+
+  // Include upgrade spending in the budget and apply the net change to money.
+  s.upgradeCost = upgradeCost;
+  s.expenses += upgradeCost;
+
+  s.money += (s.income - s.expenses);
 }
 
 

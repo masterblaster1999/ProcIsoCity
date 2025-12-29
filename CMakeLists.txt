@@ -29,8 +29,10 @@ add_library(isocity_core
   src/isocity/World.cpp
   src/isocity/ProcGen.cpp
   src/isocity/Sim.cpp
+  src/isocity/FlowField.cpp
   src/isocity/Traffic.cpp
   src/isocity/Goods.cpp
+  src/isocity/LandValue.cpp
   src/isocity/SaveLoad.cpp
   src/isocity/EditHistory.cpp
   src/isocity/Pathfinding.cpp

@@ -1,8 +1,11 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <optional>
 
+#include "isocity/Elevation.hpp"
 #include "isocity/Types.hpp"
 
 #include "raylib.h"
@@ -69,6 +72,73 @@ inline void TileDiamondCorners(Vector2 center, float tileW, float tileH, Vector2
   out[1] = Vector2{center.x + halfW, center.y}; // right
   out[2] = Vector2{center.x, center.y + halfH}; // bottom
   out[3] = Vector2{center.x - halfW, center.y}; // left
+}
+
+// -----------------------------------------------------------------------------------------------
+// Elevation helpers
+// -----------------------------------------------------------------------------------------------
+
+inline bool PointInDiamond(Vector2 worldPoint, Vector2 center, float tileW, float tileH)
+{
+  const float halfW = tileW * 0.5f;
+  const float halfH = tileH * 0.5f;
+  const float dx = std::fabs(worldPoint.x - center.x) / halfW;
+  const float dy = std::fabs(worldPoint.y - center.y) / halfH;
+  return (dx + dy) <= 1.0f;
+}
+
+inline Vector2 TileToWorldCenterElevated(const World& world, int tx, int ty, float tileW, float tileH,
+                                        const ElevationSettings& elev)
+{
+  Vector2 c = TileToWorldCenter(tx, ty, tileW, tileH);
+  if (world.inBounds(tx, ty)) {
+    c.y -= TileElevationPx(world.at(tx, ty), elev);
+  }
+  return c;
+}
+
+// Elevation-aware tile picking.
+//
+// When elevation is enabled, tiles are rendered with a vertical offset (in world/pixel units).
+// This function resolves the correct tile under the cursor by testing elevated diamond bounds
+// around an approximate inverse transform.
+inline std::optional<Point> WorldToTileElevated(Vector2 worldPos, const World& world, float tileW, float tileH,
+                                                const ElevationSettings& elev)
+{
+  const int mapW = world.width();
+  const int mapH = world.height();
+  if (mapW <= 0 || mapH <= 0) return std::nullopt;
+
+  const Point approx = WorldToTileApprox(worldPos, tileW, tileH);
+
+  std::optional<Point> best;
+  int bestSum = std::numeric_limits<int>::min();
+  int bestX = std::numeric_limits<int>::min();
+
+  // Elevation can shift the diamond by up to ~tileH, so search a slightly larger neighborhood.
+  constexpr int kSearch = 3;
+  for (int oy = -kSearch; oy <= kSearch; ++oy) {
+    for (int ox = -kSearch; ox <= kSearch; ++ox) {
+      const int tx = approx.x + ox;
+      const int ty = approx.y + oy;
+      if (tx < 0 || ty < 0 || tx >= mapW || ty >= mapH) continue;
+
+      const Vector2 c = TileToWorldCenterElevated(world, tx, ty, tileW, tileH, elev);
+      if (!PointInDiamond(worldPos, c, tileW, tileH)) continue;
+
+      // If multiple elevated diamonds overlap at this pixel, choose the one that would be
+      // drawn last (front-most) under our diagonal draw order.
+      const int sum = tx + ty;
+      if (!best || sum > bestSum || (sum == bestSum && tx > bestX)) {
+        best = Point{tx, ty};
+        bestSum = sum;
+        bestX = tx;
+      }
+    }
+  }
+
+  if (best) return best;
+  return WorldToTile(worldPos, mapW, mapH, tileW, tileH);
 }
 
 } // namespace isocity

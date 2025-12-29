@@ -57,22 +57,52 @@ ctest --test-dir build-tests --output-on-failure
 - **Right mouse drag**: pan camera  
 - **Mouse wheel**: zoom (zooms around mouse cursor)
 - **1**: Road tool
+- **U**: (Road tool) cycle road class (Street/Avenue/Highway)
 - **2**: Residential zone tool
 - **3**: Commercial zone tool
 - **4**: Industrial zone tool
 - **5**: Park tool
 - **0**: Bulldoze tool
+- **6**: Raise terrain tool (terraform)
+- **7**: Lower terrain tool (terraform)
+- **8**: Smooth terrain tool (terraform)
+- **E**: toggle elevation rendering (flat vs elevated)
 - **R**: regenerate a new world (new seed)
 - **G**: toggle grid overlay
 - **H**: toggle help overlay
+- **M**: toggle minimap (click/drag to jump camera)
+- **C**: toggle vehicle micro-sim (commuters + goods trucks)
+- **O**: toggle outside connectivity overlay
+- **T**: toggle road graph overlay
+- **V**: toggle traffic overlay
+- **B**: toggle goods overlay
+- **P**: toggle policy/budget panel
+  - **Tab**: select a setting
+  - **[ / ]**: adjust selected value (hold **Shift** for bigger steps)
+  - When the policy panel is open, **[ / ]** adjust policy instead of brush size.
+- **F3**: toggle traffic model panel (congestion-aware routing tuning)
+  - **Tab**: select a setting
+  - **[ / ]**: adjust selected value (hold **Shift** for bigger steps)
+- **F1**: toggle city report panel (time-series graphs)
+  - **Tab**: cycle report pages
+- **F2**: toggle base render cache (faster rendering on large maps)
+- **L**: cycle heatmap overlay (land value / park amenity / water amenity / pollution / traffic spill)
+  - Hold **Shift** while pressing **L** to cycle backwards.
 - **Space**: pause/resume simulation
 - **N**: step simulation by one tick (while paused)
 - **+ / -**: change simulation speed
 - **[ / ]**: brush size (diamond radius)
+- **Shift** (while painting):
+  - Road tool: Shift+drag builds a cheapest-cost road path between start/end.
+  - Terraform tools: stronger effect.
+- **Ctrl** (while using terraform tools): finer effect.
 - Painting applies each tile at most once per stroke (prevents accidental multi-upgrades while holding the mouse still).
 - Failed placements (no money / no road access / water) show a toast when you release the mouse.
-- **F5**: quick save (writes `isocity_save.bin`)
-- **F9**: quick load
+- **F6**: cycle save slot (1..5)
+- **F5**: quick save to the selected slot
+- **F9**: quick load from the selected slot
+- **F10**: open save manager (browse slots, preview minimap thumbnails, delete)
+- Autosaves write to `isocity_autosave_slot*.bin` on a wall-clock timer.
 - **Ctrl+Z**: undo last paint stroke
 - **Ctrl+Y** (or **Ctrl+Shift+Z**): redo
 - **Q**: Inspect tool (disables painting)
@@ -88,8 +118,19 @@ ctest --test-dir build-tests --output-on-failure
 - Roads now auto-connect visually (auto-tiling based on neighboring road tiles).
 - Zones and job tiles only function when connected via roads to the **map edge** (an "outside" connection).
 - Zone tiles show 1–3 pips (level) and a tiny occupancy bar when zoomed in.
+- Zone tiles also render simple **procedural 3D-ish buildings** (no external assets) at higher zoom.
 - Parks now boost happiness based on **local coverage** (zones within a small radius of a road-connected park).
-- Save files are versioned; **v2** saves store seed + procgen config + tile deltas (smaller saves).
+- Land value now feeds back into simulation:
+  - Residential growth is biased toward high-value tiles.
+  - Job assignment (commercial/industrial) is weighted by land value.
+  - Budget/demand/land value summaries are shown in the HUD; taxes and maintenance can be tweaked in the in-game policy panel (**P**).
+- Commute routing supports an optional **congestion-aware** multi-pass assignment model (tunable via **F3**).
+- Save files are versioned; current is **v6**:
+  - v2: seed + procgen config + tile deltas (small saves)
+  - v3: CRC32 checksum (corruption detection)
+  - v4: varint + delta-encoded diffs (smaller / faster)
+  - v5: persists terraforming via height deltas
+  - v6: persists SimConfig (taxes, maintenance, outside-connection rule, park radius)
 
 ---
 
@@ -100,7 +141,8 @@ ctest --test-dir build-tests --output-on-failure
 - Proper road graphs (nodes/edges) + traffic visualization
 - Smarter undo/redo (optional: track only overlays + money, not sim state)
 - Save system: compression, multiple slots, and stronger cross-version stability
-- Buildings with multi-tile footprints + procedural silhouettes
+- Buildings with multi-tile footprints + richer procedural silhouettes
+- Rendering performance: cached chunk layers (terrain/decals) + fewer draw calls
 - Multi-layer rendering (terrain, decals, structures, overlays)
 
 ---

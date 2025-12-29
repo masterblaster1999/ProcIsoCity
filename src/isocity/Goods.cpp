@@ -1,5 +1,6 @@
 #include "isocity/Goods.hpp"
 
+#include "isocity/FlowField.hpp"
 #include "isocity/Pathfinding.hpp"
 
 #include <algorithm>
@@ -50,7 +51,8 @@ struct Consumer {
   int y = 0;
   int roadIdx = -1;
   int demand = 0;
-  int dist = -1;
+  int dist = -1; // steps along the chosen producer path
+  int cost = -1; // travel-time cost (milli-steps)
   int owner = -1;
 };
 
@@ -135,63 +137,28 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
     sources.push_back(Source{ridx, supply, supply});
   }
 
-  // --- Multi-source BFS from industrial sources (nearest-producer labeling) ---
-  std::vector<int> dist(n, -1);
-  std::vector<int> parent(n, -1);
-  std::vector<int> owner(n, -1);
-  std::vector<int> queue;
-  queue.reserve(n / 2);
-
-  if (!sources.empty()) {
-    for (int si = 0; si < static_cast<int>(sources.size()); ++si) {
-      const int sidx = sources[static_cast<std::size_t>(si)].roadIdx;
-      if (sidx < 0 || static_cast<std::size_t>(sidx) >= n) continue;
-      dist[static_cast<std::size_t>(sidx)] = 0;
-      parent[static_cast<std::size_t>(sidx)] = -1;
-      owner[static_cast<std::size_t>(sidx)] = si;
-      queue.push_back(sidx);
-    }
-
-    std::size_t head = 0;
-    while (head < queue.size()) {
-      const int idx = queue[head++];
-      const int x = idx % w;
-      const int y = idx / w;
-
-      const int dcur = dist[static_cast<std::size_t>(idx)];
-      if (dcur < 0) continue;
-
-      // Deterministic neighbor order: N, E, S, W.
-      constexpr int dirs[4][2] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}};
-      for (const auto& d : dirs) {
-        const int nx = x + d[0];
-        const int ny = y + d[1];
-        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
-        const int nidx = ny * w + nx;
-        if (!isTraversableRoad(nidx)) continue;
-        if (dist[static_cast<std::size_t>(nidx)] != -1) continue;
-
-        dist[static_cast<std::size_t>(nidx)] = dcur + 1;
-        parent[static_cast<std::size_t>(nidx)] = idx;
-        owner[static_cast<std::size_t>(nidx)] = owner[static_cast<std::size_t>(idx)];
-        queue.push_back(nidx);
-      }
-    }
+  // --- Multi-source search from industrial sources (nearest-producer labeling, travel-time weighted) ---
+  std::vector<int> sourceRoadIdx;
+  sourceRoadIdx.reserve(sources.size());
+  for (const Source& s : sources) {
+    sourceRoadIdx.push_back(s.roadIdx);
   }
 
-  // --- BFS from map-edge roads (for imports/exports routing) ---
-  std::vector<int> edgeDist(n, -1);
-  std::vector<int> edgeParent(n, -1);
-  std::vector<int> edgeQueue;
-  edgeQueue.reserve(n / 4);
+  RoadFlowFieldConfig prodCfg;
+  prodCfg.requireOutsideConnection = cfg.requireOutsideConnection;
+  prodCfg.computeOwner = true;
+  prodCfg.useTravelTime = true;
+
+  const RoadFlowField prodField = BuildRoadFlowField(world, sourceRoadIdx, prodCfg, roadToEdge);
+
+  // --- Search from map-edge roads (for imports/exports routing) ---
+  std::vector<int> edgeSources;
+  edgeSources.reserve(static_cast<std::size_t>(w + h) * 2u);
 
   auto pushEdge = [&](int ex, int ey) {
     const int ridx = ey * w + ex;
     if (!isTraversableRoad(ridx)) return;
-    if (edgeDist[static_cast<std::size_t>(ridx)] != -1) return;
-    edgeDist[static_cast<std::size_t>(ridx)] = 0;
-    edgeParent[static_cast<std::size_t>(ridx)] = -1;
-    edgeQueue.push_back(ridx);
+    edgeSources.push_back(ridx);
   };
 
   // Seed with border roads (deterministic order).
@@ -204,32 +171,13 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
     if (w > 1) pushEdge(w - 1, y);
   }
 
-  // Only run BFS if we may need it.
-  if ((!edgeQueue.empty()) && (cfg.allowImports || cfg.allowExports)) {
-    std::size_t head = 0;
-    while (head < edgeQueue.size()) {
-      const int idx = edgeQueue[head++];
-      const int x = idx % w;
-      const int y = idx / w;
-
-      const int dcur = edgeDist[static_cast<std::size_t>(idx)];
-      if (dcur < 0) continue;
-
-      // Deterministic neighbor order: N, E, S, W.
-      constexpr int dirs[4][2] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}};
-      for (const auto& d : dirs) {
-        const int nx = x + d[0];
-        const int ny = y + d[1];
-        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
-        const int nidx = ny * w + nx;
-        if (!isTraversableRoad(nidx)) continue;
-        if (edgeDist[static_cast<std::size_t>(nidx)] != -1) continue;
-
-        edgeDist[static_cast<std::size_t>(nidx)] = dcur + 1;
-        edgeParent[static_cast<std::size_t>(nidx)] = idx;
-        edgeQueue.push_back(nidx);
-      }
-    }
+  RoadFlowField edgeField;
+  if (cfg.allowImports || cfg.allowExports) {
+    RoadFlowFieldConfig edgeCfg;
+    edgeCfg.requireOutsideConnection = cfg.requireOutsideConnection;
+    edgeCfg.computeOwner = false;
+    edgeCfg.useTravelTime = true;
+    edgeField = BuildRoadFlowField(world, edgeSources, edgeCfg, roadToEdge);
   }
 
   auto addAlongParentChain = [&](int startIdx, const std::vector<int>& par, int amount) {
@@ -263,19 +211,26 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
       const int ridx = road.y * w + road.x;
       if (!isTraversableRoad(ridx)) continue;
 
-      const int d = (!sources.empty()) ? dist[static_cast<std::size_t>(ridx)] : -1;
-      const int own = (d >= 0) ? owner[static_cast<std::size_t>(ridx)] : -1;
+      const std::size_t ur = static_cast<std::size_t>(ridx);
+      const int d = (!sources.empty() && ur < prodField.dist.size()) ? prodField.dist[ur] : -1;
+      const int c = (!sources.empty() && ur < prodField.cost.size()) ? prodField.cost[ur] : -1;
+      const int own = ((d >= 0 && c >= 0) && ur < prodField.owner.size()) ? prodField.owner[ur] : -1;
 
-      consumers.push_back(Consumer{x, y, ridx, demand, d, own});
+      consumers.push_back(Consumer{x, y, ridx, demand, d, c, own});
       out.goodsDemand += demand;
     }
   }
 
   // Prioritize closer consumers first so scarce supply serves the nearest commercial areas.
   std::sort(consumers.begin(), consumers.end(), [&](const Consumer& a, const Consumer& b) {
+    const int ca = (a.cost >= 0) ? a.cost : std::numeric_limits<int>::max();
+    const int cb = (b.cost >= 0) ? b.cost : std::numeric_limits<int>::max();
+    if (ca != cb) return ca < cb;
+
     const int da = (a.dist >= 0) ? a.dist : std::numeric_limits<int>::max();
     const int db = (b.dist >= 0) ? b.dist : std::numeric_limits<int>::max();
     if (da != db) return da < db;
+
     if (a.y != b.y) return a.y < b.y;
     return a.x < b.x;
   });
@@ -288,26 +243,26 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
     int delivered = 0;
 
     // Deliver from nearest local producer if possible.
-    if (!sources.empty() && c.dist >= 0 && c.owner >= 0 && c.owner < static_cast<int>(sources.size())) {
+    if (!sources.empty() && c.cost >= 0 && c.owner >= 0 && c.owner < static_cast<int>(sources.size())) {
       Source& src = sources[static_cast<std::size_t>(c.owner)];
       const int give = std::min(src.remaining, remaining);
       if (give > 0) {
         src.remaining -= give;
         remaining -= give;
         delivered += give;
-        addAlongParentChain(c.roadIdx, parent, give);
+        addAlongParentChain(c.roadIdx, prodField.parent, give);
       }
     }
 
     // Import any remaining demand from the edge if allowed.
     if (remaining > 0 && cfg.allowImports) {
-      const int ed = edgeDist[static_cast<std::size_t>(c.roadIdx)];
+      const int ed = (!edgeField.cost.empty()) ? edgeField.cost[static_cast<std::size_t>(c.roadIdx)] : -1;
       if (ed >= 0) {
         const int imp = remaining;
         remaining = 0;
         delivered += imp;
         out.goodsImported += imp;
-        addAlongParentChain(c.roadIdx, edgeParent, imp);
+        addAlongParentChain(c.roadIdx, edgeField.parent, imp);
       }
     }
 
@@ -319,8 +274,9 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
     deliveredTotal += delivered;
 
     // Commercial tile fill ratio for overlays.
-    const float ratio = (c.demand > 0) ? std::clamp(static_cast<float>(delivered) / static_cast<float>(c.demand), 0.0f, 1.0f)
-                                       : 1.0f;
+    const float ratio = (c.demand > 0)
+                            ? std::clamp(static_cast<float>(delivered) / static_cast<float>(c.demand), 0.0f, 1.0f)
+                            : 1.0f;
     const std::size_t tidx = static_cast<std::size_t>(c.y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(c.x);
     if (tidx < out.commercialFill.size()) {
       out.commercialFill[tidx] = static_cast<std::uint8_t>(std::lround(ratio * 255.0f));
@@ -331,11 +287,11 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
   if (cfg.allowExports && !sources.empty()) {
     for (const Source& src : sources) {
       if (src.remaining <= 0) continue;
-      const int ed = edgeDist[static_cast<std::size_t>(src.roadIdx)];
+      const int ed = (!edgeField.cost.empty()) ? edgeField.cost[static_cast<std::size_t>(src.roadIdx)] : -1;
       if (ed < 0) continue;
 
       out.goodsExported += src.remaining;
-      addAlongParentChain(src.roadIdx, edgeParent, src.remaining);
+      addAlongParentChain(src.roadIdx, edgeField.parent, src.remaining);
     }
   }
 

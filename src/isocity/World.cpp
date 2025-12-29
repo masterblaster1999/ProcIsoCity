@@ -1,5 +1,7 @@
 #include "isocity/World.hpp"
 
+#include "isocity/Road.hpp"
+
 #include <algorithm>
 
 namespace isocity {
@@ -37,6 +39,10 @@ const char* ToString(Tool t)
   case Tool::Industrial: return "Industrial";
   case Tool::Park: return "Park";
   case Tool::Bulldoze: return "Bulldoze";
+  case Tool::RaiseTerrain: return "Raise";
+  case Tool::LowerTerrain: return "Lower";
+  case Tool::SmoothTerrain: return "Smooth";
+  case Tool::District: return "District";
   default: return "UnknownTool";
   }
 }
@@ -139,18 +145,28 @@ void World::setOverlay(Overlay overlay, int x, int y)
 {
   if (!inBounds(x, y)) return;
   Tile& t = at(x, y);
-  if (t.terrain == Terrain::Water) return;
+  // Allow clearing overlays even if a tile is water (useful for terraforming or future tooling),
+  // but never allow placing new content on water.
+  if (t.terrain == Terrain::Water && overlay != Overlay::None) return;
 
   const Overlay before = t.overlay;
   t.overlay = overlay;
 
-  // Reset/initialize zone state.
+  // Reset/initialize per-overlay state.
   if (overlay == Overlay::Residential || overlay == Overlay::Commercial || overlay == Overlay::Industrial) {
+    // Zone tiles use level 1..3 to represent density / building level.
     t.level = std::clamp<int>(t.level, 1, 3);
     if (t.level < 1) t.level = 1;
     if (t.level > 3) t.level = 3;
     if (t.occupants > 0) t.occupants = 0;
+  } else if (overlay == Overlay::Road) {
+    // Road tiles use level 1..3 for Street/Avenue/Highway.
+    // Preserve the level when the overlay remains Road; otherwise default to Street.
+    if (before != Overlay::Road) t.level = 1;
+    t.level = static_cast<std::uint8_t>(ClampRoadLevel(static_cast<int>(t.level)));
+    t.occupants = 0;
   } else {
+    // Non-zones and parks don't currently use the level field.
     t.level = 1;
     t.occupants = 0;
   }
@@ -163,7 +179,61 @@ void World::setOverlay(Overlay overlay, int x, int y)
 
 void World::bulldoze(int x, int y) { setOverlay(Overlay::None, x, y); }
 
-void World::setRoad(int x, int y) { setOverlay(Overlay::Road, x, y); }
+void World::setRoad(int x, int y)
+{
+  if (!inBounds(x, y)) return;
+  if (at(x, y).overlay == Overlay::Road) return;
+  setOverlay(Overlay::Road, x, y);
+}
+
+ToolApplyResult World::applyRoad(int x, int y, int targetLevel)
+{
+  if (!inBounds(x, y)) return ToolApplyResult::OutOfBounds;
+  Tile& t = at(x, y);
+
+  if (t.terrain == Terrain::Water) return ToolApplyResult::BlockedWater;
+
+  targetLevel = ClampRoadLevel(targetLevel);
+
+  auto spend = [&](int cost) -> bool {
+    if (cost <= 0) return true;
+    if (m_stats.money < cost) return false;
+    m_stats.money -= cost;
+    return true;
+  };
+
+  if (t.overlay == Overlay::Road) {
+    const int cur = ClampRoadLevel(static_cast<int>(t.level));
+    if (cur >= targetLevel) return ToolApplyResult::Noop;
+
+    const int cost = RoadBuildCostForLevel(targetLevel) - RoadBuildCostForLevel(cur);
+    if (!spend(cost)) return ToolApplyResult::InsufficientFunds;
+
+    t.level = static_cast<std::uint8_t>(targetLevel);
+    return ToolApplyResult::Applied;
+  }
+
+  if (t.overlay != Overlay::None) return ToolApplyResult::BlockedOccupied;
+
+  const int cost = RoadBuildCostForLevel(targetLevel);
+  if (!spend(cost)) return ToolApplyResult::InsufficientFunds;
+
+  setRoad(x, y);
+  t.level = static_cast<std::uint8_t>(targetLevel);
+  return ToolApplyResult::Applied;
+}
+
+ToolApplyResult World::applyDistrict(int x, int y, int districtId)
+{
+  if (!inBounds(x, y)) return ToolApplyResult::OutOfBounds;
+
+  districtId = std::clamp(districtId, 0, kDistrictCount - 1);
+  Tile& t = at(x, y);
+  const std::uint8_t d = static_cast<std::uint8_t>(districtId);
+  if (t.district == d) return ToolApplyResult::Noop;
+  t.district = d;
+  return ToolApplyResult::Applied;
+}
 
 ToolApplyResult World::applyTool(Tool tool, int x, int y)
 {
@@ -185,12 +255,7 @@ ToolApplyResult World::applyTool(Tool tool, int x, int y)
 
   switch (tool) {
   case Tool::Road: {
-    if (t.overlay == Overlay::Road) return ToolApplyResult::Noop;
-    // Don't overwrite other overlays (zones/parks). Use the bulldozer first.
-    if (t.overlay != Overlay::None) return ToolApplyResult::BlockedOccupied;
-    if (!spend(1)) return ToolApplyResult::InsufficientFunds;
-    setRoad(x, y);
-    return ToolApplyResult::Applied;
+    return applyRoad(x, y, 1);
   } break;
 
   case Tool::Park: {

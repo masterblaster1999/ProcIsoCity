@@ -6,6 +6,8 @@
 #include "isocity/Sim.hpp"
 #include "isocity/Traffic.hpp"
 #include "isocity/Goods.hpp"
+#include "isocity/LandValue.hpp"
+#include "isocity/Road.hpp"
 #include "isocity/World.hpp"
 
 #include <algorithm>
@@ -49,6 +51,19 @@ static int g_failures = 0;
       std::cerr << __FILE__ << ":" << __LINE__ << " EXPECT_NE failed: " << #a << " != " << #b << "\n";              \
     }                                                                                                                \
   } while (0)
+#define EXPECT_NEAR(a, b, eps)                                                                                        \
+  do {                                                                                                               \
+    const auto _a = (a);                                                                                             \
+    const auto _b = (b);                                                                                             \
+    const auto _e = (eps);                                                                                           \
+    if (std::fabs((_a) - (_b)) > (_e)) {                                                                             \
+      ++g_failures;                                                                                                  \
+      std::cerr << __FILE__ << ":" << __LINE__ << " EXPECT_NEAR failed: " << #a << " ~= " << #b << " (eps=" << _e   \
+                << ")\n";                                                                                            \
+    }                                                                                                                \
+  } while (0)
+
+
 
 namespace {
 
@@ -205,6 +220,202 @@ void TestToolsDoNotOverwriteOccupiedTiles()
   EXPECT_EQ(w.at(4, 3).overlay, Overlay::Road);
 }
 
+void TestRoadHierarchyApplyRoadUpgradeCost()
+{
+  using namespace isocity;
+
+  World w(5, 5, 123);
+  w.stats().money = 100;
+
+  const int costStreet = RoadBuildCostForLevel(1);
+  const int costAvenue = RoadBuildCostForLevel(2);
+  const int costHighway = RoadBuildCostForLevel(3);
+
+  // New placement at a chosen class.
+  EXPECT_EQ(w.applyRoad(2, 2, 1), ToolApplyResult::Applied);
+  EXPECT_EQ(w.at(2, 2).overlay, Overlay::Road);
+  EXPECT_EQ(static_cast<int>(w.at(2, 2).level), 1);
+  EXPECT_EQ(w.stats().money, 100 - costStreet);
+
+  // Upgrading charges only the delta.
+  EXPECT_EQ(w.applyRoad(2, 2, 2), ToolApplyResult::Applied);
+  EXPECT_EQ(static_cast<int>(w.at(2, 2).level), 2);
+  EXPECT_EQ(w.stats().money, 100 - costStreet - (costAvenue - costStreet));
+
+  // Re-applying at same or lower class is a no-op.
+  const int moneyAfterAvenue = w.stats().money;
+  EXPECT_EQ(w.applyRoad(2, 2, 2), ToolApplyResult::Noop);
+  EXPECT_EQ(w.applyRoad(2, 2, 1), ToolApplyResult::Noop);
+  EXPECT_EQ(w.stats().money, moneyAfterAvenue);
+
+  // Upgrade again.
+  EXPECT_EQ(w.applyRoad(2, 2, 3), ToolApplyResult::Applied);
+  EXPECT_EQ(static_cast<int>(w.at(2, 2).level), 3);
+  EXPECT_EQ(w.stats().money, 100 - costStreet - (costAvenue - costStreet) - (costHighway - costAvenue));
+
+  // The classic Road tool still builds Streets.
+  EXPECT_EQ(w.applyTool(Tool::Road, 1, 1), ToolApplyResult::Applied);
+  EXPECT_EQ(w.at(1, 1).overlay, Overlay::Road);
+  EXPECT_EQ(static_cast<int>(w.at(1, 1).level), 1);
+}
+
+
+void TestTrafficPrefersHighSpeedRoadsWhenStepsTie()
+{
+  using namespace isocity;
+
+  // Two equal-step routes from the residential access road to the job access road:
+  //  - Upper route is streets (slow)
+  //  - Lower route is highways (fast)
+  //
+  // Weighted routing should choose the highway route when step-count ties.
+
+  World w(7, 5, 3u);
+
+  auto idx = [&](int x, int y) -> std::size_t { return static_cast<std::size_t>(y * w.width() + x); };
+
+  // Shared edge connection + start segment.
+  w.setRoad(0, 2);
+  w.setRoad(1, 2);
+  w.at(0, 2).level = 1;
+  w.at(1, 2).level = 1;
+
+  // Goal road (job access).
+  w.setRoad(5, 2);
+  w.at(5, 2).level = 1;
+
+  // Upper street route (y=1, x=1..5).
+  for (int x = 1; x <= 5; ++x) {
+    w.setRoad(x, 1);
+    w.at(x, 1).level = 1;
+  }
+
+  // Lower highway route (y=3, x=1..5).
+  for (int x = 1; x <= 5; ++x) {
+    w.setRoad(x, 3);
+    w.at(x, 3).level = 3;
+  }
+
+  // Residential near the start, forced to use the north road (0,2) as access.
+  w.at(0, 3).overlay = Overlay::Residential;
+  w.at(0, 3).level = 3;
+  w.at(0, 3).occupants = 10;
+
+  // Industrial at the right edge, adjacent only to (5,2).
+  w.at(6, 2).overlay = Overlay::Industrial;
+  w.at(6, 2).level = 3;
+
+  TrafficConfig tc;
+  tc.requireOutsideConnection = true;
+  tc.roadTileCapacity = 20;
+
+  const TrafficResult tr = ComputeCommuteTraffic(w, tc, 1.0f);
+
+  EXPECT_EQ(tr.totalCommuters, 10);
+  EXPECT_EQ(tr.unreachableCommuters, 0);
+
+  // The lower (highway) corridor should carry the commute.
+  EXPECT_EQ(tr.roadTraffic[idx(3, 3)], 10);
+  EXPECT_EQ(tr.roadTraffic[idx(4, 3)], 10);
+
+  // The upper (street) corridor should be unused.
+  EXPECT_EQ(tr.roadTraffic[idx(3, 1)], 0);
+  EXPECT_EQ(tr.roadTraffic[idx(4, 1)], 0);
+}
+
+void TestTrafficCongestionRespectsRoadClassCapacity()
+{
+  using namespace isocity;
+
+  World w(5, 5, 1);
+  w.setRoad(2, 2);
+
+  w.setOverlay(Overlay::Residential, 2, 1);
+  w.at(2, 1).occupants = 40; // commuters
+
+  w.setOverlay(Overlay::Commercial, 2, 3);
+
+  TrafficConfig cfg{};
+  cfg.requireOutsideConnection = false;
+  cfg.roadTileCapacity = 28; // default Street capacity base
+
+  // Streets should be congested at this demand.
+  {
+    auto r = ComputeCommuteTraffic(w, cfg, 1.0f, nullptr);
+    EXPECT_EQ(r.congestedRoadTiles, 1);
+    EXPECT_NEAR(r.congestion, 12.0f / 40.0f, 1e-6f);
+  }
+
+  // Upgrading to Avenue increases capacity enough to clear congestion.
+  w.at(2, 2).level = 2;
+  {
+    auto r = ComputeCommuteTraffic(w, cfg, 1.0f, nullptr);
+    EXPECT_EQ(r.congestedRoadTiles, 0);
+    EXPECT_NEAR(r.congestion, 0.0f, 1e-6f);
+  }
+}
+
+void TestTrafficCongestionAwareSplitsParallelRoutes()
+{
+  using namespace isocity;
+
+  // Two identical parallel street corridors from a single origin to a single destination.
+  // Free-flow routing is deterministic and will pick the "upper" corridor due to tie-breaking.
+  // With congestion-aware incremental assignment enabled, traffic should split between both.
+
+  World w(9, 7, 1u);
+
+  auto idx = [&](int x, int y) -> std::size_t { return static_cast<std::size_t>(y * w.width() + x); };
+
+  // Start and end junctions.
+  w.setRoad(1, 3);
+  w.at(1, 3).level = 1;
+  w.setRoad(7, 3);
+  w.at(7, 3).level = 1;
+
+  // Upper and lower corridors.
+  for (int x = 1; x <= 7; ++x) {
+    w.setRoad(x, 2);
+    w.at(x, 2).level = 1;
+    w.setRoad(x, 4);
+    w.at(x, 4).level = 1;
+  }
+
+  // Single residential origin (100 commuters) adjacent to start junction.
+  w.at(0, 3).overlay = Overlay::Residential;
+  w.at(0, 3).level = 3;
+  w.at(0, 3).occupants = 100;
+
+  // Single commercial destination adjacent to end junction.
+  w.at(8, 3).overlay = Overlay::Commercial;
+  w.at(8, 3).level = 3;
+
+  TrafficConfig cfg;
+  cfg.requireOutsideConnection = false;
+  cfg.roadTileCapacity = 28;
+  cfg.congestionAwareRouting = true;
+  cfg.congestionIterations = 4;
+  cfg.congestionAlpha = 0.15f;
+  cfg.congestionBeta = 4.0f;
+  cfg.congestionCapacityScale = 1.0f;
+  cfg.congestionRatioClamp = 3.0f;
+
+  const TrafficResult tr = ComputeCommuteTraffic(w, cfg, 1.0f, nullptr);
+
+  EXPECT_EQ(tr.totalCommuters, 100);
+  EXPECT_EQ(tr.unreachableCommuters, 0);
+  EXPECT_TRUE(tr.usedCongestionAwareRouting);
+  EXPECT_EQ(tr.routingPasses, 4);
+
+  // Middle of each corridor should carry roughly half (deterministically 50/50 with 4 passes).
+  EXPECT_EQ(tr.roadTraffic[idx(4, 2)], 50);
+  EXPECT_EQ(tr.roadTraffic[idx(4, 4)], 50);
+
+  // Shared start/end junctions carry all commuters.
+  EXPECT_EQ(tr.roadTraffic[idx(1, 3)], 100);
+  EXPECT_EQ(tr.roadTraffic[idx(7, 3)], 100);
+}
+
 void TestSaveLoadRoundTrip()
 {
   using namespace isocity;
@@ -225,6 +436,24 @@ void TestSaveLoadRoundTrip()
   EXPECT_EQ(w.applyTool(Tool::Road, x, y), ToolApplyResult::Applied);
   EXPECT_EQ(w.applyTool(Tool::Residential, x + 1, y), ToolApplyResult::Applied);
 
+  // --- Terraforming persistence (v5) ---
+  // Simulate a height edit on the road tile while keeping it above water.
+  // (The in-game tools do this via Game::applyToolBrush; here we mutate the tile directly.)
+  const float origH = w.at(x, y).height;
+  const float newH = std::clamp(origH + 0.20f, 0.0f, 1.0f);
+  w.at(x, y).height = newH;
+  {
+    // Match the TerrainFromHeight logic used by the save/load code.
+    const float wl = std::clamp(cfg.waterLevel, 0.0f, 1.0f);
+    const float sl = std::clamp(cfg.sandLevel, 0.0f, 1.0f);
+    if (newH < wl)
+      w.at(x, y).terrain = Terrain::Water;
+    else if (newH < std::max(wl, sl))
+      w.at(x, y).terrain = Terrain::Sand;
+    else
+      w.at(x, y).terrain = Terrain::Grass;
+  }
+
   // Save to a temp-ish location (use cwd if temp isn't available).
   fs::path savePath = "isocity_test_save.bin";
   try {
@@ -233,8 +462,23 @@ void TestSaveLoadRoundTrip()
     // keep relative path
   }
 
+  // Also verify that v6 saves persist the simulation/policy config.
+  SimConfig simCfg{};
+  simCfg.tickSeconds = 0.75f;
+  simCfg.parkInfluenceRadius = 9;
+  simCfg.requireOutsideConnection = false;
+  simCfg.taxResidential = 3;
+  simCfg.taxCommercial = 5;
+  simCfg.taxIndustrial = 4;
+  simCfg.maintenanceRoad = 2;
+  simCfg.maintenancePark = 7;
+  simCfg.taxHappinessPerCapita = 0.03f;
+  simCfg.residentialDesirabilityWeight = 1.25f;
+  simCfg.commercialDesirabilityWeight = 0.90f;
+  simCfg.industrialDesirabilityWeight = 1.10f;
+
   std::string err;
-  EXPECT_TRUE(SaveWorldBinary(w, cfg, savePath.string(), err));
+  EXPECT_TRUE(SaveWorldBinary(w, cfg, simCfg, savePath.string(), err));
 
   // Sanity-check that we're writing the newest save version.
   // (We don't parse the whole file here; we just validate the header fields are present.)
@@ -249,13 +493,48 @@ void TestSaveLoadRoundTrip()
 
     EXPECT_TRUE(in.good());
     EXPECT_TRUE(std::memcmp(magic, "ISOCITY\0", 8) == 0);
-    EXPECT_EQ(version, static_cast<std::uint32_t>(4));
+    EXPECT_EQ(version, static_cast<std::uint32_t>(7));
+  }
+
+  // Save summary should parse without loading the full world.
+  {
+    SaveSummary sum{};
+    std::string err3;
+    EXPECT_TRUE(ReadSaveSummary(savePath.string(), sum, err3, true));
+    EXPECT_EQ(sum.version, static_cast<std::uint32_t>(7));
+    EXPECT_EQ(sum.width, w.width());
+    EXPECT_EQ(sum.height, w.height());
+    EXPECT_EQ(sum.seed, w.seed());
+    EXPECT_TRUE(sum.hasStats);
+    EXPECT_EQ(sum.stats.day, w.stats().day);
+    EXPECT_EQ(sum.stats.money, w.stats().money);
+    EXPECT_TRUE(sum.hasProcCfg);
+    EXPECT_NEAR(sum.procCfg.waterLevel, cfg.waterLevel, 1e-6f);
+    EXPECT_TRUE(sum.hasSimCfg);
+    EXPECT_EQ(sum.simCfg.taxResidential, simCfg.taxResidential);
+    EXPECT_TRUE(sum.crcChecked);
+    EXPECT_TRUE(sum.crcOk);
   }
 
   World loaded;
   ProcGenConfig loadedCfg{};
+  SimConfig loadedSimCfg{};
   err.clear();
-  EXPECT_TRUE(LoadWorldBinary(loaded, loadedCfg, savePath.string(), err));
+  EXPECT_TRUE(LoadWorldBinary(loaded, loadedCfg, loadedSimCfg, savePath.string(), err));
+
+  // SimConfig should round-trip (within reasonable float epsilon).
+  EXPECT_NEAR(loadedSimCfg.tickSeconds, simCfg.tickSeconds, 1e-6f);
+  EXPECT_EQ(loadedSimCfg.parkInfluenceRadius, simCfg.parkInfluenceRadius);
+  EXPECT_EQ(loadedSimCfg.requireOutsideConnection, simCfg.requireOutsideConnection);
+  EXPECT_EQ(loadedSimCfg.taxResidential, simCfg.taxResidential);
+  EXPECT_EQ(loadedSimCfg.taxCommercial, simCfg.taxCommercial);
+  EXPECT_EQ(loadedSimCfg.taxIndustrial, simCfg.taxIndustrial);
+  EXPECT_EQ(loadedSimCfg.maintenanceRoad, simCfg.maintenanceRoad);
+  EXPECT_EQ(loadedSimCfg.maintenancePark, simCfg.maintenancePark);
+  EXPECT_NEAR(loadedSimCfg.taxHappinessPerCapita, simCfg.taxHappinessPerCapita, 1e-6f);
+  EXPECT_NEAR(loadedSimCfg.residentialDesirabilityWeight, simCfg.residentialDesirabilityWeight, 1e-6f);
+  EXPECT_NEAR(loadedSimCfg.commercialDesirabilityWeight, simCfg.commercialDesirabilityWeight, 1e-6f);
+  EXPECT_NEAR(loadedSimCfg.industrialDesirabilityWeight, simCfg.industrialDesirabilityWeight, 1e-6f);
 
   // Basic world identity checks.
   EXPECT_EQ(loaded.width(), w.width());
@@ -265,6 +544,15 @@ void TestSaveLoadRoundTrip()
   // Check our edits survived.
   EXPECT_EQ(loaded.at(x, y).overlay, Overlay::Road);
   EXPECT_EQ(loaded.at(x + 1, y).overlay, Overlay::Residential);
+
+  // Check terraforming survived (height is quantized in v5).
+  auto quantizeHeight = [](float h) -> std::uint16_t {
+    const float hc = std::clamp(h, 0.0f, 1.0f);
+    const float scaled = hc * 65535.0f;
+    const int q = static_cast<int>(std::lround(scaled));
+    return static_cast<std::uint16_t>(std::clamp(q, 0, 65535));
+  };
+  EXPECT_EQ(quantizeHeight(loaded.at(x, y).height), quantizeHeight(newH));
 
   // Check core stats persisted.
   EXPECT_EQ(loaded.stats().money, w.stats().money);
@@ -298,8 +586,23 @@ void TestSaveLoadDetectsCorruption()
     // keep relative path
   }
 
+  // Also verify that v6 saves persist the simulation/policy config.
+  SimConfig simCfg{};
+  simCfg.tickSeconds = 0.75f;
+  simCfg.parkInfluenceRadius = 9;
+  simCfg.requireOutsideConnection = false;
+  simCfg.taxResidential = 3;
+  simCfg.taxCommercial = 5;
+  simCfg.taxIndustrial = 4;
+  simCfg.maintenanceRoad = 2;
+  simCfg.maintenancePark = 7;
+  simCfg.taxHappinessPerCapita = 0.03f;
+  simCfg.residentialDesirabilityWeight = 1.25f;
+  simCfg.commercialDesirabilityWeight = 0.90f;
+  simCfg.industrialDesirabilityWeight = 1.10f;
+
   std::string err;
-  EXPECT_TRUE(SaveWorldBinary(w, cfg, savePath.string(), err));
+  EXPECT_TRUE(SaveWorldBinary(w, cfg, simCfg, savePath.string(), err));
 
   // Read file bytes.
   std::vector<std::uint8_t> bytes;
@@ -329,6 +632,15 @@ void TestSaveLoadDetectsCorruption()
     std::ofstream out(savePath, std::ios::binary | std::ios::trunc);
     EXPECT_TRUE(static_cast<bool>(out));
     out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  }
+
+  // Save summary can still be read, but CRC should report corruption.
+  {
+    SaveSummary sum{};
+    std::string errS;
+    EXPECT_TRUE(ReadSaveSummary(savePath.string(), sum, errS, true));
+    EXPECT_TRUE(sum.crcChecked);
+    EXPECT_TRUE(!sum.crcOk);
   }
 
   // Loading a corrupted v3 save should fail and mention CRC.
@@ -890,6 +1202,192 @@ void TestGoodsUnreachableDemandWhenNoImports()
   EXPECT_EQ(static_cast<int>(gr.commercialFill[commIdx]), 0);
 }
 
+void TestLandValueParkAmenityBoostsNearby()
+{
+  using namespace isocity;
+
+  World w(12, 12, 99u);
+
+  // Place a park with an adjacent road so it counts as a "connected" park.
+  w.setRoad(6, 6);
+  w.setOverlay(Overlay::Park, 6, 5);
+
+  LandValueConfig cfg;
+  cfg.requireOutsideConnection = false;
+  cfg.parkRadius = 6;
+
+  const LandValueResult lv = ComputeLandValue(w, cfg);
+
+  const std::size_t nearIdx = static_cast<std::size_t>(5) * static_cast<std::size_t>(w.width()) +
+                              static_cast<std::size_t>(6);
+  const std::size_t farIdx = static_cast<std::size_t>(1) * static_cast<std::size_t>(w.width()) +
+                             static_cast<std::size_t>(1);
+
+  EXPECT_TRUE(lv.parkAmenity[nearIdx] > lv.parkAmenity[farIdx]);
+  EXPECT_TRUE(lv.value[nearIdx] > lv.value[farIdx]);
+}
+
+void TestLandValueWaterAmenityIncreasesNearCoast()
+{
+  using namespace isocity;
+
+  World w(12, 12, 123u);
+
+  // Create a water strip on the left edge.
+  for (int y = 0; y < w.height(); ++y) {
+    w.at(0, y).terrain = Terrain::Water;
+  }
+
+  LandValueConfig cfg;
+  cfg.requireOutsideConnection = false;
+  cfg.waterRadius = 6;
+
+  const LandValueResult lv = ComputeLandValue(w, cfg);
+
+  const std::size_t nearIdx = static_cast<std::size_t>(5) * static_cast<std::size_t>(w.width()) +
+                              static_cast<std::size_t>(1);
+  const std::size_t farIdx = static_cast<std::size_t>(5) * static_cast<std::size_t>(w.width()) +
+                             static_cast<std::size_t>(6);
+
+  EXPECT_TRUE(lv.waterAmenity[nearIdx] > lv.waterAmenity[farIdx]);
+}
+
+void TestLandValuePollutionPenalizesNearby()
+{
+  using namespace isocity;
+
+  World w(12, 12, 7u);
+  w.setOverlay(Overlay::Industrial, 2, 2);
+  w.at(2, 2).level = 1;
+
+  LandValueConfig cfg;
+  cfg.requireOutsideConnection = false;
+  cfg.pollutionRadius = 7;
+
+  const LandValueResult lv = ComputeLandValue(w, cfg);
+
+  const std::size_t nearIdx = static_cast<std::size_t>(2) * static_cast<std::size_t>(w.width()) +
+                              static_cast<std::size_t>(3);
+  const std::size_t farIdx = static_cast<std::size_t>(10) * static_cast<std::size_t>(w.width()) +
+                             static_cast<std::size_t>(10);
+
+  EXPECT_TRUE(lv.pollution[nearIdx] > lv.pollution[farIdx]);
+  EXPECT_TRUE(lv.value[nearIdx] < lv.value[farIdx]);
+}
+
+void TestLandValueTrafficSpillUsesAdjacentRoadTraffic()
+{
+  using namespace isocity;
+
+  World w(6, 6, 1u);
+  w.setRoad(2, 2);
+
+  TrafficResult tr;
+  tr.roadTraffic.assign(static_cast<std::size_t>(w.width()) * static_cast<std::size_t>(w.height()), 0);
+  tr.maxTraffic = 100;
+  tr.roadTraffic[static_cast<std::size_t>(2) * static_cast<std::size_t>(w.width()) + static_cast<std::size_t>(2)] =
+      100;
+
+  LandValueConfig cfg;
+  cfg.requireOutsideConnection = false;
+
+  const LandValueResult lv = ComputeLandValue(w, cfg, &tr);
+
+  const std::size_t adjIdx = static_cast<std::size_t>(2) * static_cast<std::size_t>(w.width()) +
+                             static_cast<std::size_t>(3);
+  const std::size_t farIdx = static_cast<std::size_t>(0) * static_cast<std::size_t>(w.width()) +
+                             static_cast<std::size_t>(0);
+
+  EXPECT_TRUE(lv.traffic[adjIdx] > 0.001f);
+  EXPECT_TRUE(lv.traffic[farIdx] < 0.001f);
+}
+
+void TestResidentialDesirabilityPrefersHighLandValue()
+{
+  using namespace isocity;
+
+  World w(9, 5, 123);
+
+  // Outside-connected road spine.
+  for (int x = 0; x < w.width(); ++x) {
+    w.setRoad(x, 3);
+  }
+
+  // Two residential tiles (both road-adjacent).
+  w.setOverlay(Overlay::Residential, 2, 2); // low value (polluted)
+  w.setOverlay(Overlay::Residential, 6, 2); // high value (near park)
+
+  // Jobs so demand isn't zero.
+  w.setOverlay(Overlay::Commercial, 4, 2);
+
+  // Park next to the road near the high-value residential.
+  w.setOverlay(Overlay::Park, 6, 4);
+
+  // Industrial pollution source near the low-value residential.
+  w.setOverlay(Overlay::Industrial, 2, 1);
+
+  // Keep the test deterministic: disable money-driven auto upgrades.
+  w.stats().money = 0;
+
+  SimConfig cfg;
+  cfg.requireOutsideConnection = true;
+  cfg.taxResidential = 0;
+  cfg.taxCommercial = 0;
+  cfg.taxIndustrial = 0;
+  cfg.maintenanceRoad = 0;
+  cfg.maintenancePark = 0;
+
+  Simulator sim(cfg);
+
+  // Run a few ticks so desirability has time to diverge occupancy targets.
+  for (int i = 0; i < 6; ++i) {
+    sim.stepOnce(w);
+  }
+
+  const int lowOcc = w.at(2, 2).occupants;
+  const int highOcc = w.at(6, 2).occupants;
+  EXPECT_TRUE(highOcc > lowOcc);
+}
+
+void TestJobAssignmentPrefersHighLandValueCommercial()
+{
+  using namespace isocity;
+
+  World w(9, 5, 456);
+
+  for (int x = 0; x < w.width(); ++x) {
+    w.setRoad(x, 3);
+  }
+
+  // One housing tile provides population.
+  w.setOverlay(Overlay::Residential, 4, 2);
+  w.at(4, 2).occupants = 8;
+
+  // Two commercial job sites. The *later* one in scan order is made more desirable.
+  w.setOverlay(Overlay::Commercial, 2, 2); // low value (polluted)
+  w.setOverlay(Overlay::Commercial, 6, 2); // high value (near park)
+
+  w.setOverlay(Overlay::Park, 6, 4);
+  w.setOverlay(Overlay::Industrial, 2, 1);
+
+  w.stats().money = 0;
+
+  SimConfig cfg;
+  cfg.requireOutsideConnection = true;
+  cfg.taxResidential = 0;
+  cfg.taxCommercial = 0;
+  cfg.taxIndustrial = 0;
+  cfg.maintenanceRoad = 0;
+  cfg.maintenancePark = 0;
+
+  Simulator sim(cfg);
+  sim.stepOnce(w);
+
+  const int lowJobs = w.at(2, 2).occupants;
+  const int highJobs = w.at(6, 2).occupants;
+  EXPECT_TRUE(highJobs > lowJobs);
+}
+
 } // namespace
 
 int main()
@@ -898,6 +1396,9 @@ int main()
   TestEditHistoryUndoRedo();
   TestEditHistoryUndoRedoFixesRoadMasksLocally();
   TestToolsDoNotOverwriteOccupiedTiles();
+  TestRoadHierarchyApplyRoadUpgradeCost();
+  TestTrafficCongestionRespectsRoadClassCapacity();
+  TestTrafficCongestionAwareSplitsParallelRoutes();
   TestSaveLoadRoundTrip();
   TestSaveLoadDetectsCorruption();
   TestOutsideConnectionAffectsZoneAccess();
@@ -908,10 +1409,19 @@ int main()
   TestRoadGraphPlusIntersection();
   TestRoadGraphCornerCreatesNode();
   TestTrafficCommuteHeatmapSimple();
+  TestTrafficPrefersHighSpeedRoadsWhenStepsTie();
   TestTrafficUnreachableAcrossDisconnectedEdgeComponents();
   TestGoodsIndustrySuppliesCommercial();
   TestGoodsImportsWhenNoIndustry();
   TestGoodsUnreachableDemandWhenNoImports();
+
+  TestLandValueParkAmenityBoostsNearby();
+  TestLandValueWaterAmenityIncreasesNearCoast();
+  TestLandValuePollutionPenalizesNearby();
+  TestLandValueTrafficSpillUsesAdjacentRoadTraffic();
+
+  TestResidentialDesirabilityPrefersHighLandValue();
+  TestJobAssignmentPrefersHighLandValueCommercial();
 
 
   TestRoadPathfindingAStar();

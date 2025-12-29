@@ -14,6 +14,13 @@ namespace isocity {
 
 class Renderer {
 public:
+  enum class HeatmapRamp : std::uint8_t {
+    // 0 => bad (red), 1 => good (green)
+    Good = 0,
+    // 0 => good (green), 1 => bad (red)
+    Bad = 1,
+  };
+
   Renderer(int tileW, int tileH, std::uint64_t seed);
   ~Renderer();
 
@@ -22,26 +29,97 @@ public:
 
   void rebuildTextures(std::uint64_t seed);
 
+  void setElevationSettings(const ElevationSettings& s)
+  {
+    m_elev = s;
+    // Elevation changes world-space placement; cached base layers must be redrawn.
+    markBaseCacheDirtyAll();
+  }
+  const ElevationSettings& elevationSettings() const { return m_elev; }
+
+  // Performance: optional render cache for the static base world (terrain + cliffs + base overlays).
+  void setBaseCacheEnabled(bool enabled) { m_useBandCache = enabled; }
+  bool baseCacheEnabled() const { return m_useBandCache; }
+
+  // Mark cached base world dirty (re-rendered lazily when drawn).
+  void markBaseCacheDirtyAll();
+  void markBaseCacheDirtyForTiles(const std::vector<Point>& tiles, int mapW, int mapH);
+
+  // Screen-space minimap layout helper (used by the game for hit-testing).
+  struct MinimapLayout {
+    Rectangle rect{};      // destination rectangle in screen space
+    float pixelsPerTile = 1.0f; // how many screen pixels represent one world tile
+  };
+
+  // Compute where the minimap will be drawn on screen for the given world.
+  // This stays stable across frames (depends only on screen size + world size).
+  MinimapLayout minimapLayout(const World& world, int screenW, int screenH) const;
+
+  // Mark minimap texture dirty (recomputed lazily when drawn).
+  void markMinimapDirty() { m_minimapDirty = true; }
+
+  // Export the current minimap (one pixel per tile) to an image file.
+  // The image is optionally downscaled so its max dimension is <= maxSize.
+  // Returns true on success.
+  bool exportMinimapThumbnail(const World& world, const char* fileName, int maxSize = 256);
+
   void drawWorld(const World& world, const Camera2D& camera, float timeSec, std::optional<Point> hovered,
                  bool drawGrid, int brushRadius, std::optional<Point> selected, const std::vector<Point>* highlightPath,
                  const std::vector<std::uint8_t>* roadToEdgeMask = nullptr,
                  const std::vector<std::uint16_t>* roadTraffic = nullptr, int trafficMax = 0,
                  const std::vector<std::uint16_t>* roadGoodsTraffic = nullptr, int goodsMax = 0,
-                 const std::vector<std::uint8_t>* commercialGoodsFill = nullptr);
+                 const std::vector<std::uint8_t>* commercialGoodsFill = nullptr,
+                 const std::vector<float>* heatmap = nullptr,
+                 HeatmapRamp heatmapRamp = HeatmapRamp::Good);
 
-  void drawHUD(const World& world, Tool tool, std::optional<Point> hovered, int screenW, int screenH, bool showHelp,
-               int brushRadius, int undoCount, int redoCount, bool simPaused, float simSpeed, int saveSlot,
-               const char* inspectInfo);
+  void drawHUD(const World& world, const Camera2D& camera, Tool tool, int roadBuildLevel,
+               std::optional<Point> hovered, int screenW, int screenH, bool showHelp, int brushRadius,
+               int undoCount, int redoCount, bool simPaused, float simSpeed, int saveSlot, bool showMinimap,
+               const char* inspectInfo, const char* heatmapInfo);
 
 private:
   int m_tileW = 64;
   int m_tileH = 32;
 
+  ElevationSettings m_elev{};
+
   std::array<Texture2D, 3> m_terrainTex{};
   std::array<Texture2D, 6> m_overlayTex{};
   std::array<Texture2D, 16> m_roadTex{}; // auto-tiling variants (connection mask 0..15)
 
+  // Minimap texture (one pixel per tile). This is purely a UI convenience.
+  Texture2D m_minimapTex{};
+  int m_minimapW = 0;
+  int m_minimapH = 0;
+  std::vector<Color> m_minimapPixels;
+  bool m_minimapDirty = true;
+
+  // Base world render cache (static layers baked into render textures).
+  struct BandCache {
+    RenderTexture2D rt{};
+    int sum0 = 0; // inclusive
+    int sum1 = 0; // inclusive
+    Vector2 origin{}; // world-space top-left where this texture should be drawn
+    bool dirty = true;
+  };
+
+  static constexpr int kBandSums = 8; // how many (x+y) diagonals are baked per band
+
+  bool m_useBandCache = true;
+  int m_bandMapW = 0;
+  int m_bandMapH = 0;
+  float m_bandMaxPixels = 0.0f;
+  bool m_bandCacheDirtyAll = true;
+  std::vector<BandCache> m_bands;
+
   void unloadTextures();
+
+  void unloadBaseCache();
+  void ensureBaseCache(const World& world);
+  void rebuildBaseCacheBand(const World& world, BandCache& band);
+
+  void unloadMinimap();
+  void ensureMinimapUpToDate(const World& world);
 
   Texture2D& terrain(Terrain t);
   Texture2D& overlay(Overlay o);

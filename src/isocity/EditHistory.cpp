@@ -66,7 +66,7 @@ void EditHistory::clear()
 bool EditHistory::tilesEqual(const Tile& a, const Tile& b)
 {
   return a.terrain == b.terrain && a.overlay == b.overlay && a.height == b.height && a.variation == b.variation &&
-         a.level == b.level && a.occupants == b.occupants;
+         a.level == b.level && a.occupants == b.occupants && a.district == b.district;
 }
 
 void EditHistory::beginStroke(const World& world)

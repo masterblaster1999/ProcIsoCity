@@ -1,6 +1,8 @@
 #include "isocity/Traffic.hpp"
 
+#include "isocity/FlowField.hpp"
 #include "isocity/Pathfinding.hpp"
+#include "isocity/Road.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -44,6 +46,59 @@ bool MaskUsable(const std::vector<std::uint8_t>* mask, int w, int h)
   return mask->size() == expect;
 }
 
+void BuildCongestionExtraCostMilli(const World& world, const TrafficConfig& cfg,
+                                  const std::vector<std::uint32_t>& traffic,
+                                  std::vector<int>& outExtra)
+{
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) {
+    outExtra.clear();
+    return;
+  }
+  const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+  outExtra.assign(n, 0);
+  if (traffic.size() != n) return;
+
+  const double alpha = std::max(0.0, static_cast<double>(cfg.congestionAlpha));
+  const double beta = std::max(0.0, static_cast<double>(cfg.congestionBeta));
+  if (alpha <= 0.0 || beta <= 0.0) return;
+
+  const double capScale = std::max(0.01, static_cast<double>(cfg.congestionCapacityScale));
+  const double ratioClamp = std::clamp(static_cast<double>(cfg.congestionRatioClamp), 0.5, 10.0);
+
+  // Use at least 1 so divisions are safe.
+  const int baseCap = std::max(1, cfg.roadTileCapacity);
+
+  for (std::size_t i = 0; i < n; ++i) {
+    const std::uint32_t v = traffic[i];
+    if (v == 0) continue;
+    const int x = static_cast<int>(i % static_cast<std::size_t>(w));
+    const int y = static_cast<int>(i / static_cast<std::size_t>(w));
+    if (!world.inBounds(x, y)) continue;
+    const Tile& t = world.at(x, y);
+    if (t.overlay != Overlay::Road) continue;
+
+    const int level = static_cast<int>(t.level);
+    const int capRaw = RoadCapacityForLevel(baseCap, level);
+    const double cap = std::max(1.0, static_cast<double>(std::max(1, capRaw)) * capScale);
+
+    double ratio = static_cast<double>(v) / cap;
+    if (ratio <= 0.0) continue;
+    ratio = std::min(ratio, ratioClamp);
+
+    const double mult = alpha * std::pow(ratio, beta);
+    if (mult <= 0.0) continue;
+
+    const int baseCost = RoadTravelTimeMilliForLevel(level);
+    const double extraD = static_cast<double>(baseCost) * mult;
+    int extra = static_cast<int>(std::lround(extraD));
+    if (extra < 0) extra = 0;
+    // Keep per-tile costs bounded so int path costs stay safe.
+    extra = std::min(extra, 200000);
+    outExtra[i] = extra;
+  }
+}
 
 } // namespace
 
@@ -84,7 +139,7 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
     return HasAdjacentRoadConnectedToEdge(world, *roadToEdge, zx, zy);
   };
 
-  // --- Collect job access points (BFS sources) ---
+  // --- Collect job access points (sources) ---
   std::vector<std::uint8_t> isSource(n, 0);
   std::vector<int> sources;
   sources.reserve(n / 16);
@@ -174,102 +229,101 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
     return r;
   }
 
-  // --- Multi-source BFS on road tiles (shortest paths in road steps) ---
-  std::vector<int> dist(n, -1);
-  std::vector<int> parent(n, -1);
-  std::vector<int> queue;
-  queue.reserve(n / 2);
+  // --- Multi-pass routing / assignment ---
+  //
+  // Classic behavior: 1 pass, assign everyone on the single shortest path.
+  // Congestion-aware: multiple incremental passes with travel time penalties derived
+  // from the traffic predicted so far.
+  RoadFlowFieldConfig fcfg;
+  fcfg.requireOutsideConnection = cfg.requireOutsideConnection;
+  fcfg.computeOwner = false;
+  fcfg.useTravelTime = true;
 
-  for (int sidx : sources) {
-    if (sidx < 0 || static_cast<std::size_t>(sidx) >= n) continue;
-    dist[static_cast<std::size_t>(sidx)] = 0;
-    parent[static_cast<std::size_t>(sidx)] = -1;
-    queue.push_back(sidx);
-  }
+  const bool useCongestion = cfg.congestionAwareRouting && cfg.congestionIterations > 1 &&
+                             cfg.congestionAlpha > 0.0f && cfg.congestionBeta > 0.0f;
+  const int passes = useCongestion ? std::clamp(cfg.congestionIterations, 2, 16) : 1;
+  r.usedCongestionAwareRouting = useCongestion;
+  r.routingPasses = passes;
 
-  auto isTraversableRoad = [&](int ridx) -> bool {
-    if (ridx < 0 || static_cast<std::size_t>(ridx) >= n) return false;
-    const int x = ridx % w;
-    const int y = ridx / w;
-    if (!world.inBounds(x, y)) return false;
-    if (world.at(x, y).overlay != Overlay::Road) return false;
-    if (cfg.requireOutsideConnection) {
-      const std::size_t ui = static_cast<std::size_t>(ridx);
-      if (ui >= roadToEdge->size() || (*roadToEdge)[ui] == 0) return false;
-    }
-    return true;
-  };
+  std::vector<std::uint32_t> trafficForCost(n, 0);
+  std::vector<int> extraCost;
 
-  std::size_t head = 0;
-  while (head < queue.size()) {
-    const int idx = queue[head++];
-    const int x = idx % w;
-    const int y = idx / w;
-
-    const int dcur = dist[static_cast<std::size_t>(idx)];
-    if (dcur < 0) continue;
-
-    // Deterministic neighbor order: N, E, S, W.
-    constexpr int dirs[4][2] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}};
-    for (const auto& d : dirs) {
-      const int nx = x + d[0];
-      const int ny = y + d[1];
-      if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
-      const int nidx = ny * w + nx;
-
-      const std::size_t ui = static_cast<std::size_t>(nidx);
-      if (ui >= n) continue;
-      if (dist[ui] != -1) continue;
-
-      if (!isTraversableRoad(nidx)) continue;
-
-      dist[ui] = dcur + 1;
-      parent[ui] = idx;
-      queue.push_back(nidx);
-    }
-  }
-
-  // --- Assign commuters and accumulate traffic ---
   std::vector<std::pair<int, int>> commuteSamples;
-  commuteSamples.reserve(origins.size());
+  std::vector<std::pair<int, int>> timeSamples;
+  commuteSamples.reserve(origins.size() * static_cast<std::size_t>(passes));
+  timeSamples.reserve(origins.size() * static_cast<std::size_t>(passes));
 
   double sumDist = 0.0;
+  double sumCost = 0.0;
   int reachable = 0;
 
-  for (const Origin& o : origins) {
-    if (o.roadIdx < 0 || static_cast<std::size_t>(o.roadIdx) >= n) continue;
-    if (!isTraversableRoad(o.roadIdx)) {
-      r.unreachableCommuters += o.commuters;
-      continue;
+  constexpr double kMilli = 1000.0;
+
+  for (int pass = 0; pass < passes; ++pass) {
+    if (useCongestion) {
+      BuildCongestionExtraCostMilli(world, cfg, trafficForCost, extraCost);
+    } else {
+      extraCost.clear();
     }
 
-    const int d = dist[static_cast<std::size_t>(o.roadIdx)];
-    if (d < 0) {
-      r.unreachableCommuters += o.commuters;
-      continue;
-    }
+    const RoadFlowField field = BuildRoadFlowField(world, sources, fcfg, roadToEdge,
+                                                   useCongestion ? &extraCost : nullptr);
 
-    reachable += o.commuters;
-    sumDist += static_cast<double>(d) * static_cast<double>(o.commuters);
-    commuteSamples.emplace_back(d, o.commuters);
+    for (const Origin& o : origins) {
+      if (o.commuters <= 0) continue;
+      if (o.roadIdx < 0 || static_cast<std::size_t>(o.roadIdx) >= n) continue;
 
-    // Trace the parent pointers back to a job access point and increment traffic.
-    int cur = o.roadIdx;
-    while (cur != -1) {
-      const std::size_t ui = static_cast<std::size_t>(cur);
-      if (ui >= n) break;
-      r.roadTraffic[ui] = SatAddU16(r.roadTraffic[ui], static_cast<std::uint32_t>(o.commuters));
-      r.maxTraffic = std::max(r.maxTraffic, static_cast<int>(r.roadTraffic[ui]));
-      cur = parent[ui];
+      // Deterministic partition of each origin's commuters across passes.
+      const int a = (o.commuters * pass) / passes;
+      const int b = (o.commuters * (pass + 1)) / passes;
+      const int chunk = b - a;
+      if (chunk <= 0) continue;
+
+      if (static_cast<std::size_t>(o.roadIdx) >= field.dist.size() ||
+          static_cast<std::size_t>(o.roadIdx) >= field.cost.size()) {
+        r.unreachableCommuters += chunk;
+        continue;
+      }
+
+      const std::size_t uo = static_cast<std::size_t>(o.roadIdx);
+      const int d = field.dist[uo];
+      const int c = field.cost[uo];
+
+      if (d < 0 || c < 0) {
+        r.unreachableCommuters += chunk;
+        continue;
+      }
+
+      reachable += chunk;
+      sumDist += static_cast<double>(d) * static_cast<double>(chunk);
+      sumCost += static_cast<double>(c) * static_cast<double>(chunk);
+      commuteSamples.emplace_back(d, chunk);
+      timeSamples.emplace_back(c, chunk);
+
+      // Trace the parent pointers back to a job access point and increment traffic.
+      int cur = o.roadIdx;
+      int guard = 0;
+      while (cur != -1 && guard++ < static_cast<int>(n) + 8) {
+        const std::size_t ui = static_cast<std::size_t>(cur);
+        if (ui >= n) break;
+        r.roadTraffic[ui] = SatAddU16(r.roadTraffic[ui], static_cast<std::uint32_t>(chunk));
+        trafficForCost[ui] += static_cast<std::uint32_t>(chunk);
+        cur = field.parent[ui];
+      }
     }
   }
 
   r.reachableCommuters = reachable;
+  // Compute max after assignment so it reflects the final heatmap.
+  for (std::size_t i = 0; i < n; ++i) {
+    r.maxTraffic = std::max(r.maxTraffic, static_cast<int>(r.roadTraffic[i]));
+  }
 
   if (reachable > 0) {
     r.avgCommute = static_cast<float>(sumDist / static_cast<double>(reachable));
+    r.avgCommuteTime = static_cast<float>((sumCost / static_cast<double>(reachable)) / kMilli);
 
-    // Weighted 95th percentile.
+    // Weighted 95th percentile (steps).
     std::sort(commuteSamples.begin(), commuteSamples.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
     const int target = static_cast<int>(std::ceil(static_cast<double>(reachable) * 0.95));
@@ -281,20 +335,38 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
       if (accum >= target) break;
     }
     r.p95Commute = static_cast<float>(p95);
+
+    // Weighted 95th percentile (travel time).
+    std::sort(timeSamples.begin(), timeSamples.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    accum = 0;
+    int p95Cost = 0;
+    for (const auto& s : timeSamples) {
+      accum += s.second;
+      p95Cost = s.first;
+      if (accum >= target) break;
+    }
+    r.p95CommuteTime = static_cast<float>(static_cast<double>(p95Cost) / kMilli);
   }
 
   // Congestion metric.
-  const int cap = std::max(0, cfg.roadTileCapacity);
+  //
+  // Capacity is road-class dependent: upgraded roads can carry more commuters before
+  // being considered congested.
+  const int baseCap = cfg.roadTileCapacity;
   std::uint64_t totalTraffic = 0;
   std::uint64_t over = 0;
 
-  if (cap > 0) {
+  if (baseCap > 0) {
     for (std::size_t i = 0; i < n; ++i) {
       const std::uint32_t tv = static_cast<std::uint32_t>(r.roadTraffic[i]);
       if (tv == 0) continue;
       totalTraffic += tv;
-      if (tv > static_cast<std::uint32_t>(cap)) {
-        over += (tv - static_cast<std::uint32_t>(cap));
+      const int rx = static_cast<int>(i % static_cast<std::size_t>(w));
+      const int ry = static_cast<int>(i / static_cast<std::size_t>(w));
+      const int cap = RoadCapacityForLevel(baseCap, static_cast<int>(world.at(rx, ry).level));
+      if (tv > static_cast<std::uint32_t>(std::max(0, cap))) {
+        over += (tv - static_cast<std::uint32_t>(std::max(0, cap)));
         r.congestedRoadTiles += 1;
       }
     }

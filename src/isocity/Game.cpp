@@ -2,11 +2,15 @@
 
 #include "isocity/Pathfinding.hpp"
 #include "isocity/Random.hpp"
+#include "isocity/Road.hpp"
 #include "isocity/SaveLoad.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 
 namespace isocity {
@@ -16,6 +20,30 @@ namespace {
 constexpr const char* kLegacyQuickSavePath = "isocity_save.bin";
 constexpr int kSaveSlotMin = 1;
 constexpr int kSaveSlotMax = 5;
+
+// Autosaves rotate through a separate set of slots.
+constexpr int kAutosaveSlotMin = 1;
+constexpr int kAutosaveSlotMax = 3;
+constexpr float kAutosaveIntervalSec = 60.0f;
+
+// --- Vehicle micro-sim tuning ---
+constexpr int kMaxCommuteVehicles = 160;
+constexpr int kMaxGoodsVehicles = 120;
+constexpr int kCommutersPerCar = 40; // how many commuters one visible car represents
+constexpr int kGoodsPerTruck = 80;   // goods units represented by one visible truck
+constexpr int kMaxSpawnPerFrame = 2;
+
+inline float Rand01(std::uint64_t& state)
+{
+  // 24-bit mantissa float in [0,1)
+  const std::uint64_t u = SplitMix64Next(state);
+  return static_cast<float>((u >> 40) & 0x00FFFFFFu) / 16777216.0f;
+}
+
+inline float RandRange(std::uint64_t& state, float a, float b)
+{
+  return a + (b - a) * Rand01(state);
+}
 
 // Discrete sim speed presets (dt multiplier).
 constexpr float kSimSpeeds[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f, 16.0f};
@@ -32,6 +60,26 @@ std::string Game::savePathForSlot(int slot) const
   return std::string(buf);
 }
 
+std::string Game::autosavePathForSlot(int slot) const
+{
+  const int s = std::clamp(slot, kAutosaveSlotMin, kAutosaveSlotMax);
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "isocity_autosave_slot%d.bin", s);
+  return std::string(buf);
+}
+
+std::string Game::thumbPathForSavePath(const std::string& savePath) const
+{
+  // Convert "*.bin" -> "*.png" (thumbnail image).
+  std::string p = savePath;
+  const std::size_t dot = p.find_last_of('.');
+  if (dot != std::string::npos) {
+    p = p.substr(0, dot);
+  }
+  p += ".png";
+  return p;
+}
+
 void Game::cycleSaveSlot(int delta)
 {
   const int range = (kSaveSlotMax - kSaveSlotMin + 1);
@@ -41,6 +89,111 @@ void Game::cycleSaveSlot(int delta)
   while (s < kSaveSlotMin) s += range;
   while (s > kSaveSlotMax) s -= range;
   m_saveSlot = s;
+}
+
+bool Game::saveToPath(const std::string& path, bool makeThumbnail, const char* toastLabel)
+{
+  endPaintStroke();
+
+  std::string err;
+  if (!SaveWorldBinary(m_world, m_procCfg, m_sim.config(), path, err)) {
+    showToast(std::string("Save failed: ") + err, 4.0f);
+    return false;
+  }
+
+  if (makeThumbnail) {
+    const std::string thumb = thumbPathForSavePath(path);
+    // Best effort: do not fail the save if thumbnail export fails.
+    (void)m_renderer.exportMinimapThumbnail(m_world, thumb.c_str(), 256);
+  }
+
+  if (toastLabel) {
+    showToast(TextFormat("Saved: %s", toastLabel));
+  } else {
+    showToast(TextFormat("Saved: %s", path.c_str()));
+  }
+
+  // If the slot browser is open, refresh it so metadata/thumbnails update.
+  if (m_showSaveMenu) refreshSaveMenu();
+  return true;
+}
+
+bool Game::loadFromPath(const std::string& path, const char* toastLabel)
+{
+  endPaintStroke();
+
+  std::string err;
+  World loaded;
+  ProcGenConfig loadedProcCfg{};
+  SimConfig loadedSimCfg{};
+
+  if (!LoadWorldBinary(loaded, loadedProcCfg, loadedSimCfg, path, err)) {
+    showToast(std::string("Load failed: ") + err, 4.0f);
+    return false;
+  }
+
+  m_world = std::move(loaded);
+  m_procCfg = loadedProcCfg;
+  m_sim.config() = loadedSimCfg;
+  m_sim.resetTimer();
+
+  m_renderer.markMinimapDirty();
+  m_renderer.markBaseCacheDirtyAll();
+  m_roadGraphDirty = true;
+  m_trafficDirty = true;
+  m_goodsDirty = true;
+  m_landValueDirty = true;
+  m_vehiclesDirty = true;
+  m_vehicles.clear();
+
+  // Deterministic vehicle RNG seed per world seed.
+  m_vehicleRngState = (m_world.seed() ^ 0x9E3779B97F4A7C15ULL);
+
+  // Loading invalidates history.
+  m_history.clear();
+  m_painting = false;
+
+  // Loaded world invalidates inspect selection/debug overlays.
+  m_inspectSelected.reset();
+  m_inspectPath.clear();
+  m_inspectPathCost = 0;
+  m_inspectInfo.clear();
+
+  // Loaded world invalidates any road-drag preview.
+  m_roadDragActive = false;
+  m_roadDragStart.reset();
+  m_roadDragEnd.reset();
+  m_roadDragPath.clear();
+  m_roadDragBuildCost = 0;
+  m_roadDragUpgradeTiles = 0;
+  m_roadDragMoneyCost = 0;
+  m_roadDragValid = false;
+
+  // Keep config in sync with loaded world, so regen & camera recenter behave.
+  m_cfg.mapWidth = m_world.width();
+  m_cfg.mapHeight = m_world.height();
+  m_cfg.seed = m_world.seed();
+
+  m_renderer.rebuildTextures(m_cfg.seed);
+  SetWindowTitle(TextFormat("ProcIsoCity  |  seed: %llu", static_cast<unsigned long long>(m_cfg.seed)));
+
+  // Recenter camera on loaded map.
+  m_camera.target = TileToWorldCenterElevated(m_world, m_cfg.mapWidth / 2, m_cfg.mapHeight / 2,
+                                              static_cast<float>(m_cfg.tileWidth),
+                                              static_cast<float>(m_cfg.tileHeight), m_elev);
+
+  m_sim.refreshDerivedStats(m_world);
+  clearHistory();
+  recordHistorySample(m_world.stats());
+
+  if (toastLabel) {
+    showToast(TextFormat("Loaded: %s", toastLabel));
+  } else {
+    showToast(TextFormat("Loaded: %s", path.c_str()));
+  }
+
+  if (m_showSaveMenu) refreshSaveMenu();
+  return true;
 }
 
 RaylibContext::RaylibContext(int w, int h, const char* title, bool vsync)
@@ -54,6 +207,11 @@ RaylibContext::RaylibContext(int w, int h, const char* title, bool vsync)
 
 RaylibContext::~RaylibContext() { CloseWindow(); }
 
+Game::~Game()
+{
+  unloadSaveMenuThumbnails();
+}
+
 Game::Game(Config cfg)
     : m_cfg(cfg)
     , m_rl(cfg.windowWidth, cfg.windowHeight, "ProcIsoCity", cfg.vsync)
@@ -61,6 +219,13 @@ Game::Game(Config cfg)
     , m_sim(SimConfig{})
     , m_renderer(cfg.tileWidth, cfg.tileHeight, cfg.seed)
 {
+  // Elevation settings derived from config.
+  m_elevDefault.maxPixels = static_cast<float>(m_cfg.tileHeight) * std::max(0.0f, m_cfg.elevationScale);
+  m_elevDefault.quantizeSteps = std::max(0, m_cfg.elevationSteps);
+  m_elevDefault.flattenWater = true;
+  m_elev = m_elevDefault;
+  m_renderer.setElevationSettings(m_elev);
+
   resetWorld(m_cfg.seed);
 
   // Camera
@@ -68,9 +233,9 @@ Game::Game(Config cfg)
   m_camera.rotation = 0.0f;
   m_camera.offset = Vector2{m_cfg.windowWidth * 0.5f, m_cfg.windowHeight * 0.5f};
 
-  const Vector2 center =
-      TileToWorldCenter(m_cfg.mapWidth / 2, m_cfg.mapHeight / 2, static_cast<float>(m_cfg.tileWidth),
-                        static_cast<float>(m_cfg.tileHeight));
+  const Vector2 center = TileToWorldCenterElevated(
+      m_world, m_cfg.mapWidth / 2, m_cfg.mapHeight / 2, static_cast<float>(m_cfg.tileWidth),
+      static_cast<float>(m_cfg.tileHeight), m_elev);
   m_camera.target = center;
 }
 
@@ -80,9 +245,817 @@ void Game::showToast(const std::string& msg, float seconds)
   m_toastTimer = std::max(0.0f, seconds);
 }
 
+
+void Game::clearHistory()
+{
+  m_cityHistory.clear();
+}
+
+void Game::recordHistorySample(const Stats& s)
+{
+  // Avoid recording duplicate days (can happen when resetting/loading).
+  if (!m_cityHistory.empty() && m_cityHistory.back().day == s.day) return;
+
+  CityHistorySample hs{};
+  hs.day = s.day;
+  hs.population = s.population;
+  hs.money = s.money;
+  hs.happiness = s.happiness;
+  hs.demandResidential = s.demandResidential;
+  hs.avgLandValue = s.avgLandValue;
+  hs.avgTaxPerCapita = s.avgTaxPerCapita;
+  hs.income = s.income;
+  hs.expenses = s.expenses;
+  hs.taxRevenue = s.taxRevenue;
+  hs.maintenanceCost = s.maintenanceCost;
+  hs.commuters = s.commuters;
+  hs.avgCommute = s.avgCommute;
+  hs.avgCommuteTime = s.avgCommuteTime;
+  hs.trafficCongestion = s.trafficCongestion;
+  hs.goodsSatisfaction = s.goodsSatisfaction;
+
+  m_cityHistory.push_back(hs);
+
+  // Keep a bounded history window (simple ring behavior).
+  const int maxDays = std::max(16, m_cityHistoryMax);
+  while (static_cast<int>(m_cityHistory.size()) > maxDays) {
+    m_cityHistory.erase(m_cityHistory.begin());
+  }
+}
+
+void Game::unloadSaveMenuThumbnails()
+{
+  auto unloadVec = [&](std::vector<SaveMenuSlot>& v) {
+    for (SaveMenuSlot& e : v) {
+      if (e.thumbLoaded && e.thumb.id != 0) {
+        UnloadTexture(e.thumb);
+      }
+      e.thumb = Texture2D{};
+      e.thumbLoaded = false;
+    }
+  };
+
+  unloadVec(m_saveMenuManual);
+  unloadVec(m_saveMenuAutos);
+}
+
+void Game::refreshSaveMenu()
+{
+  namespace fs = std::filesystem;
+
+  unloadSaveMenuThumbnails();
+  m_saveMenuManual.clear();
+  m_saveMenuAutos.clear();
+
+  auto ageTextForPath = [&](const std::string& path) -> std::string {
+    std::error_code ec;
+    const fs::file_time_type ft = fs::last_write_time(fs::path(path), ec);
+    if (ec) return std::string("(unknown time)");
+
+    const auto now = fs::file_time_type::clock::now();
+    auto d = (now >= ft) ? (now - ft) : (ft - now);
+    const auto sec = std::chrono::duration_cast<std::chrono::seconds>(d).count();
+    if (sec < 60) return std::string("just now");
+    if (sec < 3600) {
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "%lldm ago", static_cast<long long>(sec / 60));
+      return std::string(buf);
+    }
+    if (sec < 86400) {
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "%lldh ago", static_cast<long long>(sec / 3600));
+      return std::string(buf);
+    }
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%lldd ago", static_cast<long long>(sec / 86400));
+    return std::string(buf);
+  };
+
+  auto fill = [&](std::vector<SaveMenuSlot>& out, bool autosave, int minSlot, int maxSlot,
+                  auto pathForSlot) {
+    for (int slot = minSlot; slot <= maxSlot; ++slot) {
+      SaveMenuSlot e;
+      e.slot = slot;
+      e.autosave = autosave;
+      e.path = pathForSlot(slot);
+      e.thumbPath = thumbPathForSavePath(e.path);
+
+      std::error_code ec;
+      e.exists = fs::exists(fs::path(e.path), ec) && !ec;
+
+      if (e.exists) {
+        std::string err;
+        e.summaryOk = ReadSaveSummary(e.path, e.summary, err, true);
+        e.crcChecked = e.summary.crcChecked;
+        e.crcOk = e.summary.crcOk;
+        e.timeText = ageTextForPath(e.path);
+      } else {
+        e.summaryOk = false;
+        e.timeText = std::string("(empty)");
+      }
+
+      // Load thumbnail if present.
+      if (fs::exists(fs::path(e.thumbPath), ec) && !ec) {
+        e.thumb = LoadTexture(e.thumbPath.c_str());
+        e.thumbLoaded = (e.thumb.id != 0);
+      }
+
+      out.push_back(std::move(e));
+    }
+  };
+
+  fill(m_saveMenuManual, false, kSaveSlotMin, kSaveSlotMax, [&](int s) { return savePathForSlot(s); });
+  fill(m_saveMenuAutos, true, kAutosaveSlotMin, kAutosaveSlotMax, [&](int s) { return autosavePathForSlot(s); });
+
+  // Clamp selection indices.
+  const int manualCount = static_cast<int>(m_saveMenuManual.size());
+  const int autoCount = static_cast<int>(m_saveMenuAutos.size());
+  if (m_saveMenuGroup == 0) {
+    m_saveMenuSelection = std::clamp(m_saveMenuSelection, 0, std::max(0, manualCount - 1));
+  } else {
+    m_saveMenuSelection = std::clamp(m_saveMenuSelection, 0, std::max(0, autoCount - 1));
+  }
+}
+
+void Game::drawSaveMenuPanel()
+{
+  if (!m_showSaveMenu) return;
+
+  const int screenW = GetScreenWidth();
+  const int screenH = GetScreenHeight();
+
+  const int panelW = 760;
+  const int panelH = 420;
+  const int x0 = (screenW - panelW) / 2;
+  const int y0 = 96;
+
+  DrawRectangle(x0, y0, panelW, panelH, Color{0, 0, 0, 200});
+  DrawRectangleLines(x0, y0, panelW, panelH, Color{255, 255, 255, 80});
+
+  int x = x0 + 12;
+  int y = y0 + 10;
+  DrawText("Save Manager", x, y, 22, RAYWHITE);
+  y += 26;
+
+  const char* tabName = (m_saveMenuGroup == 0) ? "Manual" : "Autosaves";
+  DrawText(TextFormat("Tab: switch  |  Up/Down: select  |  Enter/F9: load  |  F5: save  |  Del: delete  |  Group: %s",
+                      tabName),
+           x, y, 15, Color{220, 220, 220, 255});
+  y += 22;
+
+  const int listW = 470;
+  const int previewX = x0 + listW + 24;
+  const int previewY = y;
+  const int previewW = panelW - listW - 36;
+  const int previewH = panelH - (previewY - y0) - 14;
+
+  DrawRectangle(x0 + 12, y, listW, panelH - (y - y0) - 14, Color{0, 0, 0, 120});
+  DrawRectangleLines(x0 + 12, y, listW, panelH - (y - y0) - 14, Color{255, 255, 255, 50});
+
+  const std::vector<SaveMenuSlot>& list = (m_saveMenuGroup == 0) ? m_saveMenuManual : m_saveMenuAutos;
+  const int rows = static_cast<int>(list.size());
+  const int rowH = 52;
+  const int rowX = x0 + 18;
+  int rowY = y + 6;
+
+  for (int i = 0; i < rows; ++i) {
+    const SaveMenuSlot& e = list[static_cast<std::size_t>(i)];
+    const bool sel = (i == m_saveMenuSelection);
+    if (sel) {
+      DrawRectangle(rowX - 4, rowY - 2, listW - 12, rowH - 2, Color{255, 255, 255, 35});
+    }
+
+    const char* slotLabel = e.autosave ? "Auto" : "Slot";
+    DrawText(TextFormat("%s %d", slotLabel, e.slot), rowX, rowY, 18,
+             sel ? Color{255, 255, 255, 255} : Color{220, 220, 220, 255});
+
+    if (!e.exists) {
+      DrawText("(empty)", rowX + 90, rowY + 2, 16, Color{180, 180, 180, 255});
+    } else if (!e.summaryOk) {
+      DrawText("(unreadable)", rowX + 90, rowY + 2, 16, Color{255, 120, 120, 255});
+    } else {
+      const Stats& s = e.summary.stats;
+      DrawText(TextFormat("Day %d  Pop %d  $%d  Happy %.0f%%", s.day, s.population, s.money,
+                          static_cast<double>(s.happiness * 100.0f)),
+               rowX + 90, rowY + 2, 16, Color{210, 210, 210, 255});
+    }
+
+    // Right-aligned metadata.
+    Color meta = Color{180, 180, 180, 255};
+    if (e.crcChecked && !e.crcOk) meta = Color{255, 90, 90, 255};
+
+    const char* crcText = (e.crcChecked && !e.crcOk) ? "CORRUPT" : nullptr;
+    if (crcText) {
+      DrawText(crcText, x0 + listW - 40, rowY + 2, 14, meta);
+    }
+    DrawText(e.timeText.c_str(), x0 + listW - 140, rowY + 24, 14, meta);
+
+    rowY += rowH;
+  }
+
+  // Preview panel
+  DrawRectangle(previewX, previewY, previewW, previewH, Color{0, 0, 0, 120});
+  DrawRectangleLines(previewX, previewY, previewW, previewH, Color{255, 255, 255, 50});
+  DrawText("Preview", previewX + 8, previewY + 6, 18, RAYWHITE);
+
+  if (!list.empty()) {
+    const int idx = std::clamp(m_saveMenuSelection, 0, static_cast<int>(list.size()) - 1);
+    const SaveMenuSlot& e = list[static_cast<std::size_t>(idx)];
+
+    int py = previewY + 30;
+    DrawText(TextFormat("Path: %s", e.path.c_str()), previewX + 8, py, 14, Color{220, 220, 220, 255});
+    py += 18;
+
+    if (e.exists && e.summaryOk) {
+      const Stats& s = e.summary.stats;
+      DrawText(TextFormat("Seed: %llu", static_cast<unsigned long long>(e.summary.seed)), previewX + 8, py, 14,
+               Color{220, 220, 220, 255});
+      py += 18;
+      DrawText(TextFormat("Day %d | Pop %d | Money %d", s.day, s.population, s.money), previewX + 8, py, 14,
+               Color{220, 220, 220, 255});
+      py += 18;
+      DrawText(TextFormat("Happiness: %.0f%%", static_cast<double>(s.happiness * 100.0f)), previewX + 8, py, 14,
+               Color{220, 220, 220, 255});
+      py += 18;
+    }
+
+    if (e.thumbLoaded && e.thumb.id != 0) {
+      const int margin = 12;
+      Rectangle dst{static_cast<float>(previewX + margin), static_cast<float>(py + 8),
+                    static_cast<float>(previewW - margin * 2), static_cast<float>(previewH - (py - previewY) - 18)};
+
+      const float sx = dst.width / static_cast<float>(e.thumb.width);
+      const float sy = dst.height / static_cast<float>(e.thumb.height);
+      const float s = std::min(sx, sy);
+      const float w = static_cast<float>(e.thumb.width) * s;
+      const float h = static_cast<float>(e.thumb.height) * s;
+      const float dx = dst.x + (dst.width - w) * 0.5f;
+      const float dy = dst.y + (dst.height - h) * 0.5f;
+
+      DrawTextureEx(e.thumb, Vector2{dx, dy}, 0.0f, s, RAYWHITE);
+      DrawRectangleLinesEx(Rectangle{dx, dy, w, h}, 1, Color{255, 255, 255, 80});
+    } else {
+      DrawText("(no thumbnail)", previewX + 8, py + 18, 14, Color{180, 180, 180, 255});
+    }
+  }
+}
+
+
+namespace {
+
+inline float U32ToUnitFloat(std::uint32_t u)
+{
+  // [0,1)
+  return static_cast<float>(u) / 4294967296.0f;
+}
+
+template <typename Item>
+int PickWeightedIndex(std::uint64_t& rngState, const std::vector<Item>& items, std::uint64_t totalWeight,
+                      int (*getWeight)(const Item&))
+{
+  if (items.empty()) return -1;
+  if (totalWeight == 0) return -1;
+
+  const std::uint64_t r = SplitMix64Next(rngState) % totalWeight;
+  std::uint64_t acc = 0;
+  for (int i = 0; i < static_cast<int>(items.size()); ++i) {
+    const int w = std::max(0, getWeight(items[static_cast<std::size_t>(i)]));
+    acc += static_cast<std::uint64_t>(w);
+    if (r < acc) return i;
+  }
+  return static_cast<int>(items.size()) - 1;
+}
+
+bool BuildPathFollowingParents(int startRoadIdx, int w, int h, const std::vector<int>& parent,
+                              std::vector<Point>& outPath)
+{
+  outPath.clear();
+  if (w <= 0 || h <= 0) return false;
+  const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+  if (parent.size() != n) return false;
+  if (startRoadIdx < 0 || static_cast<std::size_t>(startRoadIdx) >= n) return false;
+
+  int cur = startRoadIdx;
+  int guard = 0;
+  while (cur != -1 && guard++ < static_cast<int>(n) + 8) {
+    const int x = cur % w;
+    const int y = cur / w;
+    outPath.push_back(Point{x, y});
+    const std::size_t ui = static_cast<std::size_t>(cur);
+    if (ui >= parent.size()) break;
+    cur = parent[ui];
+  }
+  return outPath.size() >= 2;
+}
+
+} // namespace
+
+void Game::rebuildVehiclesRoutingCache()
+{
+  m_vehiclesDirty = false;
+  m_vehicleSpawnAccum = 0.0f;
+
+  m_vehicles.clear();
+
+  m_commuteJobSources.clear();
+  m_commuteOrigins.clear();
+  m_commuteOriginWeightTotal = 0;
+  m_commuteField = RoadFlowField{};
+
+  m_goodsProducerRoads.clear();
+  m_goodsProducerSupply.clear();
+  m_goodsProducerWeightTotal = 0;
+  m_goodsProducerField = RoadFlowField{};
+
+  m_goodsConsumers.clear();
+  m_goodsConsumerWeightTotal = 0;
+
+  m_goodsEdgeSources.clear();
+  m_goodsEdgeField = RoadFlowField{};
+
+  const int w = m_world.width();
+  const int h = m_world.height();
+  if (w <= 0 || h <= 0) return;
+  const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+
+  // Outside-connection constraint mirrors the core simulation.
+  const bool requireOutside = m_sim.config().requireOutsideConnection;
+  std::vector<std::uint8_t> roadToEdgeLocal;
+  const std::vector<std::uint8_t>* roadToEdge = nullptr;
+  if (requireOutside) {
+    ComputeRoadsConnectedToEdge(m_world, roadToEdgeLocal);
+    roadToEdge = &roadToEdgeLocal;
+  }
+
+  auto isTraversableRoad = [&](int ridx) -> bool {
+    if (ridx < 0 || static_cast<std::size_t>(ridx) >= n) return false;
+    const int x = ridx % w;
+    const int y = ridx / w;
+    if (!m_world.inBounds(x, y)) return false;
+    if (m_world.at(x, y).overlay != Overlay::Road) return false;
+    if (requireOutside) {
+      if (!roadToEdge || roadToEdge->size() != n) return false;
+      if ((*roadToEdge)[static_cast<std::size_t>(ridx)] == 0) return false;
+    }
+    return true;
+  };
+
+  auto zoneHasAccess = [&](int zx, int zy) -> bool {
+    if (!m_world.hasAdjacentRoad(zx, zy)) return false;
+    if (!requireOutside) return true;
+    return roadToEdge && HasAdjacentRoadConnectedToEdge(m_world, *roadToEdge, zx, zy);
+  };
+
+  // --- Commute routing: sources are road tiles adjacent to commercial/industrial zones ---
+  std::vector<std::uint8_t> isJobSource(n, 0);
+  m_commuteJobSources.reserve(n / 16);
+
+  const int dirs[4][2] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}};
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const Tile& t = m_world.at(x, y);
+      if (t.overlay != Overlay::Commercial && t.overlay != Overlay::Industrial) continue;
+      if (!zoneHasAccess(x, y)) continue;
+
+      for (const auto& d : dirs) {
+        const int rx = x + d[0];
+        const int ry = y + d[1];
+        if (!m_world.inBounds(rx, ry)) continue;
+        if (m_world.at(rx, ry).overlay != Overlay::Road) continue;
+        const int ridx = ry * w + rx;
+        if (requireOutside && roadToEdge && roadToEdge->size() == n) {
+          if ((*roadToEdge)[static_cast<std::size_t>(ridx)] == 0) continue;
+        }
+        const std::size_t ui = static_cast<std::size_t>(ridx);
+        if (ui >= isJobSource.size()) continue;
+        if (isJobSource[ui]) continue;
+        isJobSource[ui] = 1;
+        m_commuteJobSources.push_back(ridx);
+      }
+    }
+  }
+
+  RoadFlowFieldConfig commuteCfg;
+  commuteCfg.requireOutsideConnection = requireOutside;
+  commuteCfg.computeOwner = false;
+  commuteCfg.useTravelTime = true;
+  m_commuteField = BuildRoadFlowField(m_world, m_commuteJobSources, commuteCfg, roadToEdge);
+
+  // Origins: residential zones with occupants.
+  const float employedShare = (m_world.stats().population > 0)
+                                  ? (static_cast<float>(m_world.stats().employed) /
+                                     static_cast<float>(m_world.stats().population))
+                                  : 0.0f;
+
+  const std::uint32_t seedMix = static_cast<std::uint32_t>(m_world.seed() ^ (m_world.seed() >> 32));
+  m_commuteOrigins.reserve(n / 16);
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const Tile& t = m_world.at(x, y);
+      if (t.overlay != Overlay::Residential) continue;
+      if (t.occupants == 0) continue;
+      if (!zoneHasAccess(x, y)) continue;
+
+      Point road{};
+      if (!PickAdjacentRoadTile(m_world, roadToEdge, x, y, road)) continue;
+      const int ridx = road.y * w + road.x;
+      if (!isTraversableRoad(ridx)) continue;
+
+      if (m_commuteField.dist.empty() || static_cast<std::size_t>(ridx) >= m_commuteField.dist.size()) continue;
+      if (m_commuteField.dist[static_cast<std::size_t>(ridx)] < 0) continue; // unreachable to any job
+
+      const float desired = static_cast<float>(t.occupants) * std::clamp(employedShare, 0.0f, 1.0f);
+      int commuters = static_cast<int>(std::floor(desired));
+      const float frac = desired - static_cast<float>(commuters);
+      if (frac > 0.0f) {
+        const std::uint32_t h32 = HashCoords32(x, y, seedMix);
+        if (U32ToUnitFloat(h32) < frac) commuters += 1;
+      }
+      commuters = std::clamp(commuters, 0, static_cast<int>(t.occupants));
+      if (commuters <= 0) continue;
+
+      m_commuteOrigins.emplace_back(ridx, commuters);
+      m_commuteOriginWeightTotal += static_cast<std::uint64_t>(commuters);
+    }
+  }
+
+  // --- Goods routing (mirrors the core goods model closely enough for visuals) ---
+  GoodsConfig gc;
+  gc.requireOutsideConnection = requireOutside;
+  // Keep allowImports/allowExports as defaults.
+
+  std::vector<int> supplyPerRoad(n, 0);
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const Tile& t = m_world.at(x, y);
+      if (t.overlay != Overlay::Industrial) continue;
+      if (t.level == 0) continue;
+      if (!zoneHasAccess(x, y)) continue;
+
+      Point road{};
+      if (!PickAdjacentRoadTile(m_world, roadToEdge, x, y, road)) continue;
+      const int ridx = road.y * w + road.x;
+      if (!isTraversableRoad(ridx)) continue;
+
+      const float raw = static_cast<float>(12 * std::clamp(static_cast<int>(t.level), 0, 3)) * gc.supplyScale;
+      const int supply = std::max(0, static_cast<int>(std::lround(raw)));
+      if (supply <= 0) continue;
+      supplyPerRoad[static_cast<std::size_t>(ridx)] += supply;
+    }
+  }
+
+  for (int ridx = 0; ridx < static_cast<int>(n); ++ridx) {
+    const int supply = supplyPerRoad[static_cast<std::size_t>(ridx)];
+    if (supply <= 0) continue;
+    if (!isTraversableRoad(ridx)) continue;
+    m_goodsProducerRoads.push_back(ridx);
+    m_goodsProducerSupply.push_back(supply);
+    m_goodsProducerWeightTotal += static_cast<std::uint64_t>(supply);
+  }
+
+  RoadFlowFieldConfig prodCfg;
+  prodCfg.requireOutsideConnection = requireOutside;
+  prodCfg.computeOwner = true;
+  prodCfg.useTravelTime = true;
+  m_goodsProducerField = BuildRoadFlowField(m_world, m_goodsProducerRoads, prodCfg, roadToEdge);
+
+  m_goodsConsumers.reserve(n / 16);
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const Tile& t = m_world.at(x, y);
+      if (t.overlay != Overlay::Commercial) continue;
+      if (t.level == 0) continue;
+      if (!zoneHasAccess(x, y)) continue;
+
+      const float raw = static_cast<float>(8 * std::clamp(static_cast<int>(t.level), 0, 3)) * gc.demandScale;
+      const int demand = std::max(0, static_cast<int>(std::lround(raw)));
+      if (demand <= 0) continue;
+
+      Point road{};
+      if (!PickAdjacentRoadTile(m_world, roadToEdge, x, y, road)) continue;
+      const int ridx = road.y * w + road.x;
+      if (!isTraversableRoad(ridx)) continue;
+
+      const int d = (!m_goodsProducerRoads.empty() && static_cast<std::size_t>(ridx) < m_goodsProducerField.dist.size())
+                        ? m_goodsProducerField.dist[static_cast<std::size_t>(ridx)]
+                        : -1;
+      const int own = (d >= 0 && static_cast<std::size_t>(ridx) < m_goodsProducerField.owner.size())
+                          ? m_goodsProducerField.owner[static_cast<std::size_t>(ridx)]
+                          : -1;
+
+      m_goodsConsumers.push_back(GoodsConsumerLite{ridx, demand, d, own});
+      m_goodsConsumerWeightTotal += static_cast<std::uint64_t>(demand);
+    }
+  }
+
+  // Edge routing (imports/exports) uses border roads as sources.
+  m_goodsEdgeSources.reserve(static_cast<std::size_t>(w + h) * 2u);
+  auto pushEdge = [&](int ex, int ey) {
+    const int ridx = ey * w + ex;
+    if (!isTraversableRoad(ridx)) return;
+    m_goodsEdgeSources.push_back(ridx);
+  };
+
+  for (int x = 0; x < w; ++x) {
+    pushEdge(x, 0);
+    if (h > 1) pushEdge(x, h - 1);
+  }
+  for (int y = 1; y < h - 1; ++y) {
+    pushEdge(0, y);
+    if (w > 1) pushEdge(w - 1, y);
+  }
+
+  if (gc.allowImports || gc.allowExports) {
+    RoadFlowFieldConfig edgeCfg;
+    edgeCfg.requireOutsideConnection = requireOutside;
+    edgeCfg.computeOwner = false;
+    edgeCfg.useTravelTime = true;
+    m_goodsEdgeField = BuildRoadFlowField(m_world, m_goodsEdgeSources, edgeCfg, roadToEdge);
+  }
+}
+
+void Game::updateVehicles(float dt)
+{
+  if (!m_showVehicles) return;
+
+  if (m_vehiclesDirty) {
+    rebuildVehiclesRoutingCache();
+  }
+
+  // --- Integrate movement ---
+  if (dt > 0.0f) {
+    std::vector<Vehicle> alive;
+    alive.reserve(m_vehicles.size());
+
+    for (Vehicle& v : m_vehicles) {
+      if (v.path.size() < 2) continue;
+
+      const float maxS = static_cast<float>(static_cast<int>(v.path.size()) - 1);
+      v.s += v.dir * v.speed * dt;
+
+      bool keep = true;
+      if (v.s >= maxS) {
+        v.s = maxS;
+        if (v.kind == VehicleKind::Commute && v.turnsRemaining > 0) {
+          v.dir = -1.0f;
+          v.turnsRemaining -= 1;
+        } else {
+          keep = false;
+        }
+      } else if (v.s <= 0.0f) {
+        v.s = 0.0f;
+        // Commute vehicles despawn when they return to the origin.
+        if (v.kind == VehicleKind::Commute && v.dir < 0.0f) {
+          keep = false;
+        }
+      }
+
+      if (keep) alive.push_back(std::move(v));
+    }
+
+    m_vehicles.swap(alive);
+  }
+
+  // Don't spawn while paused / painting (dt==0).
+  if (dt <= 0.0f) return;
+
+  // --- Targets ---
+  int targetCommute = std::clamp(m_world.stats().commuters / kCommutersPerCar, 0, kMaxCommuteVehicles);
+  int targetGoods = std::clamp((m_world.stats().goodsDelivered + m_world.stats().goodsExported) / kGoodsPerTruck,
+                               0, kMaxGoodsVehicles);
+
+  if (m_commuteJobSources.empty() || m_commuteOrigins.empty()) targetCommute = 0;
+  if (m_goodsConsumers.empty()) targetGoods = 0;
+
+  int curCommute = 0;
+  int curGoods = 0;
+  for (const Vehicle& v : m_vehicles) {
+    if (v.kind == VehicleKind::Commute)
+      ++curCommute;
+    else
+      ++curGoods;
+  }
+
+  auto makeVehicle = [&](VehicleKind kind, std::vector<Point>&& path, float baseSpeed, int turns) {
+    Vehicle v;
+    v.kind = kind;
+    v.path = std::move(path);
+    v.s = 0.0f;
+    v.dir = 1.0f;
+    v.speed = std::max(0.5f, baseSpeed + RandRange(m_vehicleRngState, -0.75f, 0.75f));
+    v.laneOffset = RandRange(m_vehicleRngState, -5.0f, 5.0f);
+    v.turnsRemaining = turns;
+    m_vehicles.push_back(std::move(v));
+  };
+
+  auto speedMultForPath = [&](const std::vector<Point>& path) -> float {
+    float sum = 0.0f;
+    int count = 0;
+    for (const Point& p : path) {
+      if (!m_world.inBounds(p.x, p.y)) continue;
+      const Tile& t = m_world.at(p.x, p.y);
+      if (t.overlay != Overlay::Road) continue;
+      sum += RoadSpeedMultiplierForLevel(static_cast<int>(t.level));
+      ++count;
+    }
+    return (count > 0) ? (sum / static_cast<float>(count)) : 1.0f;
+  };
+
+  auto getOriginWeight = [](const std::pair<int, int>& p) -> int { return p.second; };
+  auto getConsumerWeight = [](const GoodsConsumerLite& c) -> int { return c.demand; };
+  auto getProducerWeight = [&](const int& roadIdx) -> int {
+    (void)roadIdx;
+    return 1;
+  };
+
+  auto spawnCommute = [&]() -> bool {
+    if (m_commuteOrigins.empty()) return false;
+    if (m_commuteField.dist.empty() || m_commuteField.parent.empty()) return false;
+
+    const int idx = PickWeightedIndex(m_vehicleRngState, m_commuteOrigins, m_commuteOriginWeightTotal, getOriginWeight);
+    if (idx < 0 || idx >= static_cast<int>(m_commuteOrigins.size())) return false;
+
+    const int start = m_commuteOrigins[static_cast<std::size_t>(idx)].first;
+    if (start < 0 || static_cast<std::size_t>(start) >= m_commuteField.dist.size()) return false;
+    if (m_commuteField.dist[static_cast<std::size_t>(start)] < 0) return false;
+
+    std::vector<Point> path;
+    if (!BuildPathFollowingParents(start, m_commuteField.w, m_commuteField.h, m_commuteField.parent, path)) return false;
+
+    const float baseSpeed = 7.5f * speedMultForPath(path);
+    makeVehicle(VehicleKind::Commute, std::move(path), baseSpeed, 1);
+    return true;
+  };
+
+  auto spawnGoods = [&]() -> bool {
+    const int delivered = std::max(0, m_world.stats().goodsDelivered);
+    const int imported = std::max(0, m_world.stats().goodsImported);
+    const int exported = std::max(0, m_world.stats().goodsExported);
+    const int goodsTotal = delivered + exported;
+    if (goodsTotal <= 0) return false;
+
+    const float exportFrac = (goodsTotal > 0) ? (static_cast<float>(exported) / static_cast<float>(goodsTotal)) : 0.0f;
+    const float importFrac = (delivered > 0) ? (static_cast<float>(imported) / static_cast<float>(delivered)) : 0.0f;
+
+    const bool wantExport = (Rand01(m_vehicleRngState) < exportFrac);
+
+    // Export: producer -> edge.
+    if (wantExport) {
+      if (m_goodsProducerRoads.empty()) return false;
+      if (m_goodsEdgeField.parent.empty() || m_goodsEdgeField.dist.empty()) return false;
+
+      // Pick producer weighted by supply.
+      if (m_goodsProducerSupply.size() != m_goodsProducerRoads.size() || m_goodsProducerWeightTotal == 0) return false;
+      // Build a temporary view of producer indices for weighted picking.
+      struct ProducerRef { int idx; int w; };
+      std::vector<ProducerRef> refs;
+      refs.reserve(m_goodsProducerRoads.size());
+      for (int i = 0; i < static_cast<int>(m_goodsProducerRoads.size()); ++i) {
+        refs.push_back(ProducerRef{i, m_goodsProducerSupply[static_cast<std::size_t>(i)]});
+      }
+      auto getW = [](const ProducerRef& r) -> int { return r.w; };
+      const int pi = PickWeightedIndex(m_vehicleRngState, refs, m_goodsProducerWeightTotal, getW);
+      if (pi < 0 || pi >= static_cast<int>(refs.size())) return false;
+      const int pidx = refs[static_cast<std::size_t>(pi)].idx;
+      if (pidx < 0 || pidx >= static_cast<int>(m_goodsProducerRoads.size())) return false;
+      const int start = m_goodsProducerRoads[static_cast<std::size_t>(pidx)];
+      if (start < 0 || static_cast<std::size_t>(start) >= m_goodsEdgeField.dist.size()) return false;
+      if (m_goodsEdgeField.dist[static_cast<std::size_t>(start)] < 0) return false;
+
+      std::vector<Point> path;
+      if (!BuildPathFollowingParents(start, m_goodsEdgeField.w, m_goodsEdgeField.h, m_goodsEdgeField.parent, path)) return false;
+      const float baseSpeed = 5.5f * speedMultForPath(path);
+      makeVehicle(VehicleKind::GoodsExport, std::move(path), baseSpeed, 0);
+      return true;
+    }
+
+    // Delivery: (producer or edge) -> consumer.
+    if (m_goodsConsumers.empty()) return false;
+    const int ci = PickWeightedIndex(m_vehicleRngState, m_goodsConsumers, m_goodsConsumerWeightTotal, getConsumerWeight);
+    if (ci < 0 || ci >= static_cast<int>(m_goodsConsumers.size())) return false;
+    const GoodsConsumerLite& c = m_goodsConsumers[static_cast<std::size_t>(ci)];
+    if (c.roadIdx < 0) return false;
+
+    const bool preferImport = (Rand01(m_vehicleRngState) < importFrac);
+
+    auto tryImport = [&]() -> bool {
+      if (m_goodsEdgeField.parent.empty() || m_goodsEdgeField.dist.empty()) return false;
+      if (static_cast<std::size_t>(c.roadIdx) >= m_goodsEdgeField.dist.size()) return false;
+      if (m_goodsEdgeField.dist[static_cast<std::size_t>(c.roadIdx)] < 0) return false;
+      std::vector<Point> path;
+      if (!BuildPathFollowingParents(c.roadIdx, m_goodsEdgeField.w, m_goodsEdgeField.h, m_goodsEdgeField.parent, path)) return false;
+      std::reverse(path.begin(), path.end());
+      const float baseSpeed = 5.0f * speedMultForPath(path);
+      makeVehicle(VehicleKind::GoodsImport, std::move(path), baseSpeed, 0);
+      return true;
+    };
+
+    auto tryLocal = [&]() -> bool {
+      if (m_goodsProducerRoads.empty()) return false;
+      if (m_goodsProducerField.parent.empty() || m_goodsProducerField.dist.empty() || m_goodsProducerField.owner.empty()) return false;
+      if (static_cast<std::size_t>(c.roadIdx) >= m_goodsProducerField.dist.size()) return false;
+      if (m_goodsProducerField.dist[static_cast<std::size_t>(c.roadIdx)] < 0) return false;
+      const int own = m_goodsProducerField.owner[static_cast<std::size_t>(c.roadIdx)];
+      if (own < 0 || own >= static_cast<int>(m_goodsProducerRoads.size())) return false;
+
+      std::vector<Point> path;
+      if (!BuildPathFollowingParents(c.roadIdx, m_goodsProducerField.w, m_goodsProducerField.h, m_goodsProducerField.parent, path)) return false;
+      std::reverse(path.begin(), path.end());
+      const float baseSpeed = 5.2f * speedMultForPath(path);
+      makeVehicle(VehicleKind::GoodsDelivery, std::move(path), baseSpeed, 0);
+      return true;
+    };
+
+    if (preferImport) {
+      if (tryImport()) return true;
+      return tryLocal();
+    }
+
+    if (tryLocal()) return true;
+    return tryImport();
+  };
+
+  int spawnBudget = kMaxSpawnPerFrame;
+
+  while (spawnBudget > 0 && curCommute < targetCommute) {
+    if (!spawnCommute()) break;
+    ++curCommute;
+    --spawnBudget;
+  }
+
+  while (spawnBudget > 0 && curGoods < targetGoods) {
+    if (!spawnGoods()) break;
+    ++curGoods;
+    --spawnBudget;
+  }
+}
+
+void Game::drawVehicles()
+{
+  if (!m_showVehicles) return;
+  if (m_vehicles.empty()) return;
+
+  BeginMode2D(m_camera);
+
+  const float zoom = std::max(0.25f, m_camera.zoom);
+  const float carR = 2.4f / zoom;
+  const float truckW = 7.0f / zoom;
+  const float truckH = 4.2f / zoom;
+
+  for (const Vehicle& v : m_vehicles) {
+    if (v.path.size() < 2) continue;
+    const float maxS = static_cast<float>(static_cast<int>(v.path.size()) - 1);
+    const float s = std::clamp(v.s, 0.0f, maxS);
+    int seg = static_cast<int>(std::floor(s));
+    float t = s - static_cast<float>(seg);
+    if (seg >= static_cast<int>(v.path.size()) - 1) {
+      seg = static_cast<int>(v.path.size()) - 2;
+      t = 1.0f;
+    }
+
+    const Point a = v.path[static_cast<std::size_t>(seg)];
+    const Point b = v.path[static_cast<std::size_t>(seg + 1)];
+
+    const Vector2 wa = TileToWorldCenterElevated(m_world, a.x, a.y, static_cast<float>(m_cfg.tileWidth),
+                                                 static_cast<float>(m_cfg.tileHeight), m_elev);
+    const Vector2 wb = TileToWorldCenterElevated(m_world, b.x, b.y, static_cast<float>(m_cfg.tileWidth),
+                                                 static_cast<float>(m_cfg.tileHeight), m_elev);
+
+    Vector2 pos{wa.x + (wb.x - wa.x) * t, wa.y + (wb.y - wa.y) * t};
+    Vector2 dir{wb.x - wa.x, wb.y - wa.y};
+    const float len = std::sqrt(dir.x * dir.x + dir.y * dir.y);
+    if (len > 1e-3f) {
+      const Vector2 nrm{-dir.y / len, dir.x / len};
+      const float off = (v.laneOffset / zoom);
+      pos.x += nrm.x * off;
+      pos.y += nrm.y * off;
+    }
+
+    Color col = Color{255, 255, 255, 200};
+    switch (v.kind) {
+    case VehicleKind::Commute: col = Color{245, 245, 245, 200}; break;
+    case VehicleKind::GoodsDelivery: col = Color{255, 190, 80, 200}; break;
+    case VehicleKind::GoodsImport: col = Color{110, 190, 255, 200}; break;
+    case VehicleKind::GoodsExport: col = Color{255, 110, 200, 200}; break;
+    }
+
+    if (v.kind == VehicleKind::Commute) {
+      DrawCircleV(pos, carR, col);
+    } else {
+      DrawRectangleV(Vector2{pos.x - truckW * 0.5f, pos.y - truckH * 0.5f}, Vector2{truckW, truckH}, col);
+    }
+  }
+
+  EndMode2D();
+}
+
 void Game::applyToolBrush(int centerX, int centerY)
 {
   if (m_tool == Tool::Inspect) return;
+
+  // Terrain editing (Raise/Lower/Smooth) uses modifier keys for strength.
+  const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+  const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
 
   const int r = std::max(0, m_brushRadius);
   for (int dy = -r; dy <= r; ++dy) {
@@ -113,27 +1086,135 @@ void Game::applyToolBrush(int centerX, int centerY)
       // Road auto-tiling masks are fixed up locally by EditHistory (undo/redo) so it's
       // sufficient to track the edited tile itself.
       const Overlay beforeOverlay = m_world.at(tx, ty).overlay;
+      const Terrain beforeTerrain = m_world.at(tx, ty).terrain;
+      const float beforeHeight = m_world.at(tx, ty).height;
       m_history.noteTilePreEdit(m_world, tx, ty);
 
-      const ToolApplyResult res = m_world.applyTool(m_tool, tx, ty);
-      switch (res) {
-      case ToolApplyResult::InsufficientFunds: m_strokeFeedback.noMoney = true; break;
-      case ToolApplyResult::BlockedNoRoad: m_strokeFeedback.noRoad = true; break;
-      case ToolApplyResult::BlockedWater: m_strokeFeedback.water = true; break;
-      case ToolApplyResult::BlockedOccupied: m_strokeFeedback.occupied = true; break;
-      default: break;
-      }
+      bool applied = false;
+      ToolApplyResult res = ToolApplyResult::Noop;
 
-      // Mark cached road graph dirty when road topology changes.
-      if (res == ToolApplyResult::Applied) {
-        // Traffic depends on roads + zones + occupancy.
-        m_trafficDirty = true;
-        // Goods logistics depend on roads + industrial/commercial zoning.
-        m_goodsDirty = true;
+      // --- Terraforming tools are handled at the game layer (they need ProcGenConfig thresholds). ---
+      if (m_tool == Tool::RaiseTerrain || m_tool == Tool::LowerTerrain || m_tool == Tool::SmoothTerrain) {
+        Tile& t = m_world.at(tx, ty);
 
-        if (m_tool == Tool::Road || (m_tool == Tool::Bulldoze && beforeOverlay == Overlay::Road)) {
+        auto classifyTerrain = [&](float h) -> Terrain {
+          const float wl = std::clamp(m_procCfg.waterLevel, 0.0f, 1.0f);
+          const float sl = std::clamp(m_procCfg.sandLevel, 0.0f, 1.0f);
+          if (h < wl) return Terrain::Water;
+          if (h < std::max(wl, sl)) return Terrain::Sand;
+          return Terrain::Grass;
+        };
+
+        // Strength modifiers:
+        //  - default: medium
+        //  - Shift: stronger
+        //  - Ctrl: finer
+        float delta = 0.05f;
+        if (shift) delta = 0.10f;
+        if (ctrl) delta = 0.02f;
+
+        float newH = t.height;
+        if (m_tool == Tool::RaiseTerrain) {
+          newH = std::clamp(t.height + delta, 0.0f, 1.0f);
+        } else if (m_tool == Tool::LowerTerrain) {
+          newH = std::clamp(t.height - delta, 0.0f, 1.0f);
+        } else if (m_tool == Tool::SmoothTerrain) {
+          const int w = m_world.width();
+          const int h = m_world.height();
+          const std::size_t n = static_cast<std::size_t>(w * h);
+          if (w > 0 && h > 0 && m_heightSnapshot.size() == n) {
+            auto sample = [&](int sx, int sy) -> float {
+              if (sx < 0 || sy < 0 || sx >= w || sy >= h) return m_heightSnapshot[static_cast<std::size_t>(ty * w + tx)];
+              return m_heightSnapshot[static_cast<std::size_t>(sy * w + sx)];
+            };
+
+            // 3x3 neighborhood average from the snapshot so smoothing is order-independent.
+            float sum = 0.0f;
+            int count = 0;
+            for (int oy = -1; oy <= 1; ++oy) {
+              for (int ox = -1; ox <= 1; ++ox) {
+                sum += sample(tx + ox, ty + oy);
+                ++count;
+              }
+            }
+            const float avg = (count > 0) ? (sum / static_cast<float>(count)) : t.height;
+
+            float alpha = 0.5f;
+            if (shift) alpha = 0.75f;
+            if (ctrl) alpha = 0.25f;
+
+            newH = std::clamp(m_heightSnapshot[static_cast<std::size_t>(ty * w + tx)] + (avg - m_heightSnapshot[static_cast<std::size_t>(ty * w + tx)]) * alpha,
+                              0.0f, 1.0f);
+          }
+        }
+
+        // Apply height.
+        t.height = newH;
+
+        // Derive terrain from height thresholds.
+        const Terrain newTerrain = classifyTerrain(t.height);
+        if (newTerrain == Terrain::Water) {
+          // Clear overlays before switching to water so road masks can be updated cleanly.
+          if (t.overlay != Overlay::None) {
+            m_world.setOverlay(Overlay::None, tx, ty);
+          }
+          t.overlay = Overlay::None;
+          t.level = 1;
+          t.occupants = 0;
+        }
+        t.terrain = newTerrain;
+
+        const Overlay afterOverlay = t.overlay;
+        const bool overlayChanged = (afterOverlay != beforeOverlay);
+        const bool terrainChanged = (t.terrain != beforeTerrain);
+        const bool heightChanged = (t.height != beforeHeight);
+
+        applied = overlayChanged || terrainChanged || heightChanged;
+
+        if (applied) {
+          m_landValueDirty = true;
+        }
+
+        if (overlayChanged) {
+          m_trafficDirty = true;
+          m_goodsDirty = true;
+          m_vehiclesDirty = true;
+        }
+
+        // Road graph only changes if a road was added/removed.
+        if (overlayChanged && (beforeOverlay == Overlay::Road || afterOverlay == Overlay::Road)) {
           m_roadGraphDirty = true;
         }
+      } else {
+        // --- Regular tools go through World::applyTool (economy + rules). ---
+        res = (m_tool == Tool::Road) ? m_world.applyRoad(tx, ty, m_roadBuildLevel)
+                                     : m_world.applyTool(m_tool, tx, ty);
+        switch (res) {
+        case ToolApplyResult::InsufficientFunds: m_strokeFeedback.noMoney = true; break;
+        case ToolApplyResult::BlockedNoRoad: m_strokeFeedback.noRoad = true; break;
+        case ToolApplyResult::BlockedWater: m_strokeFeedback.water = true; break;
+        case ToolApplyResult::BlockedOccupied: m_strokeFeedback.occupied = true; break;
+        default: break;
+        }
+
+        applied = (res == ToolApplyResult::Applied);
+        if (applied) {
+          m_landValueDirty = true;
+          // Traffic depends on roads + zones + occupancy.
+          m_trafficDirty = true;
+          // Goods logistics depend on roads + industrial/commercial zoning.
+          m_goodsDirty = true;
+          // Moving vehicles (visualization) also depend on roads + zones + occupancy.
+          m_vehiclesDirty = true;
+
+          if (m_tool == Tool::Road || (m_tool == Tool::Bulldoze && beforeOverlay == Overlay::Road)) {
+            m_roadGraphDirty = true;
+          }
+        }
+      }
+
+      if (applied) {
+        m_tilesEditedThisStroke.push_back(Point{tx, ty});
       }
     }
   }
@@ -144,7 +1225,22 @@ void Game::beginPaintStroke()
   if (m_painting) return;
   m_painting = true;
   m_strokeFeedback.clear();
+  m_tilesEditedThisStroke.clear();
   m_history.beginStroke(m_world);
+
+  // Snapshot heights for order-independent smoothing.
+  m_heightSnapshot.clear();
+  if (m_tool == Tool::SmoothTerrain) {
+    const int w = m_world.width();
+    const int h = m_world.height();
+    const std::size_t n = static_cast<std::size_t>(std::max(0, w) * std::max(0, h));
+    m_heightSnapshot.resize(n, 0.0f);
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) {
+        m_heightSnapshot[static_cast<std::size_t>(y * w + x)] = m_world.at(x, y).height;
+      }
+    }
+  }
 
   // Per-stroke applied tile mask.
   m_strokeApplyW = m_world.width();
@@ -159,6 +1255,16 @@ void Game::endPaintStroke()
   if (!m_painting) return;
   m_painting = false;
   m_history.endStroke(m_world);
+
+  // A stroke potentially changes many tiles; update the minimap lazily.
+  m_renderer.markMinimapDirty();
+
+  // Also refresh the (optional) cached base render for any edited tiles.
+  m_renderer.markBaseCacheDirtyForTiles(m_tilesEditedThisStroke, m_world.width(), m_world.height());
+  m_tilesEditedThisStroke.clear();
+
+  // Height snapshot is only valid for the current stroke.
+  m_heightSnapshot.clear();
 
   m_strokeApplied.clear();
   m_strokeApplyW = 0;
@@ -193,9 +1299,13 @@ void Game::doUndo()
 
   if (m_history.undo(m_world)) {
     m_sim.refreshDerivedStats(m_world);
+    m_renderer.markMinimapDirty();
+    m_renderer.markBaseCacheDirtyAll();
     m_roadGraphDirty = true;
     m_trafficDirty = true;
     m_goodsDirty = true;
+    m_landValueDirty = true;
+    m_vehiclesDirty = true;
     showToast(TextFormat("Undo (%d left)", static_cast<int>(m_history.undoSize())));
   } else {
     showToast("Nothing to undo");
@@ -208,9 +1318,13 @@ void Game::doRedo()
 
   if (m_history.redo(m_world)) {
     m_sim.refreshDerivedStats(m_world);
+    m_renderer.markMinimapDirty();
+    m_renderer.markBaseCacheDirtyAll();
     m_roadGraphDirty = true;
     m_trafficDirty = true;
     m_goodsDirty = true;
+    m_landValueDirty = true;
+    m_vehiclesDirty = true;
     showToast(TextFormat("Redo (%d left)", static_cast<int>(m_history.redoSize())));
   } else {
     showToast("Nothing to redo");
@@ -223,9 +1337,16 @@ void Game::resetWorld(std::uint64_t newSeed)
 
   m_cfg.seed = newSeed;
   m_world = GenerateWorld(m_cfg.mapWidth, m_cfg.mapHeight, newSeed, m_procCfg);
+  m_renderer.markMinimapDirty();
   m_roadGraphDirty = true;
   m_trafficDirty = true;
   m_goodsDirty = true;
+  m_landValueDirty = true;
+  m_vehiclesDirty = true;
+  m_vehicles.clear();
+
+  // Deterministic vehicle RNG seed per world seed.
+  m_vehicleRngState = (newSeed ^ 0x9E3779B97F4A7C15ULL);
 
 
   // New world invalidates history.
@@ -244,21 +1365,27 @@ void Game::resetWorld(std::uint64_t newSeed)
   m_roadDragEnd.reset();
   m_roadDragPath.clear();
   m_roadDragBuildCost = 0;
+  m_roadDragUpgradeTiles = 0;
+  m_roadDragMoneyCost = 0;
   m_roadDragValid = false;
 
   // Optional: vary procedural textures per seed (still no assets-from-disk).
   m_renderer.rebuildTextures(newSeed);
+  m_renderer.markBaseCacheDirtyAll();
 
   // Make HUD stats immediately correct (without waiting for the first sim tick).
   m_sim.refreshDerivedStats(m_world);
+
+  clearHistory();
+  recordHistorySample(m_world.stats());
 
   // Update title with seed.
   SetWindowTitle(TextFormat("ProcIsoCity  |  seed: %llu", static_cast<unsigned long long>(newSeed)));
 
   // Recenter camera.
-  m_camera.target =
-      TileToWorldCenter(m_cfg.mapWidth / 2, m_cfg.mapHeight / 2, static_cast<float>(m_cfg.tileWidth),
-                        static_cast<float>(m_cfg.tileHeight));
+  m_camera.target = TileToWorldCenterElevated(m_world, m_cfg.mapWidth / 2, m_cfg.mapHeight / 2,
+                                              static_cast<float>(m_cfg.tileWidth),
+                                              static_cast<float>(m_cfg.tileHeight), m_elev);
 }
 
 void Game::run()
@@ -277,8 +1404,8 @@ void Game::handleInput(float dt)
 {
   // Update hovered tile from mouse.
   const Vector2 mouseWorld = GetScreenToWorld2D(GetMousePosition(), m_camera);
-  m_hovered = WorldToTile(mouseWorld, m_world.width(), m_world.height(), static_cast<float>(m_cfg.tileWidth),
-                         static_cast<float>(m_cfg.tileHeight));
+  m_hovered = WorldToTileElevated(mouseWorld, m_world, static_cast<float>(m_cfg.tileWidth),
+                                 static_cast<float>(m_cfg.tileHeight), m_elev);
 
   // Undo/redo
   const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
@@ -290,6 +1417,85 @@ void Game::handleInput(float dt)
     doUndo();
   } else if (ctrl && IsKeyPressed(KEY_Y)) {
     doRedo();
+  }
+
+  // Save manager UI (toggle with F10). When open, it captures most input.
+  if (IsKeyPressed(KEY_F10)) {
+    endPaintStroke();
+    m_showSaveMenu = !m_showSaveMenu;
+    if (m_showSaveMenu) {
+      m_saveMenuDeleteArmed = false;
+      m_saveMenuRefreshTimer = 0.0f;
+      refreshSaveMenu();
+      showToast("Save menu: ON");
+    } else {
+      unloadSaveMenuThumbnails();
+      m_saveMenuDeleteArmed = false;
+      showToast("Save menu: OFF");
+    }
+  }
+
+  if (m_showSaveMenu) {
+    // Group switch.
+    if (IsKeyPressed(KEY_TAB)) {
+      m_saveMenuGroup = (m_saveMenuGroup == 0) ? 1 : 0;
+      m_saveMenuSelection = 0;
+      m_saveMenuDeleteArmed = false;
+    }
+
+    const std::vector<SaveMenuSlot>& list = (m_saveMenuGroup == 0) ? m_saveMenuManual : m_saveMenuAutos;
+    const int count = static_cast<int>(list.size());
+
+    if (IsKeyPressed(KEY_UP)) m_saveMenuSelection = std::max(0, m_saveMenuSelection - 1);
+    if (IsKeyPressed(KEY_DOWN)) m_saveMenuSelection = std::min(std::max(0, count - 1), m_saveMenuSelection + 1);
+
+    if (count > 0) {
+      const int idx = std::clamp(m_saveMenuSelection, 0, count - 1);
+      const SaveMenuSlot& e = list[static_cast<std::size_t>(idx)];
+
+      // Load selected (Enter or F9).
+      if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) || IsKeyPressed(KEY_F9)) {
+        if (e.exists) {
+          const char* label = e.autosave ? TextFormat("Autosave %d", e.slot) : TextFormat("Slot %d", e.slot);
+          loadFromPath(e.path, label);
+        } else {
+          showToast("No save in that slot", 2.0f);
+        }
+      }
+
+      // Save into selected manual slot (F5).
+      if (IsKeyPressed(KEY_F5)) {
+        if (!e.autosave) {
+          m_saveSlot = e.slot;
+          saveToPath(e.path, true, TextFormat("Slot %d", e.slot));
+        } else {
+          showToast("Autosaves are read-only", 2.0f);
+        }
+      }
+
+      // Delete selected (Del twice to confirm).
+      if (IsKeyPressed(KEY_DELETE) || IsKeyPressed(KEY_BACKSPACE)) {
+        if (!e.exists) {
+          showToast("Slot is already empty", 2.0f);
+        } else if (!m_saveMenuDeleteArmed) {
+          m_saveMenuDeleteArmed = true;
+          m_saveMenuDeleteTimer = 1.5f;
+          showToast("Press Del again to delete", 1.5f);
+        } else {
+          namespace fs = std::filesystem;
+          std::error_code ec;
+          fs::remove(fs::path(e.path), ec);
+          const std::string tp = thumbPathForSavePath(e.path);
+          fs::remove(fs::path(tp), ec);
+          m_saveMenuDeleteArmed = false;
+          refreshSaveMenu();
+          showToast("Deleted save", 1.5f);
+        }
+      }
+    }
+
+    // While the save menu is open we don't want other gameplay inputs to fire.
+    return;
   }
 
   // Simulation controls
@@ -308,8 +1514,11 @@ void Game::handleInput(float dt)
   if (m_simPaused && IsKeyPressed(KEY_N)) {
     endPaintStroke();
     m_sim.stepOnce(m_world);
+    recordHistorySample(m_world.stats());
     m_trafficDirty = true;
     m_goodsDirty = true;
+    m_landValueDirty = true;
+    m_vehiclesDirty = true;
     showToast("Sim step");
   }
 
@@ -334,6 +1543,71 @@ void Game::handleInput(float dt)
   // Toggle UI
   if (IsKeyPressed(KEY_H)) m_showHelp = !m_showHelp;
   if (IsKeyPressed(KEY_G)) m_drawGrid = !m_drawGrid;
+
+  if (IsKeyPressed(KEY_F1)) {
+    m_showReport = !m_showReport;
+    showToast(m_showReport ? "City report: ON" : "City report: OFF");
+  }
+
+  if (IsKeyPressed(KEY_F2)) {
+    const bool enabled = !m_renderer.baseCacheEnabled();
+    m_renderer.setBaseCacheEnabled(enabled);
+    m_renderer.markBaseCacheDirtyAll();
+    showToast(enabled ? "Render cache: ON" : "Render cache: OFF");
+  }
+
+  if (IsKeyPressed(KEY_F3)) {
+    m_showTrafficModel = !m_showTrafficModel;
+    showToast(m_showTrafficModel ? "Traffic model: ON" : "Traffic model: OFF");
+  }
+
+  if (IsKeyPressed(KEY_P)) {
+    m_showPolicy = !m_showPolicy;
+    showToast(m_showPolicy ? "Policy: ON" : "Policy: OFF");
+  }
+
+
+  if (IsKeyPressed(KEY_TAB)) {
+    // Hold Shift to cycle backwards.
+    const int delta = shift ? -1 : 1;
+
+    if (m_showReport) {
+      constexpr int kPages = 4;
+      m_reportPage = (m_reportPage + delta + kPages) % kPages;
+    } else if (m_showPolicy) {
+      const int count = 7;
+      m_policySelection = (m_policySelection + delta + count) % count;
+    } else if (m_showTrafficModel) {
+      const int count = 6;
+      m_trafficModelSelection = (m_trafficModelSelection + delta + count) % count;
+    }
+  }
+
+  if (IsKeyPressed(KEY_M)) {
+    m_showMinimap = !m_showMinimap;
+    if (m_showMinimap) m_renderer.markMinimapDirty();
+    showToast(m_showMinimap ? "Minimap: ON" : "Minimap: OFF");
+  }
+
+  if (IsKeyPressed(KEY_C)) {
+    m_showVehicles = !m_showVehicles;
+    m_vehiclesDirty = true;
+    if (!m_showVehicles) m_vehicles.clear();
+    showToast(m_showVehicles ? "Vehicles: ON" : "Vehicles: OFF");
+  }
+
+  // Toggle elevation rendering (flat <-> elevated). This is purely visual; terraforming is separate.
+  if (IsKeyPressed(KEY_E)) {
+    endPaintStroke();
+    if (m_elev.maxPixels > 0.0f) {
+      m_elev.maxPixels = 0.0f;
+      showToast("Elevation: OFF");
+    } else {
+      m_elev = m_elevDefault;
+      showToast(TextFormat("Elevation: ON (max %.0fpx)", static_cast<double>(m_elev.maxPixels)));
+    }
+    m_renderer.setElevationSettings(m_elev);
+  }
   if (IsKeyPressed(KEY_O)) {
     m_showOutsideOverlay = !m_showOutsideOverlay;
     showToast(m_showOutsideOverlay ? "Outside overlay: ON" : "Outside overlay: OFF");
@@ -365,12 +1639,33 @@ void Game::handleInput(float dt)
 
       TrafficConfig tc;
       tc.requireOutsideConnection = m_sim.config().requireOutsideConnection;
-      m_traffic = ComputeCommuteTraffic(m_world, tc, share, nullptr);
+      {
+        const TrafficModelSettings& tm = m_sim.trafficModel();
+        tc.congestionAwareRouting = tm.congestionAwareRouting;
+        tc.congestionIterations = tm.congestionIterations;
+        tc.congestionAlpha = tm.congestionAlpha;
+        tc.congestionBeta = tm.congestionBeta;
+        tc.congestionCapacityScale = tm.congestionCapacityScale;
+        tc.congestionRatioClamp = tm.congestionRatioClamp;
+      }
+
+      // Traffic overlay should respect the sim's outside-connection rule even
+      // if the connectivity overlay itself is not being drawn.
+      std::vector<std::uint8_t> roadToEdge;
+      const std::vector<std::uint8_t>* pre = nullptr;
+      if (tc.requireOutsideConnection) {
+        ComputeRoadsConnectedToEdge(m_world, roadToEdge);
+        pre = &roadToEdge;
+      }
+
+      m_traffic = ComputeCommuteTraffic(m_world, tc, share, pre);
       m_trafficDirty = false;
 
-      showToast(TextFormat("Traffic overlay: ON (%d commuters, avg %.1f, cong %.0f%%)", m_traffic.totalCommuters,
-                           static_cast<double>(m_traffic.avgCommute),
-                           static_cast<double>(m_traffic.congestion * 100.0f)));
+      showToast(TextFormat(
+          "Traffic overlay: ON (%d commuters, avg %.1f (t %.1f), cong %.0f%%, %s x%d)", m_traffic.totalCommuters,
+          static_cast<double>(m_traffic.avgCommute), static_cast<double>(m_traffic.avgCommuteTime),
+          static_cast<double>(m_traffic.congestion * 100.0f),
+          m_traffic.usedCongestionAwareRouting ? "cong" : "free", m_traffic.routingPasses));
     } else {
       showToast("Traffic overlay: OFF");
     }
@@ -384,7 +1679,17 @@ void Game::handleInput(float dt)
     if (m_showGoodsOverlay) {
       GoodsConfig gc;
       gc.requireOutsideConnection = m_sim.config().requireOutsideConnection;
-      m_goods = ComputeGoodsFlow(m_world, gc, nullptr);
+
+      // Goods overlay should respect the sim's outside-connection rule even
+      // if the connectivity overlay itself is not being drawn.
+      std::vector<std::uint8_t> roadToEdge;
+      const std::vector<std::uint8_t>* pre = nullptr;
+      if (gc.requireOutsideConnection) {
+        ComputeRoadsConnectedToEdge(m_world, roadToEdge);
+        pre = &roadToEdge;
+      }
+
+      m_goods = ComputeGoodsFlow(m_world, gc, pre);
       m_goodsDirty = false;
 
       showToast(TextFormat("Goods overlay: ON (deliv %d/%d, sat %.0f%%, imp %d, exp %d)",
@@ -396,14 +1701,164 @@ void Game::handleInput(float dt)
     }
   }
 
+  // Heatmap overlay: cycle through land value + components.
+  if (IsKeyPressed(KEY_L)) {
+    auto nameOf = [&](HeatmapOverlay m) -> const char* {
+      switch (m) {
+      case HeatmapOverlay::Off: return "OFF";
+      case HeatmapOverlay::LandValue: return "Land value";
+      case HeatmapOverlay::ParkAmenity: return "Park amenity";
+      case HeatmapOverlay::WaterAmenity: return "Water amenity";
+      case HeatmapOverlay::Pollution: return "Pollution";
+      case HeatmapOverlay::TrafficSpill: return "Traffic spill";
+      default: return "Heatmap";
+      }
+    };
+
+    auto toIndex = [&](HeatmapOverlay m) -> int {
+      switch (m) {
+      case HeatmapOverlay::Off: return 0;
+      case HeatmapOverlay::LandValue: return 1;
+      case HeatmapOverlay::ParkAmenity: return 2;
+      case HeatmapOverlay::WaterAmenity: return 3;
+      case HeatmapOverlay::Pollution: return 4;
+      case HeatmapOverlay::TrafficSpill: return 5;
+      default: return 0;
+      }
+    };
+
+    auto fromIndex = [&](int i) -> HeatmapOverlay {
+      switch (i) {
+      case 0: return HeatmapOverlay::Off;
+      case 1: return HeatmapOverlay::LandValue;
+      case 2: return HeatmapOverlay::ParkAmenity;
+      case 3: return HeatmapOverlay::WaterAmenity;
+      case 4: return HeatmapOverlay::Pollution;
+      case 5: return HeatmapOverlay::TrafficSpill;
+      default: return HeatmapOverlay::Off;
+      }
+    };
+
+    const int count = 6;
+    const int delta = shift ? -1 : 1;
+    int idx = toIndex(m_heatmapOverlay);
+    idx = (idx + delta + count) % count;
+    m_heatmapOverlay = fromIndex(idx);
+
+    m_landValueDirty = true;
+    showToast(TextFormat("Heatmap: %s", nameOf(m_heatmapOverlay)));
+  }
+
   // Brush radius
   if (IsKeyPressed(KEY_LEFT_BRACKET)) {
-    m_brushRadius = std::max(0, m_brushRadius - 1);
-    showToast(TextFormat("Brush radius: %d", m_brushRadius));
+    if (m_showPolicy) {
+      // Policy adjustments
+      const int delta = shift ? -5 : -1;
+      SimConfig& cfg = m_sim.config();
+
+      auto clampInt = [&](int v, int lo, int hi) -> int { return std::clamp(v, lo, hi); };
+
+      switch (m_policySelection) {
+      case 0: cfg.taxResidential = clampInt(cfg.taxResidential + delta, 0, 10); break;
+      case 1: cfg.taxCommercial = clampInt(cfg.taxCommercial + delta, 0, 10); break;
+      case 2: cfg.taxIndustrial = clampInt(cfg.taxIndustrial + delta, 0, 10); break;
+      case 3: cfg.maintenanceRoad = clampInt(cfg.maintenanceRoad + (shift ? -2 : -1), 0, 5); break;
+      case 4: cfg.maintenancePark = clampInt(cfg.maintenancePark + (shift ? -2 : -1), 0, 5); break;
+      case 5: cfg.requireOutsideConnection = !cfg.requireOutsideConnection; break;
+      case 6: cfg.parkInfluenceRadius = clampInt(cfg.parkInfluenceRadius + (shift ? -2 : -1), 0, 20); break;
+      default: break;
+      }
+
+      // Updating policies affects derived stats and overlays.
+      m_sim.refreshDerivedStats(m_world);
+      m_trafficDirty = true;
+      m_goodsDirty = true;
+      m_landValueDirty = true;
+      m_vehiclesDirty = true;
+      m_outsideOverlayRoadToEdge.clear();
+    } else if (m_showTrafficModel) {
+      // Traffic model adjustments
+      const float fdelta = shift ? -0.20f : -0.05f;
+      TrafficModelSettings& tm = m_sim.trafficModel();
+
+      auto clampI = [](int v, int lo, int hi) -> int { return std::clamp(v, lo, hi); };
+      auto clampF = [](float v, float lo, float hi) -> float { return std::clamp(v, lo, hi); };
+
+      switch (m_trafficModelSelection) {
+      case 0: tm.congestionAwareRouting = !tm.congestionAwareRouting; break;
+      case 1: tm.congestionIterations = clampI(tm.congestionIterations + (shift ? -2 : -1), 1, 16); break;
+      case 2: tm.congestionAlpha = clampF(tm.congestionAlpha + fdelta, 0.0f, 2.0f); break;
+      case 3: tm.congestionBeta = clampF(tm.congestionBeta + (shift ? -2.0f : -1.0f), 1.0f, 8.0f); break;
+      case 4: tm.congestionCapacityScale = clampF(tm.congestionCapacityScale + (shift ? -0.25f : -0.10f), 0.25f, 4.0f);
+        break;
+      case 5: tm.congestionRatioClamp = clampF(tm.congestionRatioClamp + (shift ? -1.0f : -0.5f), 1.0f, 10.0f);
+        break;
+      default: break;
+      }
+
+      m_sim.refreshDerivedStats(m_world);
+      m_trafficDirty = true;
+      m_goodsDirty = true;
+      m_landValueDirty = true;
+      m_vehiclesDirty = true;
+    } else {
+      m_brushRadius = std::max(0, m_brushRadius - 1);
+      showToast(TextFormat("Brush radius: %d", m_brushRadius));
+    }
   }
   if (IsKeyPressed(KEY_RIGHT_BRACKET)) {
-    m_brushRadius = std::min(8, m_brushRadius + 1);
-    showToast(TextFormat("Brush radius: %d", m_brushRadius));
+    if (m_showPolicy) {
+      const int delta = shift ? 5 : 1;
+      SimConfig& cfg = m_sim.config();
+
+      auto clampInt = [&](int v, int lo, int hi) -> int { return std::clamp(v, lo, hi); };
+
+      switch (m_policySelection) {
+      case 0: cfg.taxResidential = clampInt(cfg.taxResidential + delta, 0, 10); break;
+      case 1: cfg.taxCommercial = clampInt(cfg.taxCommercial + delta, 0, 10); break;
+      case 2: cfg.taxIndustrial = clampInt(cfg.taxIndustrial + delta, 0, 10); break;
+      case 3: cfg.maintenanceRoad = clampInt(cfg.maintenanceRoad + (shift ? 2 : 1), 0, 5); break;
+      case 4: cfg.maintenancePark = clampInt(cfg.maintenancePark + (shift ? 2 : 1), 0, 5); break;
+      case 5: cfg.requireOutsideConnection = !cfg.requireOutsideConnection; break;
+      case 6: cfg.parkInfluenceRadius = clampInt(cfg.parkInfluenceRadius + (shift ? 2 : 1), 0, 20); break;
+      default: break;
+      }
+
+      m_sim.refreshDerivedStats(m_world);
+      m_trafficDirty = true;
+      m_goodsDirty = true;
+      m_landValueDirty = true;
+      m_vehiclesDirty = true;
+      m_outsideOverlayRoadToEdge.clear();
+    } else if (m_showTrafficModel) {
+      // Traffic model adjustments
+      const float fdelta = shift ? 0.20f : 0.05f;
+      TrafficModelSettings& tm = m_sim.trafficModel();
+
+      auto clampI = [](int v, int lo, int hi) -> int { return std::clamp(v, lo, hi); };
+      auto clampF = [](float v, float lo, float hi) -> float { return std::clamp(v, lo, hi); };
+
+      switch (m_trafficModelSelection) {
+      case 0: tm.congestionAwareRouting = !tm.congestionAwareRouting; break;
+      case 1: tm.congestionIterations = clampI(tm.congestionIterations + (shift ? 2 : 1), 1, 16); break;
+      case 2: tm.congestionAlpha = clampF(tm.congestionAlpha + fdelta, 0.0f, 2.0f); break;
+      case 3: tm.congestionBeta = clampF(tm.congestionBeta + (shift ? 2.0f : 1.0f), 1.0f, 8.0f); break;
+      case 4: tm.congestionCapacityScale = clampF(tm.congestionCapacityScale + (shift ? 0.25f : 0.10f), 0.25f, 4.0f);
+        break;
+      case 5: tm.congestionRatioClamp = clampF(tm.congestionRatioClamp + (shift ? 1.0f : 0.5f), 1.0f, 10.0f);
+        break;
+      default: break;
+      }
+
+      m_sim.refreshDerivedStats(m_world);
+      m_trafficDirty = true;
+      m_goodsDirty = true;
+      m_landValueDirty = true;
+      m_vehiclesDirty = true;
+    } else {
+      m_brushRadius = std::min(8, m_brushRadius + 1);
+      showToast(TextFormat("Brush radius: %d", m_brushRadius));
+    }
   }
 
   // Save slot selection
@@ -416,66 +1871,13 @@ void Game::handleInput(float dt)
 
   // Save / Load (quick save)
   if (IsKeyPressed(KEY_F5)) {
-    std::string err;
     const std::string path = savePathForSlot(m_saveSlot);
-    if (SaveWorldBinary(m_world, m_procCfg, path, err)) {
-      showToast(TextFormat("Saved slot %d: %s", m_saveSlot, path.c_str()));
-    } else {
-      showToast(std::string("Save failed: ") + err, 4.0f);
-    }
+    saveToPath(path, true, TextFormat("Slot %d", m_saveSlot));
   }
 
   if (IsKeyPressed(KEY_F9)) {
-    endPaintStroke();
-    std::string err;
-    World loaded;
-    ProcGenConfig loadedProcCfg{};
     const std::string path = savePathForSlot(m_saveSlot);
-    if (LoadWorldBinary(loaded, loadedProcCfg, path, err)) {
-      m_world = std::move(loaded);
-      m_procCfg = loadedProcCfg;
-      m_roadGraphDirty = true;
-      m_trafficDirty = true;
-      m_goodsDirty = true;
-
-
-      // Loading invalidates history.
-      m_history.clear();
-      m_painting = false;
-
-      // Loaded world invalidates inspect selection/debug overlays.
-      m_inspectSelected.reset();
-      m_inspectPath.clear();
-      m_inspectPathCost = 0;
-      m_inspectInfo.clear();
-
-      // Loaded world invalidates any road-drag preview.
-      m_roadDragActive = false;
-      m_roadDragStart.reset();
-      m_roadDragEnd.reset();
-      m_roadDragPath.clear();
-      m_roadDragBuildCost = 0;
-      m_roadDragValid = false;
-
-      // Keep config in sync with loaded world, so regen & camera recenter behave.
-      m_cfg.mapWidth = m_world.width();
-      m_cfg.mapHeight = m_world.height();
-      m_cfg.seed = m_world.seed();
-
-      m_renderer.rebuildTextures(m_cfg.seed);
-      SetWindowTitle(TextFormat("ProcIsoCity  |  seed: %llu", static_cast<unsigned long long>(m_cfg.seed)));
-
-      // Recenter camera on loaded map.
-      m_camera.target =
-          TileToWorldCenter(m_cfg.mapWidth / 2, m_cfg.mapHeight / 2, static_cast<float>(m_cfg.tileWidth),
-                            static_cast<float>(m_cfg.tileHeight));
-
-      m_sim.refreshDerivedStats(m_world);
-
-      showToast(TextFormat("Loaded slot %d: %s", m_saveSlot, path.c_str()));
-    } else {
-      showToast(std::string("Load failed: ") + err, 4.0f);
-    }
+    loadFromPath(path, TextFormat("Slot %d", m_saveSlot));
   }
 
   // Regenerate
@@ -502,6 +1904,8 @@ void Game::handleInput(float dt)
     m_roadDragEnd.reset();
     m_roadDragPath.clear();
     m_roadDragBuildCost = 0;
+    m_roadDragUpgradeTiles = 0;
+    m_roadDragMoneyCost = 0;
     m_roadDragValid = false;
   };
 
@@ -512,6 +1916,18 @@ void Game::handleInput(float dt)
   if (IsKeyPressed(KEY_FOUR)) setTool(Tool::Industrial);
   if (IsKeyPressed(KEY_FIVE)) setTool(Tool::Park);
   if (IsKeyPressed(KEY_ZERO)) setTool(Tool::Bulldoze);
+
+  // Road tool: cycle the road class used for placement/upgrade (Street/Avenue/Highway).
+  if (IsKeyPressed(KEY_U)) {
+    const int delta = shift ? -1 : 1;
+    m_roadBuildLevel += delta;
+    if (m_roadBuildLevel < 1) m_roadBuildLevel = 3;
+    if (m_roadBuildLevel > 3) m_roadBuildLevel = 1;
+    showToast(TextFormat("Road type: %s", RoadClassName(m_roadBuildLevel)));
+  }
+  if (IsKeyPressed(KEY_SIX)) setTool(Tool::RaiseTerrain);
+  if (IsKeyPressed(KEY_SEVEN)) setTool(Tool::LowerTerrain);
+  if (IsKeyPressed(KEY_EIGHT)) setTool(Tool::SmoothTerrain);
 
   // Camera pan: right mouse drag (raylib example style).
   if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
@@ -547,11 +1963,72 @@ void Game::handleInput(float dt)
   const bool leftDown = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
   const bool leftReleased = IsMouseButtonReleased(MOUSE_BUTTON_LEFT);
 
+  // --- Minimap interaction (UI consumes left mouse so we don't accidentally paint the world). ---
+  bool consumeLeft = false;
+  if (m_showMinimap && m_world.width() > 0 && m_world.height() > 0) {
+    const Renderer::MinimapLayout mini = m_renderer.minimapLayout(m_world, GetScreenWidth(), GetScreenHeight());
+    const Vector2 mp = GetMousePosition();
+    const bool over = CheckCollisionPointRec(mp, mini.rect);
+
+    if (leftPressed && over) {
+      // Cancel any in-progress stroke before moving the camera.
+      endPaintStroke();
+      m_minimapDragActive = true;
+    }
+
+    if (leftReleased) {
+      m_minimapDragActive = false;
+    }
+
+    if (leftDown && m_minimapDragActive) {
+      const float lx = std::clamp(mp.x - mini.rect.x, 0.0f, std::max(1.0f, mini.rect.width - 1.0f));
+      const float ly = std::clamp(mp.y - mini.rect.y, 0.0f, std::max(1.0f, mini.rect.height - 1.0f));
+
+      const float s = std::max(1.0e-3f, mini.pixelsPerTile);
+      const int tx = std::clamp(static_cast<int>(std::floor(lx / s)), 0, m_world.width() - 1);
+      const int ty = std::clamp(static_cast<int>(std::floor(ly / s)), 0, m_world.height() - 1);
+
+      m_camera.target = TileToWorldCenterElevated(m_world, tx, ty, static_cast<float>(m_cfg.tileWidth),
+                                                  static_cast<float>(m_cfg.tileHeight), m_elev);
+      consumeLeft = true;
+    }
+
+    // If the cursor is over the minimap, don't start any world interactions on press.
+    if (over && leftPressed) consumeLeft = true;
+  } else {
+    m_minimapDragActive = false;
+  }
+
   // Road tool: Shift+drag plans a cheapest road path (prefers existing roads) and
   // commits the whole path on release (single undoable stroke).
-  const bool roadDragMode = (m_tool == Tool::Road) && shift && !m_painting;
+  const bool roadDragMode = (m_tool == Tool::Road) && shift && !m_painting && !consumeLeft;
 
   if (roadDragMode) {
+    auto computePathEconomy = [&](const std::vector<Point>& path, int& outNewTiles, int& outUpgrades, int& outCost) {
+      outNewTiles = 0;
+      outUpgrades = 0;
+      outCost = 0;
+
+      const int targetLevel = ClampRoadLevel(m_roadBuildLevel);
+      const int targetCost = RoadBuildCostForLevel(targetLevel);
+
+      for (const Point& p : path) {
+        if (!m_world.inBounds(p.x, p.y)) continue;
+        const Tile& t = m_world.at(p.x, p.y);
+
+        if (t.overlay == Overlay::Road) {
+          const int cur = ClampRoadLevel(static_cast<int>(t.level));
+          if (cur < targetLevel) {
+            outUpgrades += 1;
+            outCost += (targetCost - RoadBuildCostForLevel(cur));
+          }
+        } else if (t.overlay == Overlay::None) {
+          outNewTiles += 1;
+          outCost += targetCost;
+        }
+      }
+    };
+
     // Start drag.
     if (leftPressed && m_hovered && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
       const Point start = *m_hovered;
@@ -566,7 +2043,7 @@ void Game::handleInput(float dt)
         m_roadDragStart = start;
         m_roadDragEnd = start;
         m_roadDragPath = std::move(tmp);
-        m_roadDragBuildCost = buildCost;
+        computePathEconomy(m_roadDragPath, m_roadDragBuildCost, m_roadDragUpgradeTiles, m_roadDragMoneyCost);
         m_roadDragValid = true;
       }
     }
@@ -583,11 +2060,13 @@ void Game::handleInput(float dt)
         if (ok && !tmp.empty()) {
           m_roadDragValid = true;
           m_roadDragPath = std::move(tmp);
-          m_roadDragBuildCost = buildCost;
+          computePathEconomy(m_roadDragPath, m_roadDragBuildCost, m_roadDragUpgradeTiles, m_roadDragMoneyCost);
         } else {
           m_roadDragValid = false;
           m_roadDragPath.clear();
           m_roadDragBuildCost = 0;
+          m_roadDragUpgradeTiles = 0;
+          m_roadDragMoneyCost = 0;
         }
       }
     }
@@ -613,9 +2092,11 @@ void Game::handleInput(float dt)
         if (!hadFailures) {
           const int spent = moneyBefore - m_world.stats().money;
           if (spent > 0) {
-            showToast(TextFormat("Built road path (%d new tiles, cost %d)", m_roadDragBuildCost, spent));
+            showToast(TextFormat("Built road path (%s: %d new, %d upgraded, cost %d)",
+                                 RoadClassName(m_roadBuildLevel), m_roadDragBuildCost, m_roadDragUpgradeTiles, spent));
           } else {
-            showToast(TextFormat("Built road path (%d new tiles)", m_roadDragBuildCost));
+            showToast(TextFormat("Built road path (%s: %d new, %d upgraded)",
+                                 RoadClassName(m_roadBuildLevel), m_roadDragBuildCost, m_roadDragUpgradeTiles));
           }
         }
       } else {
@@ -628,12 +2109,14 @@ void Game::handleInput(float dt)
       m_roadDragEnd.reset();
       m_roadDragPath.clear();
       m_roadDragBuildCost = 0;
+      m_roadDragUpgradeTiles = 0;
+      m_roadDragMoneyCost = 0;
       m_roadDragValid = false;
     }
   }
 
   // Inspect click: select tile and (if possible) compute the shortest road path to the map edge.
-  if (!roadDragMode && leftPressed && m_hovered && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && m_tool == Tool::Inspect) {
+  if (!consumeLeft && !roadDragMode && leftPressed && m_hovered && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && m_tool == Tool::Inspect) {
     m_inspectSelected = *m_hovered;
     m_inspectPath.clear();
     m_inspectPathCost = 0;
@@ -681,15 +2164,15 @@ void Game::handleInput(float dt)
     }
   }
 
-  if (!roadDragMode && leftPressed && m_hovered && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && m_tool != Tool::Inspect) {
+  if (!consumeLeft && !roadDragMode && leftPressed && m_hovered && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && m_tool != Tool::Inspect) {
     beginPaintStroke();
   }
 
-  if (!roadDragMode && leftDown && m_painting && m_hovered && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && m_tool != Tool::Inspect) {
+  if (!consumeLeft && !roadDragMode && leftDown && m_painting && m_hovered && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && m_tool != Tool::Inspect) {
     applyToolBrush(m_hovered->x, m_hovered->y);
   }
 
-  if (!roadDragMode && leftReleased) {
+  if (!consumeLeft && !roadDragMode && leftReleased) {
     endPaintStroke();
   }
 
@@ -703,20 +2186,69 @@ void Game::handleInput(float dt)
   }
 }
 
+void Game::updateAutosave(float dt)
+{
+  if (!m_autosaveEnabled) return;
+  if (m_painting) return;
+
+  m_autosaveTimer += dt;
+  if (m_autosaveTimer < kAutosaveIntervalSec) return;
+
+  // Avoid spamming identical autosaves (e.g., if the sim is paused).
+  const int day = m_world.stats().day;
+  if (day == m_lastAutosaveDay) {
+    m_autosaveTimer = kAutosaveIntervalSec;
+    return;
+  }
+
+  // Rotate through autosave slots.
+  const int slot = std::clamp(m_autosaveNextSlot, kAutosaveSlotMin, kAutosaveSlotMax);
+  const std::string path = autosavePathForSlot(slot);
+
+  // Best effort: autosaves should never disrupt gameplay.
+  std::string err;
+  if (SaveWorldBinary(m_world, m_procCfg, m_sim.config(), path, err)) {
+    const std::string thumb = thumbPathForSavePath(path);
+    (void)m_renderer.exportMinimapThumbnail(m_world, thumb.c_str(), 256);
+
+    m_lastAutosaveDay = day;
+    m_autosaveNextSlot = (slot >= kAutosaveSlotMax) ? kAutosaveSlotMin : (slot + 1);
+    m_autosaveTimer = 0.0f;
+
+    // Avoid toasts when the save menu is open; the list itself is feedback.
+    if (!m_showSaveMenu) {
+      showToast(TextFormat("Autosaved (slot %d)", slot), 1.5f);
+    }
+
+    if (m_showSaveMenu) refreshSaveMenu();
+  } else {
+    // If autosave fails, back off a bit to avoid hammering the filesystem.
+    m_autosaveTimer = kAutosaveIntervalSec * 0.75f;
+  }
+}
+
 void Game::update(float dt)
 {
   // Pause simulation while actively painting so an undoable "stroke" doesn't
   // accidentally include sim-driven money changes.
   if (!m_painting && !m_simPaused) {
-    const int dayBefore = m_world.stats().day;
     const int si = std::clamp(m_simSpeedIndex, 0, kSimSpeedCount - 1);
     const float speed = kSimSpeeds[static_cast<std::size_t>(si)];
-    m_sim.update(m_world, dt * speed);
 
-    // The sim may have advanced 0..N ticks. Traffic depends on occupants/jobs.
-    if (m_world.stats().day != dayBefore) {
+    std::vector<Stats> tickStats;
+    tickStats.reserve(4);
+    const int ticks = m_sim.update(m_world, dt * speed, &tickStats);
+
+    if (ticks > 0) {
+      // The sim advanced 1..N ticks. These derived overlays depend on occupants/jobs.
       m_trafficDirty = true;
       m_goodsDirty = true;
+      m_landValueDirty = true;
+      m_vehiclesDirty = true;
+
+      for (const Stats& s : tickStats) {
+        recordHistorySample(s);
+      }
     }
   }
 
@@ -724,7 +2256,212 @@ void Game::update(float dt)
     m_toastTimer -= dt;
     if (m_toastTimer < 0.0f) m_toastTimer = 0.0f;
   }
+
+  // Update vehicle visualization (movement pauses when sim is paused or while painting).
+  const float vdt = (!m_painting && !m_simPaused) ? dt : 0.0f;
+  updateVehicles(vdt);
+
+  // Autosave uses wall-clock time (so it works regardless of sim speed).
+  updateAutosave(dt);
+
+  // Save menu housekeeping.
+  if (m_saveMenuDeleteArmed) {
+    m_saveMenuDeleteTimer -= dt;
+    if (m_saveMenuDeleteTimer <= 0.0f) {
+      m_saveMenuDeleteTimer = 0.0f;
+      m_saveMenuDeleteArmed = false;
+    }
+  }
+
+  if (m_showSaveMenu) {
+    m_saveMenuRefreshTimer += dt;
+    if (m_saveMenuRefreshTimer >= 1.0f) {
+      m_saveMenuRefreshTimer = 0.0f;
+      refreshSaveMenu();
+    }
+  } else {
+    m_saveMenuRefreshTimer = 0.0f;
+  }
 }
+
+
+namespace {
+
+template <typename F>
+void DrawHistoryGraph(const std::vector<CityHistorySample>& samples, Rectangle r, const char* title, F getValue,
+                      float fixedMin, float fixedMax, bool fixedRange, const char* valueFmt, bool percent = false)
+{
+  DrawRectangleRec(r, Color{0, 0, 0, 150});
+  DrawRectangleLinesEx(r, 1, Color{255, 255, 255, 60});
+
+  const int pad = 10;
+  const int fontTitle = 18;
+  const int fontSmall = 14;
+
+  DrawText(title, static_cast<int>(r.x) + pad, static_cast<int>(r.y) + 6, fontTitle, RAYWHITE);
+
+  if (samples.size() < 2) {
+    DrawText("(no history yet)", static_cast<int>(r.x) + pad, static_cast<int>(r.y) + 30, fontSmall,
+             Color{220, 220, 220, 255});
+    return;
+  }
+
+  const std::size_t n = samples.size();
+
+  // Compute min/max (auto) on the visible window.
+  float vmin = fixedMin;
+  float vmax = fixedMax;
+  if (!fixedRange) {
+    vmin = getValue(samples[0]);
+    vmax = vmin;
+    for (std::size_t i = 1; i < n; ++i) {
+      const float v = getValue(samples[i]);
+      vmin = std::min(vmin, v);
+      vmax = std::max(vmax, v);
+    }
+    if (std::abs(vmax - vmin) < 1e-6f) {
+      vmax = vmin + 1.0f;
+    } else {
+      // Add a small padding so the line doesn't sit exactly on the border.
+      const float padv = 0.05f * (vmax - vmin);
+      vmin -= padv;
+      vmax += padv;
+    }
+  } else {
+    if (std::abs(vmax - vmin) < 1e-6f) vmax = vmin + 1.0f;
+  }
+
+  // Graph area (leave space for title and value labels).
+  Rectangle gr = r;
+  gr.x += pad;
+  gr.width -= pad * 2;
+  gr.y += 30;
+  gr.height -= 44;
+
+  // Grid lines
+  const int gridLines = 3;
+  for (int i = 0; i <= gridLines; ++i) {
+    const float t = static_cast<float>(i) / static_cast<float>(gridLines);
+    const int y = static_cast<int>(gr.y + t * gr.height);
+    DrawLine(static_cast<int>(gr.x), y, static_cast<int>(gr.x + gr.width), y, Color{255, 255, 255, 25});
+  }
+
+  auto mapX = [&](std::size_t i) -> float {
+    const float t = static_cast<float>(i) / static_cast<float>(n - 1);
+    return gr.x + t * gr.width;
+  };
+  auto mapY = [&](float v) -> float {
+    const float t = (v - vmin) / (vmax - vmin);
+    return gr.y + (1.0f - std::clamp(t, 0.0f, 1.0f)) * gr.height;
+  };
+
+  // Polyline
+  for (std::size_t i = 1; i < n; ++i) {
+    const float x0 = mapX(i - 1);
+    const float y0 = mapY(getValue(samples[i - 1]));
+    const float x1 = mapX(i);
+    const float y1 = mapY(getValue(samples[i]));
+    DrawLineEx(Vector2{x0, y0}, Vector2{x1, y1}, 2.0f, Color{120, 220, 255, 200});
+  }
+
+  // Labels (min/max + latest)
+  char buf[96];
+  const float latest = getValue(samples.back());
+  if (percent) {
+    std::snprintf(buf, sizeof(buf), valueFmt, static_cast<double>(latest * 100.0f));
+  } else {
+    std::snprintf(buf, sizeof(buf), valueFmt, static_cast<double>(latest));
+  }
+  DrawText(buf, static_cast<int>(r.x) + pad, static_cast<int>(r.y + r.height) - 18, fontSmall,
+           Color{230, 230, 230, 255});
+}
+
+const char* ReportPageName(int page)
+{
+  switch (page) {
+    default:
+    case 0: return "Overview";
+    case 1: return "Economy";
+    case 2: return "Traffic";
+    case 3: return "Land & Goods";
+  }
+}
+
+} // namespace
+
+void Game::drawReportPanel()
+{
+  if (!m_showReport) return;
+
+  const int panelW = 520;
+  const int panelH = 420;
+
+  const int x0 = 12;
+  const int y0 = 96;
+
+  DrawRectangle(x0, y0, panelW, panelH, Color{0, 0, 0, 180});
+  DrawRectangleLines(x0, y0, panelW, panelH, Color{255, 255, 255, 70});
+
+  int x = x0 + 12;
+  int y = y0 + 10;
+
+  DrawText("City Report", x, y, 20, RAYWHITE);
+  y += 24;
+
+  DrawText(TextFormat("Page: %s   Tab: cycle   F1: toggle", ReportPageName(m_reportPage)), x, y, 16,
+           Color{220, 220, 220, 255});
+  y += 24;
+
+  // Display a fixed window: last N days (bounded by stored history).
+  const int maxPoints = 120;
+  const int count = static_cast<int>(m_cityHistory.size());
+  const int start = (count > maxPoints) ? (count - maxPoints) : 0;
+  const std::vector<CityHistorySample> view(m_cityHistory.begin() + start, m_cityHistory.end());
+
+  Rectangle r1{static_cast<float>(x0 + 12), static_cast<float>(y), static_cast<float>(panelW - 24), 96};
+  Rectangle r2{static_cast<float>(x0 + 12), static_cast<float>(y + 104), static_cast<float>(panelW - 24), 96};
+  Rectangle r3{static_cast<float>(x0 + 12), static_cast<float>(y + 208), static_cast<float>(panelW - 24), 96};
+
+  if (m_reportPage == 0) {
+    DrawHistoryGraph(view, r1, "Population", [](const CityHistorySample& s) { return static_cast<float>(s.population); },
+                     0.0f, 0.0f, false, "Latest: %.0f");
+    DrawHistoryGraph(view, r2, "Happiness", [](const CityHistorySample& s) { return s.happiness; }, 0.0f, 1.0f, true,
+                     "Latest: %.0f%%", true);
+    DrawHistoryGraph(view, r3, "Residential demand", [](const CityHistorySample& s) { return s.demandResidential; }, 0.0f,
+                     1.0f, true, "Latest: %.0f%%", true);
+  } else if (m_reportPage == 1) {
+    DrawHistoryGraph(view, r1, "Money", [](const CityHistorySample& s) { return static_cast<float>(s.money); }, 0.0f, 0.0f,
+                     false, "Latest: %.0f");
+    DrawHistoryGraph(view, r2, "Income", [](const CityHistorySample& s) { return static_cast<float>(s.income); }, 0.0f, 0.0f,
+                     false, "Latest: %.0f");
+    DrawHistoryGraph(view, r3, "Expenses", [](const CityHistorySample& s) { return static_cast<float>(s.expenses); }, 0.0f, 0.0f,
+                     false, "Latest: %.0f");
+  } else if (m_reportPage == 2) {
+    DrawHistoryGraph(view, r1, "Commuters", [](const CityHistorySample& s) { return static_cast<float>(s.commuters); }, 0.0f, 0.0f,
+                     false, "Latest: %.0f");
+    DrawHistoryGraph(view, r2, "Avg commute (time)", [](const CityHistorySample& s) { return s.avgCommuteTime; }, 0.0f, 0.0f, false,
+                     "Latest: %.1f");
+    DrawHistoryGraph(view, r3, "Congestion", [](const CityHistorySample& s) { return s.trafficCongestion; }, 0.0f, 1.0f, true,
+                     "Latest: %.0f%%", true);
+  } else {
+    DrawHistoryGraph(view, r1, "Avg land value", [](const CityHistorySample& s) { return s.avgLandValue; }, 0.0f, 1.0f, true,
+                     "Latest: %.0f%%", true);
+    DrawHistoryGraph(view, r2, "Tax per capita", [](const CityHistorySample& s) { return s.avgTaxPerCapita; }, 0.0f, 0.0f, false,
+                     "Latest: %.2f");
+    DrawHistoryGraph(view, r3, "Goods satisfaction", [](const CityHistorySample& s) { return s.goodsSatisfaction; }, 0.0f, 1.0f,
+                     true, "Latest: %.0f%%", true);
+  }
+
+  // Footer: show day range
+  if (!view.empty()) {
+    const int d0 = view.front().day;
+    const int d1 = view.back().day;
+    DrawText(TextFormat("Days: %d..%d (showing %d / stored %d)", d0, d1, static_cast<int>(view.size()),
+                        static_cast<int>(m_cityHistory.size())),
+             x0 + 12, y0 + panelH - 22, 14, Color{220, 220, 220, 255});
+  }
+}
+
 
 void Game::draw()
 {
@@ -743,33 +2480,53 @@ void Game::draw()
     worldBrush = 0;
   }
 
-  const std::vector<std::uint8_t>* outsideMask = nullptr;
-  if (m_showOutsideOverlay) {
+  const bool heatmapActive = (m_heatmapOverlay != HeatmapOverlay::Off);
+
+  // Many derived systems need the "road component touches map edge" mask.
+  // This should be computed regardless of whether the connectivity overlay is *drawn*.
+  const bool requireOutside = m_sim.config().requireOutsideConnection;
+  const bool needRoadToEdgeMask = requireOutside &&
+                                (m_showOutsideOverlay || m_showTrafficOverlay || m_showGoodsOverlay || heatmapActive);
+
+  const std::vector<std::uint8_t>* roadToEdgeMask = nullptr;
+  if (needRoadToEdgeMask) {
     ComputeRoadsConnectedToEdge(m_world, m_outsideOverlayRoadToEdge);
-    outsideMask = &m_outsideOverlayRoadToEdge;
+    roadToEdgeMask = &m_outsideOverlayRoadToEdge;
+  }
+
+  // Only pass the mask to the renderer if the user wants the overlay.
+  const std::vector<std::uint8_t>* outsideMask = m_showOutsideOverlay ? roadToEdgeMask : nullptr;
+
+  // Traffic is used by both the explicit traffic overlay and the land value heatmap.
+  const bool needTrafficResult = (m_showTrafficOverlay || heatmapActive);
+  if (needTrafficResult && m_trafficDirty) {
+    const float share = (m_world.stats().population > 0)
+                            ? (static_cast<float>(m_world.stats().employed) /
+                               static_cast<float>(m_world.stats().population))
+                            : 0.0f;
+
+    TrafficConfig tc;
+    tc.requireOutsideConnection = requireOutside;
+    {
+      const TrafficModelSettings& tm = m_sim.trafficModel();
+      tc.congestionAwareRouting = tm.congestionAwareRouting;
+      tc.congestionIterations = tm.congestionIterations;
+      tc.congestionAlpha = tm.congestionAlpha;
+      tc.congestionBeta = tm.congestionBeta;
+      tc.congestionCapacityScale = tm.congestionCapacityScale;
+      tc.congestionRatioClamp = tm.congestionRatioClamp;
+    }
+
+    const std::vector<std::uint8_t>* pre = (tc.requireOutsideConnection ? roadToEdgeMask : nullptr);
+    m_traffic = ComputeCommuteTraffic(m_world, tc, share, pre);
+    m_trafficDirty = false;
   }
 
   const std::vector<std::uint16_t>* trafficMask = nullptr;
   int trafficMax = 0;
-  if (m_showTrafficOverlay) {
-    if (m_trafficDirty) {
-      const float share = (m_world.stats().population > 0)
-                              ? (static_cast<float>(m_world.stats().employed) /
-                                 static_cast<float>(m_world.stats().population))
-                              : 0.0f;
-
-      TrafficConfig tc;
-      tc.requireOutsideConnection = m_sim.config().requireOutsideConnection;
-
-      const std::vector<std::uint8_t>* pre = (tc.requireOutsideConnection ? outsideMask : nullptr);
-      m_traffic = ComputeCommuteTraffic(m_world, tc, share, pre);
-      m_trafficDirty = false;
-    }
-
-    if (!m_traffic.roadTraffic.empty()) {
-      trafficMask = &m_traffic.roadTraffic;
-      trafficMax = m_traffic.maxTraffic;
-    }
+  if (m_showTrafficOverlay && !m_traffic.roadTraffic.empty()) {
+    trafficMask = &m_traffic.roadTraffic;
+    trafficMax = m_traffic.maxTraffic;
   }
 
   const std::vector<std::uint16_t>* goodsTrafficMask = nullptr;
@@ -778,9 +2535,9 @@ void Game::draw()
   if (m_showGoodsOverlay) {
     if (m_goodsDirty) {
       GoodsConfig gc;
-      gc.requireOutsideConnection = m_sim.config().requireOutsideConnection;
+      gc.requireOutsideConnection = requireOutside;
 
-      const std::vector<std::uint8_t>* pre = (gc.requireOutsideConnection ? outsideMask : nullptr);
+      const std::vector<std::uint8_t>* pre = (gc.requireOutsideConnection ? roadToEdgeMask : nullptr);
       m_goods = ComputeGoodsFlow(m_world, gc, pre);
       m_goodsDirty = false;
     }
@@ -790,10 +2547,59 @@ void Game::draw()
     commercialGoodsFill = &m_goods.commercialFill;
   }
 
+  // --- Heatmap overlay (land value + component fields) ---
+  const std::vector<float>* heatmap = nullptr;
+  Renderer::HeatmapRamp heatmapRamp = Renderer::HeatmapRamp::Good;
+  const char* heatmapName = nullptr;
+
+  if (heatmapActive) {
+    if (m_landValueDirty ||
+        m_landValue.value.size() != static_cast<std::size_t>(std::max(0, m_world.width()) * std::max(0, m_world.height()))) {
+      LandValueConfig lc;
+      lc.requireOutsideConnection = requireOutside;
+      const TrafficResult* tptr = needTrafficResult ? &m_traffic : nullptr;
+      m_landValue = ComputeLandValue(m_world, lc, tptr, roadToEdgeMask);
+      m_landValueDirty = false;
+    }
+
+    switch (m_heatmapOverlay) {
+    case HeatmapOverlay::LandValue:
+      heatmapName = "Land value";
+      heatmap = &m_landValue.value;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+    case HeatmapOverlay::ParkAmenity:
+      heatmapName = "Park amenity";
+      heatmap = &m_landValue.parkAmenity;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+    case HeatmapOverlay::WaterAmenity:
+      heatmapName = "Water amenity";
+      heatmap = &m_landValue.waterAmenity;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+    case HeatmapOverlay::Pollution:
+      heatmapName = "Pollution";
+      heatmap = &m_landValue.pollution;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
+    case HeatmapOverlay::TrafficSpill:
+      heatmapName = "Traffic spill";
+      heatmap = &m_landValue.traffic;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
+    default: break;
+    }
+  }
+
   m_renderer.drawWorld(m_world, m_camera, m_timeSec, m_hovered, m_drawGrid, worldBrush, selected, pathPtr, outsideMask,
                        trafficMask, trafficMax,
                        goodsTrafficMask, goodsMax,
-                       commercialGoodsFill);
+                       commercialGoodsFill,
+                       heatmap, heatmapRamp);
+
+  // Vehicle micro-sim overlay (commuters + goods trucks).
+  drawVehicles();
 
   // Road graph overlay (debug): nodes/edges extracted from the current road tiles.
   if (m_showRoadGraphOverlay) {
@@ -832,10 +2638,10 @@ void Game::draw()
         for (std::size_t i = 1; i < e.tiles.size(); ++i) {
           const Point& a = e.tiles[i - 1];
           const Point& b = e.tiles[i];
-          const Vector2 wa = TileToWorldCenter(a.x, a.y, static_cast<float>(m_cfg.tileWidth),
-                                               static_cast<float>(m_cfg.tileHeight));
-          const Vector2 wb = TileToWorldCenter(b.x, b.y, static_cast<float>(m_cfg.tileWidth),
-                                               static_cast<float>(m_cfg.tileHeight));
+          const Vector2 wa = TileToWorldCenterElevated(m_world, a.x, a.y, static_cast<float>(m_cfg.tileWidth),
+                                                       static_cast<float>(m_cfg.tileHeight), m_elev);
+          const Vector2 wb = TileToWorldCenterElevated(m_world, b.x, b.y, static_cast<float>(m_cfg.tileWidth),
+                                                       static_cast<float>(m_cfg.tileHeight), m_elev);
           DrawLineEx(wa, wb, thickness, c);
         }
       }
@@ -849,8 +2655,8 @@ void Game::draw()
           if (idx < outsideMask->size() && (*outsideMask)[idx] == 0) c = Color{255, 80, 80, 220};
         }
 
-        const Vector2 wp = TileToWorldCenter(n.pos.x, n.pos.y, static_cast<float>(m_cfg.tileWidth),
-                                             static_cast<float>(m_cfg.tileHeight));
+        const Vector2 wp = TileToWorldCenterElevated(m_world, n.pos.x, n.pos.y, static_cast<float>(m_cfg.tileWidth),
+                                                     static_cast<float>(m_cfg.tileHeight), m_elev);
         DrawCircleV(wp, radius, c);
       }
 
@@ -860,9 +2666,130 @@ void Game::draw()
 
   const float simSpeed = kSimSpeeds[static_cast<std::size_t>(std::clamp(m_simSpeedIndex, 0, kSimSpeedCount - 1))];
   const char* inspectInfo = (m_tool == Tool::Inspect && !m_inspectInfo.empty()) ? m_inspectInfo.c_str() : nullptr;
-  m_renderer.drawHUD(m_world, m_tool, m_hovered, GetScreenWidth(), GetScreenHeight(), m_showHelp, m_brushRadius,
-                     static_cast<int>(m_history.undoSize()), static_cast<int>(m_history.redoSize()), m_simPaused,
-                     simSpeed, m_saveSlot, inspectInfo);
+
+  std::string heatmapInfo;
+  if (heatmapActive && heatmapName && heatmap && m_hovered &&
+      heatmap->size() == static_cast<std::size_t>(std::max(0, m_world.width()) * std::max(0, m_world.height()))) {
+    const std::size_t idx = static_cast<std::size_t>(m_hovered->y) * static_cast<std::size_t>(m_world.width()) +
+                            static_cast<std::size_t>(m_hovered->x);
+    const float hv = (*heatmap)[idx];
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "Heatmap: %s  %.2f", heatmapName, static_cast<double>(hv));
+    heatmapInfo = buf;
+  } else if (heatmapActive && heatmapName) {
+    heatmapInfo = std::string("Heatmap: ") + heatmapName;
+  }
+
+  const char* heatmapInfoC = (!heatmapInfo.empty()) ? heatmapInfo.c_str() : nullptr;
+
+  m_renderer.drawHUD(m_world, m_camera, m_tool, m_roadBuildLevel, m_hovered, GetScreenWidth(), GetScreenHeight(), m_showHelp,
+                     m_brushRadius, static_cast<int>(m_history.undoSize()), static_cast<int>(m_history.redoSize()),
+                     m_simPaused, simSpeed, m_saveSlot, m_showMinimap, inspectInfo, heatmapInfoC);
+
+  // Policy / budget panel (simple keyboard-driven UI).
+  if (m_showPolicy) {
+    const SimConfig& cfg = m_sim.config();
+    const Stats& st = m_world.stats();
+
+    const int panelW = 420;
+    const int panelH = 280;
+    const int x0 = GetScreenWidth() - panelW - 12;
+    const int y0 = 96;
+
+    DrawRectangle(x0, y0, panelW, panelH, Color{0, 0, 0, 180});
+    DrawRectangleLines(x0, y0, panelW, panelH, Color{255, 255, 255, 70});
+
+    int x = x0 + 12;
+    int y = y0 + 10;
+    DrawText("Policy & Budget", x, y, 20, RAYWHITE);
+    y += 24;
+    DrawText("Tab: select   [ / ]: adjust   Shift: bigger steps", x, y, 16, Color{220, 220, 220, 255});
+    y += 22;
+
+    auto row = [&](int idx, const char* label, const char* value) {
+      const bool sel = (m_policySelection == idx);
+      if (sel) {
+        DrawRectangle(x - 6, y - 2, panelW - 24, 20, Color{255, 255, 255, 40});
+      }
+      DrawText(TextFormat("%s: %s", label, value), x, y, 18,
+               sel ? Color{255, 255, 255, 255} : Color{210, 210, 210, 255});
+      y += 22;
+    };
+
+    row(0, "Residential tax", TextFormat("%d", cfg.taxResidential));
+    row(1, "Commercial tax", TextFormat("%d", cfg.taxCommercial));
+    row(2, "Industrial tax", TextFormat("%d", cfg.taxIndustrial));
+    row(3, "Road maintenance", TextFormat("%d", cfg.maintenanceRoad));
+    row(4, "Park maintenance", TextFormat("%d", cfg.maintenancePark));
+    row(5, "Outside connection", cfg.requireOutsideConnection ? "ON" : "OFF");
+    row(6, "Park radius", TextFormat("%d", cfg.parkInfluenceRadius));
+
+    y += 4;
+    DrawLine(x, y, x0 + panelW - 12, y, Color{255, 255, 255, 70});
+    y += 10;
+
+    const int tradeNet = st.exportRevenue - st.importCost;
+    const int net = st.income - st.expenses;
+    DrawText(TextFormat("Net: %+d   Income: %d   Expenses: %d", net, st.income, st.expenses), x, y, 18, RAYWHITE);
+    y += 22;
+    DrawText(TextFormat("Tax %d  Maint %d  Upg %d  Trade %+d", st.taxRevenue, st.maintenanceCost, st.upgradeCost, tradeNet),
+             x, y, 18, Color{220, 220, 220, 255});
+    y += 22;
+    DrawText(TextFormat("Land %.0f%%  Demand %.0f%%  Tax/cap %.2f", st.avgLandValue * 100.0f,
+                        st.demandResidential * 100.0f, static_cast<double>(st.avgTaxPerCapita)),
+             x, y, 18, Color{220, 220, 220, 255});
+  }
+
+  // Traffic model panel (experimental, not saved).
+  if (m_showTrafficModel) {
+    const TrafficModelSettings& tm = m_sim.trafficModel();
+    const Stats& st = m_world.stats();
+
+    const int panelW = 420;
+    const int panelH = 248;
+    const int x0 = GetScreenWidth() - panelW - 12;
+    // Stack below policy if both are visible.
+    const int y0 = m_showPolicy ? (96 + 280 + 12) : 96;
+
+    DrawRectangle(x0, y0, panelW, panelH, Color{0, 0, 0, 180});
+    DrawRectangleLines(x0, y0, panelW, panelH, Color{255, 255, 255, 70});
+
+    int x = x0 + 12;
+    int y = y0 + 10;
+    DrawText("Traffic Model", x, y, 20, RAYWHITE);
+    y += 24;
+    DrawText("Tab: select   [ / ]: adjust   Shift: bigger steps", x, y, 16, Color{220, 220, 220, 255});
+    y += 22;
+
+    auto row = [&](int idx, const char* label, const char* value) {
+      const bool sel = (m_trafficModelSelection == idx);
+      if (sel) {
+        DrawRectangle(x - 6, y - 2, panelW - 24, 20, Color{255, 255, 255, 40});
+      }
+      DrawText(TextFormat("%s: %s", label, value), x, y, 18,
+               sel ? Color{255, 255, 255, 255} : Color{210, 210, 210, 255});
+      y += 22;
+    };
+
+    row(0, "Congestion routing", tm.congestionAwareRouting ? "ON" : "OFF");
+    row(1, "Passes", TextFormat("%d", tm.congestionIterations));
+    row(2, "Alpha", TextFormat("%.2f", static_cast<double>(tm.congestionAlpha)));
+    row(3, "Beta", TextFormat("%.1f", static_cast<double>(tm.congestionBeta)));
+    row(4, "Cap scale", TextFormat("%.2f", static_cast<double>(tm.congestionCapacityScale)));
+    row(5, "Ratio clamp", TextFormat("%.1f", static_cast<double>(tm.congestionRatioClamp)));
+
+    y += 4;
+    DrawLine(x, y, x0 + panelW - 12, y, Color{255, 255, 255, 70});
+    y += 10;
+    DrawText(TextFormat("Avg commute (time): %.1f   Congestion: %.0f%%", static_cast<double>(st.avgCommuteTime),
+                        static_cast<double>(st.trafficCongestion * 100.0f)),
+             x, y, 18, Color{220, 220, 220, 255});
+  }
+
+  drawReportPanel();
+
+  // Save manager panel draws on top of the HUD.
+  drawSaveMenuPanel();
 
   // Road-drag overlay: show preview metrics without touching the HUD layout.
   if (m_roadDragActive) {
@@ -870,15 +2797,20 @@ void Game::draw()
     const int pad = 8;
 
     const char* line1 = nullptr;
-    char buf[128];
+    const char* line2 = nullptr;
+    char buf1[160];
+    char buf2[160];
     if (m_roadDragValid && !m_roadDragPath.empty()) {
-      std::snprintf(buf, sizeof(buf), "Road path: %d tiles, %d new", static_cast<int>(m_roadDragPath.size()),
-                    m_roadDragBuildCost);
-      line1 = buf;
+      std::snprintf(buf1, sizeof(buf1), "Road path (%s): %d tiles", RoadClassName(m_roadBuildLevel),
+                    static_cast<int>(m_roadDragPath.size()));
+      std::snprintf(buf2, sizeof(buf2), "New %d  Upg %d  Est $%d  (release)", m_roadDragBuildCost,
+                    m_roadDragUpgradeTiles, m_roadDragMoneyCost);
+      line1 = buf1;
+      line2 = buf2;
     } else {
       line1 = "Road path: no route";
+      line2 = "Release to cancel";
     }
-    const char* line2 = "Release to build";
 
     const int w1 = MeasureText(line1, fontSize);
     const int w2 = MeasureText(line2, fontSize);

@@ -6,6 +6,13 @@
 
 namespace isocity {
 
+// Administrative districts are a lightweight tagging layer on top of the world.
+//
+// District IDs are small integers that can be painted onto any tile. They are
+// persisted in v7+ saves and may be used by optional per-district policy
+// multipliers (tax/maintenance) and a district overlay.
+inline constexpr int kDistrictCount = 8; // IDs: 0..kDistrictCount-1
+
 enum class Terrain : std::uint8_t {
   Water = 0,
   Sand = 1,
@@ -29,6 +36,14 @@ enum class Tool : std::uint8_t {
   Industrial,
   Park,
   Bulldoze,
+
+  // Terraforming (visual elevation editing).
+  RaiseTerrain,
+  LowerTerrain,
+  SmoothTerrain,
+
+  // Administrative editing.
+  District,
 };
 
 // Return code for World::applyTool() so the game layer can provide feedback.
@@ -56,6 +71,9 @@ struct Tile {
   // Used for zoning overlays.
   std::uint8_t level = 1;      // 1..3
   std::uint16_t occupants = 0; // residents for Residential, workers for job zones
+
+  // Administrative district ID (0..kDistrictCount-1).
+  std::uint8_t district = 0;
 };
 
 struct Stats {
@@ -83,8 +101,10 @@ struct Stats {
   int commuters = 0;            // modeled commuting workers (usually ~= employed)
   int commutersUnreachable = 0; // commuters that couldn't reach any job access point
 
-  float avgCommute = 0.0f;      // road steps (edges)
-  float p95Commute = 0.0f;      // road steps (edges)
+  float avgCommute = 0.0f;        // road steps (edges)
+  float p95Commute = 0.0f;        // road steps (edges)
+  float avgCommuteTime = 0.0f;    // street-step equivalent travel time
+  float p95CommuteTime = 0.0f;    // street-step equivalent travel time
   float trafficCongestion = 0.0f; // 0..1 (excess traffic ratio)
 
   int congestedRoadTiles = 0;
@@ -99,6 +119,21 @@ struct Stats {
   int goodsUnreachableDemand = 0;
   float goodsSatisfaction = 1.0f; // delivered/demand, clamped to [0,1]
   int maxRoadGoodsTraffic = 0;
+
+  // --- Derived economy snapshot (recomputed by the simulator; not persisted in saves) ---
+  // These fields describe the *last simulated tick's* budget effects.
+  int income = 0;          // total income added this tick (taxes + export revenue)
+  int expenses = 0;        // total expenses paid this tick (maintenance + import cost)
+  int taxRevenue = 0;      // component of income
+  int maintenanceCost = 0; // component of expenses
+  int upgradeCost = 0;     // component of expenses (auto-development)
+  int importCost = 0;      // component of expenses
+  int exportRevenue = 0;   // component of income
+  float avgTaxPerCapita = 0.0f;
+
+  // --- Derived demand / valuation metrics (not persisted in saves) ---
+  float demandResidential = 0.0f; // 0..1 (global)
+  float avgLandValue = 0.0f;      // mean land value across non-water tiles
 };
 
 const char* ToString(Terrain t);
@@ -128,6 +163,18 @@ public:
 
   // Player actions / tools.
   ToolApplyResult applyTool(Tool tool, int x, int y);
+
+  // Roads support a 3-tier hierarchy using Tile::level:
+  //   1 = Street, 2 = Avenue, 3 = Highway
+  //
+  // This method applies the road tool at a desired level, charging the
+  // appropriate build/upgrade cost and clamping levels to [1,3].
+  ToolApplyResult applyRoad(int x, int y, int targetLevel);
+
+  // Paint an administrative district ID onto a tile.
+  // District painting is always allowed (including on water) since it does not
+  // change physical invariants.
+  ToolApplyResult applyDistrict(int x, int y, int districtId);
 
   // Utility editing operations.
   void bulldoze(int x, int y);

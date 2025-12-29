@@ -3,6 +3,8 @@
 #include "isocity/Pathfinding.hpp"
 
 #include "isocity/Random.hpp"
+#include "isocity/Road.hpp"
+#include "isocity/Traffic.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -22,6 +24,16 @@ inline Color Mul(Color c, float b)
   const int g = static_cast<int>(std::round(static_cast<float>(c.g) * b));
   const int bl = static_cast<int>(std::round(static_cast<float>(c.b) * b));
   return Color{ClampU8(r), ClampU8(g), ClampU8(bl), c.a};
+}
+
+inline Color Lerp(Color a, Color b, float t)
+{
+  t = std::clamp(t, 0.0f, 1.0f);
+  const int r = static_cast<int>(std::round((1.0f - t) * static_cast<float>(a.r) + t * static_cast<float>(b.r)));
+  const int g = static_cast<int>(std::round((1.0f - t) * static_cast<float>(a.g) + t * static_cast<float>(b.g)));
+  const int bl = static_cast<int>(std::round((1.0f - t) * static_cast<float>(a.b) + t * static_cast<float>(b.b)));
+  const int al = static_cast<int>(std::round((1.0f - t) * static_cast<float>(a.a) + t * static_cast<float>(b.a)));
+  return Color{ClampU8(r), ClampU8(g), ClampU8(bl), ClampU8(al)};
 }
 
 inline float Frac01(std::uint32_t u) { return static_cast<float>(u) / 4294967295.0f; }
@@ -81,7 +93,7 @@ struct TileRect {
 // Compute a conservative tile-coordinate rectangle that covers the current camera viewport.
 // This is used to avoid drawing off-screen tiles (big win when panning/zooming on larger maps).
 TileRect ComputeVisibleTileRect(const Camera2D& camera, int screenW, int screenH, int mapW, int mapH, float tileW,
-                                float tileH)
+                                float tileH, float maxElevPx)
 {
   // Viewport corners in world space.
   const Vector2 s0{0.0f, 0.0f};
@@ -110,8 +122,10 @@ TileRect ComputeVisibleTileRect(const Camera2D& camera, int screenW, int screenH
   // Expand by one tile to avoid edge pop-in (dst rect extends beyond the tile center).
   minWX -= tileW;
   maxWX += tileW;
-  minWY -= tileH;
-  maxWY += tileH;
+  // Elevation shifts tiles upward in world-space; expand Y bounds by the maximum elevation so we don't
+  // cull tiles that still contribute visible pixels above the viewport.
+  minWY -= tileH + maxElevPx;
+  maxWY += tileH + maxElevPx;
 
   const Point a = WorldToTileApprox(Vector2{minWX, minWY}, tileW, tileH);
   const Point b = WorldToTileApprox(Vector2{maxWX, minWY}, tileW, tileH);
@@ -132,6 +146,207 @@ TileRect ComputeVisibleTileRect(const Camera2D& camera, int screenW, int screenH
   r.minY = std::clamp(minTY - margin, 0, mapH - 1);
   r.maxY = std::clamp(maxTY + margin, 0, mapH - 1);
   return r;
+}
+
+struct BandBounds {
+  float minX = 0.0f;
+  float minY = 0.0f;
+  float maxX = 0.0f;
+  float maxY = 0.0f;
+};
+
+// Compute a conservative world-space AABB for an isometric diagonal band.
+//
+// A band is defined by a contiguous range of (x+y) sums [sum0..sum1].
+// We later render this entire band into a single RenderTexture2D and draw it
+// in increasing band order, which preserves the global draw ordering.
+BandBounds ComputeBandBounds(int sum0, int sum1, int mapW, int mapH, float tileW, float tileH, float maxElevPx)
+{
+  const float halfW = tileW * 0.5f;
+  const float halfH = tileH * 0.5f;
+
+  float minCenterX = std::numeric_limits<float>::infinity();
+  float maxCenterX = -std::numeric_limits<float>::infinity();
+
+  for (int sum = sum0; sum <= sum1; ++sum) {
+    const int x0 = std::max(0, sum - (mapH - 1));
+    const int x1 = std::min(mapW - 1, sum);
+    if (x0 > x1) continue;
+
+    // For fixed sum, center.x = (x-y)*halfW = (2*x - sum)*halfW.
+    const float cx0 = (2.0f * static_cast<float>(x0) - static_cast<float>(sum)) * halfW;
+    const float cx1 = (2.0f * static_cast<float>(x1) - static_cast<float>(sum)) * halfW;
+
+    minCenterX = std::min(minCenterX, cx0);
+    maxCenterX = std::max(maxCenterX, cx1);
+  }
+
+  if (!std::isfinite(minCenterX) || !std::isfinite(maxCenterX)) {
+    minCenterX = 0.0f;
+    maxCenterX = 0.0f;
+  }
+
+  BandBounds b;
+  b.minX = minCenterX - halfW;
+  b.maxX = maxCenterX + halfW;
+
+  // For fixed sum, base center.y = (x+y)*halfH = sum*halfH.
+  // Elevation shifts tiles UP (subtract), so we subtract maxElevPx from minY.
+  b.minY = static_cast<float>(sum0) * halfH - halfH - maxElevPx;
+  b.maxY = static_cast<float>(sum1) * halfH + halfH;
+  return b;
+}
+
+// Compute a stable screen-space destination rectangle for the minimap.
+Renderer::MinimapLayout ComputeMinimapLayout(int mapW, int mapH, int screenW, int screenH)
+{
+  Renderer::MinimapLayout out;
+  if (mapW <= 0 || mapH <= 0 || screenW <= 0 || screenH <= 0) {
+    out.rect = Rectangle{0, 0, 0, 0};
+    out.pixelsPerTile = 1.0f;
+    return out;
+  }
+
+  const float pad = 12.0f;
+  // Cap minimap size relative to the window so it stays usable across resolutions.
+  const float maxSize = std::min(260.0f, std::min(static_cast<float>(screenW), static_cast<float>(screenH)) * 0.38f);
+  const float denom = static_cast<float>(std::max(mapW, mapH));
+  float s = (denom > 0.0f) ? (maxSize / denom) : 1.0f;
+  s = std::clamp(s, 0.35f, 6.0f);
+
+  const float w = static_cast<float>(mapW) * s;
+  const float h = static_cast<float>(mapH) * s;
+
+  out.rect = Rectangle{static_cast<float>(screenW) - pad - w, static_cast<float>(screenH) - pad - h, w, h};
+  out.pixelsPerTile = s;
+  return out;
+}
+
+// Determine a minimap pixel color for a tile.
+Color MinimapColorForTile(const isocity::Tile& t)
+{
+  using namespace isocity;
+
+  // Base terrain colors.
+  Color base = Color{70, 160, 90, 255};
+  if (t.terrain == Terrain::Water) base = Color{35, 90, 210, 255};
+  if (t.terrain == Terrain::Sand) base = Color{195, 170, 95, 255};
+
+  // Simple height shading: higher tiles are slightly brighter.
+  const float b = std::clamp(0.70f + t.height * 0.45f, 0.35f, 1.25f);
+  base = Mul(base, b);
+
+  // Overlays: mix towards a strong color so gameplay is readable.
+  switch (t.overlay) {
+  case Overlay::None: return base;
+  case Overlay::Road: {
+    // Higher-tier roads read darker / stronger on the minimap.
+    const int lvl = std::clamp<int>(static_cast<int>(t.level), 1, 3);
+    const Color road = (lvl == 1) ? Color{28, 28, 30, 255} : (lvl == 2) ? Color{24, 24, 28, 255} : Color{20, 20, 25, 255};
+    const float k = (lvl == 1) ? 0.85f : (lvl == 2) ? 0.88f : 0.90f;
+    return Lerp(base, road, k);
+  }
+  case Overlay::Park: return Lerp(base, Color{70, 200, 95, 255}, 0.70f);
+  case Overlay::Residential: return Lerp(base, Color{80, 160, 235, 255}, 0.80f);
+  case Overlay::Commercial: return Lerp(base, Color{240, 170, 60, 255}, 0.80f);
+  case Overlay::Industrial: return Lerp(base, Color{200, 90, 220, 255}, 0.80f);
+  default: break;
+  }
+  return base;
+}
+
+// Draw a simple extruded "building" for zone tiles.
+void DrawZoneBuilding(const isocity::Tile& t, float tileW, float tileH, float zoom, const Vector2& tileCenter,
+                      float tileBrightness)
+{
+  using namespace isocity;
+
+  const bool isZone = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
+                       t.overlay == Overlay::Industrial);
+  if (!isZone) return;
+
+  // Fade out when zoomed out.
+  if (tileW * zoom < 26.0f) return;
+
+  const int lvl = std::clamp<int>(static_cast<int>(t.level), 1, 3);
+
+  int cap = 0;
+  float baseShrink = 0.54f;
+  float heightMul = 1.0f;
+  Color baseColor = Color{210, 210, 210, 255};
+
+  if (t.overlay == Overlay::Residential) {
+    cap = 10 * lvl;
+    baseShrink = 0.58f;
+    heightMul = 1.00f;
+    baseColor = Color{200, 220, 255, 255};
+  } else if (t.overlay == Overlay::Commercial) {
+    cap = 8 * lvl;
+    baseShrink = 0.50f;
+    heightMul = 1.40f;
+    baseColor = Color{255, 220, 170, 255};
+  } else if (t.overlay == Overlay::Industrial) {
+    cap = 12 * lvl;
+    baseShrink = 0.62f;
+    heightMul = 0.95f;
+    baseColor = Color{230, 210, 255, 255};
+  }
+
+  const float occRatio = (cap > 0) ? std::clamp(static_cast<float>(t.occupants) / static_cast<float>(cap), 0.0f, 1.0f)
+                                   : 0.0f;
+  const float var = static_cast<float>((t.variation >> 4) & 0x0Fu) / 15.0f;
+
+  // Height is primarily driven by level + occupancy, with some stable per-tile variety.
+  float heightPx = tileH * (0.55f + 0.35f * static_cast<float>(lvl) + 0.35f * occRatio);
+  heightPx *= heightMul;
+  heightPx *= 0.85f + 0.35f * var;
+
+  // Clamp so we don't create skyscrapers that overlap too aggressively.
+  heightPx = std::clamp(heightPx, tileH * 0.60f, tileH * 4.25f);
+
+  Vector2 diamond[4];
+  TileDiamondCorners(tileCenter, tileW, tileH, diamond);
+
+  Vector2 base[4];
+  for (int i = 0; i < 4; ++i) {
+    base[i].x = tileCenter.x + (diamond[i].x - tileCenter.x) * baseShrink;
+    base[i].y = tileCenter.y + (diamond[i].y - tileCenter.y) * baseShrink;
+  }
+
+  Vector2 top[4];
+  for (int i = 0; i < 4; ++i) {
+    top[i] = base[i];
+    top[i].y -= heightPx;
+  }
+
+  // Per-face shading.
+  const float b = std::clamp(tileBrightness, 0.35f, 1.35f);
+  const Color topC = Mul(baseColor, 1.10f * b);
+  const Color rightC = Mul(baseColor, 0.85f * b);
+  const Color leftC = Mul(baseColor, 0.70f * b);
+
+  // Right face: edge 1-2.
+  DrawTriangle(base[1], base[2], top[2], rightC);
+  DrawTriangle(base[1], top[2], top[1], rightC);
+
+  // Left face: edge 2-3.
+  DrawTriangle(base[3], base[2], top[2], leftC);
+  DrawTriangle(base[3], top[2], top[3], leftC);
+
+  // Roof (top face) drawn last.
+  DrawTriangle(top[0], top[1], top[2], topC);
+  DrawTriangle(top[0], top[2], top[3], topC);
+
+  // Optional small roof highlight at high zoom.
+  if (tileW * zoom >= 46.0f) {
+    const float invZoom = 1.0f / std::max(0.001f, zoom);
+    const float thick = 1.0f * invZoom;
+    const Color lc = Color{0, 0, 0, 70};
+    DrawLineEx(top[0], top[1], thick, lc);
+    DrawLineEx(top[1], top[2], thick, lc);
+    DrawLineEx(top[2], top[3], thick, lc);
+    DrawLineEx(top[3], top[0], thick, lc);
+  }
 }
 
 
@@ -162,6 +377,10 @@ Renderer::Renderer(int tileW, int tileH, std::uint64_t seed)
     : m_tileW(tileW)
     , m_tileH(tileH)
 {
+  // Default to flat rendering; Game can enable elevation via setElevationSettings().
+  m_elev.maxPixels = 0.0f;
+  m_elev.quantizeSteps = 16;
+  m_elev.flattenWater = true;
   rebuildTextures(seed);
 }
 
@@ -181,6 +400,325 @@ void Renderer::unloadTextures()
     if (t.id != 0) UnloadTexture(t);
     t = Texture2D{};
   }
+
+  unloadBaseCache();
+
+  unloadMinimap();
+}
+
+void Renderer::unloadMinimap()
+{
+  if (m_minimapTex.id != 0) {
+    UnloadTexture(m_minimapTex);
+    m_minimapTex = Texture2D{};
+  }
+  m_minimapW = 0;
+  m_minimapH = 0;
+  m_minimapPixels.clear();
+  m_minimapDirty = true;
+}
+
+void Renderer::unloadBaseCache()
+{
+  for (auto& b : m_bands) {
+    if (b.rt.id != 0) {
+      UnloadRenderTexture(b.rt);
+      b.rt = RenderTexture2D{};
+    }
+  }
+  m_bands.clear();
+  m_bandMapW = 0;
+  m_bandMapH = 0;
+  m_bandMaxPixels = 0.0f;
+  m_bandCacheDirtyAll = true;
+}
+
+void Renderer::markBaseCacheDirtyAll()
+{
+  m_bandCacheDirtyAll = true;
+  for (auto& b : m_bands) b.dirty = true;
+}
+
+void Renderer::markBaseCacheDirtyForTiles(const std::vector<Point>& tiles, int mapW, int mapH)
+{
+  if (tiles.empty()) return;
+  if (mapW <= 0 || mapH <= 0) return;
+
+  const int numSums = mapW + mapH - 1;
+  const int numBands = (numSums + kBandSums - 1) / kBandSums;
+
+  // If the cache hasn't been created yet (or map dimensions changed), just mark everything dirty.
+  if (m_bands.empty() || static_cast<int>(m_bands.size()) != numBands || m_bandMapW != mapW || m_bandMapH != mapH) {
+    m_bandCacheDirtyAll = true;
+    return;
+  }
+
+  auto markSum = [&](int sum) {
+    if (sum < 0 || sum >= numSums) return;
+    const int bi = sum / kBandSums;
+    if (bi >= 0 && bi < static_cast<int>(m_bands.size())) {
+      m_bands[static_cast<std::size_t>(bi)].dirty = true;
+    }
+  };
+
+  auto markTile = [&](int x, int y) {
+    if (x < 0 || y < 0 || x >= mapW || y >= mapH) return;
+    const int s = x + y;
+    markSum(s);
+    // Height changes affect cliffs drawn on tiles in front (sum+1). Road edits can also change
+    // neighbor auto-tiling masks, so we conservatively dirty the next diagonal too.
+    markSum(s + 1);
+  };
+
+  for (const Point& p : tiles) {
+    // Dirty the edited tile and its 4-neighborhood so auto-tiling road masks update correctly.
+    markTile(p.x, p.y);
+    markTile(p.x - 1, p.y);
+    markTile(p.x + 1, p.y);
+    markTile(p.x, p.y - 1);
+    markTile(p.x, p.y + 1);
+  }
+}
+
+void Renderer::ensureBaseCache(const World& world)
+{
+  const int mapW = world.width();
+  const int mapH = world.height();
+  if (mapW <= 0 || mapH <= 0) {
+    unloadBaseCache();
+    return;
+  }
+
+  const int numSums = mapW + mapH - 1;
+  const int numBands = (numSums + kBandSums - 1) / kBandSums;
+
+  const bool needsRecreate = (m_bands.empty() || m_bandMapW != mapW || m_bandMapH != mapH ||
+                              static_cast<int>(m_bands.size()) != numBands ||
+                              m_bandMaxPixels != m_elev.maxPixels);
+
+  if (needsRecreate) {
+    unloadBaseCache();
+
+    m_bandMapW = mapW;
+    m_bandMapH = mapH;
+    m_bandMaxPixels = m_elev.maxPixels;
+
+    m_bands.resize(static_cast<std::size_t>(numBands));
+
+    const float tileW = static_cast<float>(m_tileW);
+    const float tileH = static_cast<float>(m_tileH);
+
+    const float pad = 2.0f;
+    for (int i = 0; i < numBands; ++i) {
+      BandCache& b = m_bands[static_cast<std::size_t>(i)];
+      b.sum0 = i * kBandSums;
+      b.sum1 = std::min(numSums - 1, b.sum0 + (kBandSums - 1));
+      b.dirty = true;
+
+      const BandBounds bb = ComputeBandBounds(b.sum0, b.sum1, mapW, mapH, tileW, tileH, std::max(0.0f, m_bandMaxPixels));
+      b.origin = Vector2{bb.minX - pad, bb.minY - pad};
+
+      const int texW = std::max(1, static_cast<int>(std::ceil((bb.maxX - bb.minX) + pad * 2.0f)));
+      const int texH = std::max(1, static_cast<int>(std::ceil((bb.maxY - bb.minY) + pad * 2.0f)));
+
+      b.rt = LoadRenderTexture(texW, texH);
+      if (b.rt.id != 0) {
+        // Keep cached layers crisp when scaling.
+        SetTextureFilter(b.rt.texture, TEXTURE_FILTER_POINT);
+      }
+    }
+
+    m_bandCacheDirtyAll = false;
+  }
+
+  if (m_bandCacheDirtyAll) {
+    for (auto& b : m_bands) b.dirty = true;
+    m_bandCacheDirtyAll = false;
+  }
+}
+
+void Renderer::rebuildBaseCacheBand(const World& world, BandCache& band)
+{
+  if (band.rt.id == 0) {
+    band.dirty = false;
+    return;
+  }
+
+  const int mapW = world.width();
+  const int mapH = world.height();
+
+  const float tileW = static_cast<float>(m_tileW);
+  const float tileH = static_cast<float>(m_tileH);
+
+  const Rectangle src = Rectangle{0, 0, tileW, tileH};
+  const Vector2 shift = Vector2{-band.origin.x, -band.origin.y};
+
+  BeginTextureMode(band.rt);
+  ClearBackground(BLANK);
+
+  for (int sum = band.sum0; sum <= band.sum1; ++sum) {
+    const int x0 = std::max(0, sum - (mapH - 1));
+    const int x1 = std::min(mapW - 1, sum);
+    for (int x = x0; x <= x1; ++x) {
+      const int y = sum - x;
+      const Tile& t = world.at(x, y);
+
+      const float elevPx = TileElevationPx(t, m_elev);
+      const Vector2 baseCenterW = TileToWorldCenter(x, y, tileW, tileH);
+      const Vector2 baseCenter{baseCenterW.x + shift.x, baseCenterW.y + shift.y};
+      const Vector2 center{baseCenter.x, baseCenter.y - elevPx};
+
+      const Rectangle dst = Rectangle{center.x - tileW * 0.5f, center.y - tileH * 0.5f, tileW, tileH};
+
+      // Per-tile lighting based on height + variation (same as the immediate renderer,
+      // except we omit animated water shimmer for cache stability).
+      const float v = (static_cast<float>(t.variation) / 255.0f - 0.5f) * 0.10f;
+      float brightness = 0.85f + t.height * 0.30f + v;
+
+      // Draw terrain
+      DrawTexturePro(terrain(t.terrain), src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
+
+      // Draw cliff walls for higher neighbors behind this tile (same logic as immediate path).
+      {
+        Vector2 baseCorners[4];
+        TileDiamondCorners(baseCenter, tileW, tileH, baseCorners);
+
+        const float eps = 0.5f;
+
+        auto drawCliffEdge = [&](Vector2 e0, Vector2 e1, float topElev, float botElev, Color c) {
+          if (topElev <= botElev + eps) return;
+          Vector2 top0 = e0;
+          Vector2 top1 = e1;
+          Vector2 bot0 = e0;
+          Vector2 bot1 = e1;
+          top0.y -= topElev;
+          top1.y -= topElev;
+          bot0.y -= botElev;
+          bot1.y -= botElev;
+
+          DrawTriangle(top0, top1, bot1, c);
+          DrawTriangle(top0, bot1, bot0, c);
+        };
+
+        if (x > 0) {
+          const Tile& n = world.at(x - 1, y);
+          const float ne = TileElevationPx(n, m_elev);
+          const Color base = TerrainCliffBaseColor(n.terrain);
+          drawCliffEdge(baseCorners[3], baseCorners[0], ne, elevPx, Mul(base, 0.70f));
+        }
+
+        if (y > 0) {
+          const Tile& n = world.at(x, y - 1);
+          const float ne = TileElevationPx(n, m_elev);
+          const Color base = TerrainCliffBaseColor(n.terrain);
+          drawCliffEdge(baseCorners[0], baseCorners[1], ne, elevPx, Mul(base, 0.85f));
+        }
+      }
+
+      // Draw overlay (base view only: no traffic/goods/outside/heatmap tinting).
+      if (t.overlay == Overlay::Road) {
+        const std::uint8_t mask = static_cast<std::uint8_t>(t.variation & 0x0Fu);
+        DrawTexturePro(road(mask), src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
+      } else if (t.overlay != Overlay::None) {
+        DrawTexturePro(overlay(t.overlay), src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
+      }
+    }
+  }
+
+  EndTextureMode();
+  band.dirty = false;
+}
+
+Renderer::MinimapLayout Renderer::minimapLayout(const World& world, int screenW, int screenH) const
+{
+  return ComputeMinimapLayout(world.width(), world.height(), screenW, screenH);
+}
+
+void Renderer::ensureMinimapUpToDate(const World& world)
+{
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return;
+
+  const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+
+  const bool needsRecreate = (m_minimapTex.id == 0) || (m_minimapW != w) || (m_minimapH != h) ||
+                             (m_minimapPixels.size() != n);
+
+  if (needsRecreate) {
+    unloadMinimap();
+    m_minimapW = w;
+    m_minimapH = h;
+    m_minimapPixels.assign(n, BLANK);
+    m_minimapDirty = true;
+  }
+
+  if (!m_minimapDirty && m_minimapTex.id != 0) return;
+
+  // Rebuild pixel buffer.
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const Tile& t = world.at(x, y);
+      m_minimapPixels[static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x)] =
+          MinimapColorForTile(t);
+    }
+  }
+
+  if (m_minimapTex.id == 0) {
+    // Create a GPU texture directly from our CPU pixel buffer.
+    Image img{};
+    img.data = m_minimapPixels.data();
+    img.width = w;
+    img.height = h;
+    img.mipmaps = 1;
+    img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+    m_minimapTex = LoadTextureFromImage(img);
+    if (m_minimapTex.id != 0) {
+      // Keep the minimap crisp when scaling up.
+      SetTextureFilter(m_minimapTex, TEXTURE_FILTER_POINT);
+    }
+  } else {
+    UpdateTexture(m_minimapTex, m_minimapPixels.data());
+  }
+
+  m_minimapDirty = false;
+}
+
+bool Renderer::exportMinimapThumbnail(const World& world, const char* fileName, int maxSize)
+{
+  if (fileName == nullptr || fileName[0] == '\0') return false;
+
+  ensureMinimapUpToDate(world);
+  if (m_minimapW <= 0 || m_minimapH <= 0) return false;
+  if (m_minimapPixels.empty()) return false;
+
+  // Build an Image from our CPU pixel buffer. We copy because raylib image
+  // processing utilities can reallocate the data.
+  Image base{};
+  base.data = (void*)m_minimapPixels.data();
+  base.width = m_minimapW;
+  base.height = m_minimapH;
+  base.mipmaps = 1;
+  base.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+
+  Image img = ImageCopy(base);
+  if (!IsImageReady(img)) return false;
+
+  const int ms = std::max(1, maxSize);
+  const int w = img.width;
+  const int h = img.height;
+  const int maxDim = std::max(w, h);
+
+  if (maxDim > ms) {
+    const float scale = static_cast<float>(ms) / static_cast<float>(maxDim);
+    const int nw = std::max(1, static_cast<int>(std::lround(static_cast<float>(w) * scale)));
+    const int nh = std::max(1, static_cast<int>(std::lround(static_cast<float>(h) * scale)));
+    ImageResize(&img, nw, nh);
+  }
+
+  const bool ok = ExportImage(img, fileName);
+  UnloadImage(img);
+  return ok;
 }
 
 static int TerrainIndex(Terrain t)
@@ -190,6 +728,16 @@ static int TerrainIndex(Terrain t)
   case Terrain::Sand: return 1;
   case Terrain::Grass: return 2;
   default: return 2;
+  }
+}
+
+static Color TerrainCliffBaseColor(Terrain t)
+{
+  switch (t) {
+  case Terrain::Water: return Color{20, 60, 120, 255};
+  case Terrain::Sand: return Color{180, 150, 90, 255};
+  case Terrain::Grass: return Color{45, 120, 65, 255};
+  default: return Color{45, 120, 65, 255};
   }
 }
 
@@ -405,17 +953,51 @@ void Renderer::rebuildTextures(std::uint64_t seed)
   });
 }
 
+namespace {
+
+inline unsigned char LerpU8(unsigned char a, unsigned char b, float t) {
+  t = std::clamp(t, 0.0f, 1.0f);
+  return static_cast<unsigned char>(std::round(static_cast<float>(a) + (static_cast<float>(b) - static_cast<float>(a)) * t));
+}
+
+inline Color LerpColor(Color a, Color b, float t) {
+  return Color{LerpU8(a.r, b.r, t), LerpU8(a.g, b.g, t), LerpU8(a.b, b.b, t), LerpU8(a.a, b.a, t)};
+}
+
+Color HeatmapColor(float v, Renderer::HeatmapRamp ramp) {
+  v = std::clamp(v, 0.0f, 1.0f);
+  const float alphaF = std::clamp(70.0f + 110.0f * v, 0.0f, 255.0f);
+
+  const Color red{220, 70, 70, static_cast<unsigned char>(alphaF)};
+  const Color yellow{240, 220, 90, static_cast<unsigned char>(alphaF)};
+  const Color green{70, 220, 120, static_cast<unsigned char>(alphaF)};
+
+  if (ramp == Renderer::HeatmapRamp::Bad) {
+    // 0 (good) -> green ... 1 (bad) -> red
+    if (v < 0.5f) {
+      return LerpColor(green, yellow, v / 0.5f);
+    }
+    return LerpColor(yellow, red, (v - 0.5f) / 0.5f);
+  }
+
+  // 0 (bad) -> red ... 1 (good) -> green
+  if (v < 0.5f) {
+    return LerpColor(red, yellow, v / 0.5f);
+  }
+  return LerpColor(yellow, green, (v - 0.5f) / 0.5f);
+}
+
+} // namespace
+
 void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeSec, std::optional<Point> hovered,
                          bool drawGrid, int brushRadius, std::optional<Point> selected,
                          const std::vector<Point>* highlightPath, const std::vector<std::uint8_t>* roadToEdgeMask,
                          const std::vector<std::uint16_t>* roadTraffic, int trafficMax,
                          const std::vector<std::uint16_t>* roadGoodsTraffic, int goodsMax,
-                         const std::vector<std::uint8_t>* commercialGoodsFill)
+                         const std::vector<std::uint8_t>* commercialGoodsFill,
+                         const std::vector<float>* heatmap,
+                         HeatmapRamp heatmapRamp)
 {
-  (void)timeSec;
-
-  BeginMode2D(camera);
-
   const int w = world.width();
   const int h = world.height();
 
@@ -435,9 +1017,153 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
                                   commercialGoodsFill->size() ==
                                       static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
 
+  const bool showHeatmap = (heatmap && w > 0 && h > 0 &&
+                            heatmap->size() ==
+                                static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
+
+  // Base-cache usage is only valid when the base view is being rendered. Any debug overlay that
+  // tints roads/zones per-tile (traffic, goods, outside-access, heatmap) falls back to the
+  // immediate path.
+  const bool useBaseCache = (m_useBandCache && !showOutside && !showTraffic && !showGoods &&
+                             !showCommercialGoods && !showHeatmap);
+
+  bool baseCacheReady = false;
+  if (useBaseCache) {
+    ensureBaseCache(world);
+    for (auto& b : m_bands) {
+      if (b.dirty) rebuildBaseCacheBand(world, b);
+      if (b.rt.id != 0) baseCacheReady = true;
+    }
+  }
+
   // Compute a conservative visible tile range based on the current camera view.
   const TileRect vis = ComputeVisibleTileRect(camera, GetScreenWidth(), GetScreenHeight(), w, h,
-                                              static_cast<float>(m_tileW), static_cast<float>(m_tileH));
+                                             static_cast<float>(m_tileW), static_cast<float>(m_tileH),
+                                             std::max(0.0f, m_elev.maxPixels));
+
+  BeginMode2D(camera);
+
+  // Cached base path: draw the static base world (terrain + cliffs + base overlays) from
+  // off-screen render targets. Dynamic per-tile extras (grid, buildings, indicators) are drawn
+  // in-order on top.
+  if (useBaseCache && baseCacheReady) {
+    for (const auto& b : m_bands) {
+      if (b.rt.id == 0) continue;
+      const Rectangle src = Rectangle{0.0f, 0.0f, static_cast<float>(b.rt.texture.width),
+                                      -static_cast<float>(b.rt.texture.height)};
+      DrawTextureRec(b.rt.texture, src, b.origin, WHITE);
+    }
+
+    // Draw order: diagonals by (x+y) so nearer tiles draw last.
+    const int minSum = vis.minX + vis.minY;
+    const int maxSum = vis.maxX + vis.maxY;
+    for (int sum = minSum; sum <= maxSum; ++sum) {
+      const int x0 = std::max(vis.minX, sum - vis.maxY);
+      const int x1 = std::min(vis.maxX, sum - vis.minY);
+      for (int x = x0; x <= x1; ++x) {
+        const int y = sum - x;
+        if (y < vis.minY || y > vis.maxY) continue;
+
+        const Tile& t = world.at(x, y);
+
+        const float tileW = static_cast<float>(m_tileW);
+        const float tileH = static_cast<float>(m_tileH);
+
+        const float elevPx = TileElevationPx(t, m_elev);
+        const Vector2 baseCenter = TileToWorldCenter(x, y, tileW, tileH);
+        const Vector2 center{baseCenter.x, baseCenter.y - elevPx};
+
+        // Per-tile lighting based on height + variation (matches base-cache draw, minus water shimmer).
+        const float v = (static_cast<float>(t.variation) / 255.0f - 0.5f) * 0.10f;
+        const float brightness = 0.85f + t.height * 0.30f + v;
+
+        // Optional grid overlay.
+        if (drawGrid) {
+          Vector2 corners[4];
+          TileDiamondCorners(center, tileW, tileH, corners);
+          const Color c = Color{255, 255, 255, 35};
+          DrawLineV(corners[0], corners[1], c);
+          DrawLineV(corners[1], corners[2], c);
+          DrawLineV(corners[2], corners[3], c);
+          DrawLineV(corners[3], corners[0], c);
+        }
+
+        // Draw building above tile (for zones only).
+        DrawZoneBuilding(t, tileW, tileH, camera.zoom, center, brightness);
+
+        // Zone indicators: show small pips and a fill bar when zoomed in.
+        const float tileScreenW = tileW * camera.zoom;
+        if ((t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial || t.overlay == Overlay::Industrial) &&
+            tileScreenW >= 28.0f) {
+          const int lvl = std::clamp<int>(static_cast<int>(t.level), 1, 3);
+          const int cap = (t.overlay == Overlay::Residential)   ? (10 * lvl)
+                          : (t.overlay == Overlay::Commercial) ? (8 * lvl)
+                                                               : (12 * lvl);
+          const float ratio = (cap > 0) ? std::clamp(static_cast<float>(t.occupants) / static_cast<float>(cap), 0.0f, 1.0f)
+                                        : 0.0f;
+
+          const float invZoom = 1.0f / std::max(0.001f, camera.zoom);
+
+          // Draw 3 pips for level.
+          const float y0 = center.y - static_cast<float>(m_tileH) * 0.18f;
+
+          const float pip = 4.0f * invZoom;
+          const float gap = 1.5f * invZoom;
+          const float groupW = pip * 3.0f + gap * 2.0f;
+          const float x0p = center.x - groupW * 0.5f;
+
+          for (int i = 0; i < 3; ++i) {
+            Rectangle r{x0p + static_cast<float>(i) * (pip + gap), y0, pip, pip};
+            DrawRectangleRec(r, Color{0, 0, 0, 120});
+            DrawRectangleLinesEx(r, 1.0f * invZoom, Color{255, 255, 255, 60});
+            if (i < lvl) {
+              Rectangle f{r.x + 1.0f * invZoom, r.y + 1.0f * invZoom, r.width - 2.0f * invZoom,
+                          r.height - 2.0f * invZoom};
+              DrawRectangleRec(f, Color{255, 255, 255, 170});
+            }
+          }
+
+          // Occupancy bar.
+          const float barW = 22.0f * invZoom;
+          const float barH = 3.0f * invZoom;
+          const float barX = center.x - barW * 0.5f;
+          const float barY = y0 + pip + 2.0f * invZoom;
+
+          Rectangle bg{barX, barY, barW, barH};
+          DrawRectangleRec(bg, Color{0, 0, 0, 120});
+
+          Rectangle fg{barX, barY, barW * ratio, barH};
+          DrawRectangleRec(fg, Color{255, 255, 255, 170});
+          DrawRectangleLinesEx(bg, 1.0f * invZoom, Color{255, 255, 255, 60});
+        }
+
+        // Road indicators: show small pips for upgraded road class (2..3) when zoomed in.
+        if (t.overlay == Overlay::Road && tileScreenW >= 28.0f) {
+          const int lvl = std::clamp<int>(static_cast<int>(t.level), 1, 3);
+          if (lvl > 1) {
+            const float invZoom = 1.0f / std::max(0.001f, camera.zoom);
+            const float y0 = center.y - static_cast<float>(m_tileH) * 0.02f;
+
+            const float pip = 4.0f * invZoom;
+            const float gap = 1.5f * invZoom;
+            const float groupW = pip * 3.0f + gap * 2.0f;
+            const float x0 = center.x - groupW * 0.5f;
+
+            for (int i = 0; i < 3; ++i) {
+              Rectangle r{x0 + static_cast<float>(i) * (pip + gap), y0, pip, pip};
+              DrawRectangleRec(r, Color{0, 0, 0, 110});
+              DrawRectangleLinesEx(r, 1.0f * invZoom, Color{255, 255, 255, 55});
+              if (i < lvl) {
+                Rectangle f{r.x + 1.0f * invZoom, r.y + 1.0f * invZoom, r.width - 2.0f * invZoom,
+                            r.height - 2.0f * invZoom};
+                DrawRectangleRec(f, Color{255, 255, 255, 160});
+              }
+            }
+          }
+        }
+      }
+    }
+  } else {
 
   // Draw order: diagonals by (x+y) so nearer tiles draw last.
   const int minSum = vis.minX + vis.minY;
@@ -451,10 +1177,15 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
 
       const Tile& t = world.at(x, y);
 
-      const Vector2 center = TileToWorldCenter(x, y, static_cast<float>(m_tileW), static_cast<float>(m_tileH));
-      const Rectangle dst = Rectangle{center.x - m_tileW * 0.5f, center.y - m_tileH * 0.5f,
-                                      static_cast<float>(m_tileW), static_cast<float>(m_tileH)};
-      const Rectangle src = Rectangle{0, 0, static_cast<float>(m_tileW), static_cast<float>(m_tileH)};
+      const float tileW = static_cast<float>(m_tileW);
+      const float tileH = static_cast<float>(m_tileH);
+
+      const float elevPx = TileElevationPx(t, m_elev);
+      const Vector2 baseCenter = TileToWorldCenter(x, y, tileW, tileH);
+      const Vector2 center{baseCenter.x, baseCenter.y - elevPx};
+
+      const Rectangle dst = Rectangle{center.x - tileW * 0.5f, center.y - tileH * 0.5f, tileW, tileH};
+      const Rectangle src = Rectangle{0, 0, tileW, tileH};
 
       // Per-tile lighting based on height + variation.
       const float v = (static_cast<float>(t.variation) / 255.0f - 0.5f) * 0.10f;
@@ -467,6 +1198,47 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
 
       // Draw terrain
       DrawTexturePro(terrain(t.terrain), src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
+
+      // Draw cliff walls for higher neighbors behind this tile. We draw these AFTER the terrain top,
+      // but BEFORE overlays, so roads/zones stay on top.
+      {
+        // For the shared edges, we use the base (non-elevated) diamond corners.
+        Vector2 baseCorners[4];
+        TileDiamondCorners(baseCenter, tileW, tileH, baseCorners);
+
+        const float eps = 0.5f;
+
+        auto drawCliffEdge = [&](Vector2 e0, Vector2 e1, float topElev, float botElev, Color c) {
+          if (topElev <= botElev + eps) return;
+          Vector2 top0 = e0;
+          Vector2 top1 = e1;
+          Vector2 bot0 = e0;
+          Vector2 bot1 = e1;
+          top0.y -= topElev;
+          top1.y -= topElev;
+          bot0.y -= botElev;
+          bot1.y -= botElev;
+
+          DrawTriangle(top0, top1, bot1, c);
+          DrawTriangle(top0, bot1, bot0, c);
+        };
+
+        // Left neighbor (x-1, y) is behind; if it's higher, we see a cliff along our top-left edge (3-0).
+        if (x > 0) {
+          const Tile& n = world.at(x - 1, y);
+          const float ne = TileElevationPx(n, m_elev);
+          const Color base = TerrainCliffBaseColor(n.terrain);
+          drawCliffEdge(baseCorners[3], baseCorners[0], ne, elevPx, Mul(base, 0.70f));
+        }
+
+        // Up neighbor (x, y-1) is behind; if it's higher, we see a cliff along our top-right edge (0-1).
+        if (y > 0) {
+          const Tile& n = world.at(x, y - 1);
+          const float ne = TileElevationPx(n, m_elev);
+          const Color base = TerrainCliffBaseColor(n.terrain);
+          drawCliffEdge(baseCorners[0], baseCorners[1], ne, elevPx, Mul(base, 0.85f));
+        }
+      }
 
       // Draw overlay
       if (t.overlay == Overlay::Road) {
@@ -507,6 +1279,16 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
               tint.r = ClampU8(static_cast<int>(std::round(rf)));
               tint.g = ClampU8(static_cast<int>(std::round(gf)));
               tint.b = ClampU8(static_cast<int>(std::round(bf)));
+
+              // Extra hint: highlight tiles that exceed their class-dependent capacity.
+              const int baseCap = std::max(0, TrafficConfig{}.roadTileCapacity);
+              if (baseCap > 0) {
+                const int cap = RoadCapacityForLevel(baseCap, static_cast<int>(t.level));
+                if (cap > 0 && tv > cap) {
+                  const float over = std::clamp(static_cast<float>(tv - cap) / static_cast<float>(cap), 0.0f, 1.0f);
+                  tint = Lerp(tint, Color{255, 80, 80, 255}, 0.40f + 0.45f * over);
+                }
+              }
             }
           }
         }
@@ -568,6 +1350,20 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
         DrawTexturePro(overlay(t.overlay), src, dst, Vector2{0, 0}, 0.0f, tint);
       }
 
+      // Heatmap overlay (drawn after tile overlays so it can tint zones/roads).
+      if (showHeatmap) {
+        const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
+                                static_cast<std::size_t>(x);
+        if (idx < heatmap->size()) {
+          const float hv = (*heatmap)[idx];
+          const Color c = HeatmapColor(hv, heatmapRamp);
+          Vector2 corners[4];
+          TileDiamondCorners(center, tileW, tileH, corners);
+          DrawTriangle(corners[0], corners[1], corners[2], c);
+          DrawTriangle(corners[0], corners[2], corners[3], c);
+        }
+      }
+
       if (drawGrid) {
         Vector2 corners[4];
         TileDiamondCorners(center, static_cast<float>(m_tileW), static_cast<float>(m_tileH), corners);
@@ -577,6 +1373,10 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
         DrawLineV(corners[2], corners[3], gc);
         DrawLineV(corners[3], corners[0], gc);
       }
+
+      // Procedural 3D-ish buildings for zone tiles.
+      DrawZoneBuilding(t, tileW, tileH, camera.zoom, center, brightness);
+
       // Zone indicators: when zoomed in, draw small pips for building level (1..3)
       // and a tiny occupancy bar (residents/workers vs capacity).
       const bool isZone =
@@ -629,7 +1429,34 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
         DrawRectangleRec(fg, Color{255, 255, 255, 170});
         DrawRectangleLinesEx(bg, 1.0f * invZoom, Color{255, 255, 255, 60});
       }
+
+      // Road indicators: show small pips for upgraded road class (2..3) when zoomed in.
+      if (t.overlay == Overlay::Road && tileScreenW >= 28.0f) {
+        const int lvl = std::clamp<int>(static_cast<int>(t.level), 1, 3);
+        if (lvl > 1) {
+          const float invZoom = 1.0f / std::max(0.001f, camera.zoom);
+          const float y0 = center.y - static_cast<float>(m_tileH) * 0.02f;
+
+          const float pip = 4.0f * invZoom;
+          const float gap = 1.5f * invZoom;
+          const float groupW = pip * 3.0f + gap * 2.0f;
+          const float x0 = center.x - groupW * 0.5f;
+
+          for (int i = 0; i < 3; ++i) {
+            Rectangle r{x0 + static_cast<float>(i) * (pip + gap), y0, pip, pip};
+            DrawRectangleRec(r, Color{0, 0, 0, 110});
+            DrawRectangleLinesEx(r, 1.0f * invZoom, Color{255, 255, 255, 55});
+            if (i < lvl) {
+              Rectangle f{r.x + 1.0f * invZoom, r.y + 1.0f * invZoom, r.width - 2.0f * invZoom,
+                          r.height - 2.0f * invZoom};
+              DrawRectangleRec(f, Color{255, 255, 255, 160});
+            }
+          }
+        }
+      }
     }
+  }
+
   }
 
   // Highlight helpers.
@@ -637,9 +1464,12 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
 
   auto drawOutline = [&](int tx, int ty, Color c) {
     if (!world.inBounds(tx, ty)) return;
-    const Vector2 center = TileToWorldCenter(tx, ty, static_cast<float>(m_tileW), static_cast<float>(m_tileH));
+    const float tileW = static_cast<float>(m_tileW);
+    const float tileH = static_cast<float>(m_tileH);
+    Vector2 center = TileToWorldCenter(tx, ty, tileW, tileH);
+    center.y -= TileElevationPx(world.at(tx, ty), m_elev);
     Vector2 corners[4];
-    TileDiamondCorners(center, static_cast<float>(m_tileW), static_cast<float>(m_tileH), corners);
+    TileDiamondCorners(center, tileW, tileH, corners);
 
     DrawLineEx(corners[0], corners[1], thickness, c);
     DrawLineEx(corners[1], corners[2], thickness, c);
@@ -685,18 +1515,21 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, float timeS
   EndMode2D();
 }
 
-void Renderer::drawHUD(const World& world, Tool tool, std::optional<Point> hovered, int screenW, int screenH,
-                       bool showHelp, int brushRadius, int undoCount, int redoCount, bool simPaused, float simSpeed,
-                       int saveSlot, const char* inspectInfo)
+void Renderer::drawHUD(const World& world, const Camera2D& camera, Tool tool, int roadBuildLevel,
+                       std::optional<Point> hovered,
+                       int screenW, int screenH, bool showHelp, int brushRadius, int undoCount, int redoCount,
+                       bool simPaused, float simSpeed, int saveSlot, bool showMinimap, const char* inspectInfo,
+                       const char* heatmapInfo)
 {
   const Stats& s = world.stats();
 
   // HUD panel
   const int pad = 12;
   const int panelW = 420;
-  const int extraLine = (inspectInfo && inspectInfo[0] != '\0') ? 1 : 0;
-  // +2 extra lines for traffic/commute + goods/logistics stats.
-  const int panelH = (showHelp ? 360 : 228) + extraLine * 22;
+  // Budget + demand + land value add two always-on HUD lines.
+  const int extraLines = 2 + ((inspectInfo && inspectInfo[0] != '\0') ? 1 : 0) +
+                         ((heatmapInfo && heatmapInfo[0] != '\0') ? 1 : 0);
+  const int panelH = (showHelp ? 360 : 228) + extraLines * 22;
 
   DrawRectangle(pad, pad, panelW, panelH, Color{0, 0, 0, 150});
   DrawRectangleLines(pad, pad, panelW, panelH, Color{255, 255, 255, 70});
@@ -717,6 +1550,20 @@ void Renderer::drawHUD(const World& world, Tool tool, std::optional<Point> hover
   std::snprintf(buf, sizeof(buf), "Sim: %s    Speed: x%.2f", simPaused ? "PAUSED" : "RUNNING", static_cast<double>(simSpeed));
   line(buf);
 
+  {
+    const int tradeNet = s.exportRevenue - s.importCost;
+    const int net = s.income - s.expenses;
+    std::snprintf(buf, sizeof(buf), "Budget: %+d  tax %d  maint %d  trade %+d  upg %d", net, s.taxRevenue, s.maintenanceCost,
+                  tradeNet, s.upgradeCost);
+    line(buf);
+  }
+
+  {
+    std::snprintf(buf, sizeof(buf), "Demand: %.0f%%  Land: %.0f%%  Tax/cap: %.2f", static_cast<double>(s.demandResidential * 100.0f),
+                  static_cast<double>(s.avgLandValue * 100.0f), static_cast<double>(s.avgTaxPerCapita));
+    line(buf);
+  }
+
   // JobsCapacity in the core sim counts *all* job tiles, but not all jobs are necessarily
   // reachable if road networks are disconnected (outside connection rule).
   if (s.jobsCapacityAccessible != s.jobsCapacity) {
@@ -730,12 +1577,15 @@ void Renderer::drawHUD(const World& world, Tool tool, std::optional<Point> hover
 
   if (s.commuters > 0) {
     if (s.commutersUnreachable > 0) {
-      std::snprintf(buf, sizeof(buf), "Traffic: %d commute (unreach %d)  avg %.1f  cong %.0f%%", s.commuters,
-                    s.commutersUnreachable, static_cast<double>(s.avgCommute),
+      std::snprintf(buf, sizeof(buf),
+                    "Traffic: %d commute (unreach %d)  avg %.1f (t %.1f)  cong %.0f%%",
+                    s.commuters, s.commutersUnreachable, static_cast<double>(s.avgCommute),
+                    static_cast<double>(s.avgCommuteTime),
                     static_cast<double>(s.trafficCongestion * 100.0f));
     } else {
-      std::snprintf(buf, sizeof(buf), "Traffic: %d commute  avg %.1f  cong %.0f%%", s.commuters,
-                    static_cast<double>(s.avgCommute), static_cast<double>(s.trafficCongestion * 100.0f));
+      std::snprintf(buf, sizeof(buf), "Traffic: %d commute  avg %.1f (t %.1f)  cong %.0f%%", s.commuters,
+                    static_cast<double>(s.avgCommute), static_cast<double>(s.avgCommuteTime),
+                    static_cast<double>(s.trafficCongestion * 100.0f));
     }
     line(buf);
   } else {
@@ -759,10 +1609,26 @@ void Renderer::drawHUD(const World& world, Tool tool, std::optional<Point> hover
     line("Goods: (no commercial demand)");
   }
 
-  std::snprintf(buf, sizeof(buf), "Roads: %d    Parks: %d    Tool: %s    Brush: %d", s.roads, s.parks, ToString(tool), brushRadius);
+  const char* toolName = ToString(tool);
+  char toolBuf[64];
+  if (tool == Tool::Road) {
+    std::snprintf(toolBuf, sizeof(toolBuf), "Road (%s)", RoadClassName(roadBuildLevel));
+    toolName = toolBuf;
+  }
+  std::snprintf(buf, sizeof(buf), "Roads: %d    Parks: %d    Tool: %s    Brush: %d", s.roads, s.parks, toolName,
+                brushRadius);
   line(buf);
 
-  std::snprintf(buf, sizeof(buf), "Undo: %d    Redo: %d    Slot: %d", undoCount, redoCount, saveSlot);
+  if (m_useBandCache) {
+    int dirtyBands = 0;
+    for (const auto& b : m_bands) {
+      if (b.dirty) ++dirtyBands;
+    }
+    std::snprintf(buf, sizeof(buf), "Undo: %d    Redo: %d    Slot: %d    Cache: ON (dirty %d)", undoCount, redoCount,
+                  saveSlot, dirtyBands);
+  } else {
+    std::snprintf(buf, sizeof(buf), "Undo: %d    Redo: %d    Slot: %d    Cache: OFF", undoCount, redoCount, saveSlot);
+  }
   line(buf);
 
   // Happiness bar
@@ -779,9 +1645,15 @@ void Renderer::drawHUD(const World& world, Tool tool, std::optional<Point> hover
 
   if (hovered && world.inBounds(hovered->x, hovered->y)) {
     const Tile& t = world.at(hovered->x, hovered->y);
-    std::snprintf(buf, sizeof(buf), "Hover: (%d,%d)  %s + %s  h=%.2f  lvl=%d  occ=%d", hovered->x, hovered->y,
-                  ToString(t.terrain), ToString(t.overlay), static_cast<double>(t.height), t.level, t.occupants);
+    std::snprintf(buf, sizeof(buf), "Hover: (%d,%d)  %s + %s  h=%.2f  elev=%.0fpx  lvl=%d  occ=%d", hovered->x,
+                  hovered->y, ToString(t.terrain), ToString(t.overlay), static_cast<double>(t.height),
+                  static_cast<double>(TileElevationPx(t, m_elev)), t.level, t.occupants);
     DrawText(buf, pad + 10, y + 6, 16, Color{220, 220, 220, 255});
+    y += 26;
+  }
+
+  if (heatmapInfo && heatmapInfo[0] != '\0') {
+    DrawText(heatmapInfo, pad + 10, y + 6, 16, Color{230, 230, 230, 255});
     y += 26;
   }
 
@@ -791,19 +1663,76 @@ void Renderer::drawHUD(const World& world, Tool tool, std::optional<Point> hover
   }
 
   if (showHelp) {
-    DrawText("Right drag: pan | Wheel: zoom | R regen | G grid | H help | O outside | T graph | V traffic | B goods", pad + 10, y + 10, 16,
+    DrawText("Right drag: pan | Wheel: zoom | R regen | G grid | H help | M minimap | E elev | O outside | L heatmap | C vehicles | P policy | F1 report | F2 cache | F3 model | T graph | V traffic | B goods", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
     y += 22;
-    DrawText("1 Road | 2 Res | 3 Com | 4 Ind | 5 Park | 0 Doze | Q Inspect", pad + 10, y + 10, 16,
+    DrawText("1 Road | 2 Res | 3 Com | 4 Ind | 5 Park | 0 Doze | 6 Raise | 7 Lower | 8 Smooth | Q Inspect", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
     y += 22;
-    DrawText("[/] brush | Space: pause | N: step | +/-: speed", pad + 10, y + 10, 16, Color{220, 220, 220, 255});
-    y += 22;
-    DrawText("F5 save | F9 load | F6 slot | Ctrl+Z undo | Ctrl+Y redo", pad + 10, y + 10, 16,
+    DrawText("[/] brush | Space: pause | N: step | +/-: speed | U: road type", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
     y += 22;
-    DrawText("Tip: re-place a zone to upgrade. Road: Shift+drag path.", pad + 10, y + 10, 16,
+    DrawText("F5 save | F9 load | F6 slot | F10 saves | Ctrl+Z undo | Ctrl+Y redo", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
+    y += 22;
+    DrawText("Tip: re-place a zone to upgrade. Road: U selects class (paint to upgrade), Shift+drag builds path. Terraform: Shift=strong, Ctrl=fine.", pad + 10, y + 10, 16,
+             Color{220, 220, 220, 255});
+  }
+
+  // Minimap overlay (bottom-right). One pixel per tile, scaled up.
+  if (showMinimap) {
+    ensureMinimapUpToDate(world);
+    const MinimapLayout mini = minimapLayout(world, screenW, screenH);
+
+    if (mini.rect.width > 2.0f && mini.rect.height > 2.0f && m_minimapTex.id != 0) {
+      // Background + border.
+      DrawRectangleRec(mini.rect, Color{0, 0, 0, 140});
+      DrawRectangleLines(static_cast<int>(mini.rect.x), static_cast<int>(mini.rect.y), static_cast<int>(mini.rect.width),
+                         static_cast<int>(mini.rect.height), Color{255, 255, 255, 70});
+
+      // Draw the minimap texture scaled to the destination rectangle.
+      const Rectangle src{0.0f, 0.0f, static_cast<float>(m_minimapW), static_cast<float>(m_minimapH)};
+      DrawTexturePro(m_minimapTex, src, mini.rect, Vector2{0, 0}, 0.0f, WHITE);
+
+      // Outline visible world viewport.
+      const TileRect vis = ComputeVisibleTileRect(camera, screenW, screenH, world.width(), world.height(),
+                                                  static_cast<float>(m_tileW), static_cast<float>(m_tileH),
+                                                  m_elev.maxPixels);
+      const float s = std::max(1.0e-3f, mini.pixelsPerTile);
+
+      const float vx = mini.rect.x + static_cast<float>(vis.minX) * s;
+      const float vy = mini.rect.y + static_cast<float>(vis.minY) * s;
+      const float vw = static_cast<float>(vis.maxX - vis.minX + 1) * s;
+      const float vh = static_cast<float>(vis.maxY - vis.minY + 1) * s;
+
+      const int ivx = static_cast<int>(std::floor(vx));
+      const int ivy = static_cast<int>(std::floor(vy));
+      const int ivw = std::max(1, static_cast<int>(std::ceil(vw)));
+      const int ivh = std::max(1, static_cast<int>(std::ceil(vh)));
+      DrawRectangleLines(ivx, ivy, ivw, ivh, Color{255, 255, 255, 180});
+
+      // Hovered tile marker.
+      if (hovered && world.inBounds(hovered->x, hovered->y)) {
+        const int hx = static_cast<int>(std::floor(mini.rect.x + static_cast<float>(hovered->x) * s));
+        const int hy = static_cast<int>(std::floor(mini.rect.y + static_cast<float>(hovered->y) * s));
+        const int hw = std::max(1, static_cast<int>(std::ceil(s)));
+        DrawRectangleLines(hx, hy, hw, hw, Color{255, 255, 0, 200});
+      }
+
+      // Camera target marker (approx tile under the camera target).
+      if (const auto camTile = WorldToTileElevated(camera.target, world, static_cast<float>(m_tileW),
+                                                   static_cast<float>(m_tileH), m_elev)) {
+        const float cx = mini.rect.x + (static_cast<float>(camTile->x) + 0.5f) * s;
+        const float cy = mini.rect.y + (static_cast<float>(camTile->y) + 0.5f) * s;
+        const float r = std::clamp(1.0f + 0.35f * s, 1.0f, 6.0f);
+        DrawCircleV(Vector2{cx, cy}, r, Color{255, 255, 255, 190});
+        DrawCircleLines(static_cast<int>(cx), static_cast<int>(cy), r + 1.0f, Color{0, 0, 0, 90});
+      }
+
+      // Label.
+      const int labelY = std::max(0, static_cast<int>(mini.rect.y) - 18);
+      DrawText("Minimap (click/drag)", static_cast<int>(mini.rect.x), labelY, 16, Color{230, 230, 230, 230});
+    }
   }
 
   // FPS

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string>
 
 static bool StartsWith(const std::string& s, const std::string& prefix)
@@ -48,6 +49,25 @@ static bool ParseWxH(const std::string& s, int& outW, int& outH)
   }
 }
 
+static float ParseFloat(const std::string& s, float fallback)
+{
+  try {
+    // std::stof accepts leading/trailing whitespace and stops at first invalid char.
+    return std::stof(s);
+  } catch (...) {
+    return fallback;
+  }
+}
+
+static int ParseInt(const std::string& s, int fallback)
+{
+  try {
+    return std::stoi(s);
+  } catch (...) {
+    return fallback;
+  }
+}
+
 int main(int argc, char** argv)
 {
   isocity::Config cfg;
@@ -60,6 +80,9 @@ int main(int argc, char** argv)
                 << "  --seed <u64|0xHEX>\n"
                 << "  --size <W>x<H>      (map size)\n"
                 << "  --window <W>x<H>    (window size)\n"
+                << "  --elev <scale>      (elevation scale multiplier, 0=flat; default 0.75)\n"
+                << "  --elevsteps <N>     (0=smooth, otherwise quantize to N steps; default 16)\n"
+                << "  --flat              (shortcut for --elev 0)\n"
                 << "  --novsync\n";
       return 0;
     }
@@ -89,6 +112,22 @@ int main(int argc, char** argv)
 
     if (arg == "--novsync") {
       cfg.vsync = false;
+      continue;
+    }
+
+    if (arg == "--elev" && i + 1 < argc) {
+      cfg.elevationScale = ParseFloat(argv[++i], cfg.elevationScale);
+      if (cfg.elevationScale < 0.0f) cfg.elevationScale = 0.0f;
+      continue;
+    }
+
+    if (arg == "--elevsteps" && i + 1 < argc) {
+      cfg.elevationSteps = std::max(0, ParseInt(argv[++i], cfg.elevationSteps));
+      continue;
+    }
+
+    if (arg == "--flat") {
+      cfg.elevationScale = 0.0f;
       continue;
     }
   }
