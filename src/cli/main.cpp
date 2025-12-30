@@ -2,15 +2,20 @@
 #include "isocity/ProcGen.hpp"
 #include "isocity/SaveLoad.hpp"
 #include "isocity/Sim.hpp"
+#include "isocity/Export.hpp"
+#include "isocity/Pathfinding.hpp"
 
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -76,7 +81,15 @@ void PrintHelp()
       << "  proc_isocity_cli [--load <save.bin>] [--seed <u64>] [--size <WxH>] [--days <N>]\n"
       << "                 [--out <summary.json>] [--csv <ticks.csv>] [--save <save.bin>]\n"
       << "                 [--require-outside <0|1>] [--tax-res <N>] [--tax-com <N>] [--tax-ind <N>]\n"
-      << "                 [--maint-road <N>] [--maint-park <N>]\n\n"
+      << "                 [--maint-road <N>] [--maint-park <N>]\n"
+      << "                 [--export-ppm <layer> <out.ppm>]... [--export-scale <N>] [--export-tiles-csv <tiles.csv>]\n"
+      << "                 [--batch <N>]\n\n"
+      << "Export layers (for --export-ppm):\n"
+      << "  terrain overlay height landvalue traffic goods_traffic goods_fill district\n\n"
+      << "Batch mode:\n"
+      << "  - --batch N>1 runs N simulations with seeds (seed, seed+1, ...).\n"
+      << "  - To write per-run files, include {seed} or {run} in any output path.\n"
+      << "    Example: --out out_{seed}.json  --export-ppm overlay map_{seed}.ppm\n\n"
       << "Notes:\n"
       << "  - If --load is provided, the world + ProcGenConfig + SimConfig are loaded from the save.\n"
       << "  - Otherwise, a new world is generated from (--seed, --size).\n"
@@ -159,6 +172,19 @@ int main(int argc, char** argv)
   std::string savePath;
   std::string outJson;
   std::string outCsv;
+
+  // --- New headless export options ---
+  struct PpmExport {
+    ExportLayer layer = ExportLayer::Overlay;
+    std::string path;
+  };
+  std::vector<PpmExport> ppmExports;
+  int exportScale = 1;
+  std::string tilesCsvPath;
+
+  // Batch mode (optional): run multiple seeds in one invocation.
+  int batchRuns = 1;
+
 
   std::uint64_t seed = 1;
   bool seedProvided = false;
@@ -266,53 +292,229 @@ int main(int argc, char** argv)
     }
   }
 
-  World world;
-  if (!loadPath.empty()) {
-    std::string err;
-    if (!LoadWorldBinary(world, procCfg, simCfg, loadPath, err)) {
-      std::cerr << "Failed to load save: " << err << "\n";
-      return 1;
-    }
-  } else {
-    // When no seed is provided, keep a deterministic default so CI runs are stable.
-    // Users can pass --seed to randomize externally.
-    if (!seedProvided) seed = 1;
-    world = GenerateWorld(w, h, seed, procCfg);
+  if (batchRuns > 1 && !loadPath.empty()) {
+    std::cerr << "--batch cannot be combined with --load\n";
+    return 2;
   }
 
-  Simulator sim(simCfg);
-  sim.refreshDerivedStats(world);
-
-  std::ofstream csv;
-  if (!outCsv.empty()) {
-    csv.open(outCsv, std::ios::binary);
-    if (!csv) {
-      std::cerr << "Failed to open CSV for writing: " << outCsv << "\n";
-      return 1;
-    }
-    csv << "day,population,money,housingCapacity,jobsCapacity,jobsCapacityAccessible,employed,happiness,roads,parks,avgCommuteTime,trafficCongestion,goodsDemand,goodsDelivered,goodsSatisfaction,avgLandValue,demandResidential\n";
-    WriteCsvRow(csv, world.stats());
+  if (!seedProvided) {
+    // Keep a deterministic default so CI runs are stable.
+    seed = 1;
   }
 
-  for (int i = 0; i < days; ++i) {
-    sim.stepOnce(world);
-    if (csv) WriteCsvRow(csv, world.stats());
-  }
+  auto hasBatchToken = [](const std::string& p) -> bool {
+    return p.find("{seed}") != std::string::npos || p.find("{run}") != std::string::npos;
+  };
 
-  sim.refreshDerivedStats(world);
+  if (batchRuns > 1) {
+    auto checkTemplate = [&](const std::string& p, const char* flag) -> bool {
+      if (p.empty()) return true;
+      if (hasBatchToken(p)) return true;
+      std::cerr << "When using --batch, " << flag << " should include {seed} or {run} to avoid overwriting: " << p << "\n";
+      return false;
+    };
 
-  if (!savePath.empty()) {
-    std::string err;
-    if (!SaveWorldBinary(world, procCfg, sim.config(), savePath, err)) {
-      std::cerr << "Failed to save world: " << err << "\n";
-      return 1;
+    if (!checkTemplate(outJson, "--out")) return 2;
+    if (!checkTemplate(outCsv, "--csv")) return 2;
+    if (!checkTemplate(savePath, "--save")) return 2;
+    if (!checkTemplate(tilesCsvPath, "--export-tiles-csv")) return 2;
+    for (const auto& e : ppmExports) {
+      if (!checkTemplate(e.path, "--export-ppm")) return 2;
     }
   }
 
-  const std::uint64_t hash = HashWorld(world, true);
-  if (!WriteJsonSummary(world, hash, outJson)) {
-    std::cerr << "Failed to write JSON summary" << (outJson.empty() ? "" : (": " + outJson)) << "\n";
-    return 1;
+  auto replaceAll = [](std::string s, const std::string& from, const std::string& to) -> std::string {
+    if (from.empty()) return s;
+    std::size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+      s.replace(pos, from.size(), to);
+      pos += to.size();
+    }
+    return s;
+  };
+
+  auto expandPath = [&](const std::string& tmpl, int runIdx, std::uint64_t runSeed) -> std::string {
+    if (tmpl.empty()) return {};
+    std::string out = tmpl;
+    out = replaceAll(out, "{seed}", std::to_string(runSeed));
+    out = replaceAll(out, "{run}", std::to_string(runIdx));
+    out = replaceAll(out, "{w}", std::to_string(w));
+    out = replaceAll(out, "{h}", std::to_string(h));
+    out = replaceAll(out, "{days}", std::to_string(days));
+    return out;
+  };
+
+  auto ensureParentDir = [](const std::string& filePath) {
+    if (filePath.empty()) return;
+    const std::filesystem::path p(filePath);
+    const std::filesystem::path parent = p.parent_path();
+    if (!parent.empty()) {
+      std::error_code ec;
+      std::filesystem::create_directories(parent, ec);
+    }
+  };
+
+  auto writeTilesCsv = [&](const World& world, const std::string& path) -> bool {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return false;
+
+    f << "x,y,terrain,overlay,level,district,height,variation,occupants\n";
+    f << std::fixed << std::setprecision(6);
+
+    for (int y = 0; y < world.height(); ++y) {
+      for (int x = 0; x < world.width(); ++x) {
+        const Tile& t = world.at(x, y);
+        f << x << ',' << y << ',' << ToString(t.terrain) << ',' << ToString(t.overlay) << ','
+          << static_cast<int>(t.level) << ',' << static_cast<int>(t.district) << ','
+          << static_cast<double>(t.height) << ','
+          << static_cast<int>(t.variation) << ','
+          << static_cast<int>(t.occupants) << '\n';
+      }
+    }
+    return static_cast<bool>(f);
+  };
+
+  auto runOne = [&](int runIdx, std::uint64_t requestedSeed) -> int {
+    World world;
+    ProcGenConfig runProcCfg = procCfg;
+    SimConfig runSimCfg = simCfg;
+
+    if (!loadPath.empty()) {
+      std::string err;
+      if (!LoadWorldBinary(world, runProcCfg, runSimCfg, loadPath, err)) {
+        std::cerr << "Failed to load save: " << err << "\n";
+        return 1;
+      }
+    } else {
+      world = GenerateWorld(w, h, requestedSeed, runProcCfg);
+    }
+
+    const std::uint64_t actualSeed = world.seed();
+
+    Simulator sim(runSimCfg);
+    sim.refreshDerivedStats(world);
+
+    std::ofstream csv;
+    const std::string csvPath = expandPath(outCsv, runIdx, actualSeed);
+    if (!csvPath.empty()) {
+      ensureParentDir(csvPath);
+      csv.open(csvPath, std::ios::binary);
+      if (!csv) {
+        std::cerr << "Failed to open CSV for writing: " << csvPath << "\n";
+        return 1;
+      }
+      csv << "day,population,money,housingCapacity,jobsCapacity,jobsCapacityAccessible,employed,happiness,roads,parks,avgCommuteTime,trafficCongestion,goodsDemand,goodsDelivered,goodsSatisfaction,avgLandValue,demandResidential\n";
+      WriteCsvRow(csv, world.stats());
+    }
+
+    for (int i = 0; i < days; ++i) {
+      sim.stepOnce(world);
+      if (csv) WriteCsvRow(csv, world.stats());
+    }
+
+    sim.refreshDerivedStats(world);
+
+    const std::string saveP = expandPath(savePath, runIdx, actualSeed);
+    if (!saveP.empty()) {
+      ensureParentDir(saveP);
+      std::string err;
+      if (!SaveWorldBinary(world, runProcCfg, sim.config(), saveP, err)) {
+        std::cerr << "Failed to save world: " << err << "\n";
+        return 1;
+      }
+    }
+
+    const std::string tilesP = expandPath(tilesCsvPath, runIdx, actualSeed);
+    if (!tilesP.empty()) {
+      ensureParentDir(tilesP);
+      if (!writeTilesCsv(world, tilesP)) {
+        std::cerr << "Failed to write tiles CSV: " << tilesP << "\n";
+        return 1;
+      }
+    }
+
+    // Optional derived-map exports (PPM images)
+    if (!ppmExports.empty()) {
+      bool needTraffic = false;
+      bool needGoods = false;
+      bool needLandValue = false;
+
+      for (const auto& e : ppmExports) {
+        if (e.layer == ExportLayer::Traffic) needTraffic = true;
+        if (e.layer == ExportLayer::GoodsTraffic || e.layer == ExportLayer::GoodsFill) needGoods = true;
+        if (e.layer == ExportLayer::LandValue) needLandValue = true;
+      }
+
+      std::vector<std::uint8_t> roadToEdge;
+      const std::vector<std::uint8_t>* roadToEdgeMask = nullptr;
+      if (sim.config().requireOutsideConnection && (needTraffic || needGoods || needLandValue)) {
+        ComputeRoadsConnectedToEdge(world, roadToEdge);
+        roadToEdgeMask = &roadToEdge;
+      }
+
+      std::optional<TrafficResult> trafficRes;
+      if (needTraffic || needLandValue) {
+        TrafficConfig tc{};
+        tc.requireOutsideConnection = sim.config().requireOutsideConnection;
+
+        // Mirror simulator traffic model settings (so CLI exports match in-game overlays).
+        tc.congestionAwareRouting = sim.trafficModel().congestionAwareRouting;
+        tc.congestionIterations = sim.trafficModel().congestionIterations;
+        tc.congestionAlpha = sim.trafficModel().congestionAlpha;
+        tc.congestionBeta = sim.trafficModel().congestionBeta;
+        tc.congestionCapacityScale = sim.trafficModel().congestionCapacityScale;
+        tc.congestionRatioClamp = sim.trafficModel().congestionRatioClamp;
+
+        const float employedShare = (world.stats().population > 0)
+                                        ? static_cast<float>(world.stats().employed) / static_cast<float>(world.stats().population)
+                                        : 0.0f;
+
+        trafficRes = ComputeCommuteTraffic(world, tc, employedShare, roadToEdgeMask);
+      }
+
+      std::optional<GoodsResult> goodsRes;
+      if (needGoods) {
+        GoodsConfig gc{};
+        gc.requireOutsideConnection = sim.config().requireOutsideConnection;
+        goodsRes = ComputeGoodsFlow(world, gc, roadToEdgeMask);
+      }
+
+      std::optional<LandValueResult> landValueRes;
+      if (needLandValue) {
+        LandValueConfig lc{};
+        landValueRes = ComputeLandValue(world, lc, trafficRes ? &(*trafficRes) : nullptr, roadToEdgeMask);
+      }
+
+      for (const auto& e : ppmExports) {
+        const std::string outP = expandPath(e.path, runIdx, actualSeed);
+        ensureParentDir(outP);
+
+        PpmImage img = RenderPpmLayer(world, e.layer, landValueRes ? &(*landValueRes) : nullptr,
+                                     trafficRes ? &(*trafficRes) : nullptr, goodsRes ? &(*goodsRes) : nullptr);
+        if (exportScale > 1) img = ScaleNearest(img, exportScale);
+
+        std::string err;
+        if (!WritePpm(outP, img, err)) {
+          std::cerr << "Failed to write PPM (" << ExportLayerName(e.layer) << "): " << outP << " (" << err << ")\n";
+          return 1;
+        }
+      }
+    }
+
+    const std::uint64_t hash = HashWorld(world, true);
+    const std::string jsonP = expandPath(outJson, runIdx, actualSeed);
+    if (!WriteJsonSummary(world, hash, jsonP)) {
+      std::cerr << "Failed to write JSON summary" << (jsonP.empty() ? "" : (": " + jsonP)) << "\n";
+      return 1;
+    }
+
+    return 0;
+  };
+
+  for (int runIdx = 0; runIdx < batchRuns; ++runIdx) {
+    const std::uint64_t runSeed = seed + static_cast<std::uint64_t>(runIdx);
+    const int rc = runOne(runIdx, runSeed);
+    if (rc != 0) return rc;
   }
 
   return 0;

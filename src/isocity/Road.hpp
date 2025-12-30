@@ -119,4 +119,77 @@ inline float RoadTrafficSpillMultiplierForLevel(int level)
   return 1.00f;
 }
 
+
+
+// -----------------------------------------------------------------------------
+// Bridges
+// -----------------------------------------------------------------------------
+//
+// Roads are normally placed on land, but ProcIsoCity also supports building roads on
+// Water tiles. These are treated as *bridges* (same connectivity as roads, but with
+// different build/maintenance costs and (optionally) slightly different routing
+// weights).
+//
+// We keep this as a pure function layer (no Tile/World dependency) so the rest of
+// the codebase can opt-in by checking tile.terrain == Water.
+
+// Multipliers are kept as integers for deterministic gameplay + saves.
+constexpr int kBridgeBuildCostMultiplier = 4;
+constexpr int kBridgeMaintenanceUnitMultiplier = 2;
+
+// Routing penalty (in milli-steps) added to bridge tiles so pathfinding will prefer
+// land routes when they're comparable.
+constexpr int kBridgeTravelTimePenaltyMilli = 150;
+
+inline int RoadBridgeBuildCostForLevel(int level)
+{
+  return RoadBuildCostForLevel(level) * kBridgeBuildCostMultiplier;
+}
+
+inline int RoadBridgeMaintenanceUnitsForLevel(int level)
+{
+  return RoadMaintenanceUnitsForLevel(level) * kBridgeMaintenanceUnitMultiplier;
+}
+
+inline int RoadBridgeTravelTimeMilliForLevel(int level)
+{
+  return RoadTravelTimeMilliForLevel(level) + kBridgeTravelTimePenaltyMilli;
+}
+
+
+// -----------------------------------------------------------------------------
+// Road placement cost helpers
+// -----------------------------------------------------------------------------
+//
+// The simulation and tools often need the *money cost* of making a given tile
+// a road of a desired class.
+//
+// We keep this logic in one place so:
+//  - UI planners can estimate costs exactly
+//  - headless tooling can plan roads deterministically
+//  - the economy stays consistent across modules
+
+// Money cost to build or upgrade a single road tile to `targetLevel`.
+//
+// Parameters:
+//  - currentLevel: existing road level (ignored when alreadyRoad==false)
+//  - targetLevel: desired road level (clamped to [1..3])
+//  - alreadyRoad: whether the tile currently has a Road overlay
+//  - isBridge: whether the tile is a bridge (road on water) for pricing
+//
+// Returns:
+//  - For empty tiles: full build cost.
+//  - For existing roads: upgrade delta cost (0 if current >= target).
+inline int RoadPlacementCost(int currentLevel, int targetLevel, bool alreadyRoad, bool isBridge)
+{
+  targetLevel = ClampRoadLevel(targetLevel);
+  currentLevel = ClampRoadLevel(currentLevel);
+
+  const int costTarget = isBridge ? RoadBridgeBuildCostForLevel(targetLevel) : RoadBuildCostForLevel(targetLevel);
+  if (!alreadyRoad) return costTarget;
+
+  const int costCur = isBridge ? RoadBridgeBuildCostForLevel(currentLevel) : RoadBuildCostForLevel(currentLevel);
+  return std::max(0, costTarget - costCur);
+}
+
 } // namespace isocity

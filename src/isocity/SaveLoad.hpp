@@ -50,6 +50,7 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
 // v5: v4 + height deltas (persists terraforming)
 // v6: v5 + SimConfig (persists policy/economy settings)
 // v7: v6 + districts (per-tile district IDs) + optional district policy multipliers
+// v8: v7 + compressed delta payload (smaller saves; faster disk IO)
 
 // Save using an explicit ProcGenConfig + SimConfig (recommended for v2+ delta saves).
 bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const SimConfig& simCfg, const std::string& path,
@@ -64,6 +65,7 @@ bool SaveWorldBinary(const World& world, const std::string& path, std::string& o
 // Load and return the ProcGenConfig used by the save (v1 loads return ProcGenConfig{}).
 // v6+ saves also return the SimConfig stored in the file; v5 and older return SimConfig{}.
 // v7 additionally persists per-tile district IDs and optional district policy multipliers.
+// v8 stores the same data as v7 but compresses the delta section.
 bool LoadWorldBinary(World& outWorld, ProcGenConfig& outProcCfg, SimConfig& outSimCfg, const std::string& path,
                      std::string& outError);
 

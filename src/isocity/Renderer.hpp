@@ -97,7 +97,8 @@ private:
 
   std::array<Texture2D, 3> m_terrainTex{};
   std::array<Texture2D, 6> m_overlayTex{};
-  std::array<Texture2D, 16> m_roadTex{}; // auto-tiling variants (connection mask 0..15)
+  std::array<Texture2D, 16> m_roadTex{};   // auto-tiling variants (connection mask 0..15)
+  std::array<Texture2D, 16> m_bridgeTex{}; // bridge variants (roads on water)
 
   // Minimap texture (one pixel per tile). This is purely a UI convenience.
   Texture2D m_minimapTex{};
@@ -136,6 +137,7 @@ private:
   Texture2D& terrain(Terrain t);
   Texture2D& overlay(Overlay o);
   Texture2D& road(std::uint8_t mask);
+  Texture2D& bridge(std::uint8_t mask);
 
   static Color BrightnessTint(float b);
 };

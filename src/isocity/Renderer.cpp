@@ -275,6 +275,16 @@ Color MinimapColorForTile(const isocity::Tile& t)
   case Overlay::Road: {
     // Higher-tier roads read darker / stronger on the minimap.
     const int lvl = std::clamp<int>(static_cast<int>(t.level), 1, 3);
+
+    // Roads on water are bridges; render them a bit lighter/warmer so they are readable over water.
+    if (t.terrain == Terrain::Water) {
+      const Color bridge = (lvl == 1) ? Color{190, 170, 125, 255}
+                          : (lvl == 2) ? Color{180, 160, 118, 255}
+                                       : Color{170, 152, 110, 255};
+      const float k = (lvl == 1) ? 0.82f : (lvl == 2) ? 0.84f : 0.86f;
+      return Lerp(base, bridge, k);
+    }
+
     const Color road = (lvl == 1) ? Color{28, 28, 30, 255} : (lvl == 2) ? Color{24, 24, 28, 255} : Color{20, 20, 25, 255};
     const float k = (lvl == 1) ? 0.85f : (lvl == 2) ? 0.88f : 0.90f;
     return Lerp(base, road, k);
@@ -430,6 +440,10 @@ void Renderer::unloadTextures()
     t = Texture2D{};
   }
   for (auto& t : m_roadTex) {
+    if (t.id != 0) UnloadTexture(t);
+    t = Texture2D{};
+  }
+  for (auto& t : m_bridgeTex) {
     if (t.id != 0) UnloadTexture(t);
     t = Texture2D{};
   }
@@ -607,6 +621,7 @@ void Renderer::rebuildBaseCacheBand(const World& world, BandCache& band)
       // except we omit animated water shimmer for cache stability).
       const float v = (static_cast<float>(t.variation) / 255.0f - 0.5f) * 0.10f;
       float brightness = 0.85f + t.height * 0.30f + v;
+      const float baseBrightness = brightness;
 
       // Draw terrain
       DrawTexturePro(terrain(t.terrain), src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
@@ -651,7 +666,8 @@ void Renderer::rebuildBaseCacheBand(const World& world, BandCache& band)
       // Draw overlay (base view only: no traffic/goods/outside/heatmap tinting).
       if (t.overlay == Overlay::Road) {
         const std::uint8_t mask = static_cast<std::uint8_t>(t.variation & 0x0Fu);
-        DrawTexturePro(road(mask), src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
+        Texture2D& rtex = (t.terrain == Terrain::Water) ? bridge(mask) : road(mask);
+        DrawTexturePro(rtex, src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
       } else if (t.overlay != Overlay::None) {
         DrawTexturePro(overlay(t.overlay), src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
       }
@@ -889,6 +905,10 @@ Texture2D& Renderer::terrain(Terrain t) { return m_terrainTex[static_cast<std::s
 Texture2D& Renderer::overlay(Overlay o) { return m_overlayTex[static_cast<std::size_t>(OverlayIndex(o))]; }
 
 Texture2D& Renderer::road(std::uint8_t mask) { return m_roadTex[static_cast<std::size_t>(mask & 0x0Fu)]; }
+Texture2D& Renderer::bridge(std::uint8_t mask) {
+  return m_bridgeTex[static_cast<std::size_t>(mask & 0x0Fu)];
+}
+
 
 Color Renderer::BrightnessTint(float b)
 {
@@ -1018,6 +1038,67 @@ void Renderer::rebuildTextures(std::uint64_t seed)
 
   for (int i = 0; i < 16; ++i) {
     m_roadTex[static_cast<std::size_t>(i)] = makeRoadVariant(static_cast<std::uint8_t>(i));
+  }
+
+  auto makeBridgeVariant = [&](std::uint8_t mask) -> Texture2D {
+    return MakeDiamondTexture(m_tileW, m_tileH, [&](int x, int y, const DiamondParams& d) -> Color {
+      const std::uint32_t h = HashCoords32(x, y, s ^ 0xB00B1E5u ^ (static_cast<std::uint32_t>(mask) * 0x7F4A7C15u));
+      const float n = (Frac01(h) - 0.5f) * 0.10f;
+
+      const float px = d.nx;
+      const float py = d.ny;
+
+      // Same connectivity geometry as roads, but rendered as a wooden / concrete-ish bridge deck.
+      const float roadW = 0.14f;
+      const float centerR = roadW * 1.10f;
+      float sd = std::sqrt(px * px + py * py) - centerR;
+
+      float bestSegDist = 1.0e9f;
+      float bestSegT = 0.0f;
+
+      auto consider = [&](bool enabled, float ex, float ey) {
+        if (!enabled) return;
+        float tproj = 0.0f;
+        const float dist = DistPointSegment(px, py, 0.0f, 0.0f, ex, ey, tproj);
+        sd = std::min(sd, dist - roadW);
+        if (dist < bestSegDist) {
+          bestSegDist = dist;
+          bestSegT = tproj;
+        }
+      };
+
+      // Bit layout matches World::computeRoadMask().
+      consider((mask & 0x01u) != 0u, 0.5f, -0.5f); // up-right
+      consider((mask & 0x02u) != 0u, 0.5f, 0.5f);  // down-right
+      consider((mask & 0x04u) != 0u, -0.5f, 0.5f); // down-left
+      consider((mask & 0x08u) != 0u, -0.5f, -0.5f); // up-left
+
+      if (sd > 0.0f) return Color{0, 0, 0, 0};
+
+      // Deck base.
+      Color base = Color{160, 130, 95, 235};
+      base = Mul(base, 1.0f + n);
+
+      // Plank pattern along the closest segment direction (avoid the intersection blob).
+      const float centerDist = std::sqrt(px * px + py * py);
+      if (bestSegDist < (roadW * 0.60f) && centerDist > centerR * 0.55f) {
+        const int plank = static_cast<int>(std::floor(bestSegT * 18.0f + static_cast<float>(mask) * 0.21f));
+        if ((plank & 1) == 0) base = Mul(base, 0.92f);
+      }
+
+      // Darken edges to suggest guard rails / curbs.
+      if (-sd < 0.012f) base = Mul(base, 0.68f);
+
+      // Soft edges.
+      const float edgeSoft = 0.05f;
+      const float a = std::clamp((-sd) / edgeSoft, 0.0f, 1.0f);
+      base.a = static_cast<unsigned char>(static_cast<float>(base.a) * a);
+      return base;
+    });
+  };
+
+  for (int i = 0; i < 16; ++i) {
+    m_bridgeTex[static_cast<std::size_t>(i)] = makeBridgeVariant(static_cast<std::uint8_t>(i));
   }
 
   // Residential
@@ -1366,6 +1447,7 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
       // Per-tile lighting based on height + variation.
       const float v = (static_cast<float>(t.variation) / 255.0f - 0.5f) * 0.10f;
       float brightness = 0.85f + t.height * 0.30f + v;
+      const float baseBrightness = brightness;
 
       if (t.terrain == Terrain::Water) {
         // Slight animated shimmer for water (no textures-from-disk, still procedural).
@@ -1420,7 +1502,7 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
       if (t.overlay == Overlay::Road) {
         const std::uint8_t mask = static_cast<std::uint8_t>(t.variation & 0x0Fu);
 
-        Color tint = BrightnessTint(brightness);
+        Color tint = BrightnessTint((t.terrain == Terrain::Water) ? baseBrightness : brightness);
 
         bool disconnected = false;
 
@@ -1491,7 +1573,8 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
           }
         }
 
-        DrawTexturePro(road(mask), src, dst, Vector2{0, 0}, 0.0f, tint);
+        Texture2D& rtex = (t.terrain == Terrain::Water) ? bridge(mask) : road(mask);
+        DrawTexturePro(rtex, src, dst, Vector2{0, 0}, 0.0f, tint);
       } else if (t.overlay != Overlay::None) {
         Color tint = BrightnessTint(brightness);
 
@@ -1896,7 +1979,7 @@ void Renderer::drawHUD(const World& world, const Camera2D& camera, Tool tool, in
     DrawText("F8 video | F11 fullscreen | Alt+Enter borderless | Ctrl+=/- UI scale | Ctrl+0 UI auto | Ctrl+Alt+=/- world scale", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
     y += 22;
-    DrawText("Tip: re-place a zone to upgrade. Road: U selects class (paint to upgrade), Shift+drag builds path. Terraform: Shift=strong, Ctrl=fine. District: Alt+click to pick.", pad + 10, y + 10, 16,
+    DrawText("Tip: re-place a zone to upgrade. Road: U selects class (paint to upgrade), Shift+drag builds path. Terraform: Shift=strong, Ctrl=fine. District: Alt+click pick, Shift+click fill.", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
   }
 

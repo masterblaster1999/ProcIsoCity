@@ -1,5 +1,6 @@
 #include "isocity/Game.hpp"
 
+#include "isocity/DistrictStats.hpp"
 #include "isocity/Pathfinding.hpp"
 #include "isocity/Random.hpp"
 #include "isocity/Road.hpp"
@@ -199,6 +200,7 @@ bool Game::loadFromPath(const std::string& path, const char* toastLabel)
   m_roadDragPath.clear();
   m_roadDragBuildCost = 0;
   m_roadDragUpgradeTiles = 0;
+  m_roadDragBridgeTiles = 0;
   m_roadDragMoneyCost = 0;
   m_roadDragValid = false;
 
@@ -560,6 +562,7 @@ void Game::setupDevConsole()
           m_roadDragPath.clear();
           m_roadDragBuildCost = 0;
           m_roadDragUpgradeTiles = 0;
+          m_roadDragBridgeTiles = 0;
           m_roadDragMoneyCost = 0;
           m_roadDragValid = false;
         }
@@ -2390,13 +2393,14 @@ void Game::applyToolBrush(int centerX, int centerY)
         // Derive terrain from height thresholds.
         const Terrain newTerrain = classifyTerrain(t.height);
         if (newTerrain == Terrain::Water) {
-          // Clear overlays before switching to water so road masks can be updated cleanly.
-          if (t.overlay != Overlay::None) {
+          // When a tile becomes water we must clear most overlays.
+          // Roads are the exception: a Road overlay on a Water tile is treated as a bridge.
+          if (t.overlay != Overlay::None && t.overlay != Overlay::Road) {
             m_world.setOverlay(Overlay::None, tx, ty);
+            t.overlay = Overlay::None;
+            t.level = 1;
+            t.occupants = 0;
           }
-          t.overlay = Overlay::None;
-          t.level = 1;
-          t.occupants = 0;
         }
         t.terrain = newTerrain;
 
@@ -2611,6 +2615,7 @@ void Game::resetWorld(std::uint64_t newSeed)
   m_roadDragPath.clear();
   m_roadDragBuildCost = 0;
   m_roadDragUpgradeTiles = 0;
+  m_roadDragBridgeTiles = 0;
   m_roadDragMoneyCost = 0;
   m_roadDragValid = false;
 
@@ -2642,6 +2647,80 @@ void Game::run()
     handleInput(dt);
     update(dt);
     draw();
+  }
+}
+
+void Game::floodFillDistrict(Point start, bool includeRoads)
+{
+  if (!m_world.inBounds(start.x, start.y)) return;
+
+  beginPaintStroke();
+
+  const int w = m_world.width();
+  const int h = m_world.height();
+  const int n = w * h;
+
+  const std::uint8_t targetDistrict = static_cast<std::uint8_t>(std::clamp(m_activeDistrict, 0, kDistrictCount - 1));
+  const Tile& seed = m_world.at(start.x, start.y);
+
+  enum class FillMode { RoadComponent, WaterBody, LandBlock };
+  const FillMode mode = (seed.overlay == Overlay::Road) ? FillMode::RoadComponent :
+                        (seed.terrain == Terrain::Water) ? FillMode::WaterBody :
+                                                          FillMode::LandBlock;
+
+  auto canFill = [&](int x, int y) -> bool {
+    if (!m_world.inBounds(x, y)) return false;
+    const Tile& t = m_world.at(x, y);
+    switch (mode) {
+    case FillMode::RoadComponent:
+      return t.overlay == Overlay::Road;
+    case FillMode::WaterBody:
+      // Water fill excludes bridges (road overlay).
+      return t.terrain == Terrain::Water && t.overlay != Overlay::Road;
+    case FillMode::LandBlock:
+    default:
+      if (t.terrain == Terrain::Water) return false;
+      if (!includeRoads && t.overlay == Overlay::Road) return false;
+      return true;
+    }
+  };
+
+  std::vector<std::uint8_t> visited(static_cast<std::size_t>(n), 0);
+  std::vector<Point> stack;
+  stack.reserve(std::min(n, 4096));
+
+  auto push = [&](int x, int y) {
+    const int idx = y * w + x;
+    if (visited[static_cast<std::size_t>(idx)]) return;
+    visited[static_cast<std::size_t>(idx)] = 1;
+    stack.push_back({x, y});
+  };
+
+  if (canFill(start.x, start.y)) push(start.x, start.y);
+
+  int changed = 0;
+  while (!stack.empty()) {
+    const Point p = stack.back();
+    stack.pop_back();
+
+    Tile& t = m_world.at(p.x, p.y);
+    if (t.district != targetDistrict) {
+      m_history.noteTilePreEdit(m_world, p.x, p.y);
+      t.district = targetDistrict;
+      ++changed;
+    }
+
+    const int x = p.x;
+    const int y = p.y;
+    if (x > 0 && canFill(x - 1, y)) push(x - 1, y);
+    if (x + 1 < w && canFill(x + 1, y)) push(x + 1, y);
+    if (y > 0 && canFill(x, y - 1)) push(x, y - 1);
+    if (y + 1 < h && canFill(x, y + 1)) push(x, y + 1);
+  }
+
+  endPaintStroke();
+  if (changed > 0) {
+    showToast(TextFormat("District fill: %d tiles", changed));
   }
 }
 
@@ -2902,7 +2981,7 @@ void Game::handleInput(float dt)
     const int delta = shift ? -1 : 1;
 
     if (m_showReport) {
-      constexpr int kPages = 4;
+      constexpr int kPages = 5;
       m_reportPage = (m_reportPage + delta + kPages) % kPages;
     } else if (m_showPolicy) {
       const int count = 7;
@@ -3145,7 +3224,7 @@ void Game::handleInput(float dt)
       auto clampF = [](float v, float lo, float hi) -> float { return std::clamp(v, lo, hi); };
 
       const int d = std::clamp(m_activeDistrict, 0, kDistrictCount - 1);
-      DistrictPolicy& pol = cfg.districtPolicies[d];
+      DistrictPolicy& pol = cfg.districtPolicies[static_cast<std::size_t>(d)];
 
       switch (m_districtSelection) {
       case 0:
@@ -3165,24 +3244,24 @@ void Game::handleInput(float dt)
         showToast(m_showDistrictBorders ? "District borders: ON" : "District borders: OFF");
         break;
       case 4:
-        pol.taxMultRes = clampF(pol.taxMultRes + deltaF, 0.0f, 3.0f);
-        showToast(TextFormat("District %d res tax mult: %.2f", d, pol.taxMultRes));
+        pol.taxResidentialMult = clampF(pol.taxResidentialMult + deltaF, 0.0f, 3.0f);
+        showToast(TextFormat("District %d res tax mult: %.2f", d, pol.taxResidentialMult));
         break;
       case 5:
-        pol.taxMultCom = clampF(pol.taxMultCom + deltaF, 0.0f, 3.0f);
-        showToast(TextFormat("District %d com tax mult: %.2f", d, pol.taxMultCom));
+        pol.taxCommercialMult = clampF(pol.taxCommercialMult + deltaF, 0.0f, 3.0f);
+        showToast(TextFormat("District %d com tax mult: %.2f", d, pol.taxCommercialMult));
         break;
       case 6:
-        pol.taxMultInd = clampF(pol.taxMultInd + deltaF, 0.0f, 3.0f);
-        showToast(TextFormat("District %d ind tax mult: %.2f", d, pol.taxMultInd));
+        pol.taxIndustrialMult = clampF(pol.taxIndustrialMult + deltaF, 0.0f, 3.0f);
+        showToast(TextFormat("District %d ind tax mult: %.2f", d, pol.taxIndustrialMult));
         break;
       case 7:
-        pol.roadMaintMult = clampF(pol.roadMaintMult + deltaF, 0.0f, 3.0f);
-        showToast(TextFormat("District %d road maint mult: %.2f", d, pol.roadMaintMult));
+        pol.roadMaintenanceMult = clampF(pol.roadMaintenanceMult + deltaF, 0.0f, 3.0f);
+        showToast(TextFormat("District %d road maint mult: %.2f", d, pol.roadMaintenanceMult));
         break;
       case 8:
-        pol.parkMaintMult = clampF(pol.parkMaintMult + deltaF, 0.0f, 3.0f);
-        showToast(TextFormat("District %d park maint mult: %.2f", d, pol.parkMaintMult));
+        pol.parkMaintenanceMult = clampF(pol.parkMaintenanceMult + deltaF, 0.0f, 3.0f);
+        showToast(TextFormat("District %d park maint mult: %.2f", d, pol.parkMaintenanceMult));
         break;
       default: break;
       }
@@ -3251,7 +3330,7 @@ void Game::handleInput(float dt)
       SimConfig& cfg = m_sim.config();
 
       const int d = ((m_activeDistrict % kDistrictCount) + kDistrictCount) % kDistrictCount;
-      DistrictPolicy& pol = cfg.districtPolicies[d];
+      DistrictPolicy& pol = cfg.districtPolicies[static_cast<std::size_t>(d)];
       auto clampF = [](float v, float lo, float hi) -> float { return std::clamp(v, lo, hi); };
 
       switch (m_districtSelection) {
@@ -3272,24 +3351,24 @@ void Game::handleInput(float dt)
         showToast(m_showDistrictBorders ? "District borders: ON" : "District borders: OFF");
         break;
       case 4:
-        pol.taxMultRes = clampF(pol.taxMultRes + deltaF, 0.0f, 3.0f);
-        showToast(TextFormat("District %d res tax mult: %.2f", d, pol.taxMultRes));
+        pol.taxResidentialMult = clampF(pol.taxResidentialMult + deltaF, 0.0f, 3.0f);
+        showToast(TextFormat("District %d res tax mult: %.2f", d, pol.taxResidentialMult));
         break;
       case 5:
-        pol.taxMultCom = clampF(pol.taxMultCom + deltaF, 0.0f, 3.0f);
-        showToast(TextFormat("District %d com tax mult: %.2f", d, pol.taxMultCom));
+        pol.taxCommercialMult = clampF(pol.taxCommercialMult + deltaF, 0.0f, 3.0f);
+        showToast(TextFormat("District %d com tax mult: %.2f", d, pol.taxCommercialMult));
         break;
       case 6:
-        pol.taxMultInd = clampF(pol.taxMultInd + deltaF, 0.0f, 3.0f);
-        showToast(TextFormat("District %d ind tax mult: %.2f", d, pol.taxMultInd));
+        pol.taxIndustrialMult = clampF(pol.taxIndustrialMult + deltaF, 0.0f, 3.0f);
+        showToast(TextFormat("District %d ind tax mult: %.2f", d, pol.taxIndustrialMult));
         break;
       case 7:
-        pol.roadMaintMult = clampF(pol.roadMaintMult + deltaF, 0.0f, 3.0f);
-        showToast(TextFormat("District %d road maint mult: %.2f", d, pol.roadMaintMult));
+        pol.roadMaintenanceMult = clampF(pol.roadMaintenanceMult + deltaF, 0.0f, 3.0f);
+        showToast(TextFormat("District %d road maint mult: %.2f", d, pol.roadMaintenanceMult));
         break;
       case 8:
-        pol.parkMaintMult = clampF(pol.parkMaintMult + deltaF, 0.0f, 3.0f);
-        showToast(TextFormat("District %d park maint mult: %.2f", d, pol.parkMaintMult));
+        pol.parkMaintenanceMult = clampF(pol.parkMaintenanceMult + deltaF, 0.0f, 3.0f);
+        showToast(TextFormat("District %d park maint mult: %.2f", d, pol.parkMaintenanceMult));
         break;
       default: break;
       }
@@ -3347,6 +3426,7 @@ void Game::handleInput(float dt)
     m_roadDragPath.clear();
     m_roadDragBuildCost = 0;
     m_roadDragUpgradeTiles = 0;
+    m_roadDragBridgeTiles = 0;
     m_roadDragMoneyCost = 0;
     m_roadDragValid = false;
   };
@@ -3453,43 +3533,51 @@ void Game::handleInput(float dt)
     m_minimapDragActive = false;
   }
 
-  // Road tool: Shift+drag plans a cheapest road path (prefers existing roads) and
-  // commits the whole path on release (single undoable stroke).
+  // Road tool: Shift+drag plans a cheapest (money cost) road path (includes upgrades/bridges)
+  // and commits the whole path on release (single undoable stroke).
   const bool roadDragMode = (m_tool == Tool::Road) && shift && !m_painting && !consumeLeft;
 
   if (roadDragMode) {
-    auto computePathEconomy = [&](const std::vector<Point>& path, int& outNewTiles, int& outUpgrades, int& outCost) {
+    auto computePathEconomy = [&](const std::vector<Point>& path, int& outNewTiles, int& outUpgrades, int& outBridgeTiles, int& outCost) {
       outNewTiles = 0;
       outUpgrades = 0;
+      outBridgeTiles = 0;
       outCost = 0;
 
       const int targetLevel = ClampRoadLevel(m_roadBuildLevel);
-      const int targetCost = RoadBuildCostForLevel(targetLevel);
 
       for (const Point& p : path) {
         if (!m_world.inBounds(p.x, p.y)) continue;
         const Tile& t = m_world.at(p.x, p.y);
+        const bool isBridge = (t.terrain == Terrain::Water);
 
         if (t.overlay == Overlay::Road) {
           const int cur = ClampRoadLevel(static_cast<int>(t.level));
           if (cur < targetLevel) {
             outUpgrades += 1;
-            outCost += (targetCost - RoadBuildCostForLevel(cur));
+            if (isBridge) outBridgeTiles += 1;
+            outCost += RoadPlacementCost(cur, targetLevel, /*alreadyRoad=*/true, isBridge);
           }
         } else if (t.overlay == Overlay::None) {
           outNewTiles += 1;
-          outCost += targetCost;
+          if (isBridge) outBridgeTiles += 1;
+          outCost += RoadPlacementCost(1, targetLevel, /*alreadyRoad=*/false, isBridge);
         }
       }
     };
+
+    // Road planner config: money-aware and bridge-aware.
+    RoadBuildPathConfig planCfg;
+    planCfg.allowBridges = true;
+    planCfg.costModel = RoadBuildPathConfig::CostModel::Money;
 
     // Start drag.
     if (leftPressed && m_hovered && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
       const Point start = *m_hovered;
 
       std::vector<Point> tmp;
-      int buildCost = 0;
-      if (!FindRoadBuildPath(m_world, start, start, tmp, &buildCost)) {
+      planCfg.targetLevel = m_roadBuildLevel;
+      if (!FindRoadBuildPath(m_world, start, start, tmp, nullptr, planCfg)) {
         showToast("Can't start a road path here", 2.5f);
       } else {
         endPaintStroke();
@@ -3497,7 +3585,7 @@ void Game::handleInput(float dt)
         m_roadDragStart = start;
         m_roadDragEnd = start;
         m_roadDragPath = std::move(tmp);
-        computePathEconomy(m_roadDragPath, m_roadDragBuildCost, m_roadDragUpgradeTiles, m_roadDragMoneyCost);
+        computePathEconomy(m_roadDragPath, m_roadDragBuildCost, m_roadDragUpgradeTiles, m_roadDragBridgeTiles, m_roadDragMoneyCost);
         m_roadDragValid = true;
       }
     }
@@ -3509,17 +3597,18 @@ void Game::handleInput(float dt)
         m_roadDragEnd = end;
 
         std::vector<Point> tmp;
-        int buildCost = 0;
-        const bool ok = FindRoadBuildPath(m_world, *m_roadDragStart, end, tmp, &buildCost);
+        planCfg.targetLevel = m_roadBuildLevel;
+        const bool ok = FindRoadBuildPath(m_world, *m_roadDragStart, end, tmp, nullptr, planCfg);
         if (ok && !tmp.empty()) {
           m_roadDragValid = true;
           m_roadDragPath = std::move(tmp);
-          computePathEconomy(m_roadDragPath, m_roadDragBuildCost, m_roadDragUpgradeTiles, m_roadDragMoneyCost);
+          computePathEconomy(m_roadDragPath, m_roadDragBuildCost, m_roadDragUpgradeTiles, m_roadDragBridgeTiles, m_roadDragMoneyCost);
         } else {
           m_roadDragValid = false;
           m_roadDragPath.clear();
           m_roadDragBuildCost = 0;
           m_roadDragUpgradeTiles = 0;
+          m_roadDragBridgeTiles = 0;
           m_roadDragMoneyCost = 0;
         }
       }
@@ -3530,27 +3619,46 @@ void Game::handleInput(float dt)
       if (m_roadDragValid && !m_roadDragPath.empty()) {
         const int moneyBefore = m_world.stats().money;
 
-        beginPaintStroke();
-        const int savedRadius = m_brushRadius;
-        m_brushRadius = 0; // path tool is always 1-tile wide
+        // Make the road-drag tool atomic: if we cannot afford the whole plan, don't build a partial path.
+        if (m_roadDragMoneyCost > moneyBefore) {
+          showToast(TextFormat("Not enough funds for planned path: need $%d (short $%d)",
+                               m_roadDragMoneyCost, m_roadDragMoneyCost - moneyBefore),
+                    3.0f);
+        } else {
+          beginPaintStroke();
+          const int savedRadius = m_brushRadius;
+          m_brushRadius = 0; // path tool is always 1-tile wide
 
-        for (const Point& p : m_roadDragPath) {
-          applyToolBrush(p.x, p.y);
-        }
+          for (const Point& p : m_roadDragPath) {
+            applyToolBrush(p.x, p.y);
+          }
 
-        m_brushRadius = savedRadius;
+          m_brushRadius = savedRadius;
 
-        const bool hadFailures = m_strokeFeedback.any();
-        endPaintStroke();
+          const bool hadFailures = m_strokeFeedback.any();
+          endPaintStroke();
 
-        if (!hadFailures) {
-          const int spent = moneyBefore - m_world.stats().money;
-          if (spent > 0) {
-            showToast(TextFormat("Built road path (%s: %d new, %d upgraded, cost %d)",
-                                 RoadClassName(m_roadBuildLevel), m_roadDragBuildCost, m_roadDragUpgradeTiles, spent));
-          } else {
-            showToast(TextFormat("Built road path (%s: %d new, %d upgraded)",
-                                 RoadClassName(m_roadBuildLevel), m_roadDragBuildCost, m_roadDragUpgradeTiles));
+          if (!hadFailures) {
+            const int spent = moneyBefore - m_world.stats().money;
+            const int bridges = m_roadDragBridgeTiles;
+            if (spent > 0) {
+              if (bridges > 0) {
+                showToast(TextFormat("Built road path (%s: %d new, %d upgraded, %d bridge tiles, cost %d)",
+                                     RoadClassName(m_roadBuildLevel), m_roadDragBuildCost, m_roadDragUpgradeTiles, bridges,
+                                     spent));
+              } else {
+                showToast(TextFormat("Built road path (%s: %d new, %d upgraded, cost %d)",
+                                     RoadClassName(m_roadBuildLevel), m_roadDragBuildCost, m_roadDragUpgradeTiles, spent));
+              }
+            } else {
+              if (bridges > 0) {
+                showToast(TextFormat("Built road path (%s: %d new, %d upgraded, %d bridge tiles)",
+                                     RoadClassName(m_roadBuildLevel), m_roadDragBuildCost, m_roadDragUpgradeTiles, bridges));
+              } else {
+                showToast(TextFormat("Built road path (%s: %d new, %d upgraded)",
+                                     RoadClassName(m_roadBuildLevel), m_roadDragBuildCost, m_roadDragUpgradeTiles));
+              }
+            }
           }
         }
       } else {
@@ -3564,6 +3672,7 @@ void Game::handleInput(float dt)
       m_roadDragPath.clear();
       m_roadDragBuildCost = 0;
       m_roadDragUpgradeTiles = 0;
+      m_roadDragBridgeTiles = 0;
       m_roadDragMoneyCost = 0;
       m_roadDragValid = false;
     }
@@ -3624,6 +3733,14 @@ void Game::handleInput(float dt)
     const Tile& t = m_world.at(m_hovered->x, m_hovered->y);
     m_activeDistrict = static_cast<int>(t.district) % kDistrictCount;
     showToast(TextFormat("Picked district: %d", m_activeDistrict));
+    consumeLeft = true;
+  }
+
+  // District tool: Shift+click flood fills a region.
+  // Ctrl+Shift allows the flood to cross roads when filling land blocks.
+  if (!consumeLeft && !roadDragMode && leftPressed && m_hovered && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && m_tool == Tool::District
+      && shift && !(IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT))) {
+    floodFillDistrict(*m_hovered, ctrl);
     consumeLeft = true;
   }
 
@@ -3850,6 +3967,7 @@ const char* ReportPageName(int page)
     case 1: return "Economy";
     case 2: return "Traffic";
     case 3: return "Land & Goods";
+    case 4: return "Districts";
   }
 }
 
@@ -3909,13 +4027,80 @@ void Game::drawReportPanel(int /*screenW*/, int /*screenH*/)
                      "Latest: %.1f");
     DrawHistoryGraph(view, r3, "Congestion", [](const CityHistorySample& s) { return s.trafficCongestion; }, 0.0f, 1.0f, true,
                      "Latest: %.0f%%", true);
-  } else {
+  } else if (m_reportPage == 3) {
     DrawHistoryGraph(view, r1, "Avg land value", [](const CityHistorySample& s) { return s.avgLandValue; }, 0.0f, 1.0f, true,
                      "Latest: %.0f%%", true);
     DrawHistoryGraph(view, r2, "Tax per capita", [](const CityHistorySample& s) { return s.avgTaxPerCapita; }, 0.0f, 0.0f, false,
                      "Latest: %.2f");
     DrawHistoryGraph(view, r3, "Goods satisfaction", [](const CityHistorySample& s) { return s.goodsSatisfaction; }, 0.0f, 1.0f,
                      true, "Latest: %.0f%%", true);
+  } else {
+    // Districts
+    const SimConfig& cfg = m_sim.config();
+    const int w = m_world.width();
+    const int h = m_world.height();
+    const int n = w * h;
+
+    const std::vector<float>* lv = (static_cast<int>(m_landValue.value.size()) == n) ? &m_landValue.value : nullptr;
+    const DistrictStatsResult ds = ComputeDistrictStats(m_world, cfg, lv, nullptr);
+
+    const int headerY = y0 + 70;
+    const int tableX = x0 + 12;
+    const int rowH = 20;
+    const int font = 16;
+
+    auto drawR = [&](int xRight, int yDraw, const char* text, Color c) {
+      const int tw = MeasureText(text, font);
+      DrawText(text, xRight - tw, yDraw, font, c);
+    };
+
+    DrawText("ID", tableX, headerY, font, Color{220, 220, 220, 255});
+    DrawText("Pop", tableX + 40, headerY, font, Color{220, 220, 220, 255});
+    DrawText("Emp", tableX + 120, headerY, font, Color{220, 220, 220, 255});
+    DrawText("Net", tableX + 200, headerY, font, Color{220, 220, 220, 255});
+    DrawText("LV", tableX + 280, headerY, font, Color{220, 220, 220, 255});
+    DrawText("Acc", tableX + 350, headerY, font, Color{220, 220, 220, 255});
+
+    const int rowStartY = headerY + 18;
+    for (int d = 0; d < kDistrictCount; ++d) {
+      const DistrictSummary& s = ds.districts[static_cast<std::size_t>(d)];
+      const int rowY = rowStartY + d * rowH;
+
+      if (d == std::clamp(m_activeDistrict, 0, kDistrictCount - 1)) {
+        DrawRectangle(x0 + 6, rowY - 2, panelW - 12, rowH, Color{255, 255, 255, 25});
+      }
+
+      DrawText(TextFormat("%d", d), tableX, rowY, font, RAYWHITE);
+      drawR(tableX + 40 + 70, rowY, TextFormat("%d", s.population), RAYWHITE);
+      drawR(tableX + 120 + 70, rowY, TextFormat("%d", s.employed), RAYWHITE);
+      drawR(tableX + 200 + 70, rowY, TextFormat("%+d", s.net), (s.net < 0) ? Color{255, 120, 120, 255} : Color{160, 255, 160, 255});
+      drawR(tableX + 280 + 50, rowY, TextFormat("%.0f%%", static_cast<double>(s.avgLandValue) * 100.0), RAYWHITE);
+      if (s.zoneTiles > 0) {
+        const double accPct = 100.0 * static_cast<double>(s.zoneTilesAccessible) / static_cast<double>(s.zoneTiles);
+        drawR(tableX + 350 + 60, rowY, TextFormat("%.0f%%", accPct), RAYWHITE);
+      } else {
+        drawR(tableX + 350 + 60, rowY, "--", Color{200, 200, 200, 255});
+      }
+    }
+
+    // Totals row
+    const int totalsY = rowStartY + kDistrictCount * rowH + 6;
+    DrawLine(x0 + 8, totalsY - 4, x0 + panelW - 8, totalsY - 4, Color{255, 255, 255, 60});
+    DrawText("All", tableX, totalsY, font, Color{220, 220, 220, 255});
+    drawR(tableX + 40 + 70, totalsY, TextFormat("%d", ds.total.population), Color{220, 220, 220, 255});
+    drawR(tableX + 120 + 70, totalsY, TextFormat("%d", ds.total.employed), Color{220, 220, 220, 255});
+    drawR(tableX + 200 + 70, totalsY, TextFormat("%+d", ds.total.net), (ds.total.net < 0) ? Color{255, 120, 120, 255} : Color{160, 255, 160, 255});
+    drawR(tableX + 280 + 50, totalsY, TextFormat("%.0f%%", static_cast<double>(ds.total.avgLandValue) * 100.0), Color{220, 220, 220, 255});
+
+    // Detail line for selected district
+    const int dSel = std::clamp(m_activeDistrict, 0, kDistrictCount - 1);
+    const DistrictSummary& sel = ds.districts[static_cast<std::size_t>(dSel)];
+    const int detailY = totalsY + 26;
+    DrawText(TextFormat("D%d: tax %d  maint %d (roads %d, parks %d)", dSel, sel.taxRevenue, sel.maintenanceCost,
+                        sel.roadMaintenanceCost, sel.parkMaintenanceCost),
+             x0 + 12, detailY, 14, Color{220, 220, 220, 255});
+    DrawText("Note: district budget excludes trade, upgrades, and one-off build costs.", x0 + 12, detailY + 18, 14,
+             Color{200, 200, 200, 255});
   }
 
   // Footer: show day range
@@ -4025,12 +4210,13 @@ void Game::draw()
   }
 
   const bool heatmapActive = (m_heatmapOverlay != HeatmapOverlay::Off);
+  const bool districtStatsActive = m_showDistrictPanel || (m_showReport && m_reportPage == 4);
 
   // Many derived systems need the "road component touches map edge" mask.
   // This should be computed regardless of whether the connectivity overlay is *drawn*.
   const bool requireOutside = m_sim.config().requireOutsideConnection;
   const bool needRoadToEdgeMask = requireOutside &&
-                                (m_showOutsideOverlay || m_showTrafficOverlay || m_showGoodsOverlay || heatmapActive);
+                                (m_showOutsideOverlay || m_showTrafficOverlay || m_showGoodsOverlay || heatmapActive || districtStatsActive);
 
   const std::vector<std::uint8_t>* roadToEdgeMask = nullptr;
   if (needRoadToEdgeMask) {
@@ -4042,7 +4228,7 @@ void Game::draw()
   const std::vector<std::uint8_t>* outsideMask = m_showOutsideOverlay ? roadToEdgeMask : nullptr;
 
   // Traffic is used by both the explicit traffic overlay and the land value heatmap.
-  const bool needTrafficResult = (m_showTrafficOverlay || heatmapActive);
+  const bool needTrafficResult = (m_showTrafficOverlay || heatmapActive || districtStatsActive);
   if (needTrafficResult && m_trafficDirty) {
     const float share = (m_world.stats().population > 0)
                             ? (static_cast<float>(m_world.stats().employed) /
@@ -4091,12 +4277,9 @@ void Game::draw()
     commercialGoodsFill = &m_goods.commercialFill;
   }
 
-  // --- Heatmap overlay (land value + component fields) ---
-  const std::vector<float>* heatmap = nullptr;
-  Renderer::HeatmapRamp heatmapRamp = Renderer::HeatmapRamp::Good;
-  const char* heatmapName = nullptr;
-
-  if (heatmapActive) {
+  // --- Land value (heatmap + district stats) ---
+  const bool needLandValueResult = heatmapActive || districtStatsActive;
+  if (needLandValueResult) {
     if (m_landValueDirty ||
         m_landValue.value.size() != static_cast<std::size_t>(std::max(0, m_world.width()) * std::max(0, m_world.height()))) {
       LandValueConfig lc;
@@ -4105,7 +4288,14 @@ void Game::draw()
       m_landValue = ComputeLandValue(m_world, lc, tptr, roadToEdgeMask);
       m_landValueDirty = false;
     }
+  }
 
+  // --- Heatmap overlay (land value + component fields) ---
+  const std::vector<float>* heatmap = nullptr;
+  Renderer::HeatmapRamp heatmapRamp = Renderer::HeatmapRamp::Good;
+  const char* heatmapName = nullptr;
+
+  if (heatmapActive) {
     switch (m_heatmapOverlay) {
     case HeatmapOverlay::LandValue:
       heatmapName = "Land value";
@@ -4415,23 +4605,41 @@ void Game::draw()
     row(2, "Overlay", m_showDistrictOverlay ? "ON" : ((m_tool == Tool::District) ? "AUTO (tool)" : "OFF"));
     row(3, "Borders", m_showDistrictBorders ? "ON" : "OFF");
 
-    const int effResTax = static_cast<int>(std::lround(static_cast<double>(cfg.taxResidential) * dp.taxMultRes));
-    const int effComTax = static_cast<int>(std::lround(static_cast<double>(cfg.taxCommercial) * dp.taxMultCom));
-    const int effIndTax = static_cast<int>(std::lround(static_cast<double>(cfg.taxIndustrial) * dp.taxMultInd));
-    const int effRoadMaint = static_cast<int>(std::lround(static_cast<double>(cfg.maintenanceRoad) * dp.maintenanceMultRoad));
-    const int effParkMaint = static_cast<int>(std::lround(static_cast<double>(cfg.maintenancePark) * dp.maintenanceMultPark));
+    const int effResTax = static_cast<int>(std::lround(static_cast<double>(cfg.taxResidential) * dp.taxResidentialMult));
+    const int effComTax = static_cast<int>(std::lround(static_cast<double>(cfg.taxCommercial) * dp.taxCommercialMult));
+    const int effIndTax = static_cast<int>(std::lround(static_cast<double>(cfg.taxIndustrial) * dp.taxIndustrialMult));
+    const int effRoadMaint = static_cast<int>(std::lround(static_cast<double>(cfg.maintenanceRoad) * dp.roadMaintenanceMult));
+    const int effParkMaint = static_cast<int>(std::lround(static_cast<double>(cfg.maintenancePark) * dp.parkMaintenanceMult));
 
-    row(4, "Res tax mult", TextFormat("x%.2f (eff %d)", static_cast<double>(dp.taxMultRes), effResTax));
-    row(5, "Com tax mult", TextFormat("x%.2f (eff %d)", static_cast<double>(dp.taxMultCom), effComTax));
-    row(6, "Ind tax mult", TextFormat("x%.2f (eff %d)", static_cast<double>(dp.taxMultInd), effIndTax));
-    row(7, "Road maint mult", TextFormat("x%.2f (eff %d)", static_cast<double>(dp.maintenanceMultRoad), effRoadMaint));
-    row(8, "Park maint mult", TextFormat("x%.2f (eff %d)", static_cast<double>(dp.maintenanceMultPark), effParkMaint));
+    row(4, "Res tax mult", TextFormat("x%.2f (eff %d)", static_cast<double>(dp.taxResidentialMult), effResTax));
+    row(5, "Com tax mult", TextFormat("x%.2f (eff %d)", static_cast<double>(dp.taxCommercialMult), effComTax));
+    row(6, "Ind tax mult", TextFormat("x%.2f (eff %d)", static_cast<double>(dp.taxIndustrialMult), effIndTax));
+    row(7, "Road maint mult", TextFormat("x%.2f (eff %d)", static_cast<double>(dp.roadMaintenanceMult), effRoadMaint));
+    row(8, "Park maint mult", TextFormat("x%.2f (eff %d)", static_cast<double>(dp.parkMaintenanceMult), effParkMaint));
 
     y += 4;
     DrawLine(x, y, x0 + panelW - 12, y, Color{255, 255, 255, 70});
     y += 10;
-    DrawText("Paint: tool 9.  ,/. change id.  Alt+Click picks hovered id.", x, y, 16,
+    DrawText("Paint: tool 9.  ,/. change id.  Alt+Click pick.  Shift+Click fill.", x, y, 16,
              Color{220, 220, 220, 255});
+
+    // Quick live snapshot for the selected district (uses cached land value when available).
+    y += 18;
+    const int w = m_world.width();
+    const int h = m_world.height();
+    const int n = w * h;
+    const std::vector<float>* lv = (static_cast<int>(m_landValue.value.size()) == n) ? &m_landValue.value : nullptr;
+    const DistrictStatsResult ds = ComputeDistrictStats(m_world, cfg, lv, roadToEdgeMask);
+    const DistrictSummary& s = ds.districts[static_cast<std::size_t>(district)];
+    const double lvPct = static_cast<double>(s.avgLandValue) * 100.0;
+    const double accPct = (s.zoneTiles > 0) ? (100.0 * static_cast<double>(s.zoneTilesAccessible) / static_cast<double>(s.zoneTiles)) : -1.0;
+    if (accPct >= 0.0) {
+      DrawText(TextFormat("Stats: Pop %d  Emp %d  LV %.0f%%  Net %+d  Acc %.0f%%", s.population, s.employed, lvPct, s.net, accPct), x, y,
+               16, Color{220, 220, 220, 255});
+    } else {
+      DrawText(TextFormat("Stats: Pop %d  Emp %d  LV %.0f%%  Net %+d  Acc --", s.population, s.employed, lvPct, s.net), x, y, 16,
+               Color{220, 220, 220, 255});
+    }
   }
 
   drawVideoSettingsPanel(uiW, uiH);
@@ -4453,8 +4661,28 @@ void Game::draw()
     if (m_roadDragValid && !m_roadDragPath.empty()) {
       std::snprintf(buf1, sizeof(buf1), "Road path (%s): %d tiles", RoadClassName(m_roadBuildLevel),
                     static_cast<int>(m_roadDragPath.size()));
-      std::snprintf(buf2, sizeof(buf2), "New %d  Upg %d  Est $%d  (release)", m_roadDragBuildCost,
-                    m_roadDragUpgradeTiles, m_roadDragMoneyCost);
+
+      const int have = m_world.stats().money;
+      const bool afford = (m_roadDragMoneyCost <= have);
+      const int shortfall = afford ? 0 : (m_roadDragMoneyCost - have);
+
+      if (m_roadDragBridgeTiles > 0) {
+        if (afford) {
+          std::snprintf(buf2, sizeof(buf2), "New %d  Upg %d  Br %d  Est $%d  (release)", m_roadDragBuildCost,
+                        m_roadDragUpgradeTiles, m_roadDragBridgeTiles, m_roadDragMoneyCost);
+        } else {
+          std::snprintf(buf2, sizeof(buf2), "New %d  Upg %d  Br %d  Est $%d  (need $%d)", m_roadDragBuildCost,
+                        m_roadDragUpgradeTiles, m_roadDragBridgeTiles, m_roadDragMoneyCost, shortfall);
+        }
+      } else {
+        if (afford) {
+          std::snprintf(buf2, sizeof(buf2), "New %d  Upg %d  Est $%d  (release)", m_roadDragBuildCost,
+                        m_roadDragUpgradeTiles, m_roadDragMoneyCost);
+        } else {
+          std::snprintf(buf2, sizeof(buf2), "New %d  Upg %d  Est $%d  (need $%d)", m_roadDragBuildCost,
+                        m_roadDragUpgradeTiles, m_roadDragMoneyCost, shortfall);
+        }
+      }
       line1 = buf1;
       line2 = buf2;
     } else {

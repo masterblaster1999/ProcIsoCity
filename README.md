@@ -93,7 +93,8 @@ ctest --test-dir build-tests --output-on-failure
 - **+ / -**: change simulation speed
 - **[ / ]**: brush size (diamond radius)
 - **Shift** (while painting):
-  - Road tool: Shift+drag builds a cheapest-cost road path between start/end.
+  - Road tool: Shift+drag plans a cheapest **money cost** road path (includes upgrades + bridges).
+    - If you can't afford the whole plan, it won't partially build.
   - Terraform tools: stronger effect.
 - **Ctrl** (while using terraform tools): finer effect.
 - Painting applies each tile at most once per stroke (prevents accidental multi-upgrades while holding the mouse still).
@@ -125,12 +126,14 @@ ctest --test-dir build-tests --output-on-failure
   - Job assignment (commercial/industrial) is weighted by land value.
   - Budget/demand/land value summaries are shown in the HUD; taxes and maintenance can be tweaked in the in-game policy panel (**P**).
 - Commute routing supports an optional **congestion-aware** multi-pass assignment model (tunable via **F3**).
-- Save files are versioned; current is **v6**:
+- Save files are versioned; current is **v8**:
   - v2: seed + procgen config + tile deltas (small saves)
   - v3: CRC32 checksum (corruption detection)
   - v4: varint + delta-encoded diffs (smaller / faster)
   - v5: persists terraforming via height deltas
   - v6: persists SimConfig (taxes, maintenance, outside-connection rule, park radius)
+  - v7: persists per-tile districts + optional district policy multipliers
+  - v8: compresses the delta payload for smaller saves / faster disk IO
 
 ---
 
@@ -140,7 +143,7 @@ ctest --test-dir build-tests --output-on-failure
 - Chunked world streaming + frustum culling
 - Proper road graphs (nodes/edges) + traffic visualization
 - Smarter undo/redo (optional: track only overlays + money, not sim state)
-- Save system: compression, multiple slots, and stronger cross-version stability
+- Save system: multiple slots and stronger cross-version stability (v8 adds delta compression)
 - Buildings with multi-tile footprints + richer procedural silhouettes
 - Rendering performance: cached chunk layers (terrain/decals) + fewer draw calls
 - Multi-layer rendering (terrain, decals, structures, overlays)

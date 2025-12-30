@@ -52,18 +52,45 @@ bool FindRoadPathToEdge(const World& world, Point start, std::vector<Point>& out
 // outCost (if non-null) is the number of steps (edges), i.e. outPath.size()-1.
 bool FindLandPathAStar(const World& world, Point start, Point goal, std::vector<Point>& outPath, int* outCost = nullptr);
 
+// Configuration for road-building path planning.
+//
+// This is used by both:
+//  - ProcGen (connect hubs, prefer reusing existing roads)
+//  - the in-game Shift+drag road planner (optimize money cost, allow bridges)
+struct RoadBuildPathConfig {
+  enum class CostModel : std::uint8_t {
+    // Classic behavior: cost = number of *new* road tiles that would be created.
+    // Existing roads have cost 0.
+    NewTiles = 0,
+
+    // Money-aware planner: cost = actual economy cost to build/upgrade each tile
+    // to `targetLevel` (including bridge multipliers and upgrade deltas).
+    Money = 1,
+  };
+
+  // Desired road level (1..3). Only used when costModel==Money.
+  int targetLevel = 1;
+
+  // If true, allow the planner to traverse Water tiles (roads on water are bridges).
+  bool allowBridges = false;
+
+  // Which cost model to optimize.
+  CostModel costModel = CostModel::NewTiles;
+};
+
 // Find a road-building path between two tiles.
 //
-// The returned path is restricted to buildable tiles where a road *can* exist
-// (terrain != Water, overlay is None or Road). This makes it suitable for UI
-// tools that want to "drag a road" without punching through zones/parks.
+// The returned path is restricted to tiles where a road *can* exist:
+//  - overlay is None or Road (we never punch through zones/parks)
+//  - terrain must be non-water unless cfg.allowBridges == true
 //
-// The path is optimized for *build cost* (number of non-road tiles in the path),
-// and ties are broken by shorter length.
+// The path is optimized according to cfg.costModel, and ties are broken by
+// fewer steps and stable per-tile variation bits.
 //
-// outBuildCost (if non-null) is the number of tiles in the path that are not
-// already roads (i.e. how many new road tiles would be created).
+// outPrimaryCost (if non-null) is:
+//  - cfg.costModel==NewTiles => number of tiles in the path that are not already roads
+//  - cfg.costModel==Money    => estimated money cost to build/upgrade the whole path
 bool FindRoadBuildPath(const World& world, Point start, Point goal, std::vector<Point>& outPath,
-                       int* outBuildCost = nullptr);
+                       int* outPrimaryCost = nullptr, const RoadBuildPathConfig& cfg = {});
 
 } // namespace isocity

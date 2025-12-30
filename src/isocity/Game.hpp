@@ -71,6 +71,7 @@ public:
 private:
   void resetWorld(std::uint64_t newSeed);
   void applyToolBrush(int centerX, int centerY);
+  void floodFillDistrict(Point start, bool includeRoads);
   void showToast(const std::string& msg, float seconds = 2.5f);
 
   // City report (time-series graphs of key stats).
@@ -390,6 +391,7 @@ private:
   std::optional<Point> m_roadDragEnd;
   std::vector<Point> m_roadDragPath;
   int m_roadDragBuildCost = 0; // number of tiles in the path that are not already roads
+  int m_roadDragBridgeTiles = 0; // subset of new/upgrade tiles that are bridges (roads on water)
   int m_roadDragUpgradeTiles = 0;
   int m_roadDragMoneyCost = 0;
   bool m_roadDragValid = false;

@@ -93,7 +93,9 @@ ScanResult ScanWorld(const World& world)
 
       if (t.overlay == Overlay::Road) {
         r.roads++;
-        r.roadMaintenanceUnits += RoadMaintenanceUnitsForLevel(static_cast<int>(t.level));
+        r.roadMaintenanceUnits += (t.terrain == Terrain::Water)
+          ? RoadBridgeMaintenanceUnitsForLevel(static_cast<int>(t.level))
+          : RoadMaintenanceUnitsForLevel(static_cast<int>(t.level));
       }
       if (t.overlay == Overlay::Park) r.parks++;
 
@@ -206,7 +208,8 @@ float ParkCoverageRatio(const World& world, int radius, const std::vector<std::u
       const int nx = x + dir[0];
       const int ny = y + dir[1];
       if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
-      if (world.at(nx, ny).terrain == Terrain::Water) continue;
+      const Tile& nt = world.at(nx, ny);
+      if (nt.terrain == Terrain::Water && nt.overlay != Overlay::Road) continue;
 
       const int nidx = idxOf(nx, ny);
       int& nd = dist[static_cast<std::size_t>(nidx)];
@@ -395,7 +398,9 @@ void Simulator::refreshDerivedStats(World& world) const
 
       // Maintenance is per-tile and may be scaled by district policy.
       if (t.overlay == Overlay::Road) {
-        const int units = RoadMaintenanceUnitsForLevel(static_cast<int>(t.level));
+        const int units = (t.terrain == Terrain::Water)
+          ? RoadBridgeMaintenanceUnitsForLevel(static_cast<int>(t.level))
+          : RoadMaintenanceUnitsForLevel(static_cast<int>(t.level));
         const float mult = roadMaintMultFor(t);
         const float raw = static_cast<float>(units * std::max(0, m_cfg.maintenanceRoad)) * mult;
         roadMaint += std::max(0, static_cast<int>(std::lround(raw)));

@@ -8,6 +8,9 @@
 #include "isocity/Goods.hpp"
 #include "isocity/LandValue.hpp"
 #include "isocity/Hash.hpp"
+#include "isocity/Compression.hpp"
+#include "isocity/Export.hpp"
+#include "isocity/DistrictStats.hpp"
 #include "isocity/Road.hpp"
 #include "isocity/World.hpp"
 
@@ -67,6 +70,8 @@ static int g_failures = 0;
 
 
 namespace {
+
+using namespace isocity;
 
 bool FindEmptyAdjacentPair(const isocity::World& w, int& outX, int& outY)
 {
@@ -494,7 +499,7 @@ void TestSaveLoadRoundTrip()
 
     EXPECT_TRUE(in.good());
     EXPECT_TRUE(std::memcmp(magic, "ISOCITY\0", 8) == 0);
-    EXPECT_EQ(version, static_cast<std::uint32_t>(7));
+    EXPECT_EQ(version, static_cast<std::uint32_t>(8));
   }
 
   // Save summary should parse without loading the full world.
@@ -502,7 +507,7 @@ void TestSaveLoadRoundTrip()
     SaveSummary sum{};
     std::string err3;
     EXPECT_TRUE(ReadSaveSummary(savePath.string(), sum, err3, true));
-    EXPECT_EQ(sum.version, static_cast<std::uint32_t>(7));
+    EXPECT_EQ(sum.version, static_cast<std::uint32_t>(8));
     EXPECT_EQ(sum.width, w.width());
     EXPECT_EQ(sum.height, w.height());
     EXPECT_EQ(sum.seed, w.seed());
@@ -561,6 +566,192 @@ void TestSaveLoadRoundTrip()
   // Cleanup (best-effort).
   std::error_code ec;
   fs::remove(savePath, ec);
+}
+
+void TestSLLZCompressionRoundTrip()
+{
+  using namespace isocity;
+
+  // Highly repetitive input should compress well.
+  std::vector<std::uint8_t> input;
+  input.reserve(4096);
+  for (int i = 0; i < 1024; ++i) {
+    input.push_back('A');
+    input.push_back('B');
+    input.push_back('C');
+    input.push_back('D');
+  }
+
+  std::vector<std::uint8_t> compressed;
+  EXPECT_TRUE(CompressSLLZ(input.data(), input.size(), compressed));
+
+  std::string err;
+  std::vector<std::uint8_t> decoded;
+  EXPECT_TRUE(DecompressSLLZ(compressed.data(), compressed.size(), input.size(), decoded, err));
+  EXPECT_EQ(decoded.size(), input.size());
+  EXPECT_TRUE(std::memcmp(decoded.data(), input.data(), input.size()) == 0);
+  EXPECT_TRUE(compressed.size() < input.size());
+
+  // Non-repetitive input should still round-trip even if it doesn't compress.
+  input.clear();
+  for (int i = 0; i < 2048; ++i) {
+    input.push_back(static_cast<std::uint8_t>((i * 131) ^ (i >> 3)));
+  }
+
+  compressed.clear();
+  EXPECT_TRUE(CompressSLLZ(input.data(), input.size(), compressed));
+  decoded.clear();
+  err.clear();
+  EXPECT_TRUE(DecompressSLLZ(compressed.data(), compressed.size(), input.size(), decoded, err));
+  EXPECT_EQ(decoded.size(), input.size());
+  EXPECT_TRUE(std::memcmp(decoded.data(), input.data(), input.size()) == 0);
+}
+
+void TestSaveV8UsesCompressionForLargeDeltaPayload()
+{
+  using namespace isocity;
+
+  ProcGenConfig cfg{};
+  const std::uint64_t seed = 0xBADC0FFEEu;
+
+  // Create a world and apply a large number of uniform edits to make the delta payload
+  // very repetitive (and therefore compressible).
+  World w = GenerateWorld(64, 64, seed, cfg);
+  for (int y = 0; y < w.height(); ++y) {
+    for (int x = 0; x < w.width(); ++x) {
+      w.setRoad(x, y);
+    }
+  }
+
+  fs::path savePath = "isocity_test_save_v8_compress.bin";
+  try {
+    savePath = fs::temp_directory_path() / "isocity_test_save_v8_compress.bin";
+  } catch (...) {
+    // keep relative path
+  }
+
+  SimConfig simCfg{};
+  std::string err;
+  EXPECT_TRUE(SaveWorldBinary(w, cfg, simCfg, savePath.string(), err));
+
+  // Parse just enough of the binary file to reach the v8 compression header.
+  struct ProcGenConfigBinLocal {
+    float terrainScale;
+    float waterLevel;
+    float sandLevel;
+    std::int32_t hubs;
+    std::int32_t extraConnections;
+    float zoneChance;
+    float parkChance;
+  };
+
+  struct StatsBinLocal {
+    std::int32_t day;
+    std::int32_t population;
+    std::int32_t housingCapacity;
+    std::int32_t jobsCapacity;
+    std::int32_t employed;
+    float happiness;
+    std::int32_t money;
+    std::int32_t roads;
+    std::int32_t parks;
+  };
+
+  struct SimConfigBinLocal {
+    float tickSeconds;
+    std::int32_t parkInfluenceRadius;
+    std::uint8_t requireOutsideConnection;
+    std::int32_t taxResidential;
+    std::int32_t taxCommercial;
+    std::int32_t taxIndustrial;
+    std::int32_t maintenanceRoad;
+    std::int32_t maintenancePark;
+    float taxHappinessPerCapita;
+    float residentialDesirabilityWeight;
+    float commercialDesirabilityWeight;
+    float industrialDesirabilityWeight;
+  };
+
+  struct DistrictPolicyBinLocal {
+    float taxResidentialMult;
+    float taxCommercialMult;
+    float taxIndustrialMult;
+    float roadMaintenanceMult;
+    float parkMaintenanceMult;
+  };
+
+  auto readVarU32 = [](std::istream& is, std::uint32_t& out) -> bool {
+    out = 0;
+    std::uint32_t shift = 0;
+    for (int i = 0; i < 5; ++i) {
+      std::uint8_t b = 0;
+      is.read(reinterpret_cast<char*>(&b), 1);
+      if (!is.good()) return false;
+      out |= static_cast<std::uint32_t>(b & 0x7Fu) << shift;
+      if ((b & 0x80u) == 0) return true;
+      shift += 7;
+    }
+    return false;
+  };
+
+  std::ifstream in(savePath, std::ios::binary);
+  EXPECT_TRUE(static_cast<bool>(in));
+
+  char magic[8] = {};
+  std::uint32_t version = 0;
+  std::uint32_t wDim = 0;
+  std::uint32_t hDim = 0;
+  std::uint64_t seedRead = 0;
+  in.read(magic, 8);
+  in.read(reinterpret_cast<char*>(&version), static_cast<std::streamsize>(sizeof(version)));
+  in.read(reinterpret_cast<char*>(&wDim), static_cast<std::streamsize>(sizeof(wDim)));
+  in.read(reinterpret_cast<char*>(&hDim), static_cast<std::streamsize>(sizeof(hDim)));
+  in.read(reinterpret_cast<char*>(&seedRead), static_cast<std::streamsize>(sizeof(seedRead)));
+  EXPECT_TRUE(in.good());
+  EXPECT_TRUE(std::memcmp(magic, "ISOCITY\0", 8) == 0);
+  EXPECT_EQ(version, static_cast<std::uint32_t>(8));
+  EXPECT_EQ(wDim, static_cast<std::uint32_t>(w.width()));
+  EXPECT_EQ(hDim, static_cast<std::uint32_t>(w.height()));
+  EXPECT_EQ(seedRead, w.seed());
+
+  ProcGenConfigBinLocal pcb{};
+  StatsBinLocal sb{};
+  SimConfigBinLocal scb{};
+  in.read(reinterpret_cast<char*>(&pcb), static_cast<std::streamsize>(sizeof(pcb)));
+  in.read(reinterpret_cast<char*>(&sb), static_cast<std::streamsize>(sizeof(sb)));
+  in.read(reinterpret_cast<char*>(&scb), static_cast<std::streamsize>(sizeof(scb)));
+
+  std::uint8_t dpEnabled = 0;
+  in.read(reinterpret_cast<char*>(&dpEnabled), 1);
+  for (int d = 0; d < kDistrictCount; ++d) {
+    DistrictPolicyBinLocal dpb{};
+    in.read(reinterpret_cast<char*>(&dpb), static_cast<std::streamsize>(sizeof(dpb)));
+  }
+  EXPECT_TRUE(in.good());
+
+  std::uint8_t method = 0;
+  in.read(reinterpret_cast<char*>(&method), 1);
+  EXPECT_TRUE(in.good());
+
+  // For this intentionally repetitive delta payload, we expect SLLZ compression.
+  EXPECT_EQ(method, static_cast<std::uint8_t>(CompressionMethod::SLLZ));
+
+  std::uint32_t uncompressedSize = 0;
+  std::uint32_t storedSize = 0;
+  EXPECT_TRUE(readVarU32(in, uncompressedSize));
+  EXPECT_TRUE(readVarU32(in, storedSize));
+  EXPECT_TRUE(storedSize < uncompressedSize);
+
+  // Make sure load works end-to-end (exercises decompression).
+  World loaded;
+  ProcGenConfig cfg2;
+  SimConfig sim2;
+  std::string err2;
+  EXPECT_TRUE(LoadWorldBinary(loaded, cfg2, sim2, savePath.string(), err2));
+  EXPECT_EQ(loaded.width(), w.width());
+  EXPECT_EQ(loaded.height(), w.height());
+  EXPECT_EQ(loaded.at(0, 0).overlay, Overlay::Road);
+  EXPECT_EQ(loaded.at(loaded.width() - 1, loaded.height() - 1).overlay, Overlay::Road);
 }
 
 void TestSaveLoadDetectsCorruption()
@@ -1446,6 +1637,287 @@ void TestSimulationDeterministicHashAfterTicks()
   EXPECT_EQ(ha, hb);
 }
 
+
+
+void TestBridgeRoadsCanBeBuiltOnWater()
+{
+  World w(7, 7, 123);
+  w.stats().money = 1000;
+
+  // Start from a clean slate (procedural gen may place roads/zones).
+  for (int y = 0; y < w.height(); ++y) {
+    for (int x = 0; x < w.width(); ++x) {
+      w.setOverlay(Overlay::None, x, y);
+      Tile& t = w.at(x, y);
+      t.height = 0.8f;
+      t.terrain = Terrain::Grass;
+      t.level = 1;
+      t.occupants = 0;
+    }
+  }
+
+  // Make a single water tile and ensure road tool can place a bridge there.
+  {
+    Tile& t = w.at(3, 3);
+    t.height = 0.0f;
+    t.terrain = Terrain::Water;
+
+    const int before = w.stats().money;
+    EXPECT_EQ(w.applyTool(Tool::Road, 3, 3), ToolApplyResult::Applied);
+    EXPECT_EQ(w.at(3, 3).overlay, Overlay::Road);
+    const int after = w.stats().money;
+    EXPECT_EQ(before - after, RoadBridgeBuildCostForLevel(1));
+  }
+
+  // Bulldozing on water should remove the bridge road.
+  {
+    EXPECT_EQ(w.applyTool(Tool::Bulldoze, 3, 3), ToolApplyResult::Applied);
+    EXPECT_EQ(w.at(3, 3).overlay, Overlay::None);
+  }
+}
+
+void TestRoadBuildPathAvoidsBridgesWhenLandAlternativeExists()
+{
+  World w(7, 7, 42);
+  w.stats().money = 1000;
+
+  // Make a simple deterministic terrain: land everywhere, then a water "river" segment.
+  for (int y = 0; y < w.height(); ++y) {
+    for (int x = 0; x < w.width(); ++x) {
+      w.setOverlay(Overlay::None, x, y);
+      Tile& t = w.at(x, y);
+      t.height = 0.8f;
+      t.terrain = Terrain::Grass;
+      t.level = 1;
+      t.occupants = 0;
+    }
+  }
+
+  // Water barrier in the straight-line path: going straight crosses expensive bridge tiles,
+  // but going around (one row up/down) is cheaper.
+  for (int x = 1; x <= 5; ++x) {
+    Tile& t = w.at(x, 3);
+    t.height = 0.0f;
+    t.terrain = Terrain::Water;
+  }
+
+  const Point start{0, 3};
+  const Point goal{6, 3};
+  std::vector<Point> path;
+  const bool ok = FindRoadBuildPath(w, start, goal, path);
+  EXPECT_TRUE(ok);
+  EXPECT_TRUE(!path.empty());
+
+  // The chosen path should avoid water entirely (since land is available at low additional steps).
+  for (const Point& p : path) {
+    EXPECT_NE(w.at(p.x, p.y).terrain, Terrain::Water);
+  }
+}
+
+void TestRoadBuildPathMoneyAvoidsExpensiveBridge()
+{
+  using namespace isocity;
+
+  World w(7, 7, 777u);
+
+  // Single water tile on the straight-line route. With bridges allowed, the planner
+  // *can* cross water, but the bridge multiplier should make the detour cheaper.
+  w.at(3, 3).terrain = Terrain::Water;
+  w.at(3, 3).height = 0.0f;
+
+  const Point start{1, 3};
+  const Point goal{5, 3};
+
+  RoadBuildPathConfig cfg;
+  cfg.allowBridges = true;
+  cfg.costModel = RoadBuildPathConfig::CostModel::Money;
+  cfg.targetLevel = 3; // highway: bridges are very expensive
+
+  std::vector<Point> path;
+  EXPECT_TRUE(FindRoadBuildPath(w, start, goal, path, nullptr, cfg));
+  EXPECT_TRUE(!path.empty());
+
+  // The money-aware planner should avoid the water tile.
+  for (const Point& p : path) {
+    EXPECT_NE(w.at(p.x, p.y).terrain, Terrain::Water);
+  }
+}
+
+void TestRoadBuildPathMoneyAvoidsExpensiveUpgrades()
+{
+  using namespace isocity;
+
+  World w(9, 5, 888u);
+
+  // Deterministic flat land.
+  for (int y = 0; y < w.height(); ++y) {
+    for (int x = 0; x < w.width(); ++x) {
+      w.setOverlay(Overlay::None, x, y);
+      Tile& t = w.at(x, y);
+      t.height = 0.8f;
+      t.terrain = Terrain::Grass;
+      t.level = 1;
+      t.occupants = 0;
+    }
+  }
+
+  // Start/goal are on y=2. Provide a longer existing road detour on y=1.
+  const Point start{2, 2};
+  const Point goal{6, 2};
+
+  // Existing level-1 roads (street) along the detour path.
+  const Point detour[] = {Point{2, 2}, Point{2, 1}, Point{3, 1}, Point{4, 1}, Point{5, 1}, Point{6, 1}, Point{6, 2}};
+  for (const Point& p : detour) {
+    w.setOverlay(Overlay::Road, p.x, p.y);
+    w.at(p.x, p.y).level = 1;
+  }
+
+  RoadBuildPathConfig cfg;
+  cfg.allowBridges = false;
+  cfg.costModel = RoadBuildPathConfig::CostModel::Money;
+  cfg.targetLevel = 3; // plan a highway
+
+  std::vector<Point> path;
+  EXPECT_TRUE(FindRoadBuildPath(w, start, goal, path, nullptr, cfg));
+  EXPECT_TRUE(!path.empty());
+
+  // Money-aware behavior: upgrading 7 street tiles to highway is more expensive than
+  // building a new 5-tile highway segment on y=2.
+  EXPECT_EQ(static_cast<int>(path.size()), 5);
+  for (const Point& p : path) {
+    EXPECT_EQ(p.y, 2);
+  }
+}
+
+
+void TestExportPpmLayers()
+{
+  World w(2, 2, 123);
+
+  // Build a tiny deterministic grid with mixed terrain/overlays.
+  w.at(0, 0).terrain = Terrain::Water;
+  w.at(1, 0).terrain = Terrain::Sand;
+
+  w.at(0, 1).terrain = Terrain::Grass;
+  w.at(1, 1).terrain = Terrain::Grass;
+  w.at(1, 1).overlay = Overlay::Road;
+  w.at(1, 1).level = 3;
+
+  // Basic render sanity
+  const PpmImage terrain = RenderPpmLayer(w, ExportLayer::Terrain);
+  EXPECT_EQ(terrain.width, 2);
+  EXPECT_EQ(terrain.height, 2);
+  EXPECT_EQ(static_cast<int>(terrain.rgb.size()), 2 * 2 * 3);
+
+  const PpmImage overlay = RenderPpmLayer(w, ExportLayer::Overlay);
+  EXPECT_EQ(overlay.width, 2);
+  EXPECT_EQ(overlay.height, 2);
+  EXPECT_EQ(static_cast<int>(overlay.rgb.size()), 2 * 2 * 3);
+
+  // The road tile should differ between terrain-only and overlay render.
+  const std::size_t idx11 = (1u * 2u + 1u) * 3u;
+  EXPECT_TRUE(terrain.rgb[idx11 + 0] != overlay.rgb[idx11 + 0] || terrain.rgb[idx11 + 1] != overlay.rgb[idx11 + 1] ||
+              terrain.rgb[idx11 + 2] != overlay.rgb[idx11 + 2]);
+
+  // Parsing
+  ExportLayer layer{};
+  EXPECT_TRUE(ParseExportLayer("LV", layer));
+  EXPECT_EQ(layer, ExportLayer::LandValue);
+  EXPECT_TRUE(ParseExportLayer("goods_fill", layer));
+  EXPECT_EQ(layer, ExportLayer::GoodsFill);
+
+  // Nearest-neighbor scaling
+  const PpmImage up = ScaleNearest(terrain, 3);
+  EXPECT_EQ(up.width, 6);
+  EXPECT_EQ(up.height, 6);
+  EXPECT_EQ(static_cast<int>(up.rgb.size()), 6 * 6 * 3);
+
+  // Sample a few points to verify nearest-neighbor replication:
+  // Pixel (0,0) in the upscaled image corresponds to tile (0,0).
+  EXPECT_EQ(up.rgb[0], terrain.rgb[0]);
+  EXPECT_EQ(up.rgb[1], terrain.rgb[1]);
+  EXPECT_EQ(up.rgb[2], terrain.rgb[2]);
+
+  // Pixel (3,0) in upscaled corresponds to original (1,0) tile.
+  const std::size_t idx30 = (0u * 6u + 3u) * 3u;
+  const std::size_t idx10 = (0u * 2u + 1u) * 3u;
+  EXPECT_EQ(up.rgb[idx30 + 0], terrain.rgb[idx10 + 0]);
+  EXPECT_EQ(up.rgb[idx30 + 1], terrain.rgb[idx10 + 1]);
+  EXPECT_EQ(up.rgb[idx30 + 2], terrain.rgb[idx10 + 2]);
+}
+
+void TestDistrictStatsCompute()
+{
+  // Small 2x2 world with two districts and a simple road access setup.
+  World w(2, 2, 1);
+
+  // Layout (x, y):
+  // (0,0) Res d0  occ10 lvl1
+  // (1,0) Road d0 lvl1 (edge-connected)
+  // (0,1) Park d1
+  // (1,1) Ind d1  occ5 lvl1
+  w.at(0, 0).overlay = Overlay::Residential;
+  w.at(0, 0).level = 1;
+  w.at(0, 0).occupants = 10;
+  w.at(0, 0).district = 0;
+
+  w.at(1, 0).overlay = Overlay::Road;
+  w.at(1, 0).level = 1;
+  w.at(1, 0).district = 0;
+
+  w.at(0, 1).overlay = Overlay::Park;
+  w.at(0, 1).district = 1;
+
+  w.at(1, 1).overlay = Overlay::Industrial;
+  w.at(1, 1).level = 1;
+  w.at(1, 1).occupants = 5;
+  w.at(1, 1).district = 1;
+
+  SimConfig cfg;
+  cfg.requireOutsideConnection = true;
+  cfg.districtPoliciesEnabled = true;
+  cfg.taxResidential = 2;
+  cfg.taxCommercial = 3;
+  cfg.taxIndustrial = 4;
+  cfg.maintenanceRoad = 2;
+  cfg.maintenancePark = 1;
+
+  // District 1: double industrial tax.
+  cfg.districtPolicies[1].taxIndustrialMult = 2.0f;
+
+  // Constant land value field (0.5).
+  std::vector<float> lv(4, 0.5f);
+
+  const DistrictStatsResult ds = ComputeDistrictStats(w, cfg, &lv, nullptr);
+
+  const auto& d0 = ds.districts[0];
+  EXPECT_EQ(d0.population, 10);
+  EXPECT_EQ(d0.housingCapacity, 10);
+  EXPECT_EQ(d0.employed, 0);
+  EXPECT_EQ(d0.jobsCapacity, 0);
+  EXPECT_EQ(d0.taxRevenue, 23);
+  EXPECT_EQ(d0.roadMaintenanceCost, 2);
+  EXPECT_EQ(d0.maintenanceCost, 2);
+  EXPECT_EQ(d0.net, 21);
+  EXPECT_EQ(d0.zoneTiles, 1);
+  EXPECT_EQ(d0.zoneTilesAccessible, 1);
+  EXPECT_NEAR(d0.avgLandValue, 0.5f, 1e-6f);
+
+  const auto& d1 = ds.districts[1];
+  EXPECT_EQ(d1.population, 0);
+  EXPECT_EQ(d1.housingCapacity, 0);
+  EXPECT_EQ(d1.employed, 5);
+  EXPECT_EQ(d1.jobsCapacity, 12);
+  EXPECT_EQ(d1.taxRevenue, 45);
+  EXPECT_EQ(d1.parkMaintenanceCost, 1);
+  EXPECT_EQ(d1.maintenanceCost, 1);
+  EXPECT_EQ(d1.net, 44);
+  EXPECT_EQ(d1.zoneTiles, 1);
+  EXPECT_EQ(d1.zoneTilesAccessible, 1);
+  EXPECT_NEAR(d1.avgLandValue, 0.5f, 1e-6f);
+}
+
+
 } // namespace
 
 int main()
@@ -1458,6 +1930,8 @@ int main()
   TestTrafficCongestionRespectsRoadClassCapacity();
   TestTrafficCongestionAwareSplitsParallelRoutes();
   TestSaveLoadRoundTrip();
+  TestSLLZCompressionRoundTrip();
+  TestSaveV8UsesCompressionForLargeDeltaPayload();
   TestSaveLoadDetectsCorruption();
   TestOutsideConnectionAffectsZoneAccess();
   TestSimulatorStepInvariants();
@@ -1483,11 +1957,17 @@ int main()
 
   TestWorldHashDeterministicForSameSeed();
   TestSimulationDeterministicHashAfterTicks();
+  TestDistrictStatsCompute();
+  TestExportPpmLayers();
 
 
   TestRoadPathfindingAStar();
   TestLandPathfindingAStarAvoidsWater();
   TestRoadBuildPathPrefersExistingRoads();
+  TestBridgeRoadsCanBeBuiltOnWater();
+  TestRoadBuildPathAvoidsBridgesWhenLandAlternativeExists();
+  TestRoadBuildPathMoneyAvoidsExpensiveBridge();
+  TestRoadBuildPathMoneyAvoidsExpensiveUpgrades();
 
   if (g_failures == 0) {
     std::cout << "proc_isocity_tests: OK\n";

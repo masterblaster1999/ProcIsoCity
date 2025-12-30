@@ -1,5 +1,7 @@
 #include "isocity/Pathfinding.hpp"
 
+#include "isocity/Road.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -26,13 +28,17 @@ bool IsLand(const World& world, int x, int y)
   return world.inBounds(x, y) && world.at(x, y).terrain != Terrain::Water;
 }
 
-bool IsRoadBuildable(const World& world, int x, int y)
+bool IsRoadBuildable(const World& world, int x, int y, const RoadBuildPathConfig& cfg)
 {
   if (!world.inBounds(x, y)) return false;
   const Tile& t = world.at(x, y);
-  if (t.terrain == Terrain::Water) return false;
 
-  // Roads can only exist on empty land or on top of existing roads.
+  // By default we avoid water entirely, but the in-game road planner can opt-in to
+  // allowing roads on water (bridges).
+  if (!cfg.allowBridges && t.terrain == Terrain::Water) return false;
+
+  // The planner never bulldozes: roads can only exist on empty tiles or on top of
+  // existing roads.
   return (t.overlay == Overlay::None) || (t.overlay == Overlay::Road);
 }
 
@@ -232,13 +238,14 @@ bool FindLandPathAStar(const World& world, Point start, Point goal, std::vector<
   return false;
 }
 
-bool FindRoadBuildPath(const World& world, Point start, Point goal, std::vector<Point>& outPath, int* outBuildCost)
+bool FindRoadBuildPath(const World& world, Point start, Point goal, std::vector<Point>& outPath,
+                       int* outPrimaryCost, const RoadBuildPathConfig& cfg)
 {
   outPath.clear();
-  if (outBuildCost) *outBuildCost = 0;
+  if (outPrimaryCost) *outPrimaryCost = 0;
 
-  if (!IsRoadBuildable(world, start.x, start.y)) return false;
-  if (!IsRoadBuildable(world, goal.x, goal.y)) return false;
+  if (!IsRoadBuildable(world, start.x, start.y, cfg)) return false;
+  if (!IsRoadBuildable(world, goal.x, goal.y, cfg)) return false;
 
   const int w = world.width();
   const int h = world.height();
@@ -248,21 +255,40 @@ bool FindRoadBuildPath(const World& world, Point start, Point goal, std::vector<
   const int startIdx = Idx(start.x, start.y, w);
   const int goalIdx = Idx(goal.x, goal.y, w);
 
+  const int targetLevel = ClampRoadLevel(cfg.targetLevel);
+
+  auto computePrimaryCost = [&](const std::vector<Point>& path) -> int {
+    int cost = 0;
+    for (const Point& p : path) {
+      if (!world.inBounds(p.x, p.y)) continue;
+      const Tile& t = world.at(p.x, p.y);
+      if (cfg.costModel == RoadBuildPathConfig::CostModel::NewTiles) {
+        if (t.overlay != Overlay::Road) ++cost;
+      } else {
+        const bool isBridge = (t.terrain == Terrain::Water);
+        if (t.overlay == Overlay::Road) {
+          cost += RoadPlacementCost(static_cast<int>(t.level), targetLevel, /*alreadyRoad=*/true, isBridge);
+        } else if (t.overlay == Overlay::None) {
+          cost += RoadPlacementCost(1, targetLevel, /*alreadyRoad=*/false, isBridge);
+        }
+      }
+    }
+    return cost;
+  };
+
   // Trivial.
   if (startIdx == goalIdx) {
     outPath.push_back(start);
-    if (outBuildCost) {
-      const Tile& t = world.at(start.x, start.y);
-      *outBuildCost = (t.overlay == Overlay::Road) ? 0 : 1;
-    }
+    if (outPrimaryCost) *outPrimaryCost = computePrimaryCost(outPath);
     return true;
   }
 
   constexpr int kInf = std::numeric_limits<int>::max() / 4;
 
-  // We use Dijkstra (A* with 0 heuristic) where the cost of entering a tile is:
-  //   0 if it's already a road, 1 if it's empty land (needs building)
-  // and we tie-break by fewer steps.
+  // We use Dijkstra (A* with 0 heuristic). Cost of entering a tile depends on cfg.costModel:
+  //  - NewTiles: 0 if it's already a road, 1 if it's empty (needs a new road)
+  //  - Money:    exact build/upgrade money cost to reach targetLevel (includes bridges)
+  // and we tie-break by fewer steps, then stable per-tile variation bits.
   std::vector<int> bestCost(n, kInf);
   std::vector<int> bestSteps(n, kInf);
   std::vector<int> cameFrom(n, -1);
@@ -289,6 +315,21 @@ bool FindRoadBuildPath(const World& world, Point start, Point goal, std::vector<
     return world.at(x, y).variation;
   };
 
+  auto tileEnterCost = [&](int x, int y) -> int {
+    if (!world.inBounds(x, y)) return kInf;
+    const Tile& t = world.at(x, y);
+    if (cfg.costModel == RoadBuildPathConfig::CostModel::NewTiles) {
+      return (t.overlay == Overlay::Road) ? 0 : 1;
+    }
+
+    const bool isBridge = (t.terrain == Terrain::Water);
+    if (t.overlay == Overlay::Road) {
+      return RoadPlacementCost(static_cast<int>(t.level), targetLevel, /*alreadyRoad=*/true, isBridge);
+    }
+    // overlay==None by buildability rules
+    return RoadPlacementCost(1, targetLevel, /*alreadyRoad=*/false, isBridge);
+  };
+
   std::priority_queue<Node, std::vector<Node>, Cmp> open;
 
   bestCost[static_cast<std::size_t>(startIdx)] = 0;
@@ -306,14 +347,7 @@ bool FindRoadBuildPath(const World& world, Point start, Point goal, std::vector<
 
     if (cur.idx == goalIdx) {
       ReconstructPath(goalIdx, startIdx, w, cameFrom, outPath);
-      if (outBuildCost) {
-        int build = 0;
-        for (const Point& p : outPath) {
-          if (!world.inBounds(p.x, p.y)) continue;
-          if (world.at(p.x, p.y).overlay != Overlay::Road) ++build;
-        }
-        *outBuildCost = build;
-      }
+      if (outPrimaryCost) *outPrimaryCost = computePrimaryCost(outPath);
       return !outPath.empty();
     }
 
@@ -323,13 +357,13 @@ bool FindRoadBuildPath(const World& world, Point start, Point goal, std::vector<
     for (const auto& d : dirs) {
       const int nx = cx + d[0];
       const int ny = cy + d[1];
-      if (!IsRoadBuildable(world, nx, ny)) continue;
+      if (!IsRoadBuildable(world, nx, ny, cfg)) continue;
 
       const int nidx = Idx(nx, ny, w);
       const std::size_t unidx = static_cast<std::size_t>(nidx);
 
-      const Tile& nt = world.at(nx, ny);
-      const int stepCost = (nt.overlay == Overlay::Road) ? 0 : 1;
+      const int stepCost = tileEnterCost(nx, ny);
+      if (stepCost >= kInf) continue;
 
       const int nCost = cur.cost + stepCost;
       const int nSteps = cur.steps + 1;

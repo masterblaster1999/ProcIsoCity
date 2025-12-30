@@ -90,7 +90,9 @@ void BuildCongestionExtraCostMilli(const World& world, const TrafficConfig& cfg,
     const double mult = alpha * std::pow(ratio, beta);
     if (mult <= 0.0) continue;
 
-    const int baseCost = RoadTravelTimeMilliForLevel(level);
+    const int baseCost = (t.terrain == Terrain::Water)
+      ? RoadBridgeTravelTimeMilliForLevel(level)
+      : RoadTravelTimeMilliForLevel(level);
     const double extraD = static_cast<double>(baseCost) * mult;
     int extra = static_cast<int>(std::lround(extraD));
     if (extra < 0) extra = 0;

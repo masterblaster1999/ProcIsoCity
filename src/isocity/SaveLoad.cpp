@@ -1,5 +1,6 @@
 #include "isocity/SaveLoad.hpp"
 
+#include "isocity/Compression.hpp"
 #include "isocity/ProcGen.hpp"
 #include "isocity/Sim.hpp"
 
@@ -26,7 +27,8 @@ constexpr std::uint32_t kVersionV4 = 4; // v3 + varint/delta encoding for tile d
 constexpr std::uint32_t kVersionV5 = 5; // v4 + height deltas (terraforming)
 constexpr std::uint32_t kVersionV6 = 6; // v5 + SimConfig (policy/economy settings)
 constexpr std::uint32_t kVersionV7 = 7; // v6 + districts + district policy multipliers
-constexpr std::uint32_t kVersionCurrent = kVersionV7;
+constexpr std::uint32_t kVersionV8 = 8; // v7 + compressed delta payload
+constexpr std::uint32_t kVersionCurrent = kVersionV8;
 
 // --- CRC32 ---
 // Used by v3+ saves to detect corruption/truncation.
@@ -170,7 +172,8 @@ bool VerifyCrc32File(const std::string& path, bool& outOk, std::string& outError
 // --- Varint (unsigned LEB128) ---
 // Used by v4 to compress monotonically-increasing tile diff indices (delta-encoded)
 // and small integers like occupants.
-bool WriteVarU32(Crc32OStreamWriter& cw, std::uint32_t v)
+template <typename Writer>
+bool WriteVarU32(Writer& w, std::uint32_t v)
 {
   std::uint8_t buf[5];
   std::size_t n = 0;
@@ -181,8 +184,28 @@ bool WriteVarU32(Crc32OStreamWriter& cw, std::uint32_t v)
   }
   buf[n++] = static_cast<std::uint8_t>(v & 0x7Fu);
 
-  return cw.writeBytes(buf, n);
+  return w.writeBytes(buf, n);
 }
+
+struct VecWriter {
+  explicit VecWriter(std::vector<std::uint8_t>& dst) : out(dst) {}
+
+  bool writeBytes(const void* data, std::size_t size)
+  {
+    const auto* p = reinterpret_cast<const std::uint8_t*>(data);
+    out.insert(out.end(), p, p + size);
+    return true;
+  }
+
+  template <typename T>
+  bool writePOD(const T& value)
+  {
+    static_assert(std::is_trivially_copyable_v<T>, "VecWriter can only write POD/trivially-copyable types");
+    return writeBytes(&value, sizeof(value));
+  }
+
+  std::vector<std::uint8_t>& out;
+};
 
 bool ReadVarU32(std::istream& is, std::uint32_t& out)
 {
@@ -529,6 +552,161 @@ bool LoadBodyV1(std::istream& is, std::uint32_t w, std::uint32_t h, std::uint64_
   loaded.recomputeRoadMasks();
 
   outWorld = std::move(loaded);
+  return true;
+}
+
+// Apply v7-style delta streams (overlay/level/district/occupants + height edits) onto a baseline world.
+// Used by both v7 (raw deltas) and v8 (compressed delta payload).
+bool ApplyDeltasV7(std::istream& is, std::uint32_t w, std::uint32_t h, World& loaded, const ProcGenConfig& procCfg,
+                   std::string& outError)
+{
+  // --- Overlay diffs ---
+  std::uint32_t diffCount = 0;
+  if (!ReadVarU32(is, diffCount)) {
+    outError = "Read failed (diff count)";
+    return false;
+  }
+
+  const std::uint64_t maxTiles = static_cast<std::uint64_t>(w) * static_cast<std::uint64_t>(h);
+  if (static_cast<std::uint64_t>(diffCount) > maxTiles) {
+    outError = "Invalid diff count in save file";
+    return false;
+  }
+
+  std::uint32_t prevIdx = 0;
+  for (std::uint32_t i = 0; i < diffCount; ++i) {
+    std::uint32_t delta = 0;
+    if (!ReadVarU32(is, delta)) {
+      outError = "Read failed (diff idx delta)";
+      return false;
+    }
+    if (i > 0 && delta == 0) {
+      outError = "Invalid diff idx delta (non-increasing)";
+      return false;
+    }
+
+    const std::uint64_t idx64 = static_cast<std::uint64_t>(prevIdx) + static_cast<std::uint64_t>(delta);
+    if (idx64 >= maxTiles || idx64 > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
+      outError = "Invalid tile index in diff list";
+      return false;
+    }
+    const std::uint32_t idx = static_cast<std::uint32_t>(idx64);
+    prevIdx = idx;
+
+    std::uint8_t overlayU8 = 0;
+    std::uint8_t level = 1;
+    std::uint8_t districtU8 = 0;
+    if (!Read(is, overlayU8) || !Read(is, level) || !Read(is, districtU8)) {
+      outError = "Read failed (diff tile header)";
+      return false;
+    }
+    if (districtU8 >= static_cast<std::uint8_t>(kDistrictCount)) {
+      outError = "Invalid district value in save file";
+      return false;
+    }
+
+    std::uint32_t occ32 = 0;
+    if (!ReadVarU32(is, occ32)) {
+      outError = "Read failed (diff occupants)";
+      return false;
+    }
+    if (occ32 > static_cast<std::uint32_t>(std::numeric_limits<std::uint16_t>::max())) {
+      outError = "Invalid occupants value in save file";
+      return false;
+    }
+    const std::uint16_t occ = static_cast<std::uint16_t>(occ32);
+
+    // Basic enum validation (avoid UB on corrupted saves).
+    if (overlayU8 > static_cast<std::uint8_t>(Overlay::Park)) {
+      outError = "Invalid overlay value in save file";
+      return false;
+    }
+
+    const int x = static_cast<int>(idx % w);
+    const int y = static_cast<int>(idx / w);
+
+    Tile& t = loaded.at(x, y);
+    t.overlay = static_cast<Overlay>(overlayU8);
+    t.district = districtU8;
+
+    const bool isZone =
+      (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial || t.overlay == Overlay::Industrial);
+    const bool isRoad = (t.overlay == Overlay::Road);
+
+    if (isZone) {
+      t.level = static_cast<std::uint8_t>(std::clamp<int>(static_cast<int>(level), 1, 3));
+      t.occupants = occ;
+    } else if (isRoad) {
+      t.level = static_cast<std::uint8_t>(std::clamp<int>(static_cast<int>(level), 1, 3));
+      t.occupants = 0;
+    } else {
+      t.level = 1;
+      t.occupants = 0;
+    }
+  }
+
+  // --- Height diffs ---
+  std::uint32_t heightDiffCount = 0;
+  if (!ReadVarU32(is, heightDiffCount)) {
+    outError = "Read failed (height diff count)";
+    return false;
+  }
+  if (static_cast<std::uint64_t>(heightDiffCount) > maxTiles) {
+    outError = "Invalid height diff count in save file";
+    return false;
+  }
+
+  prevIdx = 0;
+  for (std::uint32_t i = 0; i < heightDiffCount; ++i) {
+    std::uint32_t delta = 0;
+    if (!ReadVarU32(is, delta)) {
+      outError = "Read failed (height diff idx delta)";
+      return false;
+    }
+    if (i > 0 && delta == 0) {
+      outError = "Invalid height diff idx delta (non-increasing)";
+      return false;
+    }
+
+    const std::uint64_t idx64 = static_cast<std::uint64_t>(prevIdx) + static_cast<std::uint64_t>(delta);
+    if (idx64 >= maxTiles || idx64 > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
+      outError = "Invalid tile index in height diff list";
+      return false;
+    }
+    const std::uint32_t idx = static_cast<std::uint32_t>(idx64);
+    prevIdx = idx;
+
+    std::uint16_t hq = 0;
+    if (!Read(is, hq)) {
+      outError = "Read failed (height diff value)";
+      return false;
+    }
+
+    const int x = static_cast<int>(idx % w);
+    const int y = static_cast<int>(idx / w);
+    Tile& t = loaded.at(x, y);
+
+    t.height = DequantizeHeight(hq);
+    t.terrain = TerrainFromHeight(t.height, procCfg);
+
+    if (t.terrain == Terrain::Water) {
+      // If terraforming made this tile water, clear most overlays to keep invariants.
+      // Roads on water are bridges and are allowed.
+      if (t.overlay != Overlay::Road) {
+        t.overlay = Overlay::None;
+        t.level = 1;
+        t.occupants = 0;
+      } else {
+        t.occupants = 0;
+        t.level = static_cast<std::uint8_t>(std::clamp<int>(static_cast<int>(t.level), 1, 3));
+      }
+    }
+  }
+
+  // Road auto-tiling uses per-tile masks stored in Tile::variation low bits.
+  // Deltas do not store those; we recompute after all overlays are applied.
+  loaded.recomputeRoadMasks();
+
   return true;
 }
 
@@ -895,10 +1073,16 @@ bool LoadBodyV5(std::istream& is, std::uint32_t w, std::uint32_t h, std::uint64_
     t.terrain = TerrainFromHeight(t.height, outProcCfg);
 
     if (t.terrain == Terrain::Water) {
-      // If terraforming made this tile water, clear any overlays to keep invariants.
-      t.overlay = Overlay::None;
-      t.level = 1;
-      t.occupants = 0;
+      // If terraforming made this tile water, clear most overlays to keep invariants.
+      // Roads on water are bridges and are allowed.
+      if (t.overlay != Overlay::Road) {
+        t.overlay = Overlay::None;
+        t.level = 1;
+        t.occupants = 0;
+      } else {
+        t.occupants = 0;
+        t.level = static_cast<std::uint8_t>(std::clamp<int>(static_cast<int>(t.level), 1, 3));
+      }
     }
   }
 
@@ -1077,10 +1261,16 @@ bool LoadBodyV6(std::istream& is, std::uint32_t w, std::uint32_t h, std::uint64_
     t.terrain = TerrainFromHeight(t.height, outProcCfg);
 
     if (t.terrain == Terrain::Water) {
-      // If terraforming made this tile water, clear any overlays to keep invariants.
-      t.overlay = Overlay::None;
-      t.level = 1;
-      t.occupants = 0;
+      // If terraforming made this tile water, clear most overlays to keep invariants.
+      // Roads on water are bridges and are allowed.
+      if (t.overlay != Overlay::Road) {
+        t.overlay = Overlay::None;
+        t.level = 1;
+        t.occupants = 0;
+      } else {
+        t.occupants = 0;
+        t.level = static_cast<std::uint8_t>(std::clamp<int>(static_cast<int>(t.level), 1, 3));
+      }
     }
   }
 
@@ -1151,147 +1341,128 @@ bool LoadBodyV7(std::istream& is, std::uint32_t w, std::uint32_t h, std::uint64_
 
   World loaded = GenerateWorld(static_cast<int>(w), static_cast<int>(h), seed, outProcCfg);
 
-  // --- Overlay diffs ---
-  std::uint32_t diffCount = 0;
-  if (!ReadVarU32(is, diffCount)) {
-    outError = "Read failed (diff count)";
+  if (!ApplyDeltasV7(is, w, h, loaded, outProcCfg, outError)) {
     return false;
   }
-
-  const std::uint64_t maxTiles = static_cast<std::uint64_t>(w) * static_cast<std::uint64_t>(h);
-  if (static_cast<std::uint64_t>(diffCount) > maxTiles) {
-    outError = "Invalid diff count in save file";
-    return false;
-  }
-
-  std::uint32_t prevIdx = 0;
-  for (std::uint32_t i = 0; i < diffCount; ++i) {
-    std::uint32_t delta = 0;
-    if (!ReadVarU32(is, delta)) {
-      outError = "Read failed (diff idx delta)";
-      return false;
-    }
-    if (i > 0 && delta == 0) {
-      outError = "Invalid diff idx delta (non-increasing)";
-      return false;
-    }
-
-    const std::uint64_t idx64 = static_cast<std::uint64_t>(prevIdx) + static_cast<std::uint64_t>(delta);
-    if (idx64 >= maxTiles || idx64 > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
-      outError = "Invalid tile index in diff list";
-      return false;
-    }
-    const std::uint32_t idx = static_cast<std::uint32_t>(idx64);
-    prevIdx = idx;
-
-    std::uint8_t overlayU8 = 0;
-    std::uint8_t level = 1;
-    std::uint8_t districtU8 = 0;
-    if (!Read(is, overlayU8) || !Read(is, level) || !Read(is, districtU8)) {
-      outError = "Read failed (diff tile header)";
-      return false;
-    }
-
-    if (districtU8 >= static_cast<std::uint8_t>(kDistrictCount)) {
-      outError = "Invalid district value in save file";
-      return false;
-    }
-
-    std::uint32_t occ32 = 0;
-    if (!ReadVarU32(is, occ32)) {
-      outError = "Read failed (diff occupants)";
-      return false;
-    }
-    if (occ32 > static_cast<std::uint32_t>(std::numeric_limits<std::uint16_t>::max())) {
-      outError = "Invalid occupants value in save file";
-      return false;
-    }
-    const std::uint16_t occ = static_cast<std::uint16_t>(occ32);
-
-    // Basic enum validation (avoid UB on corrupted saves).
-    if (overlayU8 > static_cast<std::uint8_t>(Overlay::Park)) {
-      outError = "Invalid overlay value in save file";
-      return false;
-    }
-
-    const int x = static_cast<int>(idx % w);
-    const int y = static_cast<int>(idx / w);
-
-    Tile& t = loaded.at(x, y);
-    t.overlay = static_cast<Overlay>(overlayU8);
-    t.district = districtU8;
-
-    const bool isZone =
-      (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial || t.overlay == Overlay::Industrial);
-    const bool isRoad = (t.overlay == Overlay::Road);
-
-    if (isZone) {
-      t.level = static_cast<std::uint8_t>(std::clamp<int>(static_cast<int>(level), 1, 3));
-      t.occupants = occ;
-    } else if (isRoad) {
-      t.level = static_cast<std::uint8_t>(std::clamp<int>(static_cast<int>(level), 1, 3));
-      t.occupants = 0;
-    } else {
-      t.level = 1;
-      t.occupants = 0;
-    }
-  }
-
-  // --- Height diffs (same as v5/v6) ---
-  std::uint32_t heightDiffCount = 0;
-  if (!ReadVarU32(is, heightDiffCount)) {
-    outError = "Read failed (height diff count)";
-    return false;
-  }
-  if (static_cast<std::uint64_t>(heightDiffCount) > maxTiles) {
-    outError = "Invalid height diff count in save file";
-    return false;
-  }
-
-  prevIdx = 0;
-  for (std::uint32_t i = 0; i < heightDiffCount; ++i) {
-    std::uint32_t delta = 0;
-    if (!ReadVarU32(is, delta)) {
-      outError = "Read failed (height diff idx delta)";
-      return false;
-    }
-    if (i > 0 && delta == 0) {
-      outError = "Invalid height diff idx delta (non-increasing)";
-      return false;
-    }
-
-    const std::uint64_t idx64 = static_cast<std::uint64_t>(prevIdx) + static_cast<std::uint64_t>(delta);
-    if (idx64 >= maxTiles || idx64 > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
-      outError = "Invalid tile index in height diff list";
-      return false;
-    }
-    const std::uint32_t idx = static_cast<std::uint32_t>(idx64);
-    prevIdx = idx;
-
-    std::uint16_t hq = 0;
-    if (!Read(is, hq)) {
-      outError = "Read failed (height diff value)";
-      return false;
-    }
-
-    const int x = static_cast<int>(idx % w);
-    const int y = static_cast<int>(idx / w);
-    Tile& t = loaded.at(x, y);
-
-    t.height = DequantizeHeight(hq);
-    t.terrain = TerrainFromHeight(t.height, outProcCfg);
-
-    if (t.terrain == Terrain::Water) {
-      // If terraforming made this tile water, clear any overlays to keep invariants.
-      t.overlay = Overlay::None;
-      t.level = 1;
-      t.occupants = 0;
-    }
-  }
-
-  loaded.recomputeRoadMasks();
   FromBin(loaded.stats(), sb);
 
+  outWorld = std::move(loaded);
+  return true;
+}
+
+bool LoadBodyV8(std::istream& is, std::uint32_t w, std::uint32_t h, std::uint64_t seed, World& outWorld,
+                ProcGenConfig& outProcCfg, SimConfig& outSimCfg, std::string& outError)
+{
+  // v8: v7 + compressed delta payload.
+  //
+  // Payload:
+  //   ProcGenConfigBin
+  //   StatsBin
+  //   SimConfigBin
+  //   u8 districtPoliciesEnabled
+  //   DistrictPolicyBin[kDistrictCount]
+  //   u8 compressionMethod (0=None, 1=SLLZ)
+  //   varint(uncompressedSize)
+  //   varint(storedSize)
+  //   stored bytes
+  //
+  // The uncompressed bytes are a v7-style delta stream (see ApplyDeltasV7).
+
+  ProcGenConfigBin pcb{};
+  if (!Read(is, pcb)) {
+    outError = "Read failed (procgen config)";
+    return false;
+  }
+  FromBin(outProcCfg, pcb);
+
+  StatsBin sb{};
+  if (!Read(is, sb)) {
+    outError = "Read failed (stats)";
+    return false;
+  }
+
+  SimConfigBin scb{};
+  if (!Read(is, scb)) {
+    outError = "Read failed (sim config)";
+    return false;
+  }
+  FromBin(outSimCfg, scb);
+
+  // District policy chunk (v7+).
+  std::uint8_t dpEnabled = 0;
+  if (!Read(is, dpEnabled)) {
+    outError = "Read failed (district policy enabled)";
+    return false;
+  }
+  outSimCfg.districtPoliciesEnabled = (dpEnabled != 0);
+
+  for (int d = 0; d < kDistrictCount; ++d) {
+    DistrictPolicyBin dpb{};
+    if (!Read(is, dpb)) {
+      outError = "Read failed (district policy)";
+      return false;
+    }
+    FromBin(outSimCfg.districtPolicies[static_cast<std::size_t>(d)], dpb);
+  }
+
+  // Compressed delta payload.
+  std::uint8_t methodU8 = 0;
+  if (!Read(is, methodU8)) {
+    outError = "Read failed (compression method)";
+    return false;
+  }
+
+  std::uint32_t uncompressedSize = 0;
+  std::uint32_t storedSize = 0;
+  if (!ReadVarU32(is, uncompressedSize) || !ReadVarU32(is, storedSize)) {
+    outError = "Read failed (compressed payload sizes)";
+    return false;
+  }
+
+  const std::uint64_t tileCount = static_cast<std::uint64_t>(w) * static_cast<std::uint64_t>(h);
+  const std::uint64_t maxReasonable = tileCount * 32ull + 1024ull;
+  if (static_cast<std::uint64_t>(uncompressedSize) > maxReasonable || static_cast<std::uint64_t>(storedSize) > maxReasonable) {
+    outError = "Invalid compressed payload size";
+    return false;
+  }
+
+  std::vector<std::uint8_t> stored(storedSize);
+  if (storedSize > 0) {
+    is.read(reinterpret_cast<char*>(stored.data()), static_cast<std::streamsize>(storedSize));
+    if (!is.good()) {
+      outError = "Read failed (compressed payload bytes)";
+      return false;
+    }
+  }
+
+  std::vector<std::uint8_t> delta;
+  if (methodU8 == static_cast<std::uint8_t>(CompressionMethod::None)) {
+    if (storedSize != uncompressedSize) {
+      outError = "Invalid payload sizes for uncompressed delta stream";
+      return false;
+    }
+    delta = std::move(stored);
+  } else if (methodU8 == static_cast<std::uint8_t>(CompressionMethod::SLLZ)) {
+    std::string decErr;
+    if (!DecompressSLLZ(stored.data(), stored.size(), static_cast<std::size_t>(uncompressedSize), delta, decErr)) {
+      outError = "Delta payload decompression failed: " + decErr;
+      return false;
+    }
+  } else {
+    outError = "Unknown compression method in save file";
+    return false;
+  }
+
+  World loaded = GenerateWorld(static_cast<int>(w), static_cast<int>(h), seed, outProcCfg);
+
+  // Parse delta stream from an in-memory buffer.
+  std::string deltaStr(reinterpret_cast<const char*>(delta.data()), delta.size());
+  std::istringstream ds(deltaStr, std::ios::binary);
+  if (!ApplyDeltasV7(ds, w, h, loaded, outProcCfg, outError)) {
+    return false;
+  }
+
+  FromBin(loaded.stats(), sb);
   outWorld = std::move(loaded);
   return true;
 }
@@ -1597,41 +1768,6 @@ bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const Sim
     }
   }
 
-  // v7: write varint(diffCount) then each diff as:
-  //   varint(idxDelta), u8 overlay, u8 level, u8 district, varint(occupants)
-  // idx is delta-encoded to shrink typical edits (roads/zones tend to cluster).
-  const std::uint32_t diffCount = static_cast<std::uint32_t>(diffs.size());
-  if (!WriteVarU32(cw, diffCount)) {
-    outError = "Write failed (diff count)";
-    return false;
-  }
-
-  std::uint32_t prevIdx = 0;
-  for (const Diff& d : diffs) {
-    if (d.idx < prevIdx) {
-      outError = "Internal error: diff list not sorted";
-      return false;
-    }
-
-    const std::uint32_t delta = d.idx - prevIdx;
-    prevIdx = d.idx;
-
-    if (!WriteVarU32(cw, delta)) {
-      outError = "Write failed (diff idx delta)";
-      return false;
-    }
-
-    if (!cw.write(d.overlay) || !cw.write(d.level) || !cw.write(d.district)) {
-      outError = "Write failed (diff tile header)";
-      return false;
-    }
-
-    if (!WriteVarU32(cw, static_cast<std::uint32_t>(d.occupants))) {
-      outError = "Write failed (diff occupants)";
-      return false;
-    }
-  }
-
   // --- Height deltas (terraforming) ---
   // v5 extends the delta format by persisting Tile::height changes.
   //
@@ -1659,8 +1795,61 @@ bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const Sim
     }
   }
 
+  // --- Delta payload (v8) ---
+  // v8 compresses the delta streams as a single blob:
+  //   u8 compressionMethod (0=None, 1=SLLZ)
+  //   varint(uncompressedSize)
+  //   varint(storedSize)
+  //   stored bytes (either raw or SLLZ compressed)
+  //
+  // The *uncompressed* delta payload is compatible with v7's encoding:
+  //   varint(diffCount)
+  //   repeated diffCount times:
+  //     varint(idxDelta), u8 overlay, u8 level, u8 district, varint(occupants)
+  //   varint(heightDiffCount)
+  //   repeated heightDiffCount times:
+  //     varint(idxDelta), u16 heightQ
+
+  std::vector<std::uint8_t> deltaPayload;
+  deltaPayload.reserve(diffs.size() * 8 + heightDiffs.size() * 4 + 32);
+  VecWriter vw(deltaPayload);
+
+  // Overlay/zone/road diffs.
+  const std::uint32_t diffCount = static_cast<std::uint32_t>(diffs.size());
+  if (!WriteVarU32(vw, diffCount)) {
+    outError = "Write failed (diff count)";
+    return false;
+  }
+
+  std::uint32_t prevIdx = 0;
+  for (const Diff& d : diffs) {
+    if (d.idx < prevIdx) {
+      outError = "Internal error: diff list not sorted";
+      return false;
+    }
+
+    const std::uint32_t delta = d.idx - prevIdx;
+    prevIdx = d.idx;
+
+    if (!WriteVarU32(vw, delta)) {
+      outError = "Write failed (diff idx delta)";
+      return false;
+    }
+
+    if (!vw.writePOD(d.overlay) || !vw.writePOD(d.level) || !vw.writePOD(d.district)) {
+      outError = "Write failed (diff tile header)";
+      return false;
+    }
+
+    if (!WriteVarU32(vw, static_cast<std::uint32_t>(d.occupants))) {
+      outError = "Write failed (diff occupants)";
+      return false;
+    }
+  }
+
+  // Height diffs.
   const std::uint32_t heightDiffCount = static_cast<std::uint32_t>(heightDiffs.size());
-  if (!WriteVarU32(cw, heightDiffCount)) {
+  if (!WriteVarU32(vw, heightDiffCount)) {
     outError = "Write failed (height diff count)";
     return false;
   }
@@ -1675,15 +1864,48 @@ bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const Sim
     const std::uint32_t delta = d.idx - prevIdx;
     prevIdx = d.idx;
 
-    if (!WriteVarU32(cw, delta)) {
+    if (!WriteVarU32(vw, delta)) {
       outError = "Write failed (height diff idx delta)";
       return false;
     }
 
-    if (!cw.write(d.heightQ)) {
+    if (!vw.writePOD(d.heightQ)) {
       outError = "Write failed (height diff value)";
       return false;
     }
+  }
+
+  // Compress (SLLZ) when it helps.
+  CompressionMethod method = CompressionMethod::None;
+  std::vector<std::uint8_t> compressed;
+  CompressSLLZ(deltaPayload.data(), deltaPayload.size(), compressed);
+  const std::vector<std::uint8_t>* stored = &deltaPayload;
+  if (!compressed.empty() && compressed.size() < deltaPayload.size()) {
+    method = CompressionMethod::SLLZ;
+    stored = &compressed;
+  }
+
+  if (deltaPayload.size() > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) ||
+      stored->size() > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+    outError = "Delta payload too large";
+    return false;
+  }
+
+  const std::uint8_t methodU8 = static_cast<std::uint8_t>(method);
+  const std::uint32_t uncompressedSizeU32 = static_cast<std::uint32_t>(deltaPayload.size());
+  const std::uint32_t storedSizeU32 = static_cast<std::uint32_t>(stored->size());
+
+  if (!cw.write(methodU8)) {
+    outError = "Write failed (compression method)";
+    return false;
+  }
+  if (!WriteVarU32(cw, uncompressedSizeU32) || !WriteVarU32(cw, storedSizeU32)) {
+    outError = "Write failed (compressed payload sizes)";
+    return false;
+  }
+  if (storedSizeU32 > 0 && !cw.writeBytes(stored->data(), stored->size())) {
+    outError = "Write failed (compressed payload bytes)";
+    return false;
   }
 
   // CRC32 (v3) - appended at the end and NOT included in the CRC itself.
@@ -1698,7 +1920,7 @@ bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const Sim
 
 bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const std::string& path, std::string& outError)
 {
-  // Back-compat helper: use the default sim config (v7 stores SimConfig).
+  // Back-compat helper: use the default sim config (v6+ stores SimConfig).
   return SaveWorldBinary(world, procCfg, SimConfig{}, path, outError);
 }
 
@@ -1739,7 +1961,7 @@ bool LoadWorldBinary(World& outWorld, ProcGenConfig& outProcCfg, SimConfig& outS
   }
 
   if (version == kVersionV3 || version == kVersionV4 || version == kVersionV5 || version == kVersionV6 ||
-      version == kVersionV7) {
+      version == kVersionV7 || version == kVersionV8) {
     // v3/v4: CRC32 is appended at the end of the file.
     // We validate the CRC before parsing to detect corruption/truncation.
 
@@ -1814,14 +2036,19 @@ bool LoadWorldBinary(World& outWorld, ProcGenConfig& outProcCfg, SimConfig& outS
       return LoadBodyV6(is, w2, h2, seed2, outWorld, outProcCfg, outSimCfg, outError);
     }
 
-    // v7: includes per-tile districts + district policy multipliers.
-    return LoadBodyV7(is, w2, h2, seed2, outWorld, outProcCfg, outSimCfg, outError);
+    if (version == kVersionV7) {
+      // v7: includes per-tile districts + district policy multipliers.
+      return LoadBodyV7(is, w2, h2, seed2, outWorld, outProcCfg, outSimCfg, outError);
+    }
+
+    // v8: same as v7 but with a compressed delta payload.
+    return LoadBodyV8(is, w2, h2, seed2, outWorld, outProcCfg, outSimCfg, outError);
   }
 
   std::ostringstream oss;
   oss << "Unsupported save version: " << version << " (supported: " << kVersionV1 << ", " << kVersionV2 << ", "
       << kVersionV3 << ", " << kVersionV4 << ", " << kVersionV5 << ", " << kVersionV6 << ", "
-      << kVersionV7 << ")";
+      << kVersionV7 << ", " << kVersionV8 << ")";
   outError = oss.str();
   return false;
 }

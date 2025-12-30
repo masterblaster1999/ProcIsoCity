@@ -145,9 +145,9 @@ void World::setOverlay(Overlay overlay, int x, int y)
 {
   if (!inBounds(x, y)) return;
   Tile& t = at(x, y);
-  // Allow clearing overlays even if a tile is water (useful for terraforming or future tooling),
-  // but never allow placing new content on water.
-  if (t.terrain == Terrain::Water && overlay != Overlay::None) return;
+  // Allow clearing overlays even if a tile is water (useful for terraforming or future tooling).
+  // Most content can't be placed on water, except roads (bridges).
+  if (t.terrain == Terrain::Water && overlay != Overlay::None && overlay != Overlay::Road) return;
 
   const Overlay before = t.overlay;
   t.overlay = overlay;
@@ -191,8 +191,6 @@ ToolApplyResult World::applyRoad(int x, int y, int targetLevel)
   if (!inBounds(x, y)) return ToolApplyResult::OutOfBounds;
   Tile& t = at(x, y);
 
-  if (t.terrain == Terrain::Water) return ToolApplyResult::BlockedWater;
-
   targetLevel = ClampRoadLevel(targetLevel);
 
   auto spend = [&](int cost) -> bool {
@@ -206,7 +204,10 @@ ToolApplyResult World::applyRoad(int x, int y, int targetLevel)
     const int cur = ClampRoadLevel(static_cast<int>(t.level));
     if (cur >= targetLevel) return ToolApplyResult::Noop;
 
-    const int cost = RoadBuildCostForLevel(targetLevel) - RoadBuildCostForLevel(cur);
+    const bool isBridge = (t.terrain == Terrain::Water);
+    const int costTarget = isBridge ? RoadBridgeBuildCostForLevel(targetLevel) : RoadBuildCostForLevel(targetLevel);
+    const int costCur = isBridge ? RoadBridgeBuildCostForLevel(cur) : RoadBuildCostForLevel(cur);
+    const int cost = costTarget - costCur;
     if (!spend(cost)) return ToolApplyResult::InsufficientFunds;
 
     t.level = static_cast<std::uint8_t>(targetLevel);
@@ -215,7 +216,8 @@ ToolApplyResult World::applyRoad(int x, int y, int targetLevel)
 
   if (t.overlay != Overlay::None) return ToolApplyResult::BlockedOccupied;
 
-  const int cost = RoadBuildCostForLevel(targetLevel);
+  const bool isBridge = (t.terrain == Terrain::Water);
+  const int cost = isBridge ? RoadBridgeBuildCostForLevel(targetLevel) : RoadBuildCostForLevel(targetLevel);
   if (!spend(cost)) return ToolApplyResult::InsufficientFunds;
 
   setRoad(x, y);
@@ -242,8 +244,10 @@ ToolApplyResult World::applyTool(Tool tool, int x, int y)
 
   if (tool == Tool::Inspect) return ToolApplyResult::Noop;
 
-  // Can't build on water.
-  if (t.terrain == Terrain::Water) return ToolApplyResult::BlockedWater;
+  // Most tools can't build on water.
+  // Roads are allowed on water (bridges), and bulldozing should be able to remove bridge tiles.
+  if (t.terrain == Terrain::Water && tool != Tool::Road && tool != Tool::Bulldoze)
+    return ToolApplyResult::BlockedWater;
 
   // Tool costs (tiny placeholder economy).
   auto spend = [&](int cost) -> bool {
