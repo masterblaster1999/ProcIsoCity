@@ -47,7 +47,6 @@ endfunction()
 add_library(isocity_core
   src/isocity/Compression.cpp
   src/isocity/World.cpp
-  src/isocity/WorldDiff.cpp
   src/isocity/ProcGen.cpp
   src/isocity/Sim.cpp
   src/isocity/FlowField.cpp
@@ -138,6 +137,12 @@ if (PROCISOCITY_BUILD_APP)
   target_include_directories(proc_isocity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(proc_isocity PRIVATE isocity_core raylib)
 
+  # raylib pulls in Windows headers; prevent `min`/`max` macro pollution that
+  # breaks std::min/std::max in our sources.
+  if (WIN32)
+    target_compile_definitions(proc_isocity PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+  endif()
+
   procisocity_set_strict_warnings(proc_isocity)
 
   # Convenience: copy DLLs on Windows when using MSVC + shared builds.
@@ -163,15 +168,6 @@ if (PROCISOCITY_BUILD_CLI)
   target_link_libraries(proc_isocity_cli PRIVATE isocity_core)
 
   procisocity_set_strict_warnings(proc_isocity_cli)
-
-  add_executable(proc_isocity_diff
-    src/tools/diff.cpp
-  )
-
-  target_include_directories(proc_isocity_diff PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  target_link_libraries(proc_isocity_diff PRIVATE isocity_core)
-
-  procisocity_set_strict_warnings(proc_isocity_diff)
 endif()
 
 # ---- Tests (headless) ----

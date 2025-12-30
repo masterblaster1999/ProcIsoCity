@@ -123,7 +123,7 @@ private:
   float clampWorldRenderScale(float scale) const;
   void ensureWorldRenderTarget(int screenW, int screenH);
   void unloadWorldRenderTarget();
-  void drawVideoSettingsPanel(float uiW, float uiH);
+  void drawVideoSettingsPanel(int uiW, int uiH);
   void adjustVideoSettings(int dir);
   void toggleFullscreen();
   void toggleBorderlessWindowed();
@@ -342,6 +342,9 @@ private:
   // UI scaling (helps readability on very high resolutions / high-DPI displays).
   bool m_uiScaleAuto = true;
   float m_uiScale = 1.0f;
+  // When switching between auto/manual UI scaling, preserve the last manual
+  // value so "toggle" does what users expect.
+  float m_uiScaleManual = 1.0f;
 
   // World render resolution scaling (terrain + world overlays only). When enabled,
   // the world is rendered to an offscreen target and then scaled to the window.
@@ -352,13 +355,16 @@ private:
   int m_worldRenderTargetFps = 60;
   bool m_worldRenderFilterPoint = false;
 
-  float m_smoothedFrameTime = 1.0f / 60.0f;
-  float m_worldRenderAutoAccum = 0.0f;
+  // Smoothed CPU frame time (for the video/settings panel + auto world scaling).
+  float m_frameTimeSmoothed = 1.0f / 60.0f;
+
+  // Accumulator used to throttle auto world render-scale adjustments.
+  float m_worldRenderAutoTimer = 0.0f;
 
   RenderTexture2D m_worldRenderRT{};
   bool m_worldRenderRTValid = false;
-  int m_worldRenderRTW = 0;
-  int m_worldRenderRTH = 0;
+  int m_worldRenderRTWidth = 0;
+  int m_worldRenderRTHeight = 0;
 
   bool m_showVideoSettings = false;
   int m_videoSelection = 0;
@@ -375,6 +381,11 @@ private:
   // Screenshot capture (queued from input and executed in draw() so the capture includes the rendered frame)
   bool m_pendingScreenshot = false;
   std::string m_pendingScreenshotPath;
+
+  // World export capture (queued from input and executed in draw() after the
+  // frame so the export uses up-to-date textures/state).
+  bool m_pendingMapExport = false;
+  std::string m_pendingMapExportPath;
 
   std::optional<Point> m_hovered;
 

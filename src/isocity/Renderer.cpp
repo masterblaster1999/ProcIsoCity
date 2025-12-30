@@ -14,6 +14,10 @@
 
 namespace isocity {
 
+// Forward declarations (Renderer.cpp is a single TU with many helpers; keep things
+// declared before first use so MSVC doesn't fail with "identifier not found" errors).
+static Color TerrainCliffBaseColor(Terrain t);
+
 namespace {
 
 inline unsigned char ClampU8(int v) { return static_cast<unsigned char>(std::clamp(v, 0, 255)); }
@@ -58,10 +62,6 @@ inline Color DistrictFillColor(std::uint8_t d, unsigned char alpha)
 }
 
 inline float Frac01(std::uint32_t u) { return static_cast<float>(u) / 4294967295.0f; }
-
-// Forward declarations (Renderer.cpp is a single TU with many helpers; keep things declared
-// before first use so MSVC doesn't fail with "identifier not found" errors).
-static Color TerrainCliffBaseColor(Terrain t);
 
 inline bool IsImageReadyCompat(const Image& img)
 {
@@ -621,7 +621,6 @@ void Renderer::rebuildBaseCacheBand(const World& world, BandCache& band)
       // except we omit animated water shimmer for cache stability).
       const float v = (static_cast<float>(t.variation) / 255.0f - 0.5f) * 0.10f;
       float brightness = 0.85f + t.height * 0.30f + v;
-      const float baseBrightness = brightness;
 
       // Draw terrain
       DrawTexturePro(terrain(t.terrain), src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
@@ -2017,18 +2016,18 @@ void Renderer::drawHUD(const World& world, const Camera2D& camera, Tool tool, in
 
       // Hovered tile marker.
       if (hovered && world.inBounds(hovered->x, hovered->y)) {
-        const int hx = static_cast<int>(std::floor(mini.rect.x + static_cast<float>(hovered->x) * s));
-        const int hy = static_cast<int>(std::floor(mini.rect.y + static_cast<float>(hovered->y) * s));
-        const int hw = std::max(1, static_cast<int>(std::ceil(s)));
+        const int hx = static_cast<int>(std::floor(mini.rect.x + static_cast<float>(hovered->x) * pixelsPerTile));
+        const int hy = static_cast<int>(std::floor(mini.rect.y + static_cast<float>(hovered->y) * pixelsPerTile));
+        const int hw = std::max(1, static_cast<int>(std::ceil(pixelsPerTile)));
         DrawRectangleLines(hx, hy, hw, hw, Color{255, 255, 0, 200});
       }
 
       // Camera target marker (approx tile under the camera target).
       if (const auto camTile = WorldToTileElevated(camera.target, world, static_cast<float>(m_tileW),
                                                    static_cast<float>(m_tileH), m_elev)) {
-        const float cx = mini.rect.x + (static_cast<float>(camTile->x) + 0.5f) * s;
-        const float cy = mini.rect.y + (static_cast<float>(camTile->y) + 0.5f) * s;
-        const float r = std::clamp(1.0f + 0.35f * s, 1.0f, 6.0f);
+        const float cx = mini.rect.x + (static_cast<float>(camTile->x) + 0.5f) * pixelsPerTile;
+        const float cy = mini.rect.y + (static_cast<float>(camTile->y) + 0.5f) * pixelsPerTile;
+        const float r = std::clamp(1.0f + 0.35f * pixelsPerTile, 1.0f, 6.0f);
         DrawCircleV(Vector2{cx, cy}, r, Color{255, 255, 255, 190});
         DrawCircleLines(static_cast<int>(cx), static_cast<int>(cy), r + 1.0f, Color{0, 0, 0, 90});
       }

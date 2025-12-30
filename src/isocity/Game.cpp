@@ -382,6 +382,18 @@ void Game::setupDevConsole()
     }
   };
 
+  auto heatmapName = [](HeatmapOverlay h) -> const char* {
+    switch (h) {
+    case HeatmapOverlay::Off: return "off";
+    case HeatmapOverlay::LandValue: return "land";
+    case HeatmapOverlay::ParkAmenity: return "park";
+    case HeatmapOverlay::WaterAmenity: return "water";
+    case HeatmapOverlay::Pollution: return "pollution";
+    case HeatmapOverlay::TrafficSpill: return "traffic";
+    default: return "?";
+    }
+  };
+
   // --- help/utility ---
   m_console.registerCommand(
       "help", "help [cmd]  - list commands or show help for one command",
@@ -529,7 +541,7 @@ void Game::setupDevConsole()
   m_console.registerCommand(
       "tool",
       "tool <road|res|com|ind|park|bulldoze|inspect|raise|lower|smooth|district>  - select tool",
-      [this, toLower](DevConsole& c, const DevConsole::Args& args) {
+      [this, toLower, heatmapName](DevConsole& c, const DevConsole::Args& args) {
         if (args.size() != 1) {
           c.print("Usage: tool <name>");
           return;
@@ -566,8 +578,8 @@ void Game::setupDevConsole()
           m_roadDragMoneyCost = 0;
           m_roadDragValid = false;
         }
-        showToast(TextFormat("Tool: %s", ToolName(m_tool)));
-        c.print(TextFormat("tool = %s", ToolName(m_tool)));
+        showToast(TextFormat("Tool: %s", ToString(m_tool)));
+        c.print(TextFormat("tool = %s", ToString(m_tool)));
       });
 
   m_console.registerCommand(
@@ -613,17 +625,17 @@ void Game::setupDevConsole()
         const std::string h = toLower(args[0]);
         if (h == "off") m_heatmapOverlay = HeatmapOverlay::Off;
         else if (h == "land") m_heatmapOverlay = HeatmapOverlay::LandValue;
-        else if (h == "park") m_heatmapOverlay = HeatmapOverlay::Park; // legacy alias
-        else if (h == "water") m_heatmapOverlay = HeatmapOverlay::Water;
+        else if (h == "park") m_heatmapOverlay = HeatmapOverlay::ParkAmenity;
+        else if (h == "water") m_heatmapOverlay = HeatmapOverlay::WaterAmenity;
         else if (h == "pollution") m_heatmapOverlay = HeatmapOverlay::Pollution;
-        else if (h == "traffic") m_heatmapOverlay = HeatmapOverlay::Traffic;
+        else if (h == "traffic") m_heatmapOverlay = HeatmapOverlay::TrafficSpill;
         else {
           c.print("Unknown heatmap: " + args[0]);
           return;
         }
         m_landValueDirty = true;
-        showToast(TextFormat("Heatmap: %s", HeatmapName(m_heatmapOverlay)));
-        c.print(TextFormat("heatmap = %s", HeatmapName(m_heatmapOverlay)));
+        showToast(TextFormat("Heatmap: %s", heatmapName(m_heatmapOverlay)));
+        c.print(TextFormat("heatmap = %s", heatmapName(m_heatmapOverlay)));
       });
 
   m_console.registerCommand(
@@ -663,8 +675,8 @@ void Game::setupDevConsole()
           m_showHelp = want(m_showHelp);
           showToast(m_showHelp ? "Help: ON" : "Help: OFF");
         } else if (name == "policy" || name == "policies") {
-          m_showPolicies = want(m_showPolicies);
-          showToast(m_showPolicies ? "Policies: ON" : "Policies: OFF");
+          m_showPolicy = want(m_showPolicy);
+          showToast(m_showPolicy ? "Policy panel: ON" : "Policy panel: OFF");
         } else if (name == "report") {
           m_showReport = want(m_showReport);
           showToast(m_showReport ? "City report: ON" : "City report: OFF");
@@ -785,7 +797,7 @@ void Game::setupDevConsole()
 
   // --- video/ui ---
   m_console.registerCommand(
-      "ui_scale", "ui_scale [auto|value] - set UI scale (0.5..3.0)",
+      "ui_scale", "ui_scale [auto|value] - set UI scale (0.5..4.0)",
       [this, parseF32](DevConsole& c, const DevConsole::Args& args) {
         if (args.empty()) {
           c.print(TextFormat("ui_scale = %.2f (%s)", static_cast<double>(m_uiScale), m_uiScaleAuto ? "auto" : "manual"));
@@ -812,7 +824,8 @@ void Game::setupDevConsole()
         }
 
         m_uiScaleAuto = false;
-        m_uiScale = std::clamp(s, 0.5f, 3.0f);
+        m_uiScale = std::clamp(s, 0.5f, 4.0f);
+        m_uiScaleManual = m_uiScale;
         showToast(TextFormat("UI scale: %.2f", static_cast<double>(m_uiScale)), 1.5f);
         c.print(TextFormat("ui_scale -> %.2f", static_cast<double>(m_uiScale)));
       });
@@ -1094,6 +1107,9 @@ void Game::updateUiScaleHotkeys()
   }
 
   if (userChanged) {
+    if (!m_uiScaleAuto) {
+      m_uiScaleManual = m_uiScale;
+    }
     char buf[128];
     if (m_uiScaleAuto) {
       std::snprintf(buf, sizeof(buf), "UI scale: auto (%.2fx)", m_uiScale);
@@ -1176,16 +1192,6 @@ void Game::ensureWorldRenderTarget(int screenW, int screenH)
   if (m_worldRenderRTValid) {
     SetTextureFilter(m_worldRenderRT.texture,
                      m_worldRenderFilterPoint ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
-  }
-}
-
-void Game::toggleVsync()
-{
-  m_cfg.vsync = !m_cfg.vsync;
-  if (m_cfg.vsync) {
-    SetWindowState(FLAG_VSYNC_HINT);
-  } else {
-    ClearWindowState(FLAG_VSYNC_HINT);
   }
 }
 
@@ -1301,7 +1307,6 @@ void Game::adjustVideoSettings(int dir)
   switch (m_videoSelection) {
     case 0: {
       toggleFullscreen();
-      showToast(m_fullscreen ? "Fullscreen: ON" : "Fullscreen: OFF");
       break;
     }
     case 1: {
@@ -1321,6 +1326,9 @@ void Game::adjustVideoSettings(int dir)
         m_uiScale = computeAutoUiScale(GetScreenWidth(), GetScreenHeight());
         showToast(TextFormat("UI scale: AUTO (%.2fx)", m_uiScale));
       } else {
+        // Seed manual scale from the current value when switching out of auto,
+        // so toggling doesn't unexpectedly jump to 1.0x.
+        m_uiScaleManual = std::clamp(m_uiScale, 0.5f, 4.0f);
         m_uiScale = m_uiScaleManual;
         showToast(TextFormat("UI scale: %.2fx", m_uiScale));
       }
@@ -4113,9 +4121,13 @@ void Game::drawReportPanel(int /*screenW*/, int /*screenH*/)
   }
 }
 
-void Game::drawVideoSettingsPanel(float uiW, float uiH)
+void Game::drawVideoSettingsPanel(int uiW, int uiH)
 {
   if (!m_showVideoSettings) return;
+
+  // Currently, the panel layout only needs the UI height; keep the width
+  // parameter for possible future responsive layouts.
+  static_cast<void>(uiW);
 
   const int panelW = 520;
   const int rowH = 22;
@@ -4131,8 +4143,8 @@ void Game::drawVideoSettingsPanel(float uiW, float uiH)
   }
 
   // Clamp to screen height.
-  if (y0 + panelH > static_cast<int>(uiH) - 12) {
-    y0 = std::max(12, static_cast<int>(uiH) - panelH - 12);
+  if (y0 + panelH > uiH - 12) {
+    y0 = std::max(12, uiH - panelH - 12);
   }
 
   DrawRectangle(x0, y0, panelW, panelH, Color{0, 0, 0, 180});
@@ -4165,7 +4177,7 @@ void Game::drawVideoSettingsPanel(float uiW, float uiH)
   };
 
   // 0..10 must match adjustVideoSettings() and Tab cycling.
-  drawRow(0, "Fullscreen", m_fullscreen ? "On" : "Off");
+  drawRow(0, "Fullscreen", IsWindowFullscreen() ? "On" : "Off");
   drawRow(1, "Borderless windowed", m_borderlessWindowed ? "On" : "Off");
   drawRow(2, "VSync", m_cfg.vsync ? "On" : "Off");
   drawRow(3, "UI scale mode", m_uiScaleAuto ? "Auto" : "Manual");
@@ -4325,6 +4337,11 @@ void Game::draw()
     default: break;
     }
   }
+
+  // District overlay rendering controls.
+  const bool showDistrictOverlay = (m_showDistrictOverlay || m_showDistrictPanel || (m_tool == Tool::District));
+  const int highlightDistrict = showDistrictOverlay ? std::clamp(m_activeDistrict, 0, kDistrictCount - 1) : -1;
+  const bool showDistrictBorders = showDistrictOverlay && m_showDistrictBorders;
 
   // World pass: optionally render to an offscreen target for resolution scaling.
   if (wantsWorldRenderTarget()) {
@@ -4735,6 +4752,21 @@ void Game::draw()
   }
 
   EndMode2D();
+
+  // Map export (queued from dev console so we can run the renderer with a valid
+  // graphics context). Must run *outside* any active BeginMode2D() to avoid
+  // nested mode state.
+  if (m_pendingMapExport && !m_pendingMapExportPath.empty()) {
+    const std::string path = m_pendingMapExportPath;
+    m_pendingMapExport = false;
+    m_pendingMapExportPath.clear();
+
+    const bool ok = m_renderer.exportWorldOverview(m_world, m_sim.config(), path);
+    showToast(ok ? (std::string("Map exported: ") + path)
+                 : (std::string("Map export failed: ") + path),
+             4.0f);
+  }
+
   EndDrawing();
 }
 

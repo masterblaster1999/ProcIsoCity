@@ -8,7 +8,32 @@
 #include <optional>
 #include <vector>
 
+// raylib on Windows pulls in <windows.h>, which by default defines the `min` and
+// `max` macros. Those macros break std::min/std::max and can lead to very
+// confusing compile errors (especially around std::max/std::min usage inside
+// our game code).
+//
+// Ensure NOMINMAX is set before any Windows headers are included.
+#if defined(_WIN32)
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+#endif
+
 #include "raylib.h"
+
+// Some environments still define min/max even with NOMINMAX; undef defensively.
+#if defined(_WIN32)
+  #ifdef min
+    #undef min
+  #endif
+  #ifdef max
+    #undef max
+  #endif
+#endif
 
 namespace isocity {
 
