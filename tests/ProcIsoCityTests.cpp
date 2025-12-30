@@ -12,6 +12,7 @@
 #include "isocity/Export.hpp"
 #include "isocity/DistrictStats.hpp"
 #include "isocity/Road.hpp"
+#include "isocity/WorldDiff.hpp"
 #include "isocity/World.hpp"
 
 #include <algorithm>
@@ -1917,6 +1918,35 @@ void TestDistrictStatsCompute()
   EXPECT_NEAR(d1.avgLandValue, 0.5f, 1e-6f);
 }
 
+void TestWorldDiffCounts()
+{
+  using namespace isocity;
+
+  World a(4, 4, 123u);
+  World b = a;
+
+  // Introduce a few controlled differences.
+  b.setRoad(1, 1);
+  b.setRoad(2, 1); // updates road masks on both tiles => variation differs too.
+
+  b.at(0, 0).height = 0.25f;
+  b.at(3, 3).district = 2;
+
+  const WorldDiffStats d = DiffWorldTiles(a, b, 1e-6f);
+  EXPECT_EQ(d.tilesCompared, 16);
+  EXPECT_EQ(d.sizeMismatch, false);
+
+  EXPECT_EQ(d.terrainDifferent, 0);
+  EXPECT_EQ(d.overlayDifferent, 2);
+  EXPECT_EQ(d.variationDifferent, 2);
+  EXPECT_EQ(d.levelDifferent, 0);
+  EXPECT_EQ(d.occupantsDifferent, 0);
+  EXPECT_EQ(d.heightDifferent, 1);
+  EXPECT_EQ(d.districtDifferent, 1);
+
+  EXPECT_EQ(d.tilesDifferent, 4);
+}
+
 
 } // namespace
 
@@ -1957,6 +1987,7 @@ int main()
 
   TestWorldHashDeterministicForSameSeed();
   TestSimulationDeterministicHashAfterTicks();
+  TestWorldDiffCounts();
   TestDistrictStatsCompute();
   TestExportPpmLayers();
 

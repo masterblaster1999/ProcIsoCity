@@ -285,6 +285,48 @@ int main(int argc, char** argv)
         std::cerr << "--maint-park requires an integer\n";
         return 2;
       }
+    } else if (arg == "--export-ppm") {
+      std::string layerName;
+      std::string outPath;
+      if (!requireValue(i, layerName) || !requireValue(i, outPath)) {
+        std::cerr << "--export-ppm requires: <layer> <out.ppm>\n";
+        return 2;
+      }
+      ExportLayer layer = ExportLayer::Overlay;
+      if (!ParseExportLayer(layerName, layer)) {
+        std::cerr << "Unknown export layer: " << layerName << "\n";
+        std::cerr << "Valid layers: terrain overlay height landvalue traffic goods_traffic goods_fill district\n";
+        return 2;
+      }
+      ppmExports.push_back(PpmExport{layer, outPath});
+    } else if (arg == "--export-scale") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--export-scale requires an integer\n";
+        return 2;
+      }
+      int s = 1;
+      if (!ParseI32(val, &s) || s < 1) {
+        std::cerr << "--export-scale requires an integer >= 1\n";
+        return 2;
+      }
+      exportScale = s;
+    } else if (arg == "--export-tiles-csv") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--export-tiles-csv requires a path\n";
+        return 2;
+      }
+      tilesCsvPath = val;
+    } else if (arg == "--batch") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--batch requires an integer\n";
+        return 2;
+      }
+      int n = 1;
+      if (!ParseI32(val, &n) || n < 1) {
+        std::cerr << "--batch requires an integer >= 1\n";
+        return 2;
+      }
+      batchRuns = n;
     } else {
       std::cerr << "Unknown argument: " << arg << "\n\n";
       PrintHelp();

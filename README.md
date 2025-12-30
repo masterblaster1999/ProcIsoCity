@@ -48,7 +48,33 @@ ctest --test-dir build-tests --output-on-failure
 
 - `PROCISOCITY_BUILD_APP` (default: ON) — build the interactive raylib app (`proc_isocity`).
 - `PROCISOCITY_BUILD_TESTS` (default: OFF) — build `proc_isocity_tests` and enable `ctest`.
+- `PROCISOCITY_BUILD_CLI` (default: ON) — build headless command-line tools (`proc_isocity_cli`, `proc_isocity_diff`).
 - `PROCISOCITY_USE_SYSTEM_RAYLIB` (default: OFF) — when building the app, use a system raylib instead of FetchContent.
+
+### Headless CLI tools (optional)
+
+If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a couple of **headless** utilities that don't require raylib:
+
+- `proc_isocity_cli`: generate a world (or load a save), step the simulation, and write artifacts:
+  - JSON summary (`--out`)
+  - per-tick CSV (`--csv`)
+  - tile CSV (`--export-tiles-csv`)
+  - PPM exports (`--export-ppm <layer> <out.ppm>`, repeatable) with optional upscaling (`--export-scale`)
+  - batch runs across multiple seeds (`--batch N`)
+
+  Example:
+
+  ```bash
+  ./build/proc_isocity_cli --seed 1 --size 128x128 --days 200 \
+    --out out_{seed}.json --csv ticks_{seed}.csv \
+    --export-ppm overlay overlay_{seed}.ppm --export-scale 4 --batch 3
+  ```
+
+- `proc_isocity_diff`: compare two save files (deep tile diff + hash) and optionally write a color-coded diff map:
+
+  ```bash
+  ./build/proc_isocity_diff saveA.bin saveB.bin --ppm diff.ppm --scale 4
+  ```
 
 ---
 
