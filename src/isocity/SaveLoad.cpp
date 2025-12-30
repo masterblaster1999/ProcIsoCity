@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <limits>
 #include <sstream>
 #include <type_traits>
@@ -62,12 +63,6 @@ std::uint32_t Crc32Update(std::uint32_t crc, const std::uint8_t* data, std::size
   return crc;
 }
 
-std::uint32_t Crc32(const std::uint8_t* data, std::size_t size)
-{
-  std::uint32_t crc = 0xFFFFFFFFu;
-  crc = Crc32Update(crc, data, size);
-  return crc ^ 0xFFFFFFFFu;
-}
 
 struct Crc32OStreamWriter {
   explicit Crc32OStreamWriter(std::ostream& out) : os(out) {}
@@ -1672,11 +1667,40 @@ bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const Sim
 {
   outError.clear();
 
-  std::ofstream f(path, std::ios::binary);
-  if (!f) {
-    outError = "Unable to open file for writing: " + path;
+  namespace fs = std::filesystem;
+
+  if (path.empty()) {
+    outError = "Save path is empty";
     return false;
   }
+
+  const fs::path outPath(path);
+  fs::path tmpPath = outPath;
+  tmpPath += ".tmp";
+  fs::path bakPath = outPath;
+  bakPath += ".bak";
+
+  std::error_code ec;
+
+  // Ensure the parent directory exists (if specified).
+  const fs::path parent = outPath.parent_path();
+  if (!parent.empty()) {
+    fs::create_directories(parent, ec);
+    if (ec) {
+      outError = "Unable to create save directory: " + parent.string() + " (" + ec.message() + ")";
+      return false;
+    }
+  }
+
+  // Remove a stale temp file from a prior failed/crashed save.
+  fs::remove(tmpPath, ec);
+
+  std::ofstream f(tmpPath, std::ios::binary | std::ios::trunc);
+  if (!f) {
+    outError = "Unable to open file for writing: " + tmpPath.string();
+    return false;
+  }
+
 
   // v3+ computes a CRC32 over the whole file (excluding the final CRC field).
   Crc32OStreamWriter cw(f);
@@ -1915,8 +1939,45 @@ bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const Sim
     return false;
   }
 
+  // Make sure all bytes hit disk before we swap the temp file into place.
+  f.flush();
+  if (!f.good()) {
+    outError = "Write failed (flush)";
+    return false;
+  }
+  f.close();
+
+  // Atomically replace the destination:
+  //  - move existing -> .bak
+  //  - move tmp -> destination
+  //  - cleanup .bak on success
+  fs::remove(bakPath, ec);
+
+  if (fs::exists(outPath, ec)) {
+    fs::rename(outPath, bakPath, ec);
+    if (ec) {
+      outError = "Unable to backup existing save: " + outPath.string() + " (" + ec.message() + ")";
+      return false;
+    }
+  }
+
+  fs::rename(tmpPath, outPath, ec);
+  if (ec) {
+    // Best-effort rollback: restore the previous save if it exists.
+    std::error_code ec2;
+    if (fs::exists(bakPath, ec2)) {
+      fs::rename(bakPath, outPath, ec2);
+    }
+    outError = "Unable to move temp save into place: " + outPath.string() + " (" + ec.message() + ")";
+    return false;
+  }
+
+  // Best-effort cleanup of the backup file.
+  fs::remove(bakPath, ec);
+
   return true;
 }
+
 
 bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const std::string& path, std::string& outError)
 {
@@ -1962,87 +2023,48 @@ bool LoadWorldBinary(World& outWorld, ProcGenConfig& outProcCfg, SimConfig& outS
 
   if (version == kVersionV3 || version == kVersionV4 || version == kVersionV5 || version == kVersionV6 ||
       version == kVersionV7 || version == kVersionV8) {
-    // v3/v4: CRC32 is appended at the end of the file.
+    // v3+ saves append a CRC32 at the end of the file.
+    //
     // We validate the CRC before parsing to detect corruption/truncation.
-
-    // Read the whole file into memory to verify CRC.
-    f.clear();
-    f.seekg(0, std::ios::end);
-    const std::streamoff fileSize = f.tellg();
-    if (fileSize <= 0) {
-      outError = "Read failed (file size)";
+    //
+    // Implementation note:
+    //   We do a streaming CRC pass over the on-disk file (no full file buffering),
+    //   then parse the body from the already-open ifstream. This is memory-friendly
+    //   for large saves at the cost of an extra read pass.
+    bool crcOk = true;
+    std::string crcErr;
+    if (!VerifyCrc32File(path, crcOk, crcErr)) {
+      outError = crcErr;
       return false;
     }
-    if (fileSize < static_cast<std::streamoff>(sizeof(std::uint32_t))) {
-      outError = "Read failed (crc)";
-      return false;
-    }
-    if (static_cast<std::uint64_t>(fileSize) > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-      outError = "Save file too large";
-      return false;
-    }
-
-    const std::size_t sizeU = static_cast<std::size_t>(fileSize);
-    std::vector<std::uint8_t> bytes(sizeU);
-
-    f.seekg(0, std::ios::beg);
-    f.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(sizeU));
-    if (!f.good()) {
-      outError = "Read failed (file)";
-      return false;
-    }
-
-    std::uint32_t storedCrc = 0;
-    std::memcpy(&storedCrc, bytes.data() + (sizeU - sizeof(std::uint32_t)), sizeof(std::uint32_t));
-
-    const std::uint32_t calcCrc = Crc32(bytes.data(), sizeU - sizeof(std::uint32_t));
-    if (storedCrc != calcCrc) {
+    if (!crcOk) {
       outError = "Save file CRC mismatch (file is corrupted or incomplete)";
-      return false;
-    }
-
-    // Parse the CRC-verified payload (excluding the final CRC field).
-    const std::size_t payloadSize = sizeU - sizeof(std::uint32_t);
-    std::string payload(reinterpret_cast<const char*>(bytes.data()), payloadSize);
-    std::istringstream is(payload, std::ios::binary);
-
-    std::uint32_t v2 = 0;
-    std::uint32_t w2 = 0;
-    std::uint32_t h2 = 0;
-    std::uint64_t seed2 = 0;
-    if (!ReadAndValidateHeader(is, v2, w2, h2, seed2, outError)) {
-      return false;
-    }
-    if (v2 != version) {
-      outError = "Save file version mismatch after CRC validation";
       return false;
     }
 
     if (version == kVersionV3) {
       outSimCfg = SimConfig{};
-      return LoadBodyV2(is, w2, h2, seed2, outWorld, outProcCfg, outError);
+      return LoadBodyV2(f, w, h, seed, outWorld, outProcCfg, outError);
     }
     if (version == kVersionV4) {
       outSimCfg = SimConfig{};
-      return LoadBodyV4(is, w2, h2, seed2, outWorld, outProcCfg, outError);
+      return LoadBodyV4(f, w, h, seed, outWorld, outProcCfg, outError);
     }
     if (version == kVersionV5) {
       // v5 saves did not include SimConfig.
       outSimCfg = SimConfig{};
-      return LoadBodyV5(is, w2, h2, seed2, outWorld, outProcCfg, outError);
+      return LoadBodyV5(f, w, h, seed, outWorld, outProcCfg, outError);
     }
-
     if (version == kVersionV6) {
-      return LoadBodyV6(is, w2, h2, seed2, outWorld, outProcCfg, outSimCfg, outError);
+      return LoadBodyV6(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
     }
-
     if (version == kVersionV7) {
       // v7: includes per-tile districts + district policy multipliers.
-      return LoadBodyV7(is, w2, h2, seed2, outWorld, outProcCfg, outSimCfg, outError);
+      return LoadBodyV7(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
     }
 
     // v8: same as v7 but with a compressed delta payload.
-    return LoadBodyV8(is, w2, h2, seed2, outWorld, outProcCfg, outSimCfg, outError);
+    return LoadBodyV8(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
   }
 
   std::ostringstream oss;

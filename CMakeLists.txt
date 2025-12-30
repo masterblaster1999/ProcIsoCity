@@ -46,7 +46,10 @@ endfunction()
 # ---- Core library (no raylib dependency) ----
 add_library(isocity_core
   src/isocity/Compression.cpp
+  src/isocity/Districting.cpp
+  src/isocity/FloodFill.cpp
   src/isocity/World.cpp
+  src/isocity/WorldDiff.cpp
   src/isocity/ProcGen.cpp
   src/isocity/Sim.cpp
   src/isocity/FlowField.cpp
@@ -60,6 +63,7 @@ add_library(isocity_core
   src/isocity/EditHistory.cpp
   src/isocity/Pathfinding.cpp
   src/isocity/RoadGraph.cpp
+  src/isocity/ZoneParcels.cpp
 )
 
 target_include_directories(isocity_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -168,6 +172,36 @@ if (PROCISOCITY_BUILD_CLI)
   target_link_libraries(proc_isocity_cli PRIVATE isocity_core)
 
   procisocity_set_strict_warnings(proc_isocity_cli)
+
+  # Save diff tool (headless): compare two save files and emit a summary + optional diff artifacts.
+  add_executable(proc_isocity_diff
+    src/cli/diff.cpp
+  )
+
+  target_include_directories(proc_isocity_diff PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_diff PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_diff)
+
+  # Save inspector (headless): print a fast header/metadata summary without loading the full world.
+  add_executable(proc_isocity_inspect
+    src/cli/inspect.cpp
+  )
+
+  target_include_directories(proc_isocity_inspect PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_inspect PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_inspect)
+
+  # Script runner (headless): apply deterministic editing/simulation scripts for regression testing.
+  add_executable(proc_isocity_script
+    src/cli/script.cpp
+  )
+
+  target_include_directories(proc_isocity_script PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_script PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_script)
 endif()
 
 # ---- Tests (headless) ----

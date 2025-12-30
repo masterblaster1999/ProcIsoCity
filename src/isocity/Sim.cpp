@@ -12,6 +12,8 @@
 
 #include "isocity/Random.hpp"
 
+#include "isocity/ZoneMetrics.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
@@ -20,10 +22,6 @@
 namespace isocity {
 
 namespace {
-inline int HousingForLevel(int level) { return 10 * level; }
-inline int JobsCommercialForLevel(int level) { return 8 * level; }
-inline int JobsIndustrialForLevel(int level) { return 12 * level; }
-
 inline int JobsForTile(const Tile& t)
 {
   if (t.overlay == Overlay::Commercial) return JobsCommercialForLevel(t.level);

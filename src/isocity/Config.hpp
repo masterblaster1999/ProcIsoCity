@@ -55,6 +55,7 @@ struct Config {
   // true  => point/nearest (crisper, can shimmer when moving)
   // false => bilinear (smoother)
   bool worldRenderFilterPoint = false;
+  bool mergedZoneBuildings = true;
 };
 
 } // namespace isocity

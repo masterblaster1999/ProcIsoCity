@@ -1,7 +1,9 @@
 #include "isocity/Game.hpp"
 
 #include "isocity/DistrictStats.hpp"
+#include "isocity/Districting.hpp"
 #include "isocity/Export.hpp"
+#include "isocity/FloodFill.hpp"
 #include "isocity/Pathfinding.hpp"
 #include "isocity/Random.hpp"
 #include "isocity/Road.hpp"
@@ -300,6 +302,7 @@ Game::Game(Config cfg)
   }
   m_worldRenderTargetFps = std::max(15, m_cfg.worldRenderTargetFps);
   m_worldRenderFilterPoint = m_cfg.worldRenderFilterPoint;
+  m_mergedZoneBuildings = m_cfg.mergedZoneBuildings;
   if (m_worldRenderScaleAuto) {
     // Prefer best quality first; let the auto-scaler reduce resolution only
     // if we can't hit the target FPS.
@@ -2811,6 +2814,124 @@ void Game::floodFillDistrict(Point start, bool includeRoads)
   }
 }
 
+void Game::floodFillTool(Point start, bool includeRoads)
+{
+  if (!m_world.inBounds(start.x, start.y)) return;
+
+  // Only a subset of tools make sense for flood fill.
+  const bool supported = (m_tool == Tool::Residential || m_tool == Tool::Commercial || m_tool == Tool::Industrial ||
+                          m_tool == Tool::Park || m_tool == Tool::Bulldoze);
+  if (!supported) return;
+
+  // Region selection matches the district fill behavior:
+  //  - click a road: select that connected road component
+  //  - click water: select that connected water body (excluding bridges)
+  //  - click land: select the land block bounded by water and (optionally) roads
+  const FloodFillResult region = FloodFillAuto(m_world, start, includeRoads);
+  if (region.tiles.empty()) return;
+
+  const int moneyBefore = m_world.stats().money;
+
+  std::vector<Point> targets;
+  targets.reserve(region.tiles.size());
+
+  int estimatedCost = 0;
+
+  auto labelForTool = [&]() -> const char* {
+    switch (m_tool) {
+    case Tool::Residential: return "Residential";
+    case Tool::Commercial: return "Commercial";
+    case Tool::Industrial: return "Industrial";
+    case Tool::Park: return "Park";
+    case Tool::Bulldoze: return "Bulldoze";
+    default: return "Tool";
+    }
+  };
+
+  if (m_tool == Tool::Park) {
+    // Parks only place on empty non-water tiles.
+    for (const Point& p : region.tiles) {
+      if (!m_world.inBounds(p.x, p.y)) continue;
+      const Tile& t = m_world.at(p.x, p.y);
+      if (t.terrain == Terrain::Water) continue;
+      if (t.overlay != Overlay::None) continue;
+      targets.push_back(p);
+      estimatedCost += 3;
+    }
+  } else if (m_tool == Tool::Bulldoze) {
+    // Bulldoze clears any non-empty overlay. (Cost is always 0.)
+    for (const Point& p : region.tiles) {
+      if (!m_world.inBounds(p.x, p.y)) continue;
+      const Tile& t = m_world.at(p.x, p.y);
+      if (t.overlay == Overlay::None) continue;
+      targets.push_back(p);
+    }
+  } else {
+    // Zoning tools: place or upgrade where possible.
+    const Overlay zone = (m_tool == Tool::Residential) ? Overlay::Residential :
+                         (m_tool == Tool::Commercial) ? Overlay::Commercial :
+                                                       Overlay::Industrial;
+
+    for (const Point& p : region.tiles) {
+      if (!m_world.inBounds(p.x, p.y)) continue;
+      const Tile& t = m_world.at(p.x, p.y);
+      if (t.terrain == Terrain::Water) continue;
+
+      // Zoning rules: must have adjacent road.
+      if (!m_world.hasAdjacentRoad(p.x, p.y)) continue;
+
+      if (t.overlay == Overlay::None) {
+        targets.push_back(p);
+        estimatedCost += 5;
+      } else if (t.overlay == zone) {
+        // Upgrade only if not already max level.
+        if (static_cast<int>(t.level) >= 3) continue;
+        targets.push_back(p);
+        estimatedCost += 5;
+      }
+    }
+  }
+
+  if (targets.empty()) {
+    showToast(TextFormat("%s fill: no eligible tiles", labelForTool()));
+    return;
+  }
+
+  // Make flood fill atomic for costed tools (parks + zoning): if we can't afford the whole
+  // plan, don't partially build.
+  if (estimatedCost > moneyBefore) {
+    showToast(TextFormat("Not enough funds for %s fill: need $%d (short $%d)",
+                         labelForTool(), estimatedCost, estimatedCost - moneyBefore),
+              3.0f);
+    return;
+  }
+
+  beginPaintStroke();
+
+  const int savedRadius = m_brushRadius;
+  m_brushRadius = 0; // flood fills are always single-tile wide
+
+  for (const Point& p : targets) {
+    applyToolBrush(p.x, p.y);
+  }
+
+  m_brushRadius = savedRadius;
+
+  const bool hadFailures = m_strokeFeedback.any();
+  endPaintStroke();
+
+  if (!hadFailures) {
+    const int spent = moneyBefore - m_world.stats().money;
+    if (m_tool == Tool::Bulldoze) {
+      showToast(TextFormat("Bulldozed %d tiles", static_cast<int>(targets.size())));
+    } else if (spent > 0) {
+      showToast(TextFormat("%s fill: %d tiles (cost %d)", labelForTool(), static_cast<int>(targets.size()), spent));
+    } else {
+      showToast(TextFormat("%s fill: %d tiles", labelForTool(), static_cast<int>(targets.size())));
+    }
+  }
+}
+
 void Game::handleInput(float dt)
 {
   // Keep UI scaling in sync with monitor DPI and any window resizes.
@@ -3038,6 +3159,13 @@ void Game::handleInput(float dt)
     m_renderer.markBaseCacheDirtyAll();
     showToast(enabled ? "Render cache: ON" : "Render cache: OFF");
   }
+
+    if (IsKeyPressed(KEY_I)) {
+      m_mergedZoneBuildings = !m_mergedZoneBuildings;
+      m_cfg.mergedZoneBuildings = m_mergedZoneBuildings;
+      showToast(std::string("Merged zone buildings: ") +
+                (m_mergedZoneBuildings ? "ON" : "OFF"));
+    }
 
   if (IsKeyPressed(KEY_F3)) {
     m_showTrafficModel = !m_showTrafficModel;
@@ -3539,6 +3667,26 @@ void Game::handleInput(float dt)
   if (IsKeyPressed(KEY_EIGHT)) setTool(Tool::SmoothTerrain);
   if (IsKeyPressed(KEY_NINE)) setTool(Tool::District);
 
+  // Auto-generate administrative districts based on the current road network.
+  // K = use all roads. Shift+K = use only roads connected to the map edge.
+  if (IsKeyPressed(KEY_K)) {
+    endPaintStroke();
+
+    AutoDistrictConfig dc;
+    dc.districts = kDistrictCount;
+    dc.fillAllTiles = true;
+    dc.useTravelTime = true;
+    dc.requireOutsideConnection = shift;
+
+    const AutoDistrictResult r = AutoAssignDistricts(m_world, dc);
+    m_sim.refreshDerivedStats(m_world);
+
+    showToast(TextFormat("Auto districts: used %d/%d (seeds=%d)%s",
+                         r.districtsUsed, r.districtsRequested,
+                         static_cast<int>(r.seedRoadIdx.size()),
+                         dc.requireOutsideConnection ? " [outside]" : ""));
+  }
+
   if (m_tool == Tool::District) {
     if (IsKeyPressed(KEY_COMMA)) {
       m_activeDistrict = (m_activeDistrict + kDistrictCount - 1) % kDistrictCount;
@@ -3828,6 +3976,19 @@ void Game::handleInput(float dt)
   if (!consumeLeft && !roadDragMode && leftPressed && m_hovered && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && m_tool == Tool::District
       && shift && !(IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT))) {
     floodFillDistrict(*m_hovered, ctrl);
+    consumeLeft = true;
+  }
+
+  // --- Block operations for build tools ---
+  // Shift+click flood-fills the region under the cursor and applies the current tool:
+  //   - Land: fills the land block bounded by water and roads
+  //   - Road: fills the connected road component
+  //   - Water: fills the connected water body (excluding bridges)
+  // Ctrl+Shift allows the fill to cross roads (land-block mode). Use carefully.
+  if (!consumeLeft && !roadDragMode && leftPressed && m_hovered && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && shift
+      && (m_tool == Tool::Residential || m_tool == Tool::Commercial || m_tool == Tool::Industrial || m_tool == Tool::Park
+          || m_tool == Tool::Bulldoze)) {
+    floodFillTool(*m_hovered, ctrl);
     consumeLeft = true;
   }
 

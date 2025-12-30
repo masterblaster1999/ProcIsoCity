@@ -11,8 +11,13 @@
 #include "isocity/Compression.hpp"
 #include "isocity/Export.hpp"
 #include "isocity/DistrictStats.hpp"
+#include "isocity/Districting.hpp"
+#include "isocity/Brush.hpp"
+#include "isocity/ZoneParcels.hpp"
+#include "isocity/ZoneMetrics.hpp"
 #include "isocity/Road.hpp"
 #include "isocity/WorldDiff.hpp"
+#include "isocity/FloodFill.hpp"
 #include "isocity/World.hpp"
 
 #include <algorithm>
@@ -486,6 +491,10 @@ void TestSaveLoadRoundTrip()
 
   std::string err;
   EXPECT_TRUE(SaveWorldBinary(w, cfg, simCfg, savePath.string(), err));
+
+  // Atomic save should not leave temp/backup files behind on success.
+  EXPECT_TRUE(!fs::exists(savePath.string() + ".tmp"));
+  EXPECT_TRUE(!fs::exists(savePath.string() + ".bak"));
 
   // Sanity-check that we're writing the newest save version.
   // (We don't parse the whole file here; we just validate the header fields are present.)
@@ -1918,6 +1927,77 @@ void TestDistrictStatsCompute()
   EXPECT_NEAR(d1.avgLandValue, 0.5f, 1e-6f);
 }
 
+void TestAutoDistrictsSeparatesDisconnectedRoadComponents()
+{
+  using namespace isocity;
+
+  // Two disconnected road components should not collapse into the same district when
+  // we request at least two districts.
+  World w(8, 5, 1);
+
+  // Component A: a short road segment on the left.
+  w.setRoad(1, 2);
+  w.setRoad(2, 2);
+
+  // Component B: a short road segment on the right.
+  w.setRoad(5, 2);
+  w.setRoad(6, 2);
+
+  AutoDistrictConfig cfg;
+  cfg.districts = 2;
+  cfg.requireOutsideConnection = false;
+  cfg.useTravelTime = true;
+  cfg.fillAllTiles = false; // only roads; simpler invariants
+
+  const AutoDistrictResult r = AutoAssignDistricts(w, cfg);
+  EXPECT_EQ(r.districtsRequested, 2);
+  EXPECT_TRUE(r.districtsUsed >= 2);
+
+  const std::uint8_t dA = w.at(1, 2).district;
+  const std::uint8_t dB = w.at(5, 2).district;
+  EXPECT_NE(dA, dB);
+
+  // All road tiles in a component should share the same district.
+  EXPECT_EQ(w.at(2, 2).district, dA);
+  EXPECT_EQ(w.at(6, 2).district, dB);
+}
+
+void TestAutoDistrictsFillAllTilesIsDeterministic()
+{
+  using namespace isocity;
+
+  World a(12, 12, 123);
+  World b = a;
+
+  // Build a small cross of roads.
+  for (int x = 2; x <= 9; ++x) {
+    a.setRoad(x, 6);
+    b.setRoad(x, 6);
+  }
+  for (int y = 2; y <= 9; ++y) {
+    a.setRoad(6, y);
+    b.setRoad(6, y);
+  }
+
+  AutoDistrictConfig cfg;
+  cfg.districts = 4;
+  cfg.fillAllTiles = true;
+  cfg.useTravelTime = true;
+
+  const AutoDistrictResult ra = AutoAssignDistricts(a, cfg);
+  const AutoDistrictResult rb = AutoAssignDistricts(b, cfg);
+  EXPECT_EQ(ra.districtsUsed, rb.districtsUsed);
+  EXPECT_EQ(ra.seedRoadIdx.size(), rb.seedRoadIdx.size());
+  EXPECT_EQ(ra.seedRoadIdx, rb.seedRoadIdx);
+
+  for (int y = 0; y < a.height(); ++y) {
+    for (int x = 0; x < a.width(); ++x) {
+      EXPECT_EQ(a.at(x, y).district, b.at(x, y).district);
+      EXPECT_TRUE(a.at(x, y).district < static_cast<std::uint8_t>(kDistrictCount));
+    }
+  }
+}
+
 void TestWorldDiffCounts()
 {
   using namespace isocity;
@@ -1949,6 +2029,219 @@ void TestWorldDiffCounts()
 
 
 } // namespace
+
+
+static void TestZoneBuildingParcelsDeterministic()
+{
+  using namespace isocity;
+
+  World world = GenerateWorld(32, 32, 1234567ULL);
+
+  ZoneBuildingParcels a;
+  ZoneBuildingParcels b;
+  BuildZoneBuildingParcels(world, a);
+  BuildZoneBuildingParcels(world, b);
+
+  EXPECT_EQ(a.width, b.width);
+  EXPECT_EQ(a.height, b.height);
+  EXPECT_EQ(a.parcels.size(), b.parcels.size());
+  EXPECT_EQ(a.tileToParcel.size(), b.tileToParcel.size());
+  EXPECT_EQ(a.anchorToParcel.size(), b.anchorToParcel.size());
+
+  // Mapping arrays should be byte-for-byte deterministic for identical input.
+  for (std::size_t i = 0; i < a.tileToParcel.size(); ++i) {
+    EXPECT_EQ(a.tileToParcel[i], b.tileToParcel[i]);
+  }
+  for (std::size_t i = 0; i < a.anchorToParcel.size(); ++i) {
+    EXPECT_EQ(a.anchorToParcel[i], b.anchorToParcel[i]);
+  }
+
+  // All zone tiles should be assigned to exactly one parcel, and non-zone tiles
+  // should remain unassigned.
+  const int w = a.width;
+  const int h = a.height;
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const Tile& t = world.at(x, y);
+      const int idx = y * w + x;
+      const bool isZone = IsZoneOverlay(t.overlay) && t.terrain != Terrain::Water;
+      if (isZone) {
+        EXPECT_NE(a.tileToParcel[idx], -1);
+      } else {
+        EXPECT_EQ(a.tileToParcel[idx], -1);
+        EXPECT_EQ(a.anchorToParcel[idx], -1);
+      }
+    }
+  }
+
+  // Parcel invariants.
+  for (int pi = 0; pi < static_cast<int>(a.parcels.size()); ++pi) {
+    const ZoneBuildingParcel& p = a.parcels[static_cast<std::size_t>(pi)];
+    EXPECT_TRUE(IsZoneOverlay(p.overlay));
+    EXPECT_TRUE(p.w >= 1);
+    EXPECT_TRUE(p.h >= 1);
+
+    const int ax = p.x0 + p.w - 1;
+    const int ay = p.y0 + p.h - 1;
+    EXPECT_EQ(a.anchorToParcel[ay * w + ax], pi);
+
+    int occSum = 0;
+    int capSum = 0;
+    for (int y = p.y0; y < p.y0 + p.h; ++y) {
+      for (int x = p.x0; x < p.x0 + p.w; ++x) {
+        const int idx = y * w + x;
+        EXPECT_EQ(a.tileToParcel[idx], pi);
+
+        const Tile& t = world.at(x, y);
+        EXPECT_EQ(t.overlay, p.overlay);
+        EXPECT_EQ(t.level, p.level);
+
+        occSum += static_cast<int>(t.occupants);
+        capSum += CapacityForOverlayLevel(t.overlay, static_cast<int>(t.level));
+      }
+    }
+
+    EXPECT_EQ(occSum, p.occupants);
+    EXPECT_EQ(capSum, p.capacity);
+  }
+}
+
+static void TestBrushRasterShapes()
+{
+  using namespace isocity;
+
+  auto expect4Connected = [&](const std::vector<Point>& pts) {
+    for (std::size_t i = 1; i < pts.size(); ++i) {
+      const int dx = std::abs(pts[i].x - pts[i - 1].x);
+      const int dy = std::abs(pts[i].y - pts[i - 1].y);
+      EXPECT_EQ(dx + dy, 1);
+    }
+  };
+
+  // Horizontal line.
+  {
+    const std::vector<Point> pts = RasterLine(Point{0, 0}, Point{3, 0});
+    EXPECT_EQ(pts.size(), static_cast<std::size_t>(4));
+    EXPECT_EQ(pts.front().x, 0);
+    EXPECT_EQ(pts.front().y, 0);
+    EXPECT_EQ(pts.back().x, 3);
+    EXPECT_EQ(pts.back().y, 0);
+    expect4Connected(pts);
+  }
+
+  // Diagonal line.
+  {
+    const std::vector<Point> pts = RasterLine(Point{0, 0}, Point{4, 4});
+    // 4-connected raster emits dx+dy+1 points.
+    EXPECT_EQ(pts.size(), static_cast<std::size_t>(9));
+    EXPECT_EQ(pts.front().x, 0);
+    EXPECT_EQ(pts.front().y, 0);
+    EXPECT_EQ(pts.back().x, 4);
+    EXPECT_EQ(pts.back().y, 4);
+
+    // Monotonic for this direction.
+    for (std::size_t i = 1; i < pts.size(); ++i) {
+      EXPECT_TRUE(pts[i].x >= pts[i - 1].x);
+      EXPECT_TRUE(pts[i].y >= pts[i - 1].y);
+    }
+    expect4Connected(pts);
+  }
+
+  // Steep line: ensure no gaps.
+  {
+    const std::vector<Point> pts = RasterLine(Point{2, 1}, Point{3, 7});
+    EXPECT_TRUE(!pts.empty());
+    EXPECT_EQ(pts.front().x, 2);
+    EXPECT_EQ(pts.front().y, 1);
+    EXPECT_EQ(pts.back().x, 3);
+    EXPECT_EQ(pts.back().y, 7);
+    expect4Connected(pts);
+  }
+
+  // Filled rectangle: inclusive bounds.
+  {
+    const std::vector<Point> pts = RasterRectFilled(Point{1, 1}, Point{3, 2});
+    // width=3 (1..3), height=2 (1..2)
+    EXPECT_EQ(pts.size(), static_cast<std::size_t>(6));
+  }
+
+  // Outline rectangle: no duplicated corners.
+  {
+    const std::vector<Point> pts = RasterRectOutline(Point{1, 1}, Point{3, 2});
+    // perimeter = 2*w + 2*h - 4 => 2*3 + 2*2 - 4 = 6
+    EXPECT_EQ(pts.size(), static_cast<std::size_t>(6));
+    expect4Connected(pts);
+  }
+}
+
+static void TestFloodFillRegions()
+{
+  // A 5x5 grass world split by a vertical road barrier.
+  World w(5, 5, 123);
+  for (int y = 0; y < w.height(); ++y) {
+    for (int x = 0; x < w.width(); ++x) {
+      Tile& t = w.at(x, y);
+      t.terrain = Terrain::Grass;
+      t.overlay = Overlay::None;
+      t.level = 1;
+      t.occupants = 0;
+    }
+  }
+  for (int y = 0; y < w.height(); ++y) {
+    w.setOverlay(Overlay::Road, 2, y);
+    w.at(2, y).level = 1;
+  }
+
+  // Land block (default) should not cross roads.
+  {
+    const FloodFillResult r = FloodFillAuto(w, Point{0, 0}, /*includeRoadsInLandBlock=*/false);
+    EXPECT_EQ(r.tiles.size(), static_cast<std::size_t>(10));
+  }
+  {
+    const FloodFillResult r = FloodFillAuto(w, Point{4, 4}, /*includeRoadsInLandBlock=*/false);
+    EXPECT_EQ(r.tiles.size(), static_cast<std::size_t>(10));
+  }
+
+  // Clicking a road returns the whole connected road component.
+  {
+    const FloodFillResult r = FloodFillAuto(w, Point{2, 0}, /*includeRoadsInLandBlock=*/false);
+    EXPECT_EQ(r.tiles.size(), static_cast<std::size_t>(5));
+  }
+
+  // Land block with includeRoads==true crosses the barrier and includes roads.
+  {
+    const FloodFillResult r = FloodFillAuto(w, Point{0, 0}, /*includeRoadsInLandBlock=*/true);
+    EXPECT_EQ(r.tiles.size(), static_cast<std::size_t>(25));
+  }
+
+  // Water-body fill excludes bridges (road overlay on water).
+  {
+    World ww(3, 3, 1);
+    for (int y = 0; y < ww.height(); ++y) {
+      for (int x = 0; x < ww.width(); ++x) {
+        Tile& t = ww.at(x, y);
+        t.terrain = Terrain::Grass;
+        t.overlay = Overlay::None;
+        t.level = 1;
+        t.occupants = 0;
+      }
+    }
+
+    // 2x2 water in the corner.
+    ww.at(0, 0).terrain = Terrain::Water;
+    ww.at(1, 0).terrain = Terrain::Water;
+    ww.at(0, 1).terrain = Terrain::Water;
+    ww.at(1, 1).terrain = Terrain::Water;
+
+    // Bridge on (0,0).
+    ww.setOverlay(Overlay::Road, 0, 0);
+    ww.at(0, 0).level = 1;
+
+    const FloodFillResult r = FloodFillAuto(ww, Point{1, 1}, /*includeRoadsInLandBlock=*/false);
+    EXPECT_EQ(ChooseFloodFillMode(ww, Point{1, 1}), FloodFillMode::WaterBody);
+    EXPECT_EQ(r.tiles.size(), static_cast<std::size_t>(3));
+  }
+}
 
 int main()
 {
@@ -1989,7 +2282,13 @@ int main()
   TestSimulationDeterministicHashAfterTicks();
   TestWorldDiffCounts();
   TestDistrictStatsCompute();
+  TestAutoDistrictsSeparatesDisconnectedRoadComponents();
+  TestAutoDistrictsFillAllTilesIsDeterministic();
   TestExportPpmLayers();
+
+  TestZoneBuildingParcelsDeterministic();
+  TestBrushRasterShapes();
+  TestFloodFillRegions();
 
 
   TestRoadPathfindingAStar();

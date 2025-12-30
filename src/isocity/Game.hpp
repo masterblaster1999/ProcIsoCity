@@ -72,6 +72,7 @@ private:
   void resetWorld(std::uint64_t newSeed);
   void applyToolBrush(int centerX, int centerY);
   void floodFillDistrict(Point start, bool includeRoads);
+  void floodFillTool(Point start, bool includeRoads);
   void showToast(const std::string& msg, float seconds = 2.5f);
 
   // City report (time-series graphs of key stats).
@@ -354,6 +355,7 @@ private:
   float m_worldRenderScaleMax = 1.00f;
   int m_worldRenderTargetFps = 60;
   bool m_worldRenderFilterPoint = false;
+  bool m_mergedZoneBuildings = true;
 
   // Smoothed CPU frame time (for the video/settings panel + auto world scaling).
   float m_frameTimeSmoothed = 1.0f / 60.0f;

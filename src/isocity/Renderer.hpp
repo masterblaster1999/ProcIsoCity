@@ -2,6 +2,7 @@
 
 #include "isocity/Iso.hpp"
 #include "isocity/World.hpp"
+#include "isocity/ZoneParcels.hpp"
 
 #include <array>
 #include <cstdint>
@@ -107,7 +108,8 @@ public:
                  HeatmapRamp heatmapRamp = HeatmapRamp::Good,
                  bool showDistrictOverlay = false,
                  int highlightDistrict = -1,
-                 bool showDistrictBorders = false);
+                 bool showDistrictBorders = false,
+                 bool mergeZoneBuildings = true);
 
   void drawHUD(const World& world, const Camera2D& camera, Tool tool, int roadBuildLevel,
                std::optional<Point> hovered, int screenW, int screenH, bool showHelp, int brushRadius,
@@ -149,6 +151,9 @@ private:
   float m_bandMaxPixels = 0.0f;
   bool m_bandCacheDirtyAll = true;
   std::vector<BandCache> m_bands;
+
+  // Scratch storage for merged zone-building parcels (reused every frame).
+  ZoneBuildingParcels m_zoneParcelsScratch;
 
   void unloadTextures();
 
