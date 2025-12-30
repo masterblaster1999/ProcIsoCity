@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <string>
 
@@ -340,6 +341,44 @@ bool WritePpm(const std::string& path, const PpmImage& img, std::string& outErro
 
   f << "P6\n" << img.width << " " << img.height << "\n255\n";
   f.write(reinterpret_cast<const char*>(img.rgb.data()), static_cast<std::streamsize>(img.rgb.size()));
+  if (!f) {
+    outError = "Failed while writing file";
+    return false;
+  }
+  return true;
+}
+
+bool WriteTilesCsv(const World& world, const std::string& path, std::string& outError)
+{
+  outError.clear();
+
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) {
+    outError = "Invalid world dimensions";
+    return false;
+  }
+
+  std::ofstream f(path, std::ios::binary);
+  if (!f) {
+    outError = "Failed to open file for writing";
+    return false;
+  }
+
+  f << "x,y,terrain,overlay,level,district,height,variation,occupants\n";
+  f << std::fixed << std::setprecision(6);
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const Tile& t = world.at(x, y);
+      f << x << ',' << y << ',' << ToString(t.terrain) << ',' << ToString(t.overlay) << ','
+        << static_cast<int>(t.level) << ',' << static_cast<int>(t.district) << ','
+        << static_cast<double>(t.height) << ','
+        << static_cast<int>(t.variation) << ','
+        << static_cast<int>(t.occupants) << '\n';
+    }
+  }
+
   if (!f) {
     outError = "Failed while writing file";
     return false;

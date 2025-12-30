@@ -1,6 +1,7 @@
 #include "isocity/Game.hpp"
 
 #include "isocity/DistrictStats.hpp"
+#include "isocity/Export.hpp"
 #include "isocity/Pathfinding.hpp"
 #include "isocity/Random.hpp"
 #include "isocity/Road.hpp"
@@ -617,7 +618,7 @@ void Game::setupDevConsole()
 
   m_console.registerCommand(
       "heatmap", "heatmap <off|land|park|water|pollution|traffic> - set heatmap overlay",
-      [this, toLower](DevConsole& c, const DevConsole::Args& args) {
+      [this, toLower, heatmapName](DevConsole& c, const DevConsole::Args& args) {
         if (args.size() != 1) {
           c.print("Usage: heatmap <off|land|park|water|pollution|traffic>");
           return;
@@ -711,17 +712,95 @@ void Game::setupDevConsole()
       });
 
   m_console.registerCommand(
-      "map", "map           - export a world overview PNG to captures/",
-      [this](DevConsole& c, const DevConsole::Args&) {
+      "map", "map [maxSize] [path] - export a world overview PNG to captures/ (queued)",
+      [this, parseI64, joinArgs](DevConsole& c, const DevConsole::Args& args) {
         namespace fs = std::filesystem;
         fs::create_directories("captures");
-        const std::string path =
-            TextFormat("captures/map_seed%llu_%s.png", static_cast<unsigned long long>(m_cfg.seed),
-                       FileTimestamp().c_str());
+
+        // Defaults
+        int maxSize = 4096;
+        std::string path =
+            TextFormat("captures/map_seed%llu_%s.png", static_cast<unsigned long long>(m_cfg.seed), FileTimestamp().c_str());
+
+        auto clampSize = [](long long v) {
+          // Keep this sane; exportWorldOverview may allocate a large render texture.
+          return std::clamp(static_cast<int>(v), 64, 16384);
+        };
+
+        if (!args.empty()) {
+          long long v = 0;
+          // Allow either:
+          //   map 4096
+          //   map 4096 my.png
+          //   map my.png
+          //   map my.png 4096
+          if (parseI64(args[0], v)) {
+            maxSize = clampSize(v);
+            if (args.size() >= 2) {
+              path = joinArgs(args, 1);
+            }
+          } else {
+            // Path first.
+            path = joinArgs(args, 0);
+
+            // If the last token is a number, treat it as maxSize.
+            if (args.size() >= 2 && parseI64(args.back(), v)) {
+              maxSize = clampSize(v);
+              std::string p;
+              for (std::size_t i = 0; i + 1 < args.size(); ++i) {
+                if (!p.empty()) p.push_back(' ');
+                p += args[i];
+              }
+              if (!p.empty()) path = p;
+            }
+          }
+        }
+
+        if (path.empty()) {
+          c.print("Usage: map [maxSize] [path]");
+          return;
+        }
+
         m_pendingMapExport = true;
         m_pendingMapExportPath = path;
-        showToast(TextFormat("Queued map export: %s", path.c_str()), 2.0f);
-        c.print("queued: " + path);
+        m_pendingMapExportMaxSize = maxSize;
+        showToast(TextFormat("Queued map export (%dpx): %s", maxSize, path.c_str()), 2.0f);
+        c.print(TextFormat("queued: %s (maxSize=%d)", path.c_str(), maxSize));
+      });
+
+  m_console.registerCommand(
+      "tiles_csv",
+      "tiles_csv [path] - export per-tile world data to CSV (x,y,terrain,overlay,level,district,height,variation,occupants)",
+      [this, joinArgs](DevConsole& c, const DevConsole::Args& args) {
+        namespace fs = std::filesystem;
+
+        const std::string path = args.empty()
+                                    ? TextFormat("captures/tiles_seed%llu_%s.csv",
+                                                 static_cast<unsigned long long>(m_cfg.seed),
+                                                 FileTimestamp().c_str())
+                                    : joinArgs(args, 0);
+
+        if (path.empty()) {
+          c.print("Usage: tiles_csv [path]");
+          return;
+        }
+
+        // Create parent directories if needed.
+        std::error_code ec;
+        const fs::path p(path);
+        if (!p.parent_path().empty()) {
+          fs::create_directories(p.parent_path(), ec);
+        }
+
+        std::string err;
+        if (!WriteTilesCsv(m_world, path, err)) {
+          c.print("Failed to write tiles CSV: " + path + (err.empty() ? "" : (" (" + err + ")")));
+          showToast("Tiles CSV export failed", 2.5f);
+          return;
+        }
+
+        showToast(TextFormat("Exported tiles CSV: %s", path.c_str()), 2.0f);
+        c.print("wrote: " + path);
       });
 
   m_console.registerCommand(
@@ -4758,10 +4837,12 @@ void Game::draw()
   // nested mode state.
   if (m_pendingMapExport && !m_pendingMapExportPath.empty()) {
     const std::string path = m_pendingMapExportPath;
+    const int maxSize = m_pendingMapExportMaxSize;
     m_pendingMapExport = false;
     m_pendingMapExportPath.clear();
+    m_pendingMapExportMaxSize = 4096;
 
-    const bool ok = m_renderer.exportWorldOverview(m_world, m_sim.config(), path);
+    const bool ok = m_renderer.exportWorldOverview(m_world, path.c_str(), maxSize);
     showToast(ok ? (std::string("Map exported: ") + path)
                  : (std::string("Map export failed: ") + path),
              4.0f);

@@ -386,6 +386,7 @@ private:
   // frame so the export uses up-to-date textures/state).
   bool m_pendingMapExport = false;
   std::string m_pendingMapExportPath;
+  int m_pendingMapExportMaxSize = 4096;
 
   std::optional<Point> m_hovered;
 

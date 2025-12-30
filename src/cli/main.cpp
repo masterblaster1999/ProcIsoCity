@@ -396,26 +396,6 @@ int main(int argc, char** argv)
     }
   };
 
-  auto writeTilesCsv = [&](const World& world, const std::string& path) -> bool {
-    std::ofstream f(path, std::ios::binary);
-    if (!f) return false;
-
-    f << "x,y,terrain,overlay,level,district,height,variation,occupants\n";
-    f << std::fixed << std::setprecision(6);
-
-    for (int y = 0; y < world.height(); ++y) {
-      for (int x = 0; x < world.width(); ++x) {
-        const Tile& t = world.at(x, y);
-        f << x << ',' << y << ',' << ToString(t.terrain) << ',' << ToString(t.overlay) << ','
-          << static_cast<int>(t.level) << ',' << static_cast<int>(t.district) << ','
-          << static_cast<double>(t.height) << ','
-          << static_cast<int>(t.variation) << ','
-          << static_cast<int>(t.occupants) << '\n';
-      }
-    }
-    return static_cast<bool>(f);
-  };
-
   auto runOne = [&](int runIdx, std::uint64_t requestedSeed) -> int {
     World world;
     ProcGenConfig runProcCfg = procCfg;
@@ -469,8 +449,11 @@ int main(int argc, char** argv)
     const std::string tilesP = expandPath(tilesCsvPath, runIdx, actualSeed);
     if (!tilesP.empty()) {
       ensureParentDir(tilesP);
-      if (!writeTilesCsv(world, tilesP)) {
-        std::cerr << "Failed to write tiles CSV: " << tilesP << "\n";
+      std::string err;
+      if (!WriteTilesCsv(world, tilesP, err)) {
+        std::cerr << "Failed to write tiles CSV: " << tilesP;
+        if (!err.empty()) std::cerr << " (" << err << ")";
+        std::cerr << "\n";
         return 1;
       }
     }

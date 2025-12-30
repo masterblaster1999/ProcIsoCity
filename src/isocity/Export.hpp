@@ -65,4 +65,12 @@ PpmImage ScaleNearest(const PpmImage& src, int factor);
 // Returns true on success; on failure, outError contains a human-friendly error.
 bool WritePpm(const std::string& path, const PpmImage& img, std::string& outError);
 
+// Write a per-tile CSV for debugging / analysis.
+//
+// Columns:
+//   x,y,terrain,overlay,level,district,height,variation,occupants
+//
+// Returns true on success; on failure, outError contains a human-friendly error.
+bool WriteTilesCsv(const World& world, const std::string& path, std::string& outError);
+
 } // namespace isocity
