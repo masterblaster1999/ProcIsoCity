@@ -2,6 +2,7 @@
 
 #include "isocity/Pathfinding.hpp"
 #include "isocity/Road.hpp"
+#include "isocity/ZoneAccess.hpp"
 #include "isocity/World.hpp"
 
 #include <algorithm>
@@ -35,14 +36,6 @@ inline int JobsIndustrialForLevel(int level)
   return 12 * lv;
 }
 
-inline bool HasZoneAccess(const World& world, const SimConfig& cfg, const std::vector<std::uint8_t>* edgeMask, int x, int y)
-{
-  if (!world.hasAdjacentRoad(x, y)) return false;
-  if (!cfg.requireOutsideConnection) return true;
-  if (!edgeMask || static_cast<int>(edgeMask->size()) != world.width() * world.height()) return false;
-  return HasAdjacentRoadConnectedToEdge(world, *edgeMask, x, y);
-}
-
 } // namespace
 
 DistrictStatsResult ComputeDistrictStats(const World& world, const SimConfig& cfg, const std::vector<float>* landValueField,
@@ -72,6 +65,10 @@ DistrictStatsResult ComputeDistrictStats(const World& world, const SimConfig& cf
       edgeMask = &computedMask;
     }
   }
+
+  // Zone access map: counts interior zoned tiles as accessible if their connected zone area
+  // has a road-adjacent boundary that is (optionally) edge-connected.
+  const ZoneAccessMap zoneAccess = BuildZoneAccessMap(world, edgeMask);
 
   std::array<double, static_cast<std::size_t>(kDistrictCount)> lvSum{};
   std::array<int, static_cast<std::size_t>(kDistrictCount)> lvCount{};
@@ -118,7 +115,7 @@ DistrictStatsResult ComputeDistrictStats(const World& world, const SimConfig& cf
       }
 
       // Zoning + tax
-      const bool accessible = HasZoneAccess(world, cfg, edgeMask, x, y);
+      const bool accessible = HasZoneAccess(zoneAccess, x, y);
       if (t.overlay == Overlay::Residential) {
         out.resTiles += 1;
         out.zoneTiles += 1;

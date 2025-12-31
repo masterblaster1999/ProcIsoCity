@@ -46,17 +46,24 @@ endfunction()
 # ---- Core library (no raylib dependency) ----
 add_library(isocity_core
   src/isocity/Compression.cpp
+  src/isocity/Blueprint.cpp
   src/isocity/Districting.cpp
   src/isocity/FloodFill.cpp
+  src/isocity/Script.cpp
+  src/isocity/AutoBuild.cpp
+  src/isocity/Replay.cpp
+  src/isocity/WorldPatch.cpp
   src/isocity/World.cpp
   src/isocity/WorldDiff.cpp
   src/isocity/ProcGen.cpp
+  src/isocity/Erosion.cpp
   src/isocity/Sim.cpp
   src/isocity/FlowField.cpp
   src/isocity/Traffic.cpp
   src/isocity/Goods.cpp
   src/isocity/LandValue.cpp
   src/isocity/DistrictStats.cpp
+  src/isocity/ZoneAccess.cpp
   src/isocity/SaveLoad.cpp
   src/isocity/Export.cpp
   src/isocity/Hash.cpp
@@ -202,6 +209,46 @@ if (PROCISOCITY_BUILD_CLI)
   target_link_libraries(proc_isocity_script PRIVATE isocity_core)
 
   procisocity_set_strict_warnings(proc_isocity_script)
+
+  # Auto-build tool (headless): deterministic "city bot" growth for rapid scenario generation.
+  add_executable(proc_isocity_autobuild
+    src/cli/autobuild.cpp
+  )
+
+  target_include_directories(proc_isocity_autobuild PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_autobuild PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_autobuild)
+
+  # Binary patch tool (headless): create/apply compact diffs between saves.
+  add_executable(proc_isocity_patch
+    src/cli/patch.cpp
+  )
+
+  target_include_directories(proc_isocity_patch PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_patch PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_patch)
+
+  # Replay tool (headless): pack/inspect/play deterministic replay journals.
+  add_executable(proc_isocity_replay
+    src/cli/replay.cpp
+  )
+
+  target_include_directories(proc_isocity_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_replay PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_replay)
+
+  # Blueprint tool (headless): capture/apply rectangular stamps of a save.
+  add_executable(proc_isocity_blueprint
+    src/cli/blueprint.cpp
+  )
+
+  target_include_directories(proc_isocity_blueprint PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_blueprint PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_blueprint)
 endif()
 
 # ---- Tests (headless) ----

@@ -8,6 +8,7 @@
 #include "isocity/Random.hpp"
 #include "isocity/Road.hpp"
 #include "isocity/SaveLoad.hpp"
+#include "isocity/ZoneAccess.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -1908,6 +1909,10 @@ void Game::rebuildVehiclesRoutingCache()
     roadToEdge = &roadToEdgeLocal;
   }
 
+  // Zone access: allows interior tiles of a connected zoned area to be reachable via a
+  // road-adjacent boundary tile.
+  const ZoneAccessMap zoneAccess = BuildZoneAccessMap(m_world, roadToEdge);
+
   auto isTraversableRoad = [&](int ridx) -> bool {
     if (ridx < 0 || static_cast<std::size_t>(ridx) >= n) return false;
     const int x = ridx % w;
@@ -1922,10 +1927,9 @@ void Game::rebuildVehiclesRoutingCache()
   };
 
   auto zoneHasAccess = [&](int zx, int zy) -> bool {
-    if (!m_world.hasAdjacentRoad(zx, zy)) return false;
-    if (!requireOutside) return true;
-    return roadToEdge && HasAdjacentRoadConnectedToEdge(m_world, *roadToEdge, zx, zy);
+    return HasZoneAccess(zoneAccess, zx, zy);
   };
+
 
   // --- Commute routing: sources are road tiles adjacent to commercial/industrial zones ---
   std::vector<std::uint8_t> isJobSource(n, 0);
@@ -1938,20 +1942,37 @@ void Game::rebuildVehiclesRoutingCache()
       if (t.overlay != Overlay::Commercial && t.overlay != Overlay::Industrial) continue;
       if (!zoneHasAccess(x, y)) continue;
 
+      bool addedAdjacent = false;
+
+      // Prefer direct road adjacency when present (keeps visuals close to the core traffic model).
       for (const auto& d : dirs) {
         const int rx = x + d[0];
         const int ry = y + d[1];
         if (!m_world.inBounds(rx, ry)) continue;
         if (m_world.at(rx, ry).overlay != Overlay::Road) continue;
         const int ridx = ry * w + rx;
-        if (requireOutside && roadToEdge && roadToEdge->size() == n) {
-          if ((*roadToEdge)[static_cast<std::size_t>(ridx)] == 0) continue;
-        }
+        if (!isTraversableRoad(ridx)) continue;
         const std::size_t ui = static_cast<std::size_t>(ridx);
         if (ui >= isJobSource.size()) continue;
         if (isJobSource[ui]) continue;
         isJobSource[ui] = 1;
         m_commuteJobSources.push_back(ridx);
+        addedAdjacent = true;
+      }
+
+      // If the job tile is interior (no adjacent road), fall back to its propagated access road.
+      if (!addedAdjacent) {
+        const std::size_t zidx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+        if (zidx < zoneAccess.roadIdx.size()) {
+          const int ridx = zoneAccess.roadIdx[zidx];
+          if (isTraversableRoad(ridx)) {
+            const std::size_t ui = static_cast<std::size_t>(ridx);
+            if (ui < isJobSource.size() && !isJobSource[ui]) {
+              isJobSource[ui] = 1;
+              m_commuteJobSources.push_back(ridx);
+            }
+          }
+        }
       }
     }
   }
@@ -1977,9 +1998,14 @@ void Game::rebuildVehiclesRoutingCache()
       if (t.occupants == 0) continue;
       if (!zoneHasAccess(x, y)) continue;
 
+      const std::size_t zidx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+      int ridx = -1;
       Point road{};
-      if (!PickAdjacentRoadTile(m_world, roadToEdge, x, y, road)) continue;
-      const int ridx = road.y * w + road.x;
+      if (PickAdjacentRoadTile(m_world, roadToEdge, x, y, road)) {
+        ridx = road.y * w + road.x;
+      } else if (zidx < zoneAccess.roadIdx.size()) {
+        ridx = zoneAccess.roadIdx[zidx];
+      }
       if (!isTraversableRoad(ridx)) continue;
 
       if (m_commuteField.dist.empty() || static_cast<std::size_t>(ridx) >= m_commuteField.dist.size()) continue;
@@ -2013,9 +2039,14 @@ void Game::rebuildVehiclesRoutingCache()
       if (t.level == 0) continue;
       if (!zoneHasAccess(x, y)) continue;
 
+      const std::size_t zidx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+      int ridx = -1;
       Point road{};
-      if (!PickAdjacentRoadTile(m_world, roadToEdge, x, y, road)) continue;
-      const int ridx = road.y * w + road.x;
+      if (PickAdjacentRoadTile(m_world, roadToEdge, x, y, road)) {
+        ridx = road.y * w + road.x;
+      } else if (zidx < zoneAccess.roadIdx.size()) {
+        ridx = zoneAccess.roadIdx[zidx];
+      }
       if (!isTraversableRoad(ridx)) continue;
 
       const float raw = static_cast<float>(12 * std::clamp(static_cast<int>(t.level), 0, 3)) * gc.supplyScale;
@@ -2052,9 +2083,14 @@ void Game::rebuildVehiclesRoutingCache()
       const int demand = std::max(0, static_cast<int>(std::lround(raw)));
       if (demand <= 0) continue;
 
+      const std::size_t zidx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+      int ridx = -1;
       Point road{};
-      if (!PickAdjacentRoadTile(m_world, roadToEdge, x, y, road)) continue;
-      const int ridx = road.y * w + road.x;
+      if (PickAdjacentRoadTile(m_world, roadToEdge, x, y, road)) {
+        ridx = road.y * w + road.x;
+      } else if (zidx < zoneAccess.roadIdx.size()) {
+        ridx = zoneAccess.roadIdx[zidx];
+      }
       if (!isTraversableRoad(ridx)) continue;
 
       const int d = (!m_goodsProducerRoads.empty() && static_cast<std::size_t>(ridx) < m_goodsProducerField.dist.size())

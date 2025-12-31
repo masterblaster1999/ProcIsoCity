@@ -1,0 +1,1855 @@
+#include "isocity/Script.hpp"
+
+#include "isocity/Brush.hpp"
+#include "isocity/DistrictStats.hpp"
+#include "isocity/Districting.hpp"
+#include "isocity/Export.hpp"
+#include "isocity/FloodFill.hpp"
+#include "isocity/Goods.hpp"
+#include "isocity/Hash.hpp"
+#include "isocity/LandValue.hpp"
+#include "isocity/Pathfinding.hpp"
+#include "isocity/ProcGen.hpp"
+#include "isocity/SaveLoad.hpp"
+#include "isocity/Traffic.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <limits>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace isocity {
+
+namespace {
+
+static std::string Trim(std::string s)
+{
+  auto isWs = [](unsigned char c) { return std::isspace(c) != 0; };
+  while (!s.empty() && isWs(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+  while (!s.empty() && isWs(static_cast<unsigned char>(s.back()))) s.pop_back();
+  return s;
+}
+
+static std::vector<std::string> SplitWS(const std::string& s)
+{
+  std::vector<std::string> out;
+  std::string cur;
+  for (unsigned char uc : s) {
+    const char c = static_cast<char>(uc);
+    if (std::isspace(uc)) {
+      if (!cur.empty()) {
+        out.push_back(cur);
+        cur.clear();
+      }
+      continue;
+    }
+    cur.push_back(c);
+  }
+  if (!cur.empty()) out.push_back(cur);
+  return out;
+}
+
+static std::string ToLower(std::string s)
+{
+  for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return s;
+}
+
+static const char* ToolApplyResultName(ToolApplyResult r)
+{
+  switch (r) {
+  case ToolApplyResult::Applied: return "Applied";
+  case ToolApplyResult::Noop: return "Noop";
+  case ToolApplyResult::OutOfBounds: return "OutOfBounds";
+  case ToolApplyResult::BlockedWater: return "BlockedWater";
+  case ToolApplyResult::BlockedNoRoad: return "BlockedNoRoad";
+  case ToolApplyResult::BlockedOccupied: return "BlockedOccupied";
+  case ToolApplyResult::InsufficientFunds: return "InsufficientFunds";
+  default: return "Unknown";
+  }
+}
+
+static bool ParseI32(const std::string& s, int* out)
+{
+  if (!out) return false;
+  if (s.empty()) return false;
+  char* end = nullptr;
+  const long v = std::strtol(s.c_str(), &end, 10);
+  if (!end || *end != '\0') return false;
+  if (v < std::numeric_limits<int>::min() || v > std::numeric_limits<int>::max()) return false;
+  *out = static_cast<int>(v);
+  return true;
+}
+
+static bool ParseF32(const std::string& s, float* out)
+{
+  if (!out) return false;
+  if (s.empty()) return false;
+  char* end = nullptr;
+  const float v = std::strtof(s.c_str(), &end);
+  if (!end || *end != '\0') return false;
+  *out = v;
+  return true;
+}
+
+static bool ParseU64(const std::string& s, std::uint64_t* out)
+{
+  if (!out) return false;
+  if (s.empty()) return false;
+
+  int base = 10;
+  std::size_t offset = 0;
+  if (s.rfind("0x", 0) == 0 || s.rfind("0X", 0) == 0) {
+    base = 16;
+    offset = 2;
+  }
+
+  char* end = nullptr;
+  const unsigned long long v = std::strtoull(s.c_str() + offset, &end, base);
+  if (!end || *end != '\0') return false;
+  *out = static_cast<std::uint64_t>(v);
+  return true;
+}
+
+static bool WriteStatsCsv(const std::string& path, const std::vector<Stats>& rows, std::string& outError)
+{
+  outError.clear();
+  std::ofstream f(path, std::ios::binary);
+  if (!f) {
+    outError = "failed to open for writing";
+    return false;
+  }
+
+  f << "day,population,money,housingCapacity,jobsCapacity,jobsCapacityAccessible,employed,happiness,roads,parks,avgCommuteTime,trafficCongestion,goodsDemand,goodsDelivered,goodsSatisfaction,avgLandValue,demandResidential\n";
+  for (const auto& s : rows) {
+    f << s.day << ','
+      << s.population << ','
+      << s.money << ','
+      << s.housingCapacity << ','
+      << s.jobsCapacity << ','
+      << s.jobsCapacityAccessible << ','
+      << s.employed << ','
+      << s.happiness << ','
+      << s.roads << ','
+      << s.parks << ','
+      << s.avgCommuteTime << ','
+      << s.trafficCongestion << ','
+      << s.goodsDemand << ','
+      << s.goodsDelivered << ','
+      << s.goodsSatisfaction << ','
+      << s.avgLandValue << ','
+      << s.demandResidential << '\n';
+  }
+
+  if (!f) {
+    outError = "write failed";
+    return false;
+  }
+  return true;
+}
+
+static bool ParseBool01(const std::string& s, bool* out)
+{
+  if (!out) return false;
+  const std::string k = ToLower(s);
+  if (k == "1" || k == "true" || k == "yes" || k == "on") {
+    *out = true;
+    return true;
+  }
+  if (k == "0" || k == "false" || k == "no" || k == "off") {
+    *out = false;
+    return true;
+  }
+  return false;
+}
+
+static std::vector<std::string> SplitCommaLower(const std::string& s)
+{
+  std::vector<std::string> out;
+  std::string cur;
+  cur.reserve(s.size());
+  for (char c : s) {
+    if (c == ',') {
+      if (!cur.empty()) out.push_back(ToLower(cur));
+      cur.clear();
+      continue;
+    }
+    cur.push_back(c);
+  }
+  if (!cur.empty()) out.push_back(ToLower(cur));
+  return out;
+}
+
+static bool ParseTileFieldMaskList(const std::string& s, std::uint8_t* outMask, std::string* outError)
+{
+  if (outError) outError->clear();
+  if (!outMask) return false;
+  if (s.empty()) {
+    if (outError) *outError = "empty fields list";
+    return false;
+  }
+
+  std::uint8_t m = 0;
+  for (const auto& t : SplitCommaLower(s)) {
+    if (t == "all") {
+      m = 0xFFu;
+      continue;
+    }
+    if (t == "none") {
+      m = 0;
+      continue;
+    }
+
+    if (t == "terrain") m |= static_cast<std::uint8_t>(TileFieldMask::Terrain);
+    else if (t == "overlay") m |= static_cast<std::uint8_t>(TileFieldMask::Overlay);
+    else if (t == "height") m |= static_cast<std::uint8_t>(TileFieldMask::Height);
+    else if (t == "variation") m |= static_cast<std::uint8_t>(TileFieldMask::Variation);
+    else if (t == "level") m |= static_cast<std::uint8_t>(TileFieldMask::Level);
+    else if (t == "occupants") m |= static_cast<std::uint8_t>(TileFieldMask::Occupants);
+    else if (t == "district") m |= static_cast<std::uint8_t>(TileFieldMask::District);
+    else {
+      if (outError) *outError = "unknown field: " + t;
+      return false;
+    }
+  }
+
+  *outMask = m;
+  return true;
+}
+
+static bool ParseWxH(const std::string& s, int* outW, int* outH)
+{
+  if (!outW || !outH) return false;
+  const std::size_t pos = s.find_first_of("xX");
+  if (pos == std::string::npos) return false;
+  int w = 0;
+  int h = 0;
+  if (!ParseI32(s.substr(0, pos), &w)) return false;
+  if (!ParseI32(s.substr(pos + 1), &h)) return false;
+  if (w <= 0 || h <= 0) return false;
+  *outW = w;
+  *outH = h;
+  return true;
+}
+
+static std::string HexU64(std::uint64_t v)
+{
+  std::ostringstream oss;
+  oss << "0x" << std::hex << std::setw(16) << std::setfill('0') << v;
+  return oss.str();
+}
+
+static bool ApplyZoneTile(World& world, Tool tool, int x, int y, int targetLevel, ToolApplyResult* outFail = nullptr)
+{
+  targetLevel = std::clamp(targetLevel, 1, 3);
+
+  // Ensure the correct overlay is present (placement or upgrade).
+  ToolApplyResult r = world.applyTool(tool, x, y);
+  if (r != ToolApplyResult::Applied && r != ToolApplyResult::Noop) {
+    if (outFail) *outFail = r;
+    return false;
+  }
+
+  Tile& t = world.at(x, y);
+  if (tool == Tool::Residential && t.overlay != Overlay::Residential) return false;
+  if (tool == Tool::Commercial && t.overlay != Overlay::Commercial) return false;
+  if (tool == Tool::Industrial && t.overlay != Overlay::Industrial) return false;
+
+  // Upgrade until desired level.
+  while (static_cast<int>(t.level) < targetLevel) {
+    r = world.applyTool(tool, x, y);
+    if (r != ToolApplyResult::Applied && r != ToolApplyResult::Noop) {
+      if (outFail) *outFail = r;
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool ApplyRoadTile(World& world, int x, int y, int level, ToolApplyResult* outFail = nullptr)
+{
+  const ToolApplyResult r = world.applyRoad(x, y, level);
+  if (outFail) *outFail = r;
+  return (r == ToolApplyResult::Applied || r == ToolApplyResult::Noop);
+}
+
+static bool ApplyFill(World& world, const std::string& what, Point a, Point b, int arg, Point* outFailP = nullptr,
+                      ToolApplyResult* outFailR = nullptr)
+{
+  const std::string k = ToLower(what);
+  const int argOr1 = (arg > 0) ? arg : 1;
+
+  const bool recognized = (k == "road" || k == "park" || k == "bulldoze" || k == "district" || k == "res" ||
+                           k == "residential" || k == "com" || k == "commercial" || k == "ind" || k == "industrial");
+  if (!recognized) return false;
+
+  bool ok = true;
+  Point failP{0, 0};
+  ToolApplyResult failR = ToolApplyResult::Noop;
+
+  ForEachRectFilled(a, b, [&](Point p) {
+    if (!ok) return;
+    if (!world.inBounds(p.x, p.y)) {
+      ok = false;
+      failP = p;
+      failR = ToolApplyResult::OutOfBounds;
+      return;
+    }
+
+    if (k == "road") {
+      ToolApplyResult r = ToolApplyResult::Noop;
+      if (!ApplyRoadTile(world, p.x, p.y, argOr1, &r)) {
+        ok = false;
+        failP = p;
+        failR = r;
+      }
+      return;
+    }
+
+    if (k == "park") {
+      const ToolApplyResult r = world.applyTool(Tool::Park, p.x, p.y);
+      if (r != ToolApplyResult::Applied && r != ToolApplyResult::Noop) {
+        ok = false;
+        failP = p;
+        failR = r;
+      }
+      return;
+    }
+
+    if (k == "bulldoze") {
+      const ToolApplyResult r = world.applyTool(Tool::Bulldoze, p.x, p.y);
+      if (r != ToolApplyResult::Applied && r != ToolApplyResult::Noop) {
+        ok = false;
+        failP = p;
+        failR = r;
+      }
+      return;
+    }
+
+    if (k == "district") {
+      const ToolApplyResult r = world.applyDistrict(p.x, p.y, arg);
+      if (r != ToolApplyResult::Applied && r != ToolApplyResult::Noop) {
+        ok = false;
+        failP = p;
+        failR = r;
+      }
+      return;
+    }
+
+    // Zones.
+    Tool tool = Tool::Residential;
+    if (k == "res" || k == "residential") tool = Tool::Residential;
+    else if (k == "com" || k == "commercial") tool = Tool::Commercial;
+    else if (k == "ind" || k == "industrial") tool = Tool::Industrial;
+
+    ToolApplyResult r = ToolApplyResult::Noop;
+    if (!ApplyZoneTile(world, tool, p.x, p.y, argOr1, &r)) {
+      ok = false;
+      failP = p;
+      failR = r;
+    }
+  });
+
+  if (!ok) {
+    if (outFailP) *outFailP = failP;
+    if (outFailR) *outFailR = failR;
+  }
+
+  return ok;
+}
+
+static bool ApplyOutline(World& world, const std::string& what, Point a, Point b, int arg, Point* outFailP = nullptr,
+                         ToolApplyResult* outFailR = nullptr)
+{
+  const std::string k = ToLower(what);
+  const int argOr1 = (arg > 0) ? arg : 1;
+
+  const bool recognized = (k == "road" || k == "park" || k == "bulldoze" || k == "district" || k == "res" ||
+                           k == "residential" || k == "com" || k == "commercial" || k == "ind" || k == "industrial");
+  if (!recognized) return false;
+
+  bool ok = true;
+  Point failP{0, 0};
+  ToolApplyResult failR = ToolApplyResult::Noop;
+
+  ForEachRectOutline(a, b, [&](Point p) {
+    if (!ok) return;
+    if (!world.inBounds(p.x, p.y)) {
+      ok = false;
+      failP = p;
+      failR = ToolApplyResult::OutOfBounds;
+      return;
+    }
+
+    if (k == "road") {
+      ToolApplyResult r = ToolApplyResult::Noop;
+      if (!ApplyRoadTile(world, p.x, p.y, argOr1, &r)) {
+        ok = false;
+        failP = p;
+        failR = r;
+      }
+      return;
+    }
+
+    if (k == "park") {
+      const ToolApplyResult r = world.applyTool(Tool::Park, p.x, p.y);
+      if (r != ToolApplyResult::Applied && r != ToolApplyResult::Noop) {
+        ok = false;
+        failP = p;
+        failR = r;
+      }
+      return;
+    }
+
+    if (k == "bulldoze") {
+      const ToolApplyResult r = world.applyTool(Tool::Bulldoze, p.x, p.y);
+      if (r != ToolApplyResult::Applied && r != ToolApplyResult::Noop) {
+        ok = false;
+        failP = p;
+        failR = r;
+      }
+      return;
+    }
+
+    if (k == "district") {
+      const ToolApplyResult r = world.applyDistrict(p.x, p.y, arg);
+      if (r != ToolApplyResult::Applied && r != ToolApplyResult::Noop) {
+        ok = false;
+        failP = p;
+        failR = r;
+      }
+      return;
+    }
+
+    // Zones.
+    Tool tool = Tool::Residential;
+    if (k == "res" || k == "residential") tool = Tool::Residential;
+    else if (k == "com" || k == "commercial") tool = Tool::Commercial;
+    else if (k == "ind" || k == "industrial") tool = Tool::Industrial;
+
+    ToolApplyResult r = ToolApplyResult::Noop;
+    if (!ApplyZoneTile(world, tool, p.x, p.y, argOr1, &r)) {
+      ok = false;
+      failP = p;
+      failR = r;
+    }
+  });
+
+  if (!ok) {
+    if (outFailP) *outFailP = failP;
+    if (outFailR) *outFailR = failR;
+  }
+
+  return ok;
+}
+
+static bool ApplyFlood(World& world, const std::string& what, Point start, int arg, bool includeRoads,
+                       Point* outFailP = nullptr, ToolApplyResult* outFailR = nullptr)
+{
+  const std::string k = ToLower(what);
+  const int argOr1 = (arg > 0) ? arg : 1;
+
+  const bool recognized = (k == "road" || k == "park" || k == "bulldoze" || k == "district" || k == "res" ||
+                           k == "residential" || k == "com" || k == "commercial" || k == "ind" ||
+                           k == "industrial");
+  if (!recognized) {
+    if (outFailP) *outFailP = start;
+    if (outFailR) *outFailR = ToolApplyResult::Noop;
+    return false;
+  }
+
+  if (!world.inBounds(start.x, start.y)) {
+    if (outFailP) *outFailP = start;
+    if (outFailR) *outFailR = ToolApplyResult::OutOfBounds;
+    return false;
+  }
+
+  const FloodFillResult region = FloodFillAuto(world, start, includeRoads);
+
+  bool ok = true;
+  Point failP{0, 0};
+  ToolApplyResult failR = ToolApplyResult::Noop;
+
+  auto recordFail = [&](Point p, ToolApplyResult r) {
+    ok = false;
+    failP = p;
+    failR = r;
+  };
+
+  for (const Point& p : region.tiles) {
+    if (!ok) break;
+    if (!world.inBounds(p.x, p.y)) continue;
+
+    ToolApplyResult r = ToolApplyResult::Noop;
+
+    if (k == "road") {
+      if (!ApplyRoadTile(world, p.x, p.y, argOr1, &r)) recordFail(p, r);
+    } else if (k == "park") {
+      r = world.applyTool(Tool::Park, p.x, p.y);
+      if (r != ToolApplyResult::Applied && r != ToolApplyResult::Noop) recordFail(p, r);
+    } else if (k == "bulldoze") {
+      r = world.applyTool(Tool::Bulldoze, p.x, p.y);
+      if (r != ToolApplyResult::Applied && r != ToolApplyResult::Noop) recordFail(p, r);
+    } else if (k == "district") {
+      r = world.applyDistrict(p.x, p.y, arg);
+      if (r != ToolApplyResult::Applied && r != ToolApplyResult::Noop) recordFail(p, r);
+    } else if (k == "res" || k == "residential") {
+      if (!ApplyZoneTile(world, Tool::Residential, p.x, p.y, argOr1, &r)) recordFail(p, r);
+    } else if (k == "com" || k == "commercial") {
+      if (!ApplyZoneTile(world, Tool::Commercial, p.x, p.y, argOr1, &r)) recordFail(p, r);
+    } else if (k == "ind" || k == "industrial") {
+      if (!ApplyZoneTile(world, Tool::Industrial, p.x, p.y, argOr1, &r)) recordFail(p, r);
+    }
+  }
+
+  if (!ok) {
+    if (outFailP) *outFailP = failP;
+    if (outFailR) *outFailR = failR;
+    return false;
+  }
+
+  return true;
+}
+
+static bool WriteDistrictsJsonFile(const std::string& path, const World& world, const SimConfig& simCfg)
+{
+  if (path.empty()) return true;
+
+  // Derived fields for land-value-aware taxes.
+  LandValueConfig lvc;
+  lvc.requireOutsideConnection = simCfg.requireOutsideConnection;
+
+  std::vector<std::uint8_t> roadToEdge;
+  if (simCfg.requireOutsideConnection) {
+    ComputeRoadsConnectedToEdge(world, roadToEdge);
+  }
+
+  const LandValueResult lv =
+      ComputeLandValue(world, lvc, nullptr, simCfg.requireOutsideConnection ? &roadToEdge : nullptr);
+
+  const DistrictStatsResult ds = ComputeDistrictStats(world, simCfg, &lv.value,
+                                                     simCfg.requireOutsideConnection ? &roadToEdge : nullptr);
+
+  std::ostringstream oss;
+  oss << "{\n";
+  oss << "  \"total\": {\n";
+  oss << "    \"tiles\": " << ds.total.tiles << ",\n";
+  oss << "    \"population\": " << ds.total.population << ",\n";
+  oss << "    \"jobsCapacityAccessible\": " << ds.total.jobsCapacityAccessible << ",\n";
+  oss << "    \"taxRevenue\": " << ds.total.taxRevenue << ",\n";
+  oss << "    \"maintenanceCost\": " << ds.total.maintenanceCost << ",\n";
+  oss << "    \"net\": " << ds.total.net << "\n";
+  oss << "  },\n";
+  oss << "  \"districts\": [\n";
+
+  for (int i = 0; i < kDistrictCount; ++i) {
+    const DistrictSummary& d = ds.districts[static_cast<std::size_t>(i)];
+    oss << "    {\n";
+    oss << "      \"id\": " << d.id << ",\n";
+    oss << "      \"tiles\": " << d.tiles << ",\n";
+    oss << "      \"population\": " << d.population << ",\n";
+    oss << "      \"jobsCapacityAccessible\": " << d.jobsCapacityAccessible << ",\n";
+    oss << "      \"avgLandValue\": " << d.avgLandValue << ",\n";
+    oss << "      \"taxRevenue\": " << d.taxRevenue << ",\n";
+    oss << "      \"maintenanceCost\": " << d.maintenanceCost << ",\n";
+    oss << "      \"net\": " << d.net << "\n";
+    oss << "    }";
+    if (i != kDistrictCount - 1) oss << ',';
+    oss << "\n";
+  }
+
+  oss << "  ]\n";
+  oss << "}\n";
+
+  std::ofstream f(path, std::ios::binary);
+  if (!f) return false;
+  f << oss.str();
+  return static_cast<bool>(f);
+}
+
+} // namespace
+
+ScriptRunner::ScriptRunner() = default;
+
+void ScriptRunner::clearError()
+{
+  m_lastError.clear();
+  m_lastErrorPath.clear();
+  m_lastErrorLine = 0;
+}
+
+bool ScriptRunner::fail(const std::string& path, int line, const std::string& msg)
+{
+  m_lastErrorPath = path;
+  m_lastErrorLine = line;
+  m_lastError = path + ':' + std::to_string(line) + ": " + msg;
+  emitError(m_lastError);
+  return false;
+}
+
+void ScriptRunner::emitPrint(const std::string& line) const
+{
+  if (m_cb.print) m_cb.print(line);
+}
+
+void ScriptRunner::emitInfo(const std::string& line) const
+{
+  if (m_opt.quiet) return;
+  if (m_cb.info) m_cb.info(line);
+}
+
+void ScriptRunner::emitError(const std::string& line) const
+{
+  if (m_cb.error) m_cb.error(line);
+}
+
+std::string ScriptRunner::expandPathTemplate(const std::string& tmpl, int run) const
+{
+  auto replaceAll = [](std::string s, const std::string& from, const std::string& to) -> std::string {
+    if (from.empty()) return s;
+    std::size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+      s.replace(pos, from.size(), to);
+      pos += to.size();
+    }
+    return s;
+  };
+
+  std::string out = tmpl;
+
+  const std::uint64_t seed = m_ctx.hasWorld ? m_ctx.world.seed() : m_ctx.seed;
+  const int w = m_ctx.hasWorld ? m_ctx.world.width() : m_ctx.w;
+  const int h = m_ctx.hasWorld ? m_ctx.world.height() : m_ctx.h;
+  const int day = m_ctx.hasWorld ? m_ctx.world.stats().day : 0;
+  const int money = m_ctx.hasWorld ? m_ctx.world.stats().money : 0;
+
+  out = replaceAll(out, "{seed}", std::to_string(seed));
+  out = replaceAll(out, "{w}", std::to_string(w));
+  out = replaceAll(out, "{h}", std::to_string(h));
+  out = replaceAll(out, "{day}", std::to_string(day));
+  out = replaceAll(out, "{money}", std::to_string(money));
+  out = replaceAll(out, "{run}", std::to_string(run));
+
+  if (out.find("{hash}") != std::string::npos) {
+    std::uint64_t hv = 0;
+    if (m_ctx.hasWorld) hv = HashWorld(m_ctx.world, true);
+    out = replaceAll(out, "{hash}", HexU64(hv));
+  }
+
+  return out;
+}
+
+bool ScriptRunner::runFile(const std::string& path)
+{
+  clearError();
+  return runFileInternal(path, 0);
+}
+
+bool ScriptRunner::runText(const std::string& text, const std::string& virtualPath)
+{
+  clearError();
+  return runTextInternal(text, virtualPath, 0);
+}
+
+bool ScriptRunner::runFileInternal(const std::string& path, int depth)
+{
+  if (depth > m_opt.includeDepthLimit) {
+    return fail(path, 1, "include depth limit exceeded");
+  }
+
+  std::ifstream f(path, std::ios::binary);
+  if (!f) {
+    return fail(path, 1, "failed to open script");
+  }
+
+  std::ostringstream oss;
+  oss << f.rdbuf();
+  return runTextInternal(oss.str(), path, depth);
+}
+
+static bool EnsureWorld(ScriptRunnerState& ctx, ScriptRunner& runner, const std::string& path, int lineNo)
+{
+  if (ctx.hasWorld) return true;
+  return runner.fail(path, lineNo, "no world loaded/generated yet (use load/generate)");
+}
+
+static void RefreshIfDirty(ScriptRunnerState& ctx)
+{
+  if (!ctx.hasWorld) return;
+  if (!ctx.dirtyDerived) return;
+  ctx.sim.config() = ctx.simCfg;
+  ctx.sim.refreshDerivedStats(ctx.world);
+  ctx.dirtyDerived = false;
+}
+
+static bool CmdProc(ScriptRunnerState& ctx, ScriptRunner& runner, const std::vector<std::string>& t,
+                    const std::string& path, int lineNo)
+{
+  if (t.size() != 3) {
+    return runner.fail(path, lineNo, "proc expects: proc <key> <value>");
+  }
+
+  const std::string key = ToLower(t[1]);
+  const std::string val = t[2];
+
+  if (key == "terrainscale") {
+    return ParseF32(val, &ctx.procCfg.terrainScale);
+  }
+  if (key == "waterlevel") {
+    return ParseF32(val, &ctx.procCfg.waterLevel);
+  }
+  if (key == "sandlevel") {
+    return ParseF32(val, &ctx.procCfg.sandLevel);
+  }
+  if (key == "hubs") {
+    return ParseI32(val, &ctx.procCfg.hubs);
+  }
+  if (key == "extraconnections" || key == "extra_connections") {
+    return ParseI32(val, &ctx.procCfg.extraConnections);
+  }
+  if (key == "zonechance" || key == "zone_chance") {
+    return ParseF32(val, &ctx.procCfg.zoneChance);
+  }
+  if (key == "parkchance" || key == "park_chance") {
+    return ParseF32(val, &ctx.procCfg.parkChance);
+  }
+
+  // --- Erosion controls (new in save v9 / patch v2) ---
+  if (key == "erosion" || key == "erosion_enabled" || key == "erode") {
+    bool b = false;
+    if (!ParseBool01(val, &b)) return false;
+    ctx.procCfg.erosion.enabled = b;
+    return true;
+  }
+  if (key == "rivers" || key == "rivers_enabled") {
+    bool b = false;
+    if (!ParseBool01(val, &b)) return false;
+    ctx.procCfg.erosion.riversEnabled = b;
+    return true;
+  }
+
+  if (key == "thermaliters" || key == "thermal_iterations" || key == "erosion_thermal_iters") {
+    return ParseI32(val, &ctx.procCfg.erosion.thermalIterations);
+  }
+  if (key == "thermaltalus" || key == "thermal_talus" || key == "erosion_talus") {
+    return ParseF32(val, &ctx.procCfg.erosion.thermalTalus);
+  }
+  if (key == "thermalrate" || key == "thermal_rate" || key == "erosion_rate") {
+    return ParseF32(val, &ctx.procCfg.erosion.thermalRate);
+  }
+
+  if (key == "riverminaccum" || key == "river_min_accum" || key == "river_minaccum") {
+    return ParseI32(val, &ctx.procCfg.erosion.riverMinAccum);
+  }
+  if (key == "rivercarve" || key == "river_carve") {
+    return ParseF32(val, &ctx.procCfg.erosion.riverCarve);
+  }
+  if (key == "riverpower" || key == "river_power") {
+    return ParseF32(val, &ctx.procCfg.erosion.riverCarvePower);
+  }
+
+  if (key == "smoothiters" || key == "smooth_iterations" || key == "erosion_smooth_iters") {
+    return ParseI32(val, &ctx.procCfg.erosion.smoothIterations);
+  }
+  if (key == "smoothrate" || key == "smooth_rate") {
+    return ParseF32(val, &ctx.procCfg.erosion.smoothRate);
+  }
+
+  if (key == "quantizescale" || key == "quantize_scale" || key == "erosion_quantize_scale") {
+    return ParseI32(val, &ctx.procCfg.erosion.quantizeScale);
+  }
+
+  return runner.fail(path, lineNo, "unknown proc key: " + t[1]);
+}
+
+static bool CmdSim(ScriptRunnerState& ctx, ScriptRunner& runner, const std::vector<std::string>& t,
+                   const std::string& path, int lineNo)
+{
+  if (t.size() != 3) {
+    return runner.fail(path, lineNo, "sim expects: sim <key> <value>");
+  }
+
+  const std::string key = ToLower(t[1]);
+  const std::string val = t[2];
+
+  if (key == "tickseconds" || key == "tick_seconds") {
+    return ParseF32(val, &ctx.simCfg.tickSeconds);
+  }
+  if (key == "parkinfluenceradius" || key == "park_influence_radius") {
+    return ParseI32(val, &ctx.simCfg.parkInfluenceRadius);
+  }
+  if (key == "requireoutsideconnection" || key == "require_outside_connection" || key == "require_outside") {
+    bool b = false;
+    if (!ParseBool01(val, &b)) return false;
+    ctx.simCfg.requireOutsideConnection = b;
+    return true;
+  }
+
+  if (key == "taxresidential" || key == "tax_residential" || key == "tax_res") {
+    return ParseI32(val, &ctx.simCfg.taxResidential);
+  }
+  if (key == "taxcommercial" || key == "tax_commercial" || key == "tax_com") {
+    return ParseI32(val, &ctx.simCfg.taxCommercial);
+  }
+  if (key == "taxindustrial" || key == "tax_industrial" || key == "tax_ind") {
+    return ParseI32(val, &ctx.simCfg.taxIndustrial);
+  }
+
+  if (key == "maintenanceroad" || key == "maintenance_road" || key == "maint_road") {
+    return ParseI32(val, &ctx.simCfg.maintenanceRoad);
+  }
+  if (key == "maintenancepark" || key == "maintenance_park" || key == "maint_park") {
+    return ParseI32(val, &ctx.simCfg.maintenancePark);
+  }
+
+  if (key == "taxhappinesspercapita" || key == "tax_happiness_per_capita") {
+    return ParseF32(val, &ctx.simCfg.taxHappinessPerCapita);
+  }
+
+  if (key == "residentialdesirabilityweight" || key == "residential_desirability_weight") {
+    return ParseF32(val, &ctx.simCfg.residentialDesirabilityWeight);
+  }
+  if (key == "commercialdesirabilityweight" || key == "commercial_desirability_weight") {
+    return ParseF32(val, &ctx.simCfg.commercialDesirabilityWeight);
+  }
+  if (key == "industrialdesirabilityweight" || key == "industrial_desirability_weight") {
+    return ParseF32(val, &ctx.simCfg.industrialDesirabilityWeight);
+  }
+
+  if (key == "districtpoliciesenabled" || key == "district_policies_enabled") {
+    bool b = false;
+    if (!ParseBool01(val, &b)) return false;
+    ctx.simCfg.districtPoliciesEnabled = b;
+    return true;
+  }
+
+  return runner.fail(path, lineNo, "unknown sim key: " + t[1]);
+}
+
+static bool CmdPolicy(ScriptRunnerState& ctx, ScriptRunner& runner, const std::vector<std::string>& t,
+                      const std::string& path, int lineNo)
+{
+  if (t.size() != 4) {
+    return runner.fail(path, lineNo, "policy expects: policy <districtId> <key> <value>");
+  }
+
+  int id = 0;
+  if (!ParseI32(t[1], &id)) return false;
+  id = std::clamp(id, 0, kDistrictCount - 1);
+
+  const std::string key = ToLower(t[2]);
+  const std::string val = t[3];
+
+  DistrictPolicy& p = ctx.simCfg.districtPolicies[static_cast<std::size_t>(id)];
+
+  if (key == "taxresidentialmult" || key == "tax_residential_mult") return ParseF32(val, &p.taxResidentialMult);
+  if (key == "taxcommercialmult" || key == "tax_commercial_mult") return ParseF32(val, &p.taxCommercialMult);
+  if (key == "taxindustrialmult" || key == "tax_industrial_mult") return ParseF32(val, &p.taxIndustrialMult);
+  if (key == "roadmaintenancemult" || key == "road_maintenance_mult") return ParseF32(val, &p.roadMaintenanceMult);
+  if (key == "parkmaintenancemult" || key == "park_maintenance_mult") return ParseF32(val, &p.parkMaintenanceMult);
+
+  return runner.fail(path, lineNo, "unknown policy key: " + t[2]);
+}
+
+static bool CmdTrafficModel(ScriptRunnerState& ctx, ScriptRunner& runner, const std::vector<std::string>& t,
+                            const std::string& path, int lineNo)
+{
+  if (t.size() != 3) {
+    return runner.fail(path, lineNo, "traffic_model expects: traffic_model <key> <value>");
+  }
+
+  const std::string key = ToLower(t[1]);
+  const std::string val = t[2];
+
+  TrafficModelSettings& tm = ctx.sim.trafficModel();
+
+  if (key == "congestionawarerouting" || key == "congestion_aware_routing") {
+    bool b = false;
+    if (!ParseBool01(val, &b)) return false;
+    tm.congestionAwareRouting = b;
+    return true;
+  }
+  if (key == "congestioniterations" || key == "congestion_iterations") {
+    return ParseI32(val, &tm.congestionIterations);
+  }
+  if (key == "congestionalpha" || key == "congestion_alpha") {
+    return ParseF32(val, &tm.congestionAlpha);
+  }
+  if (key == "congestionbeta" || key == "congestion_beta") {
+    return ParseF32(val, &tm.congestionBeta);
+  }
+  if (key == "congestioncapacityscale" || key == "congestion_capacity_scale") {
+    return ParseF32(val, &tm.congestionCapacityScale);
+  }
+  if (key == "congestionratioclamp" || key == "congestion_ratio_clamp") {
+    return ParseF32(val, &tm.congestionRatioClamp);
+  }
+
+  return runner.fail(path, lineNo, "unknown traffic_model key: " + t[1]);
+}
+
+bool ScriptRunner::runTextInternal(const std::string& text, const std::string& virtualPath, int depth)
+{
+  if (depth > m_opt.includeDepthLimit) {
+    return fail(virtualPath, 1, "include depth limit exceeded");
+  }
+
+  std::istringstream iss(text);
+  std::string line;
+  int lineNo = 0;
+
+  while (std::getline(iss, line)) {
+    lineNo++;
+
+    // Strip comments.
+    const std::size_t hashPos = line.find('#');
+    if (hashPos != std::string::npos) line = line.substr(0, hashPos);
+    line = Trim(line);
+    if (line.empty()) continue;
+
+    std::vector<std::string> t = SplitWS(line);
+    if (t.empty()) continue;
+
+    const std::string cmd = ToLower(t[0]);
+
+    if (cmd == "include") {
+      if (t.size() != 2) {
+        return fail(virtualPath, lineNo, "include expects: include <script.txt>");
+      }
+      // Resolve relative includes against the including script's directory.
+      std::filesystem::path inc = std::filesystem::path(t[1]);
+      if (inc.is_relative()) {
+        std::filesystem::path base = std::filesystem::path(virtualPath).parent_path();
+        if (!base.empty()) inc = base / inc;
+      }
+      if (!runFileInternal(inc.string(), depth + 1)) {
+        // runFileInternal already populated m_lastError.
+        return false;
+      }
+      continue;
+    }
+
+    if (cmd == "size") {
+      if (t.size() != 2 || !ParseWxH(t[1], &m_ctx.w, &m_ctx.h)) {
+        return fail(virtualPath, lineNo, "size expects WxH");
+      }
+      continue;
+    }
+
+    if (cmd == "seed") {
+      if (t.size() != 2 || !ParseU64(t[1], &m_ctx.seed)) {
+        return fail(virtualPath, lineNo, "seed expects u64 (decimal or 0x...)");
+      }
+      continue;
+    }
+
+    if (cmd == "proc") {
+      if (!CmdProc(m_ctx, *this, t, virtualPath, lineNo)) return false;
+      continue;
+    }
+
+    if (cmd == "sim") {
+      if (!CmdSim(m_ctx, *this, t, virtualPath, lineNo)) return false;
+      m_ctx.dirtyDerived = true;
+      continue;
+    }
+
+    if (cmd == "policy") {
+      if (!CmdPolicy(m_ctx, *this, t, virtualPath, lineNo)) return false;
+      m_ctx.dirtyDerived = true;
+      continue;
+    }
+
+    if (cmd == "bot") {
+      if (t.size() == 2) {
+        const std::string sub = ToLower(t[1]);
+        if (sub == "reset") {
+          m_ctx.autoBuildCfg = AutoBuildConfig{};
+          emitInfo("bot: reset");
+          continue;
+        }
+        if (sub == "show") {
+          std::ostringstream oss;
+          oss << "{\n"
+              << "  \"zonesPerDay\": " << m_ctx.autoBuildCfg.zonesPerDay << ",\n"
+              << "  \"roadsPerDay\": " << m_ctx.autoBuildCfg.roadsPerDay << ",\n"
+              << "  \"parksPerDay\": " << m_ctx.autoBuildCfg.parksPerDay << ",\n"
+              << "  \"roadLevel\": " << m_ctx.autoBuildCfg.roadLevel << ",\n"
+              << "  \"maxRoadSpurLength\": " << m_ctx.autoBuildCfg.maxRoadSpurLength << ",\n"
+              << "  \"allowBridges\": " << (m_ctx.autoBuildCfg.allowBridges ? "true" : "false") << ",\n"
+              << "  \"minMoneyReserve\": " << m_ctx.autoBuildCfg.minMoneyReserve << ",\n"
+              << "  \"autoUpgradeRoads\": " << (m_ctx.autoBuildCfg.autoUpgradeRoads ? "true" : "false") << ",\n"
+              << "  \"congestionUpgradeThreshold\": " << m_ctx.autoBuildCfg.congestionUpgradeThreshold << ",\n"
+              << "  \"roadUpgradesPerDay\": " << m_ctx.autoBuildCfg.roadUpgradesPerDay << ",\n"
+              << "  \"landValueRecalcDays\": " << m_ctx.autoBuildCfg.landValueRecalcDays << ",\n"
+              << "  \"respectOutsideConnection\": " << (m_ctx.autoBuildCfg.respectOutsideConnection ? "true" : "false") << ",\n"
+              << "  \"ensureOutsideConnection\": " << (m_ctx.autoBuildCfg.ensureOutsideConnection ? "true" : "false") << "\n"
+              << "}\n";
+          emitPrint(oss.str());
+          continue;
+        }
+      }
+
+      if (t.size() != 3) {
+        return fail(virtualPath, lineNo, "bot expects: bot <key> <value> (or: bot show / bot reset)");
+      }
+      std::string err;
+      if (!ParseAutoBuildKey(t[1], t[2], m_ctx.autoBuildCfg, err)) {
+        return fail(virtualPath, lineNo, "bot parse error: " + err);
+      }
+      emitInfo("bot: set " + t[1] + "=" + t[2]);
+      continue;
+    }
+
+    if (cmd == "traffic_model") {
+      if (!CmdTrafficModel(m_ctx, *this, t, virtualPath, lineNo)) return false;
+      m_ctx.dirtyDerived = true;
+      continue;
+    }
+
+    if (cmd == "load") {
+      if (t.size() != 2) {
+        return fail(virtualPath, lineNo, "load expects: load <save.bin>");
+      }
+
+      std::string err;
+      const std::string p = expandPathTemplate(t[1]);
+      World w;
+      ProcGenConfig pc{};
+      SimConfig sc{};
+      if (!LoadWorldBinary(w, pc, sc, p, err)) {
+        return fail(virtualPath, lineNo, "load failed: " + err);
+      }
+
+      m_ctx.world = std::move(w);
+      m_ctx.procCfg = pc;
+      m_ctx.simCfg = sc;
+      m_ctx.sim.config() = m_ctx.simCfg;
+      m_ctx.sim.resetTimer();
+      m_ctx.sim.refreshDerivedStats(m_ctx.world);
+      m_ctx.hasWorld = true;
+      m_ctx.dirtyDerived = false;
+      emitInfo("loaded: " + p);
+      continue;
+    }
+
+    if (cmd == "generate") {
+      const std::uint64_t seed = (m_ctx.seed == 0) ? 1 : m_ctx.seed;
+      m_ctx.world = GenerateWorld(m_ctx.w, m_ctx.h, seed, m_ctx.procCfg);
+      // Actual seed may differ (GenerateWorld keeps what you pass, but stay consistent).
+      m_ctx.seed = m_ctx.world.seed();
+      m_ctx.sim.config() = m_ctx.simCfg;
+      m_ctx.sim.resetTimer();
+      m_ctx.sim.refreshDerivedStats(m_ctx.world);
+      m_ctx.hasWorld = true;
+      m_ctx.dirtyDerived = false;
+      emitInfo("generated: " + std::to_string(m_ctx.w) + "x" + std::to_string(m_ctx.h) + " seed=" +
+               std::to_string(m_ctx.world.seed()));
+      continue;
+    }
+
+    if (cmd == "save") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      if (t.size() != 2) {
+        return fail(virtualPath, lineNo, "save expects: save <out.bin>");
+      }
+      const std::string p = expandPathTemplate(t[1]);
+      std::string err;
+      if (!SaveWorldBinary(m_ctx.world, m_ctx.procCfg, m_ctx.simCfg, p, err)) {
+        return fail(virtualPath, lineNo, "save failed: " + err);
+      }
+      emitInfo("saved: " + p);
+      continue;
+    }
+
+    // --- Blueprint commands (bp_*) ---
+    if (cmd == "bp_clear") {
+      m_ctx.blueprint = Blueprint{};
+      m_ctx.hasBlueprint = false;
+      emitInfo("bp: cleared");
+      continue;
+    }
+
+    if (cmd == "bp_info") {
+      if (!m_ctx.hasBlueprint) {
+        return fail(virtualPath, lineNo, "bp_info: no blueprint loaded");
+      }
+      std::ostringstream oss;
+      oss << "bp: " << m_ctx.blueprint.width << "x" << m_ctx.blueprint.height
+          << " deltas=" << m_ctx.blueprint.tiles.size();
+      emitInfo(oss.str());
+      continue;
+    }
+
+    if (cmd == "bp_capture") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      if (t.size() < 5) {
+        return fail(virtualPath, lineNo, "bp_capture expects: bp_capture x0 y0 w h [key value]...");
+      }
+      int x0 = 0, y0 = 0, w = 0, h = 0;
+      if (!ParseI32(t[1], &x0) || !ParseI32(t[2], &y0) || !ParseI32(t[3], &w) || !ParseI32(t[4], &h)) {
+        return fail(virtualPath, lineNo, "bp_capture: expected integers x0 y0 w h");
+      }
+
+      BlueprintCaptureOptions opt;
+      opt.fieldMask = static_cast<std::uint8_t>(TileFieldMask::Overlay) |
+                      static_cast<std::uint8_t>(TileFieldMask::Level) |
+                      static_cast<std::uint8_t>(TileFieldMask::District) |
+                      static_cast<std::uint8_t>(TileFieldMask::Variation);
+      opt.sparseByOverlay = true;
+      opt.zeroOccupants = true;
+
+      if (((t.size() - 5) % 2) != 0) {
+        return fail(virtualPath, lineNo, "bp_capture: options must be key/value pairs");
+      }
+
+      for (std::size_t i = 5; i + 1 < t.size(); i += 2) {
+        const std::string key = ToLower(t[i]);
+        const std::string val = t[i + 1];
+        if (key == "fields") {
+          std::string err;
+          if (!ParseTileFieldMaskList(val, &opt.fieldMask, &err)) {
+            return fail(virtualPath, lineNo, "bp_capture: " + err);
+          }
+        } else if (key == "sparse") {
+          bool b = false;
+          if (!ParseBool01(val, &b)) {
+            return fail(virtualPath, lineNo, "bp_capture: sparse expects 0|1");
+          }
+          opt.sparseByOverlay = b;
+        } else if (key == "zero_occ") {
+          bool b = false;
+          if (!ParseBool01(val, &b)) {
+            return fail(virtualPath, lineNo, "bp_capture: zero_occ expects 0|1");
+          }
+          opt.zeroOccupants = b;
+        } else {
+          return fail(virtualPath, lineNo, "bp_capture: unknown option: " + key);
+        }
+      }
+
+      Blueprint bp;
+      std::string err;
+      if (!CaptureBlueprintRect(m_ctx.world, x0, y0, w, h, bp, err, opt)) {
+        return fail(virtualPath, lineNo, "bp_capture failed: " + err);
+      }
+
+      m_ctx.blueprint = std::move(bp);
+      m_ctx.hasBlueprint = true;
+
+      std::ostringstream oss;
+      oss << "bp: captured " << w << "x" << h << " deltas=" << m_ctx.blueprint.tiles.size();
+      emitInfo(oss.str());
+      continue;
+    }
+
+    if (cmd == "bp_save") {
+      if (!m_ctx.hasBlueprint) {
+        return fail(virtualPath, lineNo, "bp_save: no blueprint loaded");
+      }
+      if (t.size() < 2) {
+        return fail(virtualPath, lineNo, "bp_save expects: bp_save <out.isobp> [compress none|sllz]");
+      }
+      const std::string p = expandPathTemplate(t[1]);
+
+      BlueprintCompression comp = BlueprintCompression::SLLZ;
+      if (t.size() > 2) {
+        if (t.size() != 4 || ToLower(t[2]) != "compress") {
+          return fail(virtualPath, lineNo, "bp_save expects: bp_save <out.isobp> [compress none|sllz]");
+        }
+        const std::string c = ToLower(t[3]);
+        if (c == "none") comp = BlueprintCompression::None;
+        else if (c == "sllz") comp = BlueprintCompression::SLLZ;
+        else return fail(virtualPath, lineNo, "bp_save: compress expects none|sllz");
+      }
+
+      std::string err;
+      if (!SaveBlueprintBinary(m_ctx.blueprint, p, err, comp)) {
+        return fail(virtualPath, lineNo, "bp_save failed: " + err);
+      }
+      emitInfo("bp: saved -> " + p);
+      continue;
+    }
+
+    if (cmd == "bp_load") {
+      if (t.size() != 2) {
+        return fail(virtualPath, lineNo, "bp_load expects: bp_load <bp.isobp>");
+      }
+      const std::string p = expandPathTemplate(t[1]);
+      std::string err;
+      Blueprint bp;
+      if (!LoadBlueprintBinary(bp, p, err)) {
+        return fail(virtualPath, lineNo, "bp_load failed: " + err);
+      }
+      m_ctx.blueprint = std::move(bp);
+      m_ctx.hasBlueprint = true;
+      emitInfo("bp: loaded -> " + p);
+      continue;
+    }
+
+    if (cmd == "bp_apply") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      if (!m_ctx.hasBlueprint) {
+        return fail(virtualPath, lineNo, "bp_apply: no blueprint loaded");
+      }
+      if (t.size() < 3) {
+        return fail(virtualPath, lineNo, "bp_apply expects: bp_apply dstX dstY [key value]...");
+      }
+      int dstX = 0, dstY = 0;
+      if (!ParseI32(t[1], &dstX) || !ParseI32(t[2], &dstY)) {
+        return fail(virtualPath, lineNo, "bp_apply: expected integers dstX dstY");
+      }
+
+      BlueprintApplyOptions opt;
+      opt.mode = BlueprintApplyMode::Stamp;
+      opt.fieldMask = 0xFFu;
+      opt.allowOutOfBounds = false;
+      opt.force = true;
+      opt.recomputeRoadMasks = true;
+      opt.transform.rotateDeg = 0;
+      opt.transform.mirrorX = false;
+      opt.transform.mirrorY = false;
+
+      if (((t.size() - 3) % 2) != 0) {
+        return fail(virtualPath, lineNo, "bp_apply: options must be key/value pairs");
+      }
+
+      for (std::size_t i = 3; i + 1 < t.size(); i += 2) {
+        const std::string key = ToLower(t[i]);
+        const std::string val = t[i + 1];
+        if (key == "mode") {
+          const std::string m = ToLower(val);
+          if (m == "replace") opt.mode = BlueprintApplyMode::Replace;
+          else if (m == "stamp") opt.mode = BlueprintApplyMode::Stamp;
+          else return fail(virtualPath, lineNo, "bp_apply: mode expects replace|stamp");
+        } else if (key == "fields") {
+          std::string err;
+          if (!ParseTileFieldMaskList(val, &opt.fieldMask, &err)) {
+            return fail(virtualPath, lineNo, "bp_apply: " + err);
+          }
+        } else if (key == "rotate") {
+          int r = 0;
+          if (!ParseI32(val, &r)) return fail(virtualPath, lineNo, "bp_apply: rotate expects 0|90|180|270");
+          opt.transform.rotateDeg = r;
+        } else if (key == "mirrorx") {
+          bool b = false;
+          if (!ParseBool01(val, &b)) return fail(virtualPath, lineNo, "bp_apply: mirrorx expects 0|1");
+          opt.transform.mirrorX = b;
+        } else if (key == "mirrory") {
+          bool b = false;
+          if (!ParseBool01(val, &b)) return fail(virtualPath, lineNo, "bp_apply: mirrory expects 0|1");
+          opt.transform.mirrorY = b;
+        } else if (key == "allow_oob") {
+          bool b = false;
+          if (!ParseBool01(val, &b)) return fail(virtualPath, lineNo, "bp_apply: allow_oob expects 0|1");
+          opt.allowOutOfBounds = b;
+        } else if (key == "force") {
+          bool b = false;
+          if (!ParseBool01(val, &b)) return fail(virtualPath, lineNo, "bp_apply: force expects 0|1");
+          opt.force = b;
+        } else if (key == "recompute_roads") {
+          bool b = false;
+          if (!ParseBool01(val, &b)) return fail(virtualPath, lineNo, "bp_apply: recompute_roads expects 0|1");
+          opt.recomputeRoadMasks = b;
+        } else {
+          return fail(virtualPath, lineNo, "bp_apply: unknown option: " + key);
+        }
+      }
+
+      std::string err;
+      if (!ApplyBlueprint(m_ctx.world, m_ctx.blueprint, dstX, dstY, opt, err)) {
+        return fail(virtualPath, lineNo, "bp_apply failed: " + err);
+      }
+
+      m_ctx.dirtyDerived = true;
+      emitInfo("bp: applied");
+      continue;
+    }
+
+    if (cmd == "money") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      if (t.size() != 2) {
+        return fail(virtualPath, lineNo, "money expects: money <N>");
+      }
+      int v = 0;
+      if (!ParseI32(t[1], &v)) {
+        return fail(virtualPath, lineNo, "money expects integer");
+      }
+      m_ctx.world.stats().money = v;
+      m_ctx.dirtyDerived = true;
+      continue;
+    }
+
+    if (cmd == "tick") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      if (t.size() != 2) {
+        return fail(virtualPath, lineNo, "tick expects: tick <N>");
+      }
+      int n = 0;
+      if (!ParseI32(t[1], &n) || n < 0) {
+        return fail(virtualPath, lineNo, "tick expects non-negative integer");
+      }
+
+      m_ctx.sim.config() = m_ctx.simCfg;
+      for (int i = 0; i < n; ++i) {
+        m_ctx.sim.stepOnce(m_ctx.world);
+        m_ctx.tickStats.push_back(m_ctx.world.stats());
+      }
+      m_ctx.dirtyDerived = false;
+      continue;
+    }
+
+    if (cmd == "autobuild") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      if (t.size() != 2) {
+        return fail(virtualPath, lineNo, "autobuild expects: autobuild <days>");
+      }
+      int n = 0;
+      if (!ParseI32(t[1], &n) || n < 0) {
+        return fail(virtualPath, lineNo, "autobuild expects non-negative integer days");
+      }
+      m_ctx.sim.config() = m_ctx.simCfg;
+      const AutoBuildReport rep = RunAutoBuild(m_ctx.world, m_ctx.sim, m_ctx.autoBuildCfg, n, &m_ctx.tickStats);
+      m_ctx.dirtyDerived = false;
+      std::ostringstream oss;
+      oss << "autobuild: daysSimulated=" << rep.daysSimulated
+          << " roadsBuilt=" << rep.roadsBuilt
+          << " roadsUpgraded=" << rep.roadsUpgraded
+          << " zonesBuilt=" << rep.zonesBuilt
+          << " parksBuilt=" << rep.parksBuilt
+          << " failedBuilds=" << rep.failedBuilds;
+      emitInfo(oss.str());
+      continue;
+    }
+
+    if (cmd == "stats_clear") {
+      m_ctx.tickStats.clear();
+      emitInfo("stats: cleared");
+      continue;
+    }
+
+    if (cmd == "stats_csv") {
+      if (t.size() != 2) {
+        return fail(virtualPath, lineNo, "stats_csv expects: stats_csv <out.csv>");
+      }
+      const std::string p = expandPathTemplate(t[1]);
+      std::string err;
+      if (!WriteStatsCsv(p, m_ctx.tickStats, err)) {
+        return fail(virtualPath, lineNo, "stats_csv failed: " + err);
+      }
+      emitInfo("wrote stats csv -> " + p);
+      continue;
+    }
+
+    // --- Editing commands ---
+    if (cmd == "road") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      if (t.size() != 3 && t.size() != 4) {
+        return fail(virtualPath, lineNo, "road expects: road x y [level]");
+      }
+      int x = 0, y = 0;
+      if (!ParseI32(t[1], &x) || !ParseI32(t[2], &y)) return false;
+      int level = 1;
+      if (t.size() == 4 && !ParseI32(t[3], &level)) return false;
+      ToolApplyResult r = ToolApplyResult::Noop;
+      if (!ApplyRoadTile(m_ctx.world, x, y, level, &r)) {
+        return fail(virtualPath, lineNo,
+                    "road failed at " + std::to_string(x) + ',' + std::to_string(y) + " (" +
+                        ToolApplyResultName(r) + ")");
+      }
+      m_ctx.dirtyDerived = true;
+      continue;
+    }
+
+    if (cmd == "road_line") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      if (t.size() != 5 && t.size() != 6) {
+        return fail(virtualPath, lineNo, "road_line expects: road_line x0 y0 x1 y1 [level]");
+      }
+      int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+      if (!ParseI32(t[1], &x0) || !ParseI32(t[2], &y0) || !ParseI32(t[3], &x1) || !ParseI32(t[4], &y1)) return false;
+      int level = 1;
+      if (t.size() == 6 && !ParseI32(t[5], &level)) return false;
+
+      bool ok = true;
+      Point failP{0, 0};
+      ToolApplyResult failR = ToolApplyResult::Noop;
+      ForEachLinePoint(Point{x0, y0}, Point{x1, y1}, [&](Point p) {
+        if (!ok) return;
+        if (!m_ctx.world.inBounds(p.x, p.y)) {
+          ok = false;
+          failP = p;
+          failR = ToolApplyResult::OutOfBounds;
+          return;
+        }
+        ToolApplyResult r = ToolApplyResult::Noop;
+        if (!ApplyRoadTile(m_ctx.world, p.x, p.y, level, &r)) {
+          ok = false;
+          failP = p;
+          failR = r;
+        }
+      });
+
+      if (!ok) {
+        return fail(virtualPath, lineNo,
+                    "road_line failed at " + std::to_string(failP.x) + ',' + std::to_string(failP.y) + " (" +
+                        ToolApplyResultName(failR) + ")");
+      }
+
+      m_ctx.dirtyDerived = true;
+      continue;
+    }
+
+    if (cmd == "road_path") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      if (t.size() < 5) {
+        return fail(virtualPath, lineNo,
+                    "road_path expects: road_path x0 y0 x1 y1 [level] [allowBridges 0|1] [costModel newtiles|money]");
+      }
+      int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+      if (!ParseI32(t[1], &x0) || !ParseI32(t[2], &y0) || !ParseI32(t[3], &x1) || !ParseI32(t[4], &y1)) return false;
+
+      int level = 1;
+      if (t.size() >= 6 && !ParseI32(t[5], &level)) return false;
+
+      bool allowBridges = false;
+      if (t.size() >= 7) {
+        if (!ParseBool01(t[6], &allowBridges)) return false;
+      }
+
+      RoadBuildPathConfig cfg;
+      cfg.targetLevel = level;
+      cfg.allowBridges = allowBridges;
+      cfg.costModel = RoadBuildPathConfig::CostModel::NewTiles;
+
+      if (t.size() >= 8) {
+        const std::string cm = ToLower(t[7]);
+        if (cm == "newtiles" || cm == "new_tiles") cfg.costModel = RoadBuildPathConfig::CostModel::NewTiles;
+        else if (cm == "money") cfg.costModel = RoadBuildPathConfig::CostModel::Money;
+        else {
+          return fail(virtualPath, lineNo, "road_path costModel must be newtiles|money");
+        }
+      }
+
+      std::vector<Point> path;
+      int cost = 0;
+      if (!FindRoadBuildPath(m_ctx.world, Point{x0, y0}, Point{x1, y1}, path, &cost, cfg)) {
+        return fail(virtualPath, lineNo, "road_path failed to find a path");
+      }
+
+      bool ok = true;
+      Point failP{0, 0};
+      ToolApplyResult failR = ToolApplyResult::Noop;
+
+      for (const Point& p : path) {
+        ToolApplyResult r = ToolApplyResult::Noop;
+        if (!ApplyRoadTile(m_ctx.world, p.x, p.y, level, &r)) {
+          ok = false;
+          failP = p;
+          failR = r;
+          break;
+        }
+      }
+
+      if (!ok) {
+        return fail(virtualPath, lineNo,
+                    "road_path failed at " + std::to_string(failP.x) + ',' + std::to_string(failP.y) + " (" +
+                        ToolApplyResultName(failR) + ")");
+      }
+      m_ctx.dirtyDerived = true;
+      continue;
+    }
+
+    if (cmd == "zone") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      if (t.size() != 4 && t.size() != 5) {
+        return fail(virtualPath, lineNo, "zone expects: zone <res|com|ind> x y [level]");
+      }
+      const std::string type = ToLower(t[1]);
+      int x = 0, y = 0;
+      if (!ParseI32(t[2], &x) || !ParseI32(t[3], &y)) return false;
+      int level = 1;
+      if (t.size() == 5 && !ParseI32(t[4], &level)) return false;
+
+      Tool tool = Tool::Residential;
+      if (type == "res" || type == "residential") tool = Tool::Residential;
+      else if (type == "com" || type == "commercial") tool = Tool::Commercial;
+      else if (type == "ind" || type == "industrial") tool = Tool::Industrial;
+      else return fail(virtualPath, lineNo, "zone expects type: res|com|ind");
+
+      ToolApplyResult r = ToolApplyResult::Noop;
+      if (!ApplyZoneTile(m_ctx.world, tool, x, y, level, &r)) {
+        return fail(virtualPath, lineNo,
+                    "zone failed at " + std::to_string(x) + ',' + std::to_string(y) + " (" + ToolApplyResultName(r) +
+                        ")");
+      }
+      m_ctx.dirtyDerived = true;
+      continue;
+    }
+
+    if (cmd == "park") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      if (t.size() != 3) {
+        return fail(virtualPath, lineNo, "park expects: park x y");
+      }
+      int x = 0, y = 0;
+      if (!ParseI32(t[1], &x) || !ParseI32(t[2], &y)) return false;
+      const ToolApplyResult r = m_ctx.world.applyTool(Tool::Park, x, y);
+      if (r != ToolApplyResult::Applied && r != ToolApplyResult::Noop) {
+        return fail(virtualPath, lineNo,
+                    "park failed at " + std::to_string(x) + ',' + std::to_string(y) + " (" + ToolApplyResultName(r) +
+                        ")");
+      }
+      m_ctx.dirtyDerived = true;
+      continue;
+    }
+
+    if (cmd == "bulldoze") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      if (t.size() != 3) {
+        return fail(virtualPath, lineNo, "bulldoze expects: bulldoze x y");
+      }
+      int x = 0, y = 0;
+      if (!ParseI32(t[1], &x) || !ParseI32(t[2], &y)) return false;
+      const ToolApplyResult r = m_ctx.world.applyTool(Tool::Bulldoze, x, y);
+      if (r != ToolApplyResult::Applied && r != ToolApplyResult::Noop) {
+        return fail(virtualPath, lineNo,
+                    "bulldoze failed at " + std::to_string(x) + ',' + std::to_string(y) + " (" +
+                        ToolApplyResultName(r) + ")");
+      }
+      m_ctx.dirtyDerived = true;
+      continue;
+    }
+
+    if (cmd == "district") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      if (t.size() != 4) {
+        return fail(virtualPath, lineNo, "district expects: district x y <id 0..7>");
+      }
+      int x = 0, y = 0, id = 0;
+      if (!ParseI32(t[1], &x) || !ParseI32(t[2], &y) || !ParseI32(t[3], &id)) return false;
+      id = std::clamp(id, 0, kDistrictCount - 1);
+      const ToolApplyResult r = m_ctx.world.applyDistrict(x, y, id);
+      if (r != ToolApplyResult::Applied && r != ToolApplyResult::Noop) {
+        return fail(virtualPath, lineNo,
+                    "district failed at " + std::to_string(x) + ',' + std::to_string(y) + " (" +
+                        ToolApplyResultName(r) + ")");
+      }
+      m_ctx.dirtyDerived = true;
+      continue;
+    }
+
+    if (cmd == "district_auto") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+
+      AutoDistrictConfig cfg;
+
+      if (t.size() >= 2 && !ParseI32(t[1], &cfg.districts)) {
+        return fail(virtualPath, lineNo, "district_auto: invalid districts");
+      }
+      cfg.districts = std::clamp(cfg.districts, 1, kDistrictCount);
+
+      if (t.size() >= 3 && !ParseBool01(t[2], &cfg.fillAllTiles)) {
+        return fail(virtualPath, lineNo, "district_auto: invalid fillAllTiles (use 0|1)");
+      }
+      if (t.size() >= 4 && !ParseBool01(t[3], &cfg.useTravelTime)) {
+        return fail(virtualPath, lineNo, "district_auto: invalid useTravelTime (use 0|1)");
+      }
+      if (t.size() >= 5 && !ParseBool01(t[4], &cfg.requireOutsideConnection)) {
+        return fail(virtualPath, lineNo, "district_auto: invalid requireOutside (use 0|1)");
+      }
+
+      // Derived systems might be required for travel-time weights.
+      RefreshIfDirty(m_ctx);
+
+      const AutoDistrictResult r = AutoAssignDistricts(m_ctx.world, cfg);
+      emitInfo("district_auto: requested=" + std::to_string(r.districtsRequested) + " used=" +
+               std::to_string(r.districtsUsed) + " seeds=" + std::to_string(r.seedRoadIdx.size()));
+
+      m_ctx.dirtyDerived = true;
+      continue;
+    }
+
+    if (cmd == "flood") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      if (t.size() < 4 || t.size() > 6) {
+        return fail(virtualPath, lineNo,
+                    "flood expects: flood <road|park|bulldoze|district|res|com|ind> x y [arg] [includeRoads 0|1]");
+      }
+
+      const std::string what = t[1];
+      const std::string whatLower = ToLower(what);
+
+      int x = 0, y = 0;
+      if (!ParseI32(t[2], &x) || !ParseI32(t[3], &y)) {
+        return fail(virtualPath, lineNo, "flood: invalid coordinates");
+      }
+
+      int arg = 0;
+      bool includeRoads = false;
+
+      const bool isParkOrBulldoze = (whatLower == "park" || whatLower == "bulldoze");
+      const bool isDistrict = (whatLower == "district");
+
+      if (isParkOrBulldoze) {
+        // No arg. Optional includeRoads.
+        if (t.size() >= 5 && !ParseBool01(t[4], &includeRoads)) {
+          return fail(virtualPath, lineNo, "flood: invalid includeRoads (use 0|1)");
+        }
+        if (t.size() == 6) {
+          return fail(virtualPath, lineNo, "flood: too many arguments for " + what);
+        }
+      } else {
+        // Arg is optional for road/zones, required for district.
+        if (isDistrict && t.size() < 5) {
+          return fail(virtualPath, lineNo, "flood district expects: flood district x y <id> [includeRoads 0|1]");
+        }
+
+        if (t.size() >= 5 && !ParseI32(t[4], &arg)) {
+          return fail(virtualPath, lineNo, "flood: invalid arg");
+        }
+        if (t.size() == 6 && !ParseBool01(t[5], &includeRoads)) {
+          return fail(virtualPath, lineNo, "flood: invalid includeRoads (use 0|1)");
+        }
+      }
+
+      Point failP{0, 0};
+      ToolApplyResult failR = ToolApplyResult::Noop;
+      if (!ApplyFlood(m_ctx.world, what, Point{x, y}, arg, includeRoads, &failP, &failR)) {
+        return fail(virtualPath, lineNo,
+                    "flood failed at " + std::to_string(failP.x) + ',' + std::to_string(failP.y) + " (" +
+                        ToolApplyResultName(failR) + ")");
+      }
+      m_ctx.dirtyDerived = true;
+      continue;
+    }
+
+    if (cmd == "fill") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      if (t.size() < 6 || t.size() > 7) {
+        return fail(virtualPath, lineNo, "fill expects: fill <tool> x0 y0 x1 y1 [arg]");
+      }
+
+      const std::string what = t[1];
+      int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+      if (!ParseI32(t[2], &x0) || !ParseI32(t[3], &y0) || !ParseI32(t[4], &x1) || !ParseI32(t[5], &y1)) {
+        return fail(virtualPath, lineNo, "fill: invalid coordinates");
+      }
+
+      int arg = 0;
+      if (t.size() == 7 && !ParseI32(t[6], &arg)) {
+        return fail(virtualPath, lineNo, "fill: invalid arg");
+      }
+
+      const std::string whatLower = ToLower(what);
+      const bool recognized =
+          (whatLower == "road" || whatLower == "park" || whatLower == "bulldoze" || whatLower == "district" ||
+           whatLower == "res" || whatLower == "residential" || whatLower == "com" || whatLower == "commercial" ||
+           whatLower == "ind" || whatLower == "industrial");
+      if (!recognized) {
+        return fail(virtualPath, lineNo, "unknown tool for fill: " + what);
+      }
+
+      Point failP{0, 0};
+      ToolApplyResult failR = ToolApplyResult::Noop;
+      if (!ApplyFill(m_ctx.world, what, Point{x0, y0}, Point{x1, y1}, arg, &failP, &failR)) {
+        return fail(virtualPath, lineNo,
+                    "fill failed at " + std::to_string(failP.x) + ',' + std::to_string(failP.y) + " (" +
+                        ToolApplyResultName(failR) + ")");
+      }
+      m_ctx.dirtyDerived = true;
+      continue;
+    }
+
+    if (cmd == "outline") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      if (t.size() < 6 || t.size() > 7) {
+        return fail(virtualPath, lineNo, "outline expects: outline <tool> x0 y0 x1 y1 [arg]");
+      }
+
+      const std::string what = t[1];
+      int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+      if (!ParseI32(t[2], &x0) || !ParseI32(t[3], &y0) || !ParseI32(t[4], &x1) || !ParseI32(t[5], &y1)) {
+        return fail(virtualPath, lineNo, "outline: invalid coordinates");
+      }
+
+      int arg = 0;
+      if (t.size() == 7 && !ParseI32(t[6], &arg)) {
+        return fail(virtualPath, lineNo, "outline: invalid arg");
+      }
+
+      const std::string whatLower = ToLower(what);
+      const bool recognized =
+          (whatLower == "road" || whatLower == "park" || whatLower == "bulldoze" || whatLower == "district" ||
+           whatLower == "res" || whatLower == "residential" || whatLower == "com" || whatLower == "commercial" ||
+           whatLower == "ind" || whatLower == "industrial");
+      if (!recognized) {
+        return fail(virtualPath, lineNo, "unknown tool for outline: " + what);
+      }
+
+      Point failP{0, 0};
+      ToolApplyResult failR = ToolApplyResult::Noop;
+      if (!ApplyOutline(m_ctx.world, what, Point{x0, y0}, Point{x1, y1}, arg, &failP, &failR)) {
+        return fail(virtualPath, lineNo,
+                    "outline failed at " + std::to_string(failP.x) + ',' + std::to_string(failP.y) + " (" +
+                        ToolApplyResultName(failR) + ")");
+      }
+      m_ctx.dirtyDerived = true;
+      continue;
+    }
+
+    // --- Artifacts / assertions ---
+    if (cmd == "export_ppm") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      if (t.size() != 3 && t.size() != 4) {
+        return fail(virtualPath, lineNo, "export_ppm expects: export_ppm <layer> <out.ppm> [scale]");
+      }
+
+      ExportLayer layer = ExportLayer::Overlay;
+      if (!ParseExportLayer(t[1], layer)) {
+        return fail(virtualPath, lineNo, "unknown export layer: " + t[1]);
+      }
+
+      int scale = 1;
+      if (t.size() == 4 && (!ParseI32(t[3], &scale) || scale <= 0)) {
+        return fail(virtualPath, lineNo, "scale must be > 0");
+      }
+
+      RefreshIfDirty(m_ctx);
+
+      // Compute derived fields on demand.
+      std::vector<std::uint8_t> roadToEdge;
+      const std::vector<std::uint8_t>* roadToEdgePtr = nullptr;
+      if (m_ctx.simCfg.requireOutsideConnection) {
+        ComputeRoadsConnectedToEdge(m_ctx.world, roadToEdge);
+        roadToEdgePtr = &roadToEdge;
+      }
+
+      TrafficResult traffic;
+      GoodsResult goods;
+      LandValueResult lv;
+
+      if (layer == ExportLayer::Traffic || layer == ExportLayer::LandValue || layer == ExportLayer::GoodsTraffic ||
+          layer == ExportLayer::GoodsFill) {
+        TrafficConfig tc;
+        tc.requireOutsideConnection = m_ctx.simCfg.requireOutsideConnection;
+        tc.congestionAwareRouting = m_ctx.sim.trafficModel().congestionAwareRouting;
+        tc.congestionIterations = m_ctx.sim.trafficModel().congestionIterations;
+        tc.congestionAlpha = m_ctx.sim.trafficModel().congestionAlpha;
+        tc.congestionBeta = m_ctx.sim.trafficModel().congestionBeta;
+        tc.congestionCapacityScale = m_ctx.sim.trafficModel().congestionCapacityScale;
+        tc.congestionRatioClamp = m_ctx.sim.trafficModel().congestionRatioClamp;
+
+        float employedShare = 1.0f;
+        const int pop = m_ctx.world.stats().population;
+        if (pop > 0) {
+          employedShare = static_cast<float>(m_ctx.world.stats().employed) / static_cast<float>(pop);
+        }
+
+        traffic = ComputeCommuteTraffic(m_ctx.world, tc, employedShare, roadToEdgePtr);
+      }
+
+      if (layer == ExportLayer::GoodsTraffic || layer == ExportLayer::GoodsFill || layer == ExportLayer::LandValue) {
+        GoodsConfig gc;
+        gc.requireOutsideConnection = m_ctx.simCfg.requireOutsideConnection;
+        goods = ComputeGoodsFlow(m_ctx.world, gc, roadToEdgePtr);
+      }
+
+      if (layer == ExportLayer::LandValue) {
+        LandValueConfig lvc;
+        lvc.requireOutsideConnection = m_ctx.simCfg.requireOutsideConnection;
+        lv = ComputeLandValue(m_ctx.world, lvc, &traffic, roadToEdgePtr);
+      }
+
+      const LandValueResult* lvPtr = (layer == ExportLayer::LandValue) ? &lv : nullptr;
+      const TrafficResult* trPtr =
+          (layer == ExportLayer::Traffic || layer == ExportLayer::LandValue) ? &traffic : nullptr;
+      const GoodsResult* gPtr = (layer == ExportLayer::GoodsTraffic || layer == ExportLayer::GoodsFill ||
+                                layer == ExportLayer::LandValue)
+                                   ? &goods
+                                   : nullptr;
+
+      PpmImage img = RenderPpmLayer(m_ctx.world, layer, lvPtr, trPtr, gPtr);
+      if (scale > 1) img = ScaleNearest(img, scale);
+
+      const std::string p = expandPathTemplate(t[2]);
+      std::string err;
+      if (!WritePpm(p, img, err)) {
+        return fail(virtualPath, lineNo, "export_ppm failed: " + err);
+      }
+
+      emitInfo(std::string("exported ") + ExportLayerName(layer) + " -> " + p);
+      continue;
+    }
+
+    if (cmd == "export_tiles_csv") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      if (t.size() != 2) {
+        return fail(virtualPath, lineNo, "export_tiles_csv expects: export_tiles_csv <out.csv>");
+      }
+      const std::string p = expandPathTemplate(t[1]);
+      std::string err;
+      if (!WriteTilesCsv(m_ctx.world, p, err)) {
+        return fail(virtualPath, lineNo, "export_tiles_csv failed: " + err);
+      }
+      emitInfo("exported tiles csv -> " + p);
+      continue;
+    }
+
+    if (cmd == "districts_json") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      if (t.size() != 2) {
+        return fail(virtualPath, lineNo, "districts_json expects: districts_json <out.json>");
+      }
+      RefreshIfDirty(m_ctx);
+      const std::string p = expandPathTemplate(t[1]);
+      if (!WriteDistrictsJsonFile(p, m_ctx.world, m_ctx.simCfg)) {
+        return fail(virtualPath, lineNo, "districts_json failed");
+      }
+      emitInfo("exported districts json -> " + p);
+      continue;
+    }
+
+    if (cmd == "hash") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      RefreshIfDirty(m_ctx);
+      const std::uint64_t h = HashWorld(m_ctx.world, true);
+      emitPrint(HexU64(h));
+      continue;
+    }
+
+    if (cmd == "expect_hash") {
+      if (!EnsureWorld(m_ctx, *this, virtualPath, lineNo)) return false;
+      if (t.size() != 2) {
+        return fail(virtualPath, lineNo, "expect_hash expects: expect_hash <u64|0x...>");
+      }
+      std::uint64_t want = 0;
+      if (!ParseU64(t[1], &want)) {
+        return fail(virtualPath, lineNo, "invalid hash integer");
+      }
+      RefreshIfDirty(m_ctx);
+      const std::uint64_t got = HashWorld(m_ctx.world, true);
+      if (got != want) {
+        emitError("expect_hash FAILED");
+        emitError("  want: " + HexU64(want));
+        emitError("  got:  " + HexU64(got));
+        return false;
+      }
+      continue;
+    }
+
+    return fail(virtualPath, lineNo, "unknown command: " + t[0]);
+  }
+
+  return true;
+}
+
+} // namespace isocity

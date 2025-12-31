@@ -29,7 +29,8 @@ constexpr std::uint32_t kVersionV5 = 5; // v4 + height deltas (terraforming)
 constexpr std::uint32_t kVersionV6 = 6; // v5 + SimConfig (policy/economy settings)
 constexpr std::uint32_t kVersionV7 = 7; // v6 + districts + district policy multipliers
 constexpr std::uint32_t kVersionV8 = 8; // v7 + compressed delta payload
-constexpr std::uint32_t kVersionCurrent = kVersionV8;
+constexpr std::uint32_t kVersionV9 = 9; // v8 + ProcGen erosion config
+constexpr std::uint32_t kVersionCurrent = kVersionV9;
 
 // --- CRC32 ---
 // Used by v3+ saves to detect corruption/truncation.
@@ -329,6 +330,72 @@ void FromBin(ProcGenConfig& cfg, const ProcGenConfigBin& b)
   cfg.extraConnections = static_cast<int>(b.extraConnections);
   cfg.zoneChance = b.zoneChance;
   cfg.parkChance = b.parkChance;
+
+  // Older save versions did not persist erosion settings. Default to disabled and let newer versions override.
+  cfg.erosion = ErosionConfig{};
+  cfg.erosion.enabled = false;
+}
+
+
+
+struct ErosionConfigBin {
+  std::uint8_t enabled = 1;
+  std::uint8_t riversEnabled = 1;
+  std::uint8_t _pad0 = 0;
+  std::uint8_t _pad1 = 0;
+
+  std::int32_t thermalIterations = 20;
+  float thermalTalus = 0.02f;
+  float thermalRate = 0.50f;
+
+  std::int32_t riverMinAccum = 0;
+  float riverCarve = 0.055f;
+  float riverCarvePower = 0.60f;
+
+  std::int32_t smoothIterations = 1;
+  float smoothRate = 0.25f;
+
+  std::int32_t quantizeScale = 4096;
+};
+
+ErosionConfigBin ToBin(const ErosionConfig& cfg)
+{
+  ErosionConfigBin b;
+  b.enabled = static_cast<std::uint8_t>(cfg.enabled ? 1 : 0);
+  b.riversEnabled = static_cast<std::uint8_t>(cfg.riversEnabled ? 1 : 0);
+
+  b.thermalIterations = static_cast<std::int32_t>(cfg.thermalIterations);
+  b.thermalTalus = cfg.thermalTalus;
+  b.thermalRate = cfg.thermalRate;
+
+  b.riverMinAccum = static_cast<std::int32_t>(cfg.riverMinAccum);
+  b.riverCarve = cfg.riverCarve;
+  b.riverCarvePower = cfg.riverCarvePower;
+
+  b.smoothIterations = static_cast<std::int32_t>(cfg.smoothIterations);
+  b.smoothRate = cfg.smoothRate;
+
+  b.quantizeScale = static_cast<std::int32_t>(cfg.quantizeScale);
+  return b;
+}
+
+void FromBin(ErosionConfig& cfg, const ErosionConfigBin& b)
+{
+  cfg.enabled = (b.enabled != 0);
+  cfg.riversEnabled = (b.riversEnabled != 0);
+
+  cfg.thermalIterations = static_cast<int>(b.thermalIterations);
+  cfg.thermalTalus = b.thermalTalus;
+  cfg.thermalRate = b.thermalRate;
+
+  cfg.riverMinAccum = static_cast<int>(b.riverMinAccum);
+  cfg.riverCarve = b.riverCarve;
+  cfg.riverCarvePower = b.riverCarvePower;
+
+  cfg.smoothIterations = static_cast<int>(b.smoothIterations);
+  cfg.smoothRate = b.smoothRate;
+
+  cfg.quantizeScale = static_cast<int>(b.quantizeScale);
 }
 
 struct SimConfigBin {
@@ -1462,6 +1529,133 @@ bool LoadBodyV8(std::istream& is, std::uint32_t w, std::uint32_t h, std::uint64_
   return true;
 }
 
+bool LoadBodyV9(std::istream& is, std::uint32_t w, std::uint32_t h, std::uint64_t seed, World& outWorld,
+                ProcGenConfig& outProcCfg, SimConfig& outSimCfg, std::string& outError)
+{
+  // v9: v8 + ProcGen erosion config.
+  //
+  // Payload:
+  //   ProcGenConfigBin
+  //   ErosionConfigBin
+  //   StatsBin
+  //   SimConfigBin
+  //   u8 districtPoliciesEnabled
+  //   DistrictPolicyBin[kDistrictCount]
+  //   u8 compressionMethod (0=None, 1=SLLZ)
+  //   varint(uncompressedSize)
+  //   varint(storedSize)
+  //   stored bytes
+  //
+  // The uncompressed bytes are a v7-style delta stream (see ApplyDeltasV7).
+
+  ProcGenConfigBin pcb{};
+  if (!Read(is, pcb)) {
+    outError = "Read failed (procgen config)";
+    return false;
+  }
+  FromBin(outProcCfg, pcb);
+
+  ErosionConfigBin ecb{};
+  if (!Read(is, ecb)) {
+    outError = "Read failed (erosion config)";
+    return false;
+  }
+  FromBin(outProcCfg.erosion, ecb);
+
+  StatsBin sb{};
+  if (!Read(is, sb)) {
+    outError = "Read failed (stats)";
+    return false;
+  }
+
+  SimConfigBin scb{};
+  if (!Read(is, scb)) {
+    outError = "Read failed (sim config)";
+    return false;
+  }
+  FromBin(outSimCfg, scb);
+
+  // District policy chunk (v7+).
+  std::uint8_t dpEnabled = 0;
+  if (!Read(is, dpEnabled)) {
+    outError = "Read failed (district policy enabled)";
+    return false;
+  }
+  outSimCfg.districtPoliciesEnabled = (dpEnabled != 0);
+
+  for (int d = 0; d < kDistrictCount; ++d) {
+    DistrictPolicyBin dpb{};
+    if (!Read(is, dpb)) {
+      outError = "Read failed (district policy)";
+      return false;
+    }
+    FromBin(outSimCfg.districtPolicies[static_cast<std::size_t>(d)], dpb);
+  }
+
+  // Compressed delta payload.
+  std::uint8_t methodU8 = 0;
+  if (!Read(is, methodU8)) {
+    outError = "Read failed (compression method)";
+    return false;
+  }
+
+  std::uint32_t uncompressedSize = 0;
+  std::uint32_t storedSize = 0;
+  if (!ReadVarU32(is, uncompressedSize) || !ReadVarU32(is, storedSize)) {
+    outError = "Read failed (compressed payload sizes)";
+    return false;
+  }
+
+  const std::uint64_t tileCount = static_cast<std::uint64_t>(w) * static_cast<std::uint64_t>(h);
+  const std::uint64_t maxReasonable = tileCount * 32ull + 1024ull;
+  if (static_cast<std::uint64_t>(uncompressedSize) > maxReasonable || static_cast<std::uint64_t>(storedSize) > maxReasonable) {
+    outError = "Invalid compressed payload size";
+    return false;
+  }
+
+  std::vector<std::uint8_t> stored(storedSize);
+  if (storedSize > 0) {
+    is.read(reinterpret_cast<char*>(stored.data()), static_cast<std::streamsize>(storedSize));
+    if (!is.good()) {
+      outError = "Read failed (compressed payload bytes)";
+      return false;
+    }
+  }
+
+  std::vector<std::uint8_t> delta;
+  if (methodU8 == static_cast<std::uint8_t>(CompressionMethod::None)) {
+    if (storedSize != uncompressedSize) {
+      outError = "Invalid payload sizes for uncompressed delta stream";
+      return false;
+    }
+    delta = std::move(stored);
+  } else if (methodU8 == static_cast<std::uint8_t>(CompressionMethod::SLLZ)) {
+    std::string decErr;
+    if (!DecompressSLLZ(stored.data(), stored.size(), static_cast<std::size_t>(uncompressedSize), delta, decErr)) {
+      outError = "Delta payload decompression failed: " + decErr;
+      return false;
+    }
+  } else {
+    outError = "Unknown compression method in save file";
+    return false;
+  }
+
+  World loaded = GenerateWorld(static_cast<int>(w), static_cast<int>(h), seed, outProcCfg);
+
+  // Parse delta stream from an in-memory buffer.
+  std::string deltaStr(reinterpret_cast<const char*>(delta.data()), delta.size());
+  std::istringstream ds(deltaStr, std::ios::binary);
+  if (!ApplyDeltasV7(ds, w, h, loaded, outProcCfg, outError)) {
+    return false;
+  }
+
+  FromBin(loaded.stats(), sb);
+  outWorld = std::move(loaded);
+  return true;
+}
+
+
+
 } // namespace
 
 bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::string& outError, bool verifyCrc)
@@ -1561,7 +1755,52 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
     outSummary.procCfg.extraConnections = static_cast<int>(pcb.extraConnections);
     outSummary.procCfg.zoneChance = pcb.zoneChance;
     outSummary.procCfg.parkChance = pcb.parkChance;
-    outSummary.hasProcCfg = true;
+    
+    // Erosion config (v9+). Older versions did not persist it.
+    if (version >= kVersionV9) {
+      struct ErosionConfigBinLocal {
+        std::uint8_t enabled = 1;
+        std::uint8_t riversEnabled = 1;
+        std::uint8_t _pad0 = 0;
+        std::uint8_t _pad1 = 0;
+
+        std::int32_t thermalIterations = 20;
+        float thermalTalus = 0.02f;
+        float thermalRate = 0.50f;
+
+        std::int32_t riverMinAccum = 0;
+        float riverCarve = 0.055f;
+        float riverCarvePower = 0.60f;
+
+        std::int32_t smoothIterations = 1;
+        float smoothRate = 0.25f;
+
+        std::int32_t quantizeScale = 4096;
+      };
+
+      ErosionConfigBinLocal ecb{};
+      if (!readPOD(ecb)) {
+        outError = "Read failed (erosion config)";
+        return false;
+      }
+
+      outSummary.procCfg.erosion.enabled = (ecb.enabled != 0);
+      outSummary.procCfg.erosion.riversEnabled = (ecb.riversEnabled != 0);
+      outSummary.procCfg.erosion.thermalIterations = static_cast<int>(ecb.thermalIterations);
+      outSummary.procCfg.erosion.thermalTalus = ecb.thermalTalus;
+      outSummary.procCfg.erosion.thermalRate = ecb.thermalRate;
+      outSummary.procCfg.erosion.riverMinAccum = static_cast<int>(ecb.riverMinAccum);
+      outSummary.procCfg.erosion.riverCarve = ecb.riverCarve;
+      outSummary.procCfg.erosion.riverCarvePower = ecb.riverCarvePower;
+      outSummary.procCfg.erosion.smoothIterations = static_cast<int>(ecb.smoothIterations);
+      outSummary.procCfg.erosion.smoothRate = ecb.smoothRate;
+      outSummary.procCfg.erosion.quantizeScale = static_cast<int>(ecb.quantizeScale);
+    } else {
+      outSummary.procCfg.erosion = ErosionConfig{};
+      outSummary.procCfg.erosion.enabled = false;
+    }
+
+outSummary.hasProcCfg = true;
 
     StatsBinLocal sb{};
     if (!readPOD(sb)) {
@@ -1660,51 +1899,52 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
     outSummary.crcOk = ok;
   }
 
+  
+
   return true;
 }
 
-bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const SimConfig& simCfg, const std::string& path, std::string& outError)
+
+namespace {
+
+struct Crc32VecWriter {
+  explicit Crc32VecWriter(std::vector<std::uint8_t>& out_) : out(out_) {}
+
+  std::vector<std::uint8_t>& out;
+  std::uint32_t crc = 0xFFFFFFFFu;
+
+  bool writeBytes(const void* data, std::size_t size)
+  {
+    const auto* p = reinterpret_cast<const std::uint8_t*>(data);
+    out.insert(out.end(), p, p + size);
+    crc = Crc32Update(crc, p, size);
+    return true;
+  }
+
+  template <typename T>
+  bool write(const T& v)
+  {
+    static_assert(std::is_trivially_copyable_v<T>);
+    return writeBytes(&v, sizeof(T));
+  }
+
+  std::uint32_t finalize() const { return crc ^ 0xFFFFFFFFu; }
+};
+
+// Append a trivially-copyable POD to a byte vector without any endianness conversion.
+// This matches the on-disk save format (native little-endian on supported platforms).
+template <typename T>
+void AppendPOD(std::vector<std::uint8_t>& out, const T& v)
 {
-  outError.clear();
+  static_assert(std::is_trivially_copyable_v<T>);
+  const auto* p = reinterpret_cast<const std::uint8_t*>(&v);
+  out.insert(out.end(), p, p + sizeof(T));
+}
 
-  namespace fs = std::filesystem;
-
-  if (path.empty()) {
-    outError = "Save path is empty";
-    return false;
-  }
-
-  const fs::path outPath(path);
-  fs::path tmpPath = outPath;
-  tmpPath += ".tmp";
-  fs::path bakPath = outPath;
-  bakPath += ".bak";
-
-  std::error_code ec;
-
-  // Ensure the parent directory exists (if specified).
-  const fs::path parent = outPath.parent_path();
-  if (!parent.empty()) {
-    fs::create_directories(parent, ec);
-    if (ec) {
-      outError = "Unable to create save directory: " + parent.string() + " (" + ec.message() + ")";
-      return false;
-    }
-  }
-
-  // Remove a stale temp file from a prior failed/crashed save.
-  fs::remove(tmpPath, ec);
-
-  std::ofstream f(tmpPath, std::ios::binary | std::ios::trunc);
-  if (!f) {
-    outError = "Unable to open file for writing: " + tmpPath.string();
-    return false;
-  }
-
-
-  // v3+ computes a CRC32 over the whole file (excluding the final CRC field).
-  Crc32OStreamWriter cw(f);
-
+template <typename Writer>
+bool WriteWorldBinaryPayload(Writer& cw, const World& world, const ProcGenConfig& procCfg, const SimConfig& simCfg,
+                             std::string& outError)
+{
   // Header
   if (!cw.writeBytes(kMagic, sizeof(kMagic))) {
     outError = "Write failed (magic)";
@@ -1729,6 +1969,13 @@ bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const Sim
   const ProcGenConfigBin pcb = ToBin(procCfg);
   if (!cw.write(pcb)) {
     outError = "Write failed (procgen config)";
+    return false;
+  }
+
+  // Erosion config (v9+).
+  const ErosionConfigBin ecb = ToBin(procCfg.erosion);
+  if (!cw.write(ecb)) {
+    outError = "Write failed (erosion config)";
     return false;
   }
 
@@ -1786,7 +2033,8 @@ bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const Sim
       if (cur.overlay != base.overlay || cur.level != base.level || cur.district != base.district ||
           cur.occupants != base.occupants) {
         const std::uint32_t idx = static_cast<std::uint32_t>(y * world.width() + x);
-        const std::uint8_t d = static_cast<std::uint8_t>(std::clamp<int>(static_cast<int>(cur.district), 0, kDistrictCount - 1));
+        const std::uint8_t d = static_cast<std::uint8_t>(
+            std::clamp<int>(static_cast<int>(cur.district), 0, kDistrictCount - 1));
         diffs.push_back(Diff{idx, static_cast<std::uint8_t>(cur.overlay), cur.level, d, cur.occupants});
       }
     }
@@ -1932,6 +2180,87 @@ bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const Sim
     return false;
   }
 
+  return true;
+}
+
+bool VerifyCrc32Bytes(const std::uint8_t* data, std::size_t size, bool& outOk, std::string& outError)
+{
+  outError.clear();
+  outOk = true;
+
+  if (!data || size < sizeof(std::uint32_t)) {
+    outError = "Save buffer too small for CRC32";
+    return false;
+  }
+
+  const std::size_t payloadSize = size - sizeof(std::uint32_t);
+  std::uint32_t crc = 0xFFFFFFFFu;
+  crc = Crc32Update(crc, data, payloadSize);
+
+  std::uint32_t expected = 0;
+  std::memcpy(&expected, data + payloadSize, sizeof(expected));
+
+  const std::uint32_t computed = crc ^ 0xFFFFFFFFu;
+  outOk = (computed == expected);
+  return true;
+}
+
+class SpanStreamBuf : public std::streambuf {
+public:
+  SpanStreamBuf(const std::uint8_t* data, std::size_t size)
+  {
+    char* p = const_cast<char*>(reinterpret_cast<const char*>(data));
+    setg(p, p, p + static_cast<std::ptrdiff_t>(size));
+  }
+};
+
+} // namespace
+
+bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const SimConfig& simCfg, const std::string& path, std::string& outError)
+{
+  outError.clear();
+
+  namespace fs = std::filesystem;
+
+  if (path.empty()) {
+    outError = "Save path is empty";
+    return false;
+  }
+
+  const fs::path outPath(path);
+  fs::path tmpPath = outPath;
+  tmpPath += ".tmp";
+  fs::path bakPath = outPath;
+  bakPath += ".bak";
+
+  std::error_code ec;
+
+  // Ensure the parent directory exists (if specified).
+  const fs::path parent = outPath.parent_path();
+  if (!parent.empty()) {
+    fs::create_directories(parent, ec);
+    if (ec) {
+      outError = "Unable to create save directory: " + parent.string() + " (" + ec.message() + ")";
+      return false;
+    }
+  }
+
+  // Remove a stale temp file from a prior failed/crashed save.
+  fs::remove(tmpPath, ec);
+
+  std::ofstream f(tmpPath, std::ios::binary | std::ios::trunc);
+  if (!f) {
+    outError = "Unable to open file for writing: " + tmpPath.string();
+    return false;
+  }
+
+  // v3+ computes a CRC32 over the whole file (excluding the final CRC field).
+  Crc32OStreamWriter cw(f);
+
+  if (!WriteWorldBinaryPayload(cw, world, procCfg, simCfg, outError)) {
+    return false;
+  }
+
   // CRC32 (v3) - appended at the end and NOT included in the CRC itself.
   const std::uint32_t crc = cw.finalize();
   if (!Write(f, crc)) {
@@ -1979,6 +2308,7 @@ bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const Sim
 }
 
 
+
 bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const std::string& path, std::string& outError)
 {
   // Back-compat helper: use the default sim config (v6+ stores SimConfig).
@@ -1989,6 +2319,34 @@ bool SaveWorldBinary(const World& world, const std::string& path, std::string& o
 {
   // Back-compat helper: use the default procgen + sim configs.
   return SaveWorldBinary(world, ProcGenConfig{}, SimConfig{}, path, outError);
+}
+
+bool SaveWorldBinaryToBytes(const World& world, const ProcGenConfig& procCfg, const SimConfig& simCfg,
+                            std::vector<std::uint8_t>& outBytes, std::string& outError)
+{
+  outError.clear();
+  outBytes.clear();
+
+  Crc32VecWriter cw(outBytes);
+  if (!WriteWorldBinaryPayload(cw, world, procCfg, simCfg, outError)) {
+    outBytes.clear();
+    return false;
+  }
+
+  const std::uint32_t crc = cw.finalize();
+  AppendPOD(outBytes, crc);
+  return true;
+}
+
+bool SaveWorldBinaryToBytes(const World& world, const ProcGenConfig& procCfg, std::vector<std::uint8_t>& outBytes,
+                            std::string& outError)
+{
+  return SaveWorldBinaryToBytes(world, procCfg, SimConfig{}, outBytes, outError);
+}
+
+bool SaveWorldBinaryToBytes(const World& world, std::vector<std::uint8_t>& outBytes, std::string& outError)
+{
+  return SaveWorldBinaryToBytes(world, ProcGenConfig{}, SimConfig{}, outBytes, outError);
 }
 
 bool LoadWorldBinary(World& outWorld, ProcGenConfig& outProcCfg, SimConfig& outSimCfg, const std::string& path, std::string& outError)
@@ -2022,7 +2380,7 @@ bool LoadWorldBinary(World& outWorld, ProcGenConfig& outProcCfg, SimConfig& outS
   }
 
   if (version == kVersionV3 || version == kVersionV4 || version == kVersionV5 || version == kVersionV6 ||
-      version == kVersionV7 || version == kVersionV8) {
+      version == kVersionV7 || version == kVersionV8 || version == kVersionV9) {
     // v3+ saves append a CRC32 at the end of the file.
     //
     // We validate the CRC before parsing to detect corruption/truncation.
@@ -2063,14 +2421,19 @@ bool LoadWorldBinary(World& outWorld, ProcGenConfig& outProcCfg, SimConfig& outS
       return LoadBodyV7(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
     }
 
-    // v8: same as v7 but with a compressed delta payload.
-    return LoadBodyV8(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
+    if (version == kVersionV8) {
+      // v8: same as v7 but with a compressed delta payload.
+      return LoadBodyV8(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
+    }
+
+    // v9: v8 + ProcGen erosion config.
+    return LoadBodyV9(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
   }
 
   std::ostringstream oss;
   oss << "Unsupported save version: " << version << " (supported: " << kVersionV1 << ", " << kVersionV2 << ", "
       << kVersionV3 << ", " << kVersionV4 << ", " << kVersionV5 << ", " << kVersionV6 << ", "
-      << kVersionV7 << ", " << kVersionV8 << ")";
+      << kVersionV7 << ", " << kVersionV8 << ", " << kVersionV9 << ")";
   outError = oss.str();
   return false;
 }
@@ -2086,6 +2449,94 @@ bool LoadWorldBinary(World& outWorld, const std::string& path, std::string& outE
   ProcGenConfig cfg;
   SimConfig simCfg;
   return LoadWorldBinary(outWorld, cfg, simCfg, path, outError);
+}
+
+
+bool LoadWorldBinaryFromBytes(World& outWorld, ProcGenConfig& outProcCfg, SimConfig& outSimCfg, const std::uint8_t* data,
+                              std::size_t size, std::string& outError)
+{
+  outError.clear();
+  outSimCfg = SimConfig{};
+
+  if (!data || size == 0) {
+    outError = "Save buffer is empty";
+    return false;
+  }
+
+  SpanStreamBuf buf(data, size);
+  std::istream f(&buf);
+
+  std::uint32_t version = 0;
+  std::uint32_t w = 0;
+  std::uint32_t h = 0;
+  std::uint64_t seed = 0;
+
+  if (!ReadAndValidateHeader(f, version, w, h, seed, outError)) {
+    return false;
+  }
+
+  if (version == kVersionV1) {
+    outSimCfg = SimConfig{};
+    return LoadBodyV1(f, w, h, seed, outWorld, outProcCfg, outError);
+  }
+
+  if (version == kVersionV2) {
+    outSimCfg = SimConfig{};
+    return LoadBodyV2(f, w, h, seed, outWorld, outProcCfg, outError);
+  }
+
+  if (version == kVersionV3 || version == kVersionV4 || version == kVersionV5 || version == kVersionV6 ||
+      version == kVersionV7 || version == kVersionV8 || version == kVersionV9) {
+    // v3+ saves append a CRC32 at the end of the file.
+    //
+    // For in-memory loads we validate the CRC over the buffer (excluding the final CRC field).
+    bool crcOk = true;
+    std::string crcErr;
+    if (!VerifyCrc32Bytes(data, size, crcOk, crcErr)) {
+      outError = crcErr;
+      return false;
+    }
+    if (!crcOk) {
+      outError = "Save file CRC mismatch (buffer is corrupted or incomplete)";
+      return false;
+    }
+
+    if (version == kVersionV3) {
+      outSimCfg = SimConfig{};
+      return LoadBodyV2(f, w, h, seed, outWorld, outProcCfg, outError);
+    }
+    if (version == kVersionV4) {
+      outSimCfg = SimConfig{};
+      return LoadBodyV4(f, w, h, seed, outWorld, outProcCfg, outError);
+    }
+    if (version == kVersionV5) {
+      // v5 saves did not include SimConfig.
+      outSimCfg = SimConfig{};
+      return LoadBodyV5(f, w, h, seed, outWorld, outProcCfg, outError);
+    }
+    if (version == kVersionV6) {
+      return LoadBodyV6(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
+    }
+    if (version == kVersionV7) {
+      // v7: includes per-tile districts + district policy multipliers.
+      return LoadBodyV7(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
+    }
+
+    if (version == kVersionV8) {
+      // v8: same as v7 but with a compressed delta payload.
+      return LoadBodyV8(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
+    }
+
+    // v9: v8 + ProcGen erosion config.
+    return LoadBodyV9(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
+  }
+
+  std::ostringstream oss;
+  oss << "Unsupported save version: " << version << " (supported: " << kVersionV1 << ", " << kVersionV2 << ", "
+      << kVersionV3 << ", " << kVersionV4 << ", " << kVersionV5 << ", " << kVersionV6 << ", "
+      << kVersionV7 << ", " << kVersionV8 << ", " << kVersionV9 << ")";
+  outError = oss.str();
+  return false;
 }
 
 } // namespace isocity

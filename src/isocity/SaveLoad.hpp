@@ -4,7 +4,10 @@
 #include "isocity/Sim.hpp"
 #include "isocity/World.hpp"
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace isocity {
 
@@ -51,6 +54,7 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
 // v6: v5 + SimConfig (persists policy/economy settings)
 // v7: v6 + districts (per-tile district IDs) + optional district policy multipliers
 // v8: v7 + compressed delta payload (smaller saves; faster disk IO)
+// v9: v8 + ProcGen erosion config
 
 // Save using an explicit ProcGenConfig + SimConfig (recommended for v2+ delta saves).
 bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const SimConfig& simCfg, const std::string& path,
@@ -66,6 +70,7 @@ bool SaveWorldBinary(const World& world, const std::string& path, std::string& o
 // v6+ saves also return the SimConfig stored in the file; v5 and older return SimConfig{}.
 // v7 additionally persists per-tile district IDs and optional district policy multipliers.
 // v8 stores the same data as v7 but compresses the delta section.
+// v9 additionally persists ProcGen erosion settings.
 bool LoadWorldBinary(World& outWorld, ProcGenConfig& outProcCfg, SimConfig& outSimCfg, const std::string& path,
                      std::string& outError);
 
@@ -74,5 +79,46 @@ bool LoadWorldBinary(World& outWorld, ProcGenConfig& outProcCfg, const std::stri
 
 // Back-compat helper: load and discard ProcGenConfig + SimConfig.
 bool LoadWorldBinary(World& outWorld, const std::string& path, std::string& outError);
+
+
+// In-memory save/load variants.
+//
+// These are useful for embedding saves inside higher-level containers (e.g. replay/journaling
+// systems) without touching the filesystem. The binary format is identical to the on-disk
+// SaveWorldBinary format (including CRC for v3+ saves).
+bool SaveWorldBinaryToBytes(const World& world, const ProcGenConfig& procCfg, const SimConfig& simCfg,
+                            std::vector<std::uint8_t>& outBytes, std::string& outError);
+
+// Back-compat helper: save using the default SimConfig{}.
+bool SaveWorldBinaryToBytes(const World& world, const ProcGenConfig& procCfg, std::vector<std::uint8_t>& outBytes,
+                            std::string& outError);
+
+// Back-compat helper: save using ProcGenConfig{} and SimConfig{}.
+bool SaveWorldBinaryToBytes(const World& world, std::vector<std::uint8_t>& outBytes, std::string& outError);
+
+bool LoadWorldBinaryFromBytes(World& outWorld, ProcGenConfig& outProcCfg, SimConfig& outSimCfg, const std::uint8_t* data,
+                              std::size_t size, std::string& outError);
+
+inline bool LoadWorldBinaryFromBytes(World& outWorld, ProcGenConfig& outProcCfg, SimConfig& outSimCfg,
+                                     const std::vector<std::uint8_t>& bytes, std::string& outError)
+{
+  return LoadWorldBinaryFromBytes(outWorld, outProcCfg, outSimCfg, bytes.data(), bytes.size(), outError);
+}
+
+// Back-compat helper: load and discard SimConfig.
+inline bool LoadWorldBinaryFromBytes(World& outWorld, ProcGenConfig& outProcCfg, const std::vector<std::uint8_t>& bytes,
+                                     std::string& outError)
+{
+  SimConfig simCfg;
+  return LoadWorldBinaryFromBytes(outWorld, outProcCfg, simCfg, bytes, outError);
+}
+
+// Back-compat helper: load and discard ProcGenConfig + SimConfig.
+inline bool LoadWorldBinaryFromBytes(World& outWorld, const std::vector<std::uint8_t>& bytes, std::string& outError)
+{
+  ProcGenConfig procCfg;
+  SimConfig simCfg;
+  return LoadWorldBinaryFromBytes(outWorld, procCfg, simCfg, bytes, outError);
+}
 
 } // namespace isocity

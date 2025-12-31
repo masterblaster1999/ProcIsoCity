@@ -48,12 +48,12 @@ ctest --test-dir build-tests --output-on-failure
 
 - `PROCISOCITY_BUILD_APP` (default: ON) — build the interactive raylib app (`proc_isocity`).
 - `PROCISOCITY_BUILD_TESTS` (default: OFF) — build `proc_isocity_tests` and enable `ctest`.
-- `PROCISOCITY_BUILD_CLI` (default: ON) — build headless command-line tools (`proc_isocity_cli`, `proc_isocity_diff`, `proc_isocity_inspect`).
+- `PROCISOCITY_BUILD_CLI` (default: ON) — build headless command-line tools (`proc_isocity_cli`, `proc_isocity_diff`, `proc_isocity_inspect`, `proc_isocity_patch`, `proc_isocity_script`, `proc_isocity_replay`, `proc_isocity_blueprint`).
 - `PROCISOCITY_USE_SYSTEM_RAYLIB` (default: OFF) — when building the app, use a system raylib instead of FetchContent.
 
 ### Headless CLI tools (optional)
 
-If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a couple of **headless** utilities that don't require raylib:
+If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **headless** utilities that don't require raylib:
 
 - `proc_isocity_cli`: generate a world (or load a save), step the simulation, and write artifacts:
   - JSON summary (`--out`)
@@ -74,6 +74,50 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a couple of *
 
   ```bash
   ./build/proc_isocity_diff saveA.bin saveB.bin --ppm diff.ppm --scale 4
+  ```
+
+- `proc_isocity_patch`: create/apply compact **binary patches** between two saves (great for regression artifacts or sharing a small repro):
+
+  ```bash
+  # Create a patch that transforms saveA -> saveB
+  ./build/proc_isocity_patch make saveA.bin saveB.bin out.isopatch
+
+  # Apply it back onto the base save
+  ./build/proc_isocity_patch apply saveA.bin out.isopatch saveA_patched.bin
+
+  ```
+
+- `proc_isocity_blueprint`: capture/apply **rectangular blueprints** (tile stamps) from/to saves. Supports
+  rotation/mirroring and two application modes:
+  - `replace`: overwrite all tiles present in the blueprint
+  - `stamp`: skip tiles whose blueprint overlay is `None` (useful for sparse stamps)
+
+  Examples:
+
+  ```sh
+  # Capture a sparse stamp of just overlay/level/district from a 32x32 region.
+  ./build/proc_isocity_blueprint capture saveA.bin 10 10 32 32 out.isobp \
+    --fields overlay,level,district --sparse 1
+
+  # Apply it rotated 90 degrees at (64, 64) and write a new save.
+  ./build/proc_isocity_blueprint apply saveA.bin out.isobp 64 64 saveA_stamped.bin \
+    --mode stamp --rotate 90
+  ```
+
+- `proc_isocity_replay`: pack/inspect/play deterministic **replay journals**.
+
+  Replay files embed a full base save plus a stream of Tick/Patch/Snapshot events,
+  so you can share a *single file* to reproduce a sequence of edits + simulation.
+
+  ```bash
+  # Pack a replay containing (base save) + (one patch that turns base -> target)
+  ./build/proc_isocity_replay pack saveA.bin saveB.bin out.isoreplay
+
+  # Inspect the replay header
+  ./build/proc_isocity_replay info out.isoreplay
+
+  # Play it back and emit artifacts
+  ./build/proc_isocity_replay play out.isoreplay --out summary.json --csv ticks.csv --save final.bin
   ```
 
 - `proc_isocity_inspect`: print a fast header/metadata summary for a save file (optionally verifies CRC):
@@ -117,12 +161,50 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a couple of *
   ./build/proc_isocity_script scenario.txt --out summary.json --csv ticks.csv
   ```
 
+- `proc_isocity_autobuild`: run the deterministic **city bot** headlessly (generate or load a world, then grow it for N days).
+
+  ```bash
+  # Start from a blank grass world and let the bot grow it for 365 days
+  ./build/proc_isocity_autobuild --size 96x96 --seed 42 --empty --money 2000 --days 365 \
+    --bot zonesPerDay 3 --bot roadsPerDay 1 --bot parksPerDay 1 \
+    --out bot_{seed}.json --csv bot_{seed}.csv --save bot_{seed}.bin \
+    --export-ppm overlay bot_{seed}.ppm --export-scale 4
+  ```
+
 ---
 
 ## Controls
 
 - **Right mouse drag**: pan camera  
 - **Mouse wheel**: zoom (zooms around mouse cursor)
+### ProcGen config keys (scripts)
+
+You can tweak procedural generation from a `.isocity` script:
+
+```text
+proc <key> <value>
+```
+
+New in the latest saves/patches: the default terrain pass includes an **erosion + rivers** stage. You can tune (or disable) it with:
+
+- `proc erosion 0|1` (master enable)
+- `proc rivers 0|1`
+- `proc thermal_iterations <int>`
+- `proc thermal_talus <float>`
+- `proc thermal_rate <float>`
+- `proc river_min_accum <int>` (0 = auto threshold)
+- `proc river_carve <float>`
+- `proc river_power <float>`
+- `proc smooth_iterations <int>`
+- `proc smooth_rate <float>`
+- `proc quantize_scale <int>` (0 disables quantization)
+
+The original ProcGen keys are still supported:
+
+- `terrainScale`, `waterLevel`, `sandLevel`
+- `hubs`, `extraConnections`
+- `zoneChance`, `parkChance`
+
 - **1**: Road tool
 - **U**: (Road tool) cycle road class (Street/Avenue/Highway)
 - **2**: Residential zone tool
@@ -208,7 +290,7 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a couple of *
   - Job assignment (commercial/industrial) is weighted by land value.
   - Budget/demand/land value summaries are shown in the HUD; taxes and maintenance can be tweaked in the in-game policy panel (**P**).
 - Commute routing supports an optional **congestion-aware** multi-pass assignment model (tunable via **F3**).
-- Save files are versioned; current is **v8**:
+- Save files are versioned; current is **v9**:
   - v2: seed + procgen config + tile deltas (small saves)
   - v3: CRC32 checksum (corruption detection)
   - v4: varint + delta-encoded diffs (smaller / faster)
@@ -216,6 +298,7 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a couple of *
   - v6: persists SimConfig (taxes, maintenance, outside-connection rule, park radius)
   - v7: persists per-tile districts + optional district policy multipliers
   - v8: compresses the delta payload for smaller saves / faster disk IO
+  - v9: persists ProcGen erosion config (keeps delta/regeneration deterministic)
 
 ---
 
@@ -225,7 +308,7 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a couple of *
 - Chunked world streaming + frustum culling
 - Proper road graphs (nodes/edges) + traffic visualization
 - Smarter undo/redo (optional: track only overlays + money, not sim state)
-- Save system: multiple slots and stronger cross-version stability (v8 adds delta compression)
+- Save system: multiple slots and stronger cross-version stability (v8 adds delta compression; v9 adds erosion config)
 - Buildings with multi-tile footprints + richer procedural silhouettes
 - Rendering performance: cached chunk layers (terrain/decals) + fewer draw calls
 - Multi-layer rendering (terrain, decals, structures, overlays)

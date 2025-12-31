@@ -1,6 +1,7 @@
 #include "isocity/Renderer.hpp"
 
 #include "isocity/Pathfinding.hpp"
+#include "isocity/ZoneAccess.hpp"
 
 #include "isocity/Random.hpp"
 #include "isocity/ZoneMetrics.hpp"
@@ -1549,6 +1550,11 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
                             roadToEdgeMask->size() ==
                                 static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
 
+  ZoneAccessMap zoneAccessOutside;
+  if (showOutside) {
+    zoneAccessOutside = BuildZoneAccessMap(world, roadToEdgeMask);
+  }
+
   const bool showTraffic = (roadTraffic && trafficMax > 0 && w > 0 && h > 0 &&
                             roadTraffic->size() ==
                                 static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
@@ -1983,12 +1989,21 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
         Color tint = BrightnessTint(brightness);
 
         if (showOutside) {
-          const bool isZoneOrPark = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
-                                     t.overlay == Overlay::Industrial || t.overlay == Overlay::Park);
+          const bool isZone = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
+                               t.overlay == Overlay::Industrial);
+          const bool isPark = (t.overlay == Overlay::Park);
 
-          if (isZoneOrPark && !HasAdjacentRoadConnectedToEdge(world, *roadToEdgeMask, x, y)) {
-            // Dim zones/parks that are not adjacent to an outside-connected road.
-            tint = Mul(tint, 0.55f);
+          if (isZone) {
+            // Zone access is component-based (multi-tile buildings can be served by a single road
+            // connection).
+            if (!HasZoneAccess(zoneAccessOutside, x, y)) {
+              tint = Mul(tint, 0.55f);
+            }
+          } else if (isPark) {
+            // Keep the park rule tile-local for now.
+            if (!HasAdjacentRoadConnectedToEdge(world, *roadToEdgeMask, x, y)) {
+              tint = Mul(tint, 0.55f);
+            }
           }
         }
 

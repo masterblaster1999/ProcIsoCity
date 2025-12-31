@@ -415,12 +415,25 @@ World GenerateWorld(int width, int height, std::uint64_t seed, const ProcGenConf
   World world(width, height, seed);
   RNG rng(seed32);
 
-  // Generate terrain.
+  // Generate initial terrain heights (noise).
+  std::vector<float> heights;
+  heights.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
+
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const float n = fbm(x * cfg.terrainScale, y * cfg.terrainScale, seed32, 5);
+      heights[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)] = n * 1.2f - 0.2f;
+    }
+  }
+
+  // Optional post-pass: erosion + rivers + smoothing.
+  ApplyErosion(heights, width, height, cfg.erosion, seed);
+
+  // Commit heights into tiles and classify terrain.
   for (int y = 0; y < height; ++y) {
     for (int x = 0; x < width; ++x) {
       Tile& t = world.at(x, y);
-      const float n = fbm(x * cfg.terrainScale, y * cfg.terrainScale, seed32, 5);
-      t.height = n * 1.2f - 0.2f;
+      t.height = heights[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)];
 
       t.overlay = Overlay::None;
       t.level = 1;

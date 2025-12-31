@@ -13,6 +13,7 @@
 #include "isocity/Random.hpp"
 
 #include "isocity/ZoneMetrics.hpp"
+#include "isocity/ZoneAccess.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -277,11 +278,8 @@ void Simulator::refreshDerivedStats(World& world) const
     ComputeEdgeConnectedRoads(world, roadToEdge);
   }
 
-  auto hasZoneAccess = [&] (int x, int y) -> bool {
-    if (!world.hasAdjacentRoad(x, y)) return false;
-    if (!m_cfg.requireOutsideConnection) return true;
-    return HasAdjacentEdgeConnectedRoad(world, roadToEdge, x, y);
-  };
+  const std::vector<std::uint8_t>* edgeMask = m_cfg.requireOutsideConnection ? &roadToEdge : nullptr;
+  const ZoneAccessMap zoneAccess = BuildZoneAccessMap(world, edgeMask);
 
 
   // Only job tiles that are actually reachable should count as capacity.
@@ -292,7 +290,7 @@ void Simulator::refreshDerivedStats(World& world) const
     for (int x = 0; x < world.width(); ++x) {
       const Tile& t = world.at(x, y);
       if (t.overlay != Overlay::Commercial && t.overlay != Overlay::Industrial) continue;
-      if (!hasZoneAccess(x, y)) continue;
+      if (!HasZoneAccess(zoneAccess, x, y)) continue;
       jobsCapAccessible += JobsForTile(t);
     }
   }
@@ -496,10 +494,11 @@ void Simulator::step(World& world)
     ComputeEdgeConnectedRoads(world, roadToEdge);
   }
 
+  const std::vector<std::uint8_t>* edgeMask = m_cfg.requireOutsideConnection ? &roadToEdge : nullptr;
+  const ZoneAccessMap zoneAccess = BuildZoneAccessMap(world, edgeMask);
+
   auto hasZoneAccess = [&](int x, int y) -> bool {
-    if (!world.hasAdjacentRoad(x, y)) return false;
-    if (!m_cfg.requireOutsideConnection) return true;
-    return HasAdjacentEdgeConnectedRoad(world, roadToEdge, x, y);
+    return HasZoneAccess(zoneAccess, x, y);
   };
 
   // Land value field (no traffic spill for the simulation growth step).

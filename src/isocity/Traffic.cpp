@@ -3,6 +3,7 @@
 #include "isocity/FlowField.hpp"
 #include "isocity/Pathfinding.hpp"
 #include "isocity/Road.hpp"
+#include "isocity/ZoneAccess.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -135,11 +136,9 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
     }
   }
 
-  auto zoneHasAccess = [&](int zx, int zy) -> bool {
-    if (!world.hasAdjacentRoad(zx, zy)) return false;
-    if (!cfg.requireOutsideConnection) return true;
-    return HasAdjacentRoadConnectedToEdge(world, *roadToEdge, zx, zy);
-  };
+  // Zone access: allows interior tiles of a connected zoned area to be reachable via a
+  // road-adjacent boundary tile.
+  const ZoneAccessMap zoneAccess = BuildZoneAccessMap(world, roadToEdge);
 
   // --- Collect job access points (sources) ---
   std::vector<std::uint8_t> isSource(n, 0);
@@ -157,9 +156,15 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
       if (isCommercial && !cfg.includeCommercialJobs) continue;
       if (isIndustrial && !cfg.includeIndustrialJobs) continue;
 
-      if (!zoneHasAccess(x, y)) continue;
+      const std::size_t zidx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+      if (zidx >= zoneAccess.roadIdx.size()) continue;
+      const int accessRoad = zoneAccess.roadIdx[zidx];
+      if (accessRoad < 0) continue;
 
-      // Each adjacent road tile is an access point.
+      // Preserve the older behavior for boundary tiles: if this job tile touches road tiles,
+      // treat each adjacent road as a job source. For interior tiles, fall back to the
+      // propagated access road.
+      bool addedAdjacent = false;
       constexpr int dirs[4][2] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}};
       for (const auto& d : dirs) {
         const int rx = x + d[0];
@@ -167,15 +172,25 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
         if (!world.inBounds(rx, ry)) continue;
         if (world.at(rx, ry).overlay != Overlay::Road) continue;
 
-        const std::size_t idx = static_cast<std::size_t>(ry) * static_cast<std::size_t>(w) +
-                                static_cast<std::size_t>(rx);
+        const int ridx = ry * w + rx;
+        const std::size_t ur = static_cast<std::size_t>(ridx);
+        if (ur >= isSource.size()) continue;
         if (cfg.requireOutsideConnection) {
-          if (idx >= roadToEdge->size() || (*roadToEdge)[idx] == 0) continue;
+          if (!roadToEdge || ur >= roadToEdge->size() || (*roadToEdge)[ur] == 0) continue;
         }
 
-        if (!isSource[idx]) {
-          isSource[idx] = 1;
-          sources.push_back(static_cast<int>(idx));
+        if (!isSource[ur]) {
+          isSource[ur] = 1;
+          sources.push_back(ridx);
+        }
+        addedAdjacent = true;
+      }
+
+      if (!addedAdjacent) {
+        const std::size_t ur = static_cast<std::size_t>(accessRoad);
+        if (ur < isSource.size() && !isSource[ur]) {
+          isSource[ur] = 1;
+          sources.push_back(accessRoad);
         }
       }
     }
@@ -197,9 +212,20 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
       const Tile& t = world.at(x, y);
       if (t.overlay != Overlay::Residential) continue;
       if (t.occupants == 0) continue;
-      if (!zoneHasAccess(x, y)) continue;
+
+      const std::size_t zidx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+      if (zidx >= zoneAccess.roadIdx.size()) continue;
+      if (zoneAccess.roadIdx[zidx] < 0) continue;
+
+      // Prefer a directly-adjacent road if available; otherwise use the propagated access road.
+      int ridx = -1;
       Point road{};
-      if (!PickAdjacentRoadTile(world, roadToEdge, x, y, road)) continue;
+      if (PickAdjacentRoadTile(world, roadToEdge, x, y, road)) {
+        ridx = road.y * w + road.x;
+      } else {
+        ridx = zoneAccess.roadIdx[zidx];
+      }
+      if (ridx < 0) continue;
 
       const float desired = static_cast<float>(t.occupants) * employedShare;
       int commuters = static_cast<int>(std::floor(desired));
@@ -215,8 +241,7 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
       commuters = std::clamp(commuters, 0, static_cast<int>(t.occupants));
       if (commuters <= 0) continue;
 
-      const int idx = road.y * w + road.x;
-      origins.push_back(Origin{idx, commuters});
+      origins.push_back(Origin{ridx, commuters});
       r.totalCommuters += commuters;
     }
   }

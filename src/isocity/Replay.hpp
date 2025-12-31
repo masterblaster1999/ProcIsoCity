@@ -1,0 +1,62 @@
+#pragma once
+
+#include "isocity/ProcGen.hpp"
+#include "isocity/Sim.hpp"
+#include "isocity/World.hpp"
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace isocity {
+
+// A self-contained, deterministic "journal" format for reproducing a session.
+//
+// A replay embeds a base save (the same bytes produced by SaveWorldBinary) and
+// a sequence of events:
+//   - Tick: advance the simulation by N ticks
+//   - Patch: apply an ISOPATCH blob (WorldPatch binary)
+//   - Snapshot: replace the whole world with another embedded save blob
+//
+// This is primarily intended for debugging/regression: you can ship a single
+// .isoreplay file that deterministically rebuilds a city state.
+
+enum class ReplayEventType : std::uint8_t {
+  Tick = 0,
+  Patch = 1,
+  Snapshot = 2,
+};
+
+struct ReplayEvent {
+  ReplayEventType type = ReplayEventType::Tick;
+
+  // Tick: number of Simulator::stepOnce() calls.
+  std::uint32_t ticks = 0;
+
+  // Patch: raw ISOPATCH bytes.
+  std::vector<std::uint8_t> patch;
+
+  // Snapshot: raw ISOCITY save bytes.
+  std::vector<std::uint8_t> snapshot;
+};
+
+struct Replay {
+  std::uint32_t version = 1;
+
+  // Base save bytes (ISOCITY binary save format).
+  std::vector<std::uint8_t> baseSave;
+
+  std::vector<ReplayEvent> events;
+};
+
+// Save/load a replay to disk.
+bool SaveReplayBinary(const Replay& replay, const std::string& path, std::string& outError);
+bool LoadReplayBinary(Replay& outReplay, const std::string& path, std::string& outError);
+
+// Run a replay and return the final world+configs.
+//
+// If strictPatches==true, patch events must match their recorded base hashes.
+bool PlayReplay(const Replay& replay, World& outWorld, ProcGenConfig& outProcCfg, SimConfig& outSimCfg,
+                std::string& outError, bool strictPatches = true, std::vector<Stats>* outTickStats = nullptr);
+
+} // namespace isocity
