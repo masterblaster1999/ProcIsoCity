@@ -7,6 +7,8 @@
 
 namespace isocity {
 
+struct ZoneAccessMap;
+
 struct DistrictPolicy {
   // Multipliers applied to the base citywide policy numbers.
   //  1.0 = no change
@@ -116,6 +118,11 @@ public:
   void refreshDerivedStats(World& world) const;
 
 private:
+  // Internal: allow callers (Simulator::step) to reuse expensive derived data
+  // like the road-to-edge mask and ZoneAccessMap across multiple subsystems.
+  void refreshDerivedStatsInternal(World& world, const std::vector<std::uint8_t>* precomputedRoadToEdge,
+                                  const ZoneAccessMap* precomputedZoneAccess) const;
+
   void step(World& world);
 
   SimConfig m_cfg;

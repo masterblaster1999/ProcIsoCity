@@ -1,13 +1,14 @@
 #pragma once
 
-#include "isocity/ProcGen.hpp"
-#include "isocity/Blueprint.hpp"
 #include "isocity/AutoBuild.hpp"
+#include "isocity/Blueprint.hpp"
+#include "isocity/ProcGen.hpp"
 #include "isocity/Sim.hpp"
 #include "isocity/World.hpp"
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,15 @@ struct ScriptRunnerState {
   int h = 96;
   std::uint64_t seed = 1;
 
+  // Batch-run index (used by {run} token expansion).
+  int runIndex = 0;
+
+  // Simple script variables (expanded via {name} tokens).
+  //
+  // Variable names are treated as lowercase.
+  // NOTE: Built-in tokens (seed, w, h, day, money, run, hash) are reserved.
+  std::map<std::string, std::string> vars;
+
   ProcGenConfig procCfg{};
   SimConfig simCfg{};
   AutoBuildConfig autoBuildCfg{};
@@ -45,7 +55,7 @@ struct ScriptRunnerState {
   Blueprint blueprint;
   bool hasBlueprint = false;
 
-  // Optional per-tick snapshots collected by the `tick` command.
+  // Optional per-tick snapshots collected by the `tick` / `autobuild` commands.
   std::vector<Stats> tickStats;
 };
 
@@ -91,10 +101,16 @@ public:
   // want to surface a custom error.
   bool fail(const std::string& path, int line, const std::string& msg);
 
-  // Expand tokens in a path template.
-  // Supported tokens:
+  // Expand tokens in a path / argument template.
+  //
+  // Supported built-in tokens:
   //   {seed} {day} {w} {h} {money} {run} {hash}
-  std::string expandPathTemplate(const std::string& tmpl, int run = 0) const;
+  //
+  // Also supports simple user variables set via the `set` command (or by callers
+  // mutating ScriptRunnerState::vars): {myVar}.
+  //
+  // If run < 0, uses ScriptRunnerState::runIndex.
+  std::string expandPathTemplate(const std::string& tmpl, int run = -1) const;
 
 private:
   bool runFileInternal(const std::string& path, int depth);

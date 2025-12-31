@@ -46,7 +46,10 @@ endfunction()
 # ---- Core library (no raylib dependency) ----
 add_library(isocity_core
   src/isocity/Compression.cpp
+  src/isocity/Suite.cpp
   src/isocity/Blueprint.cpp
+  src/isocity/MeshExport.cpp
+  src/isocity/RoadGraphExport.cpp
   src/isocity/Districting.cpp
   src/isocity/FloodFill.cpp
   src/isocity/Script.cpp
@@ -55,6 +58,7 @@ add_library(isocity_core
   src/isocity/WorldPatch.cpp
   src/isocity/World.cpp
   src/isocity/WorldDiff.cpp
+  src/isocity/WorldTransform.cpp
   src/isocity/ProcGen.cpp
   src/isocity/Erosion.cpp
   src/isocity/Sim.cpp
@@ -71,6 +75,8 @@ add_library(isocity_core
   src/isocity/Pathfinding.cpp
   src/isocity/RoadGraph.cpp
   src/isocity/ZoneParcels.cpp
+  src/isocity/Json.cpp
+  src/isocity/ConfigIO.cpp
 )
 
 target_include_directories(isocity_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -200,6 +206,17 @@ if (PROCISOCITY_BUILD_CLI)
 
   procisocity_set_strict_warnings(proc_isocity_inspect)
 
+  # Config tool (headless): dump/apply ProcGenConfig and SimConfig embedded in a save.
+  add_executable(proc_isocity_config
+    src/cli/config.cpp
+  )
+
+  target_include_directories(proc_isocity_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_config PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_config)
+
+
   # Script runner (headless): apply deterministic editing/simulation scripts for regression testing.
   add_executable(proc_isocity_script
     src/cli/script.cpp
@@ -249,6 +266,60 @@ if (PROCISOCITY_BUILD_CLI)
   target_link_libraries(proc_isocity_blueprint PRIVATE isocity_core)
 
   procisocity_set_strict_warnings(proc_isocity_blueprint)
+
+  # Scenario suite runner (headless): run many scripts/replays and emit CI-friendly reports.
+  add_executable(proc_isocity_suite
+    src/cli/suite.cpp
+  )
+
+  target_include_directories(proc_isocity_suite PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_suite PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_suite)
+
+
+  # World transform tool (headless): rotate/mirror/crop entire saves.
+  add_executable(proc_isocity_transform
+    src/cli/transform.cpp
+  )
+
+  target_include_directories(proc_isocity_transform PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_transform PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_transform)
+
+
+  # Road graph export tool (headless): export compressed road network graphs to DOT/JSON/CSV.
+  add_executable(proc_isocity_roadgraph
+    src/cli/roadgraph.cpp
+  )
+
+  target_include_directories(proc_isocity_roadgraph PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_roadgraph PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_roadgraph)
+
+
+  # Mesh exporter (headless): export a save/world to Wavefront OBJ+MTL for debugging/interop.
+  add_executable(proc_isocity_mesh
+    src/cli/mesh.cpp
+  )
+
+  target_include_directories(proc_isocity_mesh PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_mesh PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_mesh)
+
+  # PPM diff tool (headless): compare two PPM images (P6) and optionally write a diff visualization.
+  add_executable(proc_isocity_imagediff
+    src/cli/imagediff.cpp
+  )
+
+  target_include_directories(proc_isocity_imagediff PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_imagediff PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_imagediff)
+
 endif()
 
 # ---- Tests (headless) ----

@@ -1204,4 +1204,99 @@ bool DeserializeWorldPatchBinary(WorldPatch& outPatch, const std::uint8_t* data,
   return true;
 }
 
+
+bool InvertWorldPatch(const World& baseWorld, const ProcGenConfig& baseProcCfg, const SimConfig& baseSimCfg,
+                      const WorldPatch& forwardPatch, WorldPatch& outInverse, std::string& outError, bool force)
+{
+  outError.clear();
+  outInverse = {};
+
+  if (baseWorld.width() != forwardPatch.width || baseWorld.height() != forwardPatch.height) {
+    outError = "InvertWorldPatch: dimension mismatch";
+    return false;
+  }
+
+  const std::uint64_t baseHash = HashWorld(baseWorld, forwardPatch.includeStats);
+  if (!force && baseHash != forwardPatch.baseHash) {
+    outError = "InvertWorldPatch: base hash mismatch (refusing without --force)";
+    return false;
+  }
+
+  outInverse.width = forwardPatch.width;
+  outInverse.height = forwardPatch.height;
+
+  outInverse.includeProcCfg = forwardPatch.includeProcCfg;
+  outInverse.includeSimCfg = forwardPatch.includeSimCfg;
+  outInverse.includeStats = forwardPatch.includeStats;
+
+  // Swap hashes: inverse expects to be applied on the forward target state.
+  outInverse.baseHash = forwardPatch.targetHash;
+  outInverse.targetHash = forwardPatch.baseHash;
+
+  if (outInverse.includeProcCfg) outInverse.procCfg = baseProcCfg;
+  if (outInverse.includeSimCfg) outInverse.simCfg = baseSimCfg;
+  if (outInverse.includeStats) outInverse.stats = baseWorld.stats();
+
+  outInverse.tiles.clear();
+  outInverse.tiles.reserve(forwardPatch.tiles.size());
+
+  const int w = baseWorld.width();
+
+  for (const WorldPatchTileDelta& d : forwardPatch.tiles) {
+    const std::uint32_t idx = d.index;
+    const int x = static_cast<int>(idx % static_cast<std::uint32_t>(w));
+    const int y = static_cast<int>(idx / static_cast<std::uint32_t>(w));
+    if (!baseWorld.inBounds(x, y)) {
+      outError = "InvertWorldPatch: forward patch contains out-of-bounds tile index";
+      return false;
+    }
+
+    WorldPatchTileDelta inv;
+    inv.index = d.index;
+    inv.mask = d.mask;
+    inv.value = baseWorld.at(x, y);
+    outInverse.tiles.push_back(inv);
+  }
+
+  // Ensure deterministic ordering.
+  std::sort(outInverse.tiles.begin(), outInverse.tiles.end(),
+            [](const WorldPatchTileDelta& a, const WorldPatchTileDelta& b) { return a.index < b.index; });
+
+  return true;
+}
+
+bool ComposeWorldPatches(const World& baseWorld, const ProcGenConfig& baseProcCfg, const SimConfig& baseSimCfg,
+                         const std::vector<WorldPatch>& patches, WorldPatch& outPatch, std::string& outError,
+                         bool includeProcCfg, bool includeSimCfg, bool includeStats, bool force)
+{
+  outError.clear();
+  outPatch = {};
+
+  if (patches.empty()) {
+    outError = "ComposeWorldPatches: requires at least one patch";
+    return false;
+  }
+
+  World w = baseWorld;
+  ProcGenConfig proc = baseProcCfg;
+  SimConfig sim = baseSimCfg;
+
+  for (std::size_t i = 0; i < patches.size(); ++i) {
+    std::string err;
+    if (!ApplyWorldPatch(w, proc, sim, patches[i], err, force)) {
+      outError = "ComposeWorldPatches: apply failed at patch[" + std::to_string(i) + "]: " + err;
+      return false;
+    }
+  }
+
+  if (!MakeWorldPatch(baseWorld, baseProcCfg, baseSimCfg, w, proc, sim, outPatch, outError,
+                      includeProcCfg, includeSimCfg, includeStats)) {
+    if (outError.empty()) outError = "ComposeWorldPatches: MakeWorldPatch failed";
+    return false;
+  }
+
+  return true;
+}
+
+
 } // namespace isocity

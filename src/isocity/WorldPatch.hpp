@@ -111,4 +111,24 @@ bool SerializeWorldPatchBinary(const WorldPatch& patch, std::vector<std::uint8_t
 bool DeserializeWorldPatchBinary(WorldPatch& outPatch, const std::uint8_t* data, std::size_t size,
                                  std::string& outError);
 
+// Build an inverse patch (target -> base) given the original base state and a forward patch.
+//
+// This is useful for undo/rollback workflows and patch algebra.
+//
+// If force==false, HashWorld(baseWorld, forwardPatch.includeStats) must match forwardPatch.baseHash.
+bool InvertWorldPatch(const World& baseWorld, const ProcGenConfig& baseProcCfg, const SimConfig& baseSimCfg,
+                      const WorldPatch& forwardPatch, WorldPatch& outInverse, std::string& outError,
+                      bool force = false);
+
+// Compose a sequence of patches (applied in order) into a single patch relative to the original base.
+//
+// This applies each patch to a working copy and then computes a minimal patch from base -> final.
+//
+// If force==false, each intermediate ApplyWorldPatch() must pass its baseHash check.
+bool ComposeWorldPatches(const World& baseWorld, const ProcGenConfig& baseProcCfg, const SimConfig& baseSimCfg,
+                         const std::vector<WorldPatch>& patches, WorldPatch& outPatch, std::string& outError,
+                         bool includeProcCfg = true, bool includeSimCfg = true, bool includeStats = true,
+                         bool force = false);
+
+
 } // namespace isocity

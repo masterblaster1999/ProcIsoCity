@@ -7,6 +7,8 @@
 
 namespace isocity {
 
+struct ZoneAccessMap;
+
 // Simple commuting / traffic model derived from the road tile grid.
 //
 // The goal is NOT to be a full traffic simulator yet. Instead, we compute:
@@ -102,7 +104,11 @@ struct TrafficResult {
 //
 // If requireOutsideConnection is true, you can optionally pass a precomputed
 // road-to-edge mask (from ComputeRoadsConnectedToEdge) to avoid recomputation.
+//
+// If you already computed a ZoneAccessMap for the same world + outside-connection rule,
+// you may also pass it to avoid rebuilding the zone access mapping.
 TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg, float employedShare = 1.0f,
-                                   const std::vector<std::uint8_t>* precomputedRoadToEdge = nullptr);
+                                   const std::vector<std::uint8_t>* precomputedRoadToEdge = nullptr,
+                                   const ZoneAccessMap* precomputedZoneAccess = nullptr);
 
 } // namespace isocity

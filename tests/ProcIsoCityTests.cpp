@@ -1,8 +1,10 @@
 #include "isocity/EditHistory.hpp"
 #include "isocity/Pathfinding.hpp"
 #include "isocity/RoadGraph.hpp"
+#include "isocity/RoadGraphExport.hpp"
 #include "isocity/ProcGen.hpp"
 #include "isocity/SaveLoad.hpp"
+#include "isocity/ConfigIO.hpp"
 #include "isocity/Sim.hpp"
 #include "isocity/Traffic.hpp"
 #include "isocity/Goods.hpp"
@@ -11,7 +13,9 @@
 #include "isocity/Hash.hpp"
 #include "isocity/Compression.hpp"
 #include "isocity/Export.hpp"
+#include "isocity/MeshExport.hpp"
 #include "isocity/Script.hpp"
+#include "isocity/Suite.hpp"
 #include "isocity/AutoBuild.hpp"
 #include "isocity/DistrictStats.hpp"
 #include "isocity/Districting.hpp"
@@ -23,6 +27,7 @@
 #include "isocity/Road.hpp"
 #include "isocity/WorldDiff.hpp"
 #include "isocity/WorldPatch.hpp"
+#include "isocity/WorldTransform.hpp"
 #include "isocity/FloodFill.hpp"
 #include "isocity/World.hpp"
 
@@ -849,13 +854,22 @@ void TestSaveLoadBytesRoundTrip()
   // Mutate height directly (matching the save/load terrain mapping used elsewhere).
   const float origH = w.at(x, y).height;
   const float newH = std::clamp(origH + 0.15f, 0.0f, 1.0f);
-  w.at(x, y).height = newH;
+
+  // Save format stores height quantized to 16-bit; mirror that so hash round-trips.
+  const auto quantize16 = [](float h) {
+    const float hc = std::clamp(h, 0.0f, 1.0f);
+    const int q = static_cast<int>(std::lround(hc * 65535.0f));
+    const int qc = std::clamp(q, 0, 65535);
+    return static_cast<float>(qc) / 65535.0f;
+  };
+  const float qH = quantize16(newH);
+  w.at(x, y).height = qH;
   {
     const float wl = std::clamp(cfg.waterLevel, 0.0f, 1.0f);
     const float sl = std::clamp(cfg.sandLevel, 0.0f, 1.0f);
-    if (newH < wl)
+    if (qH < wl)
       w.at(x, y).terrain = Terrain::Water;
-    else if (newH < std::max(wl, sl))
+    else if (qH < std::max(wl, sl))
       w.at(x, y).terrain = Terrain::Sand;
     else
       w.at(x, y).terrain = Terrain::Grass;
@@ -1313,6 +1327,47 @@ void TestRoadGraphCornerCreatesNode()
   EXPECT_TRUE(foundB);
 }
 
+void TestRoadGraphExportMetricsAndJson()
+{
+  using namespace isocity;
+
+  World w(8, 8, 123);
+
+  // Build a straight horizontal road segment from (1,3) -> (5,3).
+  for (int x = 1; x <= 5; ++x) {
+    w.setRoad(x, 3);
+  }
+
+  const RoadGraph g = BuildRoadGraph(w);
+  EXPECT_EQ(static_cast<int>(g.nodes.size()), 2);
+  EXPECT_EQ(static_cast<int>(g.edges.size()), 1);
+  EXPECT_EQ(g.edges[0].length, 4);
+
+  const RoadGraphMetrics m = ComputeRoadGraphMetrics(g);
+  EXPECT_EQ(m.nodes, 2);
+  EXPECT_EQ(m.edges, 1);
+  EXPECT_EQ(m.components, 1);
+  EXPECT_EQ(m.approxDiameter, 4);
+  EXPECT_TRUE((m.diameterA == 0 && m.diameterB == 1) || (m.diameterA == 1 && m.diameterB == 0));
+
+  const RoadGraphDiameter d = ComputeApproxRoadGraphDiameter(g);
+  EXPECT_EQ(d.distance, 4);
+  EXPECT_EQ(static_cast<int>(d.nodePath.size()), 2);
+
+  std::vector<Point> tiles;
+  EXPECT_TRUE(ExpandRoadGraphNodePathToTiles(g, d.nodePath, tiles));
+  EXPECT_EQ(static_cast<int>(tiles.size()), 5);
+
+  // Basic JSON export sanity: ensure it contains the expected metrics fields.
+  std::ostringstream oss;
+  std::string err;
+  EXPECT_TRUE(WriteRoadGraphJson(oss, g, &m, &d, RoadGraphExportConfig{}, &err));
+  const std::string json = oss.str();
+  EXPECT_TRUE(json.find("\"approxDiameter\": 4") != std::string::npos);
+  EXPECT_TRUE(json.find("\"nodes\"") != std::string::npos);
+  EXPECT_TRUE(json.find("\"edges\"") != std::string::npos);
+}
+
 
 void TestRoadPathfindingAStar()
 {
@@ -1576,6 +1631,92 @@ void TestGoodsUnreachableDemandWhenNoImports()
   const std::size_t commIdx = static_cast<std::size_t>(2) * static_cast<std::size_t>(w.width()) +
                               static_cast<std::size_t>(3);
   EXPECT_EQ(static_cast<int>(gr.commercialFill[commIdx]), 0);
+}
+
+void TestTrafficAndGoodsAcceptPrecomputedZoneAccessMap()
+{
+  using namespace isocity;
+
+  // Build a small connected network with *interior* zone tiles that rely on ZoneAccessMap
+  // (i.e., zone tiles not directly adjacent to a road).
+  World w(9, 5, 123u);
+
+  // Edge-connected road row.
+  for (int x = 0; x < w.width(); ++x) {
+    w.setRoad(x, 3);
+  }
+
+  // Residential component: only (1,2) touches the road; (1,1) is interior.
+  w.setOverlay(Overlay::Residential, 1, 2);
+  w.at(1, 2).level = 1;
+  w.at(1, 2).occupants = 0;
+
+  w.setOverlay(Overlay::Residential, 1, 1);
+  w.at(1, 1).level = 3;
+  w.at(1, 1).occupants = 10;
+
+  // Commercial component: only (4,2) touches the road; (4,1) is interior.
+  w.setOverlay(Overlay::Commercial, 4, 2);
+  w.at(4, 2).level = 1;
+
+  w.setOverlay(Overlay::Commercial, 4, 1);
+  w.at(4, 1).level = 1;
+
+  // Industrial component: only (7,2) touches the road; (7,1) is interior.
+  w.setOverlay(Overlay::Industrial, 7, 2);
+  w.at(7, 2).level = 1;
+
+  w.setOverlay(Overlay::Industrial, 7, 1);
+  w.at(7, 1).level = 1;
+
+  // Precompute outside-connected roads + zone access map.
+  std::vector<std::uint8_t> roadToEdge;
+  ComputeRoadsConnectedToEdge(w, roadToEdge);
+  const ZoneAccessMap za = BuildZoneAccessMap(w, &roadToEdge);
+
+  // --- Traffic: precomputed ZoneAccessMap should be equivalent to the internal build ---
+  TrafficConfig tc;
+  tc.requireOutsideConnection = true;
+
+  const TrafficResult t0 = ComputeCommuteTraffic(w, tc, 1.0f, &roadToEdge);
+  const TrafficResult t1 = ComputeCommuteTraffic(w, tc, 1.0f, &roadToEdge, &za);
+
+  EXPECT_EQ(t0.totalCommuters, 10);
+  EXPECT_EQ(t0.totalCommuters, t1.totalCommuters);
+  EXPECT_EQ(t0.reachableCommuters, t1.reachableCommuters);
+  EXPECT_EQ(t0.unreachableCommuters, t1.unreachableCommuters);
+  EXPECT_EQ(t0.roadTraffic, t1.roadTraffic);
+
+  // A deliberately broken ZoneAccessMap should change the result (proves it's actually used).
+  ZoneAccessMap bad;
+  bad.w = w.width();
+  bad.h = w.height();
+  bad.roadIdx.assign(static_cast<std::size_t>(w.width()) * static_cast<std::size_t>(w.height()), -1);
+
+  const TrafficResult tb = ComputeCommuteTraffic(w, tc, 1.0f, &roadToEdge, &bad);
+  EXPECT_EQ(tb.totalCommuters, 0);
+
+  // --- Goods: same story, but ensure demand/supply is still computed correctly ---
+  GoodsConfig gc;
+  gc.requireOutsideConnection = true;
+  gc.allowImports = false;
+  gc.allowExports = false;
+
+  const GoodsResult g0 = ComputeGoodsFlow(w, gc, &roadToEdge);
+  const GoodsResult g1 = ComputeGoodsFlow(w, gc, &roadToEdge, &za);
+
+  EXPECT_TRUE(g0.goodsProduced > 0);
+  EXPECT_TRUE(g0.goodsDemand > 0);
+  EXPECT_EQ(g0.goodsProduced, g1.goodsProduced);
+  EXPECT_EQ(g0.goodsDemand, g1.goodsDemand);
+  EXPECT_EQ(g0.goodsDelivered, g1.goodsDelivered);
+  EXPECT_EQ(g0.unreachableDemand, g1.unreachableDemand);
+  EXPECT_EQ(g0.roadGoodsTraffic, g1.roadGoodsTraffic);
+  EXPECT_EQ(g0.commercialFill, g1.commercialFill);
+
+  const GoodsResult gb = ComputeGoodsFlow(w, gc, &roadToEdge, &bad);
+  EXPECT_EQ(gb.goodsProduced, 0);
+  EXPECT_EQ(gb.goodsDemand, 0);
 }
 
 void TestLandValueParkAmenityBoostsNearby()
@@ -2059,6 +2200,137 @@ void TestExportPpmLayers()
   EXPECT_EQ(up.rgb[idx30 + 2], terrain.rgb[idx10 + 2]);
 }
 
+void TestExportIsoOverview()
+{
+  World w(2, 2, 123);
+
+  // Deterministic tiny grid.
+  w.at(0, 0).terrain = Terrain::Water;
+  w.at(0, 0).height = 0.0f;
+
+  w.at(1, 0).terrain = Terrain::Sand;
+  w.at(1, 0).height = 0.25f;
+
+  w.at(0, 1).terrain = Terrain::Grass;
+  w.at(0, 1).height = 0.55f;
+
+  w.at(1, 1).terrain = Terrain::Grass;
+  w.at(1, 1).height = 0.90f;
+  w.at(1, 1).overlay = Overlay::Road;
+  w.at(1, 1).level = 3;
+
+  IsoOverviewConfig cfg{};
+  cfg.tileW = 16;
+  cfg.tileH = 8;
+  cfg.heightScalePx = 12;
+  cfg.marginPx = 4;
+  cfg.drawGrid = false;
+  cfg.drawCliffs = true;
+
+  const IsoOverviewResult isoTerrain = RenderIsoOverview(w, ExportLayer::Terrain, cfg);
+  const IsoOverviewResult isoOverlay = RenderIsoOverview(w, ExportLayer::Overlay, cfg);
+
+  EXPECT_TRUE(isoTerrain.image.width > 0);
+  EXPECT_TRUE(isoTerrain.image.height > 0);
+  EXPECT_TRUE(isoOverlay.image.width > 0);
+  EXPECT_TRUE(isoOverlay.image.height > 0);
+
+  // Determinism: rendering twice should yield identical buffers.
+  const IsoOverviewResult isoOverlay2 = RenderIsoOverview(w, ExportLayer::Overlay, cfg);
+  EXPECT_EQ(isoOverlay.image.width, isoOverlay2.image.width);
+  EXPECT_EQ(isoOverlay.image.height, isoOverlay2.image.height);
+  EXPECT_EQ(static_cast<int>(isoOverlay.image.rgb.size()), static_cast<int>(isoOverlay2.image.rgb.size()));
+  EXPECT_TRUE(isoOverlay.image.rgb == isoOverlay2.image.rgb);
+
+  // The road tile should differ between terrain-only and overlay iso renders at the tile center.
+  int cxT = 0, cyT = 0;
+  int cxO = 0, cyO = 0;
+  EXPECT_TRUE(IsoTileCenterToPixel(w, isoTerrain, 1, 1, cxT, cyT));
+  EXPECT_TRUE(IsoTileCenterToPixel(w, isoOverlay, 1, 1, cxO, cyO));
+
+  const std::size_t idxT =
+      (static_cast<std::size_t>(cyT) * static_cast<std::size_t>(isoTerrain.image.width) + static_cast<std::size_t>(cxT)) * 3u;
+  const std::size_t idxO =
+      (static_cast<std::size_t>(cyO) * static_cast<std::size_t>(isoOverlay.image.width) + static_cast<std::size_t>(cxO)) * 3u;
+
+  EXPECT_TRUE(idxT + 2u < isoTerrain.image.rgb.size());
+  EXPECT_TRUE(idxO + 2u < isoOverlay.image.rgb.size());
+
+  EXPECT_TRUE(isoTerrain.image.rgb[idxT + 0] != isoOverlay.image.rgb[idxO + 0] ||
+              isoTerrain.image.rgb[idxT + 1] != isoOverlay.image.rgb[idxO + 1] ||
+              isoTerrain.image.rgb[idxT + 2] != isoOverlay.image.rgb[idxO + 2]);
+}
+
+void TestPpmReadWriteAndCompare()
+{
+  using namespace isocity;
+  namespace fs = std::filesystem;
+
+  // Create an isolated temp folder for the test.
+  const std::uintptr_t tag = reinterpret_cast<std::uintptr_t>(&g_failures);
+  fs::path tmp = fs::temp_directory_path() / ("procisocity_ppm_test_" + std::to_string(tag));
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp, ec);
+  EXPECT_TRUE(!ec);
+
+  // --- Write a tiny PPM ---
+  PpmImage img{};
+  img.width = 2;
+  img.height = 2;
+  img.rgb = {
+      0, 0, 0,       // (0,0) black
+      255, 0, 0,     // (1,0) red
+      0, 255, 0,     // (0,1) green
+      0, 0, 255      // (1,1) blue
+  };
+
+  std::string err;
+  const fs::path pathA = tmp / "a.ppm";
+  EXPECT_TRUE(WritePpm(pathA.string(), img, err));
+  EXPECT_TRUE(err.empty());
+
+  // --- Read it back ---
+  PpmImage read{};
+  EXPECT_TRUE(ReadPpm(pathA.string(), read, err));
+  EXPECT_TRUE(err.empty());
+  EXPECT_EQ(read.width, 2);
+  EXPECT_EQ(read.height, 2);
+  EXPECT_TRUE(read.rgb == img.rgb);
+
+  // --- Compare with a single-channel change ---
+  PpmImage img2 = img;
+  img2.rgb[0] = 10; // bump red on pixel (0,0)
+
+  PpmDiffStats st{};
+  PpmImage diff{};
+  EXPECT_TRUE(ComparePpm(img, img2, st, /*threshold=*/0, &diff));
+  EXPECT_EQ(st.width, 2);
+  EXPECT_EQ(st.height, 2);
+  EXPECT_EQ(st.pixelsCompared, static_cast<std::uint64_t>(4));
+  EXPECT_EQ(st.pixelsDifferent, static_cast<std::uint64_t>(1));
+  EXPECT_EQ(static_cast<int>(st.maxAbsDiff), 10);
+  EXPECT_TRUE(!diff.rgb.empty());
+
+  // Diff image should have non-zero only at the changed pixel/channel.
+  EXPECT_EQ(diff.width, 2);
+  EXPECT_EQ(diff.height, 2);
+  EXPECT_EQ(static_cast<int>(diff.rgb.size()), 2 * 2 * 3);
+  EXPECT_EQ(static_cast<int>(diff.rgb[0]), 10);
+  EXPECT_EQ(static_cast<int>(diff.rgb[1]), 0);
+  EXPECT_EQ(static_cast<int>(diff.rgb[2]), 0);
+
+  // Threshold should suppress the diff when it is <= threshold.
+  PpmDiffStats st2{};
+  EXPECT_TRUE(ComparePpm(img, img2, st2, /*threshold=*/10, nullptr));
+  EXPECT_EQ(st2.pixelsDifferent, static_cast<std::uint64_t>(0));
+
+  fs::remove_all(tmp, ec);
+}
+
+
+
+
 void TestDistrictStatsCompute()
 {
   // Small 2x2 world with two districts and a simple road access setup.
@@ -2352,6 +2624,252 @@ void TestWorldPatchRejectsMismatchedBaseHash()
   EXPECT_TRUE(err.empty());
 }
 
+
+void TestWorldPatchInvertAndCompose()
+{
+  using namespace isocity;
+
+  // Deterministic base world (flat grass).
+  World base(16, 16, 42u);
+  base.stats().money = 50000;
+  base.stats().day = 3;
+
+  ProcGenConfig baseProc{};
+  baseProc.zoneChance = 0.12f;
+
+  SimConfig baseSim{};
+  baseSim.requireOutsideConnection = false;
+  baseSim.taxResidential = 3;
+
+  // Give base non-zero derived stats (hash includes Stats fields).
+  Simulator simBase(baseSim);
+  simBase.refreshDerivedStats(base);
+
+  // Mid-state edits.
+  World mid = base;
+  mid.stats().money = 51000;
+  mid.stats().day = 4;
+
+  mid.applyRoad(2, 2, 1);
+  mid.applyRoad(3, 2, 1);
+  mid.setOverlay(Overlay::Residential, 3, 3);
+  mid.at(3, 3).level = 2;
+  mid.at(3, 3).occupants = 7;
+  mid.applyDistrict(3, 3, 1);
+
+  ProcGenConfig midProc = baseProc;
+  midProc.zoneChance = 0.20f;
+
+  SimConfig midSim = baseSim;
+  midSim.taxResidential = 5;
+
+  Simulator simMid(midSim);
+  simMid.refreshDerivedStats(mid);
+
+  // Target-state edits.
+  World target = mid;
+  target.stats().money = 52000;
+  target.stats().day = 5;
+
+  target.applyRoad(10, 10, 2);
+  target.setOverlay(Overlay::Commercial, 4, 3);
+  target.at(4, 3).level = 3;
+  target.at(4, 3).occupants = 9;
+  target.applyDistrict(4, 3, 2);
+
+  ProcGenConfig targetProc = midProc;
+  targetProc.zoneChance = 0.33f;
+
+  SimConfig targetSim = midSim;
+  targetSim.taxResidential = 9;
+  targetSim.districtPoliciesEnabled = true;
+  targetSim.districtPolicies[0].taxCommercialMult = 1.50f;
+
+  Simulator simTarget(targetSim);
+  simTarget.refreshDerivedStats(target);
+
+  std::string err;
+
+  WorldPatch p1;
+  EXPECT_TRUE(MakeWorldPatch(base, baseProc, baseSim, mid, midProc, midSim, p1, err, true, true, true));
+  EXPECT_TRUE(err.empty());
+
+  WorldPatch p2;
+  EXPECT_TRUE(MakeWorldPatch(mid, midProc, midSim, target, targetProc, targetSim, p2, err, true, true, true));
+  EXPECT_TRUE(err.empty());
+
+  // Compose p1+p2 into a single base->target patch.
+  WorldPatch composed;
+  std::vector<WorldPatch> chain{p1, p2};
+  EXPECT_TRUE(ComposeWorldPatches(base, baseProc, baseSim, chain, composed, err, true, true, true, false));
+  EXPECT_TRUE(err.empty());
+
+  // Applying composed patch should match target state.
+  World applied = base;
+  ProcGenConfig appliedProc = baseProc;
+  SimConfig appliedSim = baseSim;
+
+  EXPECT_TRUE(ApplyWorldPatch(applied, appliedProc, appliedSim, composed, err, false));
+  EXPECT_TRUE(err.empty());
+
+  EXPECT_EQ(HashWorld(applied, true), HashWorld(target, true));
+  const WorldDiffStats d = DiffWorldTiles(applied, target, 0.0f);
+  EXPECT_EQ(d.tilesDifferent, 0);
+
+  EXPECT_TRUE(appliedProc.zoneChance == targetProc.zoneChance);
+  EXPECT_TRUE(appliedSim.taxResidential == targetSim.taxResidential);
+  EXPECT_TRUE(appliedSim.districtPoliciesEnabled == targetSim.districtPoliciesEnabled);
+  EXPECT_TRUE(appliedSim.districtPolicies[0].taxCommercialMult == targetSim.districtPolicies[0].taxCommercialMult);
+
+  // Inverting the composed patch should undo it back to the base state.
+  WorldPatch inv;
+  EXPECT_TRUE(InvertWorldPatch(base, baseProc, baseSim, composed, inv, err, false));
+  EXPECT_TRUE(err.empty());
+
+  World undone = applied;
+  ProcGenConfig undoneProc = appliedProc;
+  SimConfig undoneSim = appliedSim;
+
+  EXPECT_TRUE(ApplyWorldPatch(undone, undoneProc, undoneSim, inv, err, false));
+  EXPECT_TRUE(err.empty());
+
+  EXPECT_EQ(HashWorld(undone, true), HashWorld(base, true));
+  const WorldDiffStats d2 = DiffWorldTiles(undone, base, 0.0f);
+  EXPECT_EQ(d2.tilesDifferent, 0);
+
+  EXPECT_TRUE(undoneProc.zoneChance == baseProc.zoneChance);
+  EXPECT_TRUE(undoneSim.taxResidential == baseSim.taxResidential);
+  EXPECT_TRUE(undoneSim.districtPoliciesEnabled == baseSim.districtPoliciesEnabled);
+}
+
+
+void TestConfigJsonIO()
+{
+  using namespace isocity;
+
+  // --- ProcGenConfig round-trip ---
+  ProcGenConfig proc;
+  proc.terrainScale = 0.123f;
+  proc.waterLevel = 0.55f;
+  proc.sandLevel = 0.60f;
+  proc.hubs = 3;
+  proc.extraConnections = 7;
+  proc.zoneChance = 0.10f;
+  proc.parkChance = 0.99f;
+  proc.erosion.enabled = false;
+  proc.erosion.thermalIterations = 7;
+  proc.erosion.thermalTalus = 0.07f;
+  proc.erosion.riverMinAccum = 123;
+  proc.erosion.riverCarve = 0.091f;
+  proc.erosion.riverCarvePower = 0.42f;
+  proc.erosion.smoothIterations = 2;
+  proc.erosion.smoothRate = 0.12f;
+  proc.erosion.quantizeScale = 512;
+
+  const std::string procJson = ProcGenConfigToJson(proc, 2);
+  JsonValue procRoot;
+  std::string err;
+  EXPECT_TRUE(ParseJson(procJson, procRoot, err));
+  EXPECT_TRUE(err.empty());
+
+  ProcGenConfig proc2{};
+  EXPECT_TRUE(ApplyProcGenConfigJson(procRoot, proc2, err));
+  EXPECT_TRUE(err.empty());
+
+  EXPECT_TRUE(std::fabs(proc2.terrainScale - proc.terrainScale) < 1e-6f);
+  EXPECT_TRUE(std::fabs(proc2.waterLevel - proc.waterLevel) < 1e-6f);
+  EXPECT_TRUE(std::fabs(proc2.sandLevel - proc.sandLevel) < 1e-6f);
+  EXPECT_EQ(proc2.hubs, proc.hubs);
+  EXPECT_EQ(proc2.extraConnections, proc.extraConnections);
+  EXPECT_TRUE(std::fabs(proc2.zoneChance - proc.zoneChance) < 1e-6f);
+  EXPECT_TRUE(std::fabs(proc2.parkChance - proc.parkChance) < 1e-6f);
+  EXPECT_EQ(proc2.erosion.enabled, proc.erosion.enabled);
+  EXPECT_EQ(proc2.erosion.thermalIterations, proc.erosion.thermalIterations);
+  EXPECT_TRUE(std::fabs(proc2.erosion.thermalTalus - proc.erosion.thermalTalus) < 1e-6f);
+  EXPECT_EQ(proc2.erosion.riverMinAccum, proc.erosion.riverMinAccum);
+  EXPECT_TRUE(std::fabs(proc2.erosion.riverCarve - proc.erosion.riverCarve) < 1e-6f);
+  EXPECT_TRUE(std::fabs(proc2.erosion.riverCarvePower - proc.erosion.riverCarvePower) < 1e-6f);
+  EXPECT_EQ(proc2.erosion.smoothIterations, proc.erosion.smoothIterations);
+  EXPECT_TRUE(std::fabs(proc2.erosion.smoothRate - proc.erosion.smoothRate) < 1e-6f);
+  EXPECT_EQ(proc2.erosion.quantizeScale, proc.erosion.quantizeScale);
+
+  // --- SimConfig round-trip ---
+  SimConfig sim;
+  sim.tickSeconds = 0.42f;
+  sim.parkInfluenceRadius = 9;
+  sim.requireOutsideConnection = false;
+  sim.taxResidential = 11;
+  sim.taxCommercial = 2;
+  sim.taxIndustrial = 15;
+  sim.maintenanceRoad = 7;
+  sim.maintenancePark = 13;
+  sim.taxHappinessPerCapita = 0.10f;
+  sim.residentialDesirabilityWeight = 2.0f;
+  sim.commercialDesirabilityWeight = 3.0f;
+  sim.industrialDesirabilityWeight = 4.0f;
+
+  sim.districtPoliciesEnabled = true;
+  sim.districtPolicies[2].taxCommercialMult = 1.25f;
+  sim.districtPolicies[2].roadMaintenanceMult = 0.50f;
+  sim.districtPolicies[4].parkMaintenanceMult = 1.75f;
+
+  const std::string simJson = SimConfigToJson(sim, 2);
+  JsonValue simRoot;
+  err.clear();
+  EXPECT_TRUE(ParseJson(simJson, simRoot, err));
+  EXPECT_TRUE(err.empty());
+
+  SimConfig sim2{};
+  EXPECT_TRUE(ApplySimConfigJson(simRoot, sim2, err));
+  EXPECT_TRUE(err.empty());
+
+  EXPECT_TRUE(std::fabs(sim2.tickSeconds - sim.tickSeconds) < 1e-6f);
+  EXPECT_EQ(sim2.parkInfluenceRadius, sim.parkInfluenceRadius);
+  EXPECT_EQ(sim2.requireOutsideConnection, sim.requireOutsideConnection);
+  EXPECT_EQ(sim2.taxResidential, sim.taxResidential);
+  EXPECT_EQ(sim2.taxCommercial, sim.taxCommercial);
+  EXPECT_EQ(sim2.taxIndustrial, sim.taxIndustrial);
+  EXPECT_EQ(sim2.maintenanceRoad, sim.maintenanceRoad);
+  EXPECT_EQ(sim2.maintenancePark, sim.maintenancePark);
+  EXPECT_TRUE(std::fabs(sim2.taxHappinessPerCapita - sim.taxHappinessPerCapita) < 1e-6f);
+  EXPECT_TRUE(std::fabs(sim2.residentialDesirabilityWeight - sim.residentialDesirabilityWeight) < 1e-6f);
+  EXPECT_TRUE(std::fabs(sim2.commercialDesirabilityWeight - sim.commercialDesirabilityWeight) < 1e-6f);
+  EXPECT_TRUE(std::fabs(sim2.industrialDesirabilityWeight - sim.industrialDesirabilityWeight) < 1e-6f);
+
+  EXPECT_EQ(sim2.districtPoliciesEnabled, sim.districtPoliciesEnabled);
+  EXPECT_TRUE(std::fabs(sim2.districtPolicies[2].taxCommercialMult - sim.districtPolicies[2].taxCommercialMult) < 1e-6f);
+  EXPECT_TRUE(std::fabs(sim2.districtPolicies[2].roadMaintenanceMult - sim.districtPolicies[2].roadMaintenanceMult) < 1e-6f);
+  EXPECT_TRUE(std::fabs(sim2.districtPolicies[4].parkMaintenanceMult - sim.districtPolicies[4].parkMaintenanceMult) < 1e-6f);
+
+  // --- Merge semantics: missing keys should not clobber existing config ---
+  SimConfig base = SimConfig{};
+  SimConfig defaults = SimConfig{};
+
+  JsonValue partial;
+  err.clear();
+  EXPECT_TRUE(ParseJson("{\"tax_residential\":5}", partial, err));
+  EXPECT_TRUE(err.empty());
+  EXPECT_TRUE(ApplySimConfigJson(partial, base, err));
+  EXPECT_TRUE(err.empty());
+
+  EXPECT_EQ(base.taxResidential, 5);
+  EXPECT_EQ(base.taxCommercial, defaults.taxCommercial);
+  EXPECT_EQ(base.maintenanceRoad, defaults.maintenanceRoad);
+
+  // Sparse district policy edit by explicit id.
+  SimConfig sparseBase = SimConfig{};
+  JsonValue sparseRoot;
+  err.clear();
+  EXPECT_TRUE(ParseJson("{\"district_policies\":[{\"id\":2,\"tax_commercial_mult\":1.75}]}", sparseRoot, err));
+  EXPECT_TRUE(err.empty());
+  EXPECT_TRUE(ApplySimConfigJson(sparseRoot, sparseBase, err));
+  EXPECT_TRUE(err.empty());
+
+  EXPECT_TRUE(std::fabs(sparseBase.districtPolicies[2].taxCommercialMult - 1.75f) < 1e-6f);
+  EXPECT_TRUE(std::fabs(sparseBase.districtPolicies[0].taxCommercialMult - 1.0f) < 1e-6f);
+}
+
+
 void TestBlueprintCaptureApplyRotate()
 {
   using namespace isocity;
@@ -2429,6 +2947,164 @@ void TestBlueprintCaptureApplyRotate()
   // Road mask bits: top road connected south (bit2=4), bottom road connected north (bit0=1).
   EXPECT_EQ(static_cast<int>(w.at(11, 10).variation & 0x0Fu), 4);
   EXPECT_EQ(static_cast<int>(w.at(11, 11).variation & 0x0Fu), 1);
+}
+
+
+void TestBlueprintDiffCropAndTransform()
+{
+  using namespace isocity;
+
+  // ---------------------------------------------------------------------------
+  // Diff + crop + apply should reproduce the target world.
+  // ---------------------------------------------------------------------------
+  World base(12, 12, 7u);
+  World target = base;
+
+  base.setOverlay(Overlay::Road, 2, 2);
+  base.setOverlay(Overlay::Road, 3, 2);
+  base.setOverlay(Overlay::Residential, 2, 3);
+  base.at(2, 3).level = 1;
+  base.at(2, 3).district = 1;
+  base.at(2, 2).district = 1;
+  base.at(3, 2).district = 1;
+
+  target = base;
+
+  // Upgrade the residential tile and change its district.
+  target.at(2, 3).level = 3;
+  target.at(2, 3).district = 3;
+
+  // Remove one road tile.
+  target.bulldoze(3, 2);
+
+  // Add a park.
+  target.setOverlay(Overlay::Park, 5, 5);
+  target.at(5, 5).district = 2;
+
+  // Change height in a single tile.
+  target.at(6, 6).height = base.at(6, 6).height + 0.25f;
+
+  // Change only the upper variation nibble (road auto-mask uses the low nibble).
+  target.at(2, 2).variation = static_cast<std::uint8_t>(target.at(2, 2).variation ^ 0xF0u);
+
+  BlueprintDiffOptions diffOpt;
+  diffOpt.fieldMask = static_cast<std::uint8_t>(TileFieldMask::Overlay) |
+                      static_cast<std::uint8_t>(TileFieldMask::Level) |
+                      static_cast<std::uint8_t>(TileFieldMask::District) |
+                      static_cast<std::uint8_t>(TileFieldMask::Variation) |
+                      static_cast<std::uint8_t>(TileFieldMask::Height);
+  diffOpt.heightEpsilon = 0.0f;
+
+  Blueprint diff;
+  std::string err;
+  EXPECT_TRUE(CaptureBlueprintDiffRect(base, target, 0, 0, base.width(), base.height(), diff, err, diffOpt));
+  EXPECT_TRUE(err.empty());
+  EXPECT_EQ(diff.width, base.width());
+  EXPECT_EQ(diff.height, base.height());
+  EXPECT_TRUE(!diff.tiles.empty());
+
+  Blueprint cropped;
+  int offX = 0;
+  int offY = 0;
+  EXPECT_TRUE(CropBlueprintToDeltasBounds(diff, cropped, offX, offY, err, 0));
+  EXPECT_TRUE(err.empty());
+  EXPECT_TRUE(cropped.width <= diff.width);
+  EXPECT_TRUE(cropped.height <= diff.height);
+
+  World applied = base;
+  BlueprintApplyOptions ap;
+  ap.mode = BlueprintApplyMode::Replace;
+  ap.fieldMask = 0xFFu;
+  ap.allowOutOfBounds = false;
+  ap.force = true;
+  ap.recomputeRoadMasks = true;
+  ap.transform.rotateDeg = 0;
+  ap.transform.mirrorX = false;
+  ap.transform.mirrorY = false;
+
+  EXPECT_TRUE(ApplyBlueprint(applied, cropped, offX, offY, ap, err));
+  EXPECT_TRUE(err.empty());
+
+  for (int y = 0; y < base.height(); ++y) {
+    for (int x = 0; x < base.width(); ++x) {
+      const Tile& a = applied.at(x, y);
+      const Tile& b = target.at(x, y);
+      EXPECT_EQ(a.overlay, b.overlay);
+      EXPECT_EQ(a.level, b.level);
+      EXPECT_EQ(a.district, b.district);
+      EXPECT_EQ(a.variation, b.variation);
+      EXPECT_NEAR(a.height, b.height, 0.0f);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Pre-transforming a blueprint should be equivalent to apply-time transforms.
+  // ---------------------------------------------------------------------------
+
+  World src(8, 8, 1u);
+  src.setOverlay(Overlay::Road, 1, 1);
+  src.at(1, 1).level = 2;
+  src.at(1, 1).district = 4;
+
+  src.setOverlay(Overlay::Residential, 1, 2);
+  src.at(1, 2).level = 2;
+  src.at(1, 2).district = 5;
+
+  src.setOverlay(Overlay::Commercial, 2, 2);
+  src.at(2, 2).level = 3;
+  src.at(2, 2).district = 6;
+
+  BlueprintCaptureOptions cap;
+  cap.fieldMask = static_cast<std::uint8_t>(TileFieldMask::Overlay) |
+                  static_cast<std::uint8_t>(TileFieldMask::Level) |
+                  static_cast<std::uint8_t>(TileFieldMask::District) |
+                  static_cast<std::uint8_t>(TileFieldMask::Variation);
+  cap.sparseByOverlay = false;
+
+  Blueprint stamp;
+  EXPECT_TRUE(CaptureBlueprintRect(src, 1, 1, 3, 2, stamp, err, cap));
+  EXPECT_TRUE(err.empty());
+
+  BlueprintTransform tr;
+  tr.rotateDeg = 90;
+  tr.mirrorX = true;
+  tr.mirrorY = false;
+
+  Blueprint pre;
+  EXPECT_TRUE(TransformBlueprint(stamp, tr, pre, err));
+  EXPECT_TRUE(err.empty());
+
+  World wA(16, 16, 9u);
+  World wB = wA;
+
+  BlueprintApplyOptions apA;
+  apA.mode = BlueprintApplyMode::Replace;
+  apA.fieldMask = 0xFFu;
+  apA.allowOutOfBounds = false;
+  apA.force = true;
+  apA.recomputeRoadMasks = true;
+  apA.transform = tr;
+
+  BlueprintApplyOptions apB = apA;
+  apB.transform.rotateDeg = 0;
+  apB.transform.mirrorX = false;
+  apB.transform.mirrorY = false;
+
+  EXPECT_TRUE(ApplyBlueprint(wA, stamp, 10, 10, apA, err));
+  EXPECT_TRUE(err.empty());
+  EXPECT_TRUE(ApplyBlueprint(wB, pre, 10, 10, apB, err));
+  EXPECT_TRUE(err.empty());
+
+  for (int y = 0; y < wA.height(); ++y) {
+    for (int x = 0; x < wA.width(); ++x) {
+      const Tile& a = wA.at(x, y);
+      const Tile& b = wB.at(x, y);
+      EXPECT_EQ(a.overlay, b.overlay);
+      EXPECT_EQ(a.level, b.level);
+      EXPECT_EQ(a.district, b.district);
+      EXPECT_EQ(a.variation, b.variation);
+    }
+  }
 }
 
 void TestReplayRoundTrip()
@@ -2509,11 +3185,83 @@ void TestReplayRoundTrip()
   ProcGenConfig outProc;
   SimConfig outSim;
   std::vector<Stats> trace;
-  EXPECT_TRUE(PlayReplay(loaded, out, outProc, outSim, err, true, &trace));
+  EXPECT_TRUE(PlayReplay(loaded, out, outProc, outSim, err, true, true, &trace));
   EXPECT_TRUE(err.empty());
 
   EXPECT_EQ(HashWorld(out, true), HashWorld(expected, true));
   EXPECT_TRUE(trace.size() >= 8u); // base + 7 ticks
+}
+
+void TestReplayHashAsserts()
+{
+  using namespace isocity;
+
+  const fs::path tmpDir = fs::temp_directory_path();
+  const fs::path replayPath = tmpDir / "isocity_replay_asserts.isoreplay";
+
+  ProcGenConfig proc{};
+  SimConfig sim{};
+  sim.requireOutsideConnection = false;
+
+  World base = GenerateWorld(20, 20, 999ULL, proc);
+
+  // Embed base save bytes.
+  std::vector<std::uint8_t> baseBytes;
+  std::string err;
+  EXPECT_TRUE(SaveWorldBinaryToBytes(base, proc, sim, baseBytes, err));
+  EXPECT_TRUE(err.empty());
+
+  // Expected world after ticks.
+  World expected = base;
+  Simulator s(sim);
+  for (int i = 0; i < 5; ++i) s.stepOnce(expected);
+  const std::uint64_t expectedHash = HashWorld(expected, true);
+
+  Replay replay;
+  replay.baseSave = std::move(baseBytes);
+
+  ReplayEvent note;
+  note.type = ReplayEventType::Note;
+  note.note = "unit_test";
+  replay.events.push_back(note);
+
+  ReplayEvent tick;
+  tick.type = ReplayEventType::Tick;
+  tick.ticks = 5;
+  replay.events.push_back(tick);
+
+  ReplayEvent as;
+  as.type = ReplayEventType::AssertHash;
+  as.expectedHash = expectedHash;
+  as.includeStatsInHash = true;
+  as.label = "after 5 ticks";
+  replay.events.push_back(as);
+
+  EXPECT_TRUE(SaveReplayBinary(replay, replayPath.string(), err));
+  EXPECT_TRUE(err.empty());
+
+  Replay loaded;
+  EXPECT_TRUE(LoadReplayBinary(loaded, replayPath.string(), err));
+  EXPECT_TRUE(err.empty());
+  EXPECT_EQ(loaded.version, 2u);
+  EXPECT_EQ(loaded.events.size(), replay.events.size());
+
+  // Strict asserts should pass.
+  World out;
+  ProcGenConfig outProc;
+  SimConfig outSim;
+  EXPECT_TRUE(PlayReplay(loaded, out, outProc, outSim, err, true, true, nullptr));
+  EXPECT_TRUE(err.empty());
+
+  // Corrupt the expected hash and verify strict assert fails.
+  loaded.events.back().expectedHash ^= 0x1234ULL;
+  EXPECT_TRUE(!PlayReplay(loaded, out, outProc, outSim, err, true, true, nullptr));
+  EXPECT_TRUE(!err.empty());
+
+  // But relaxed asserts should ignore it.
+  err.clear();
+  EXPECT_TRUE(PlayReplay(loaded, out, outProc, outSim, err, true, false, nullptr));
+  EXPECT_TRUE(err.empty());
 }
 
 
@@ -2848,6 +3596,443 @@ static void TestScriptRunnerBasic()
   EXPECT_TRUE(expanded.find("{hash}") == std::string::npos);
 }
 
+static void TestScriptRunnerVarsAndExpr()
+{
+  using namespace isocity;
+
+  std::vector<std::string> printed;
+
+  ScriptRunner runner;
+  runner.setOptions(ScriptRunOptions{.quiet = true});
+  runner.setCallbacks(ScriptCallbacks{
+    .print = [&](const std::string& line) { printed.push_back(line); },
+    .info = [&](const std::string&) {},
+    .error = [&](const std::string&) {},
+  });
+
+  const std::string script =
+      "set out out_{day}_{run}_{seed}.ppm\n"
+      "size 8x8\n"
+      "seed 10+5\n"
+      "proc terrainScale 0\n"
+      "proc waterLevel -999\n"
+      "proc sandLevel -999\n"
+      "proc zoneChance 0\n"
+      "proc parkChance 0\n"
+      "generate\n"
+      "echo {out}\n"
+      "tick 3\n"
+      "echo {out}\n"
+      "money 1000+200\n";
+
+  EXPECT_TRUE(runner.runText(script, "<unit_test_vars>"));
+  EXPECT_TRUE(runner.state().hasWorld);
+
+  if (runner.state().hasWorld) {
+    EXPECT_EQ(runner.state().world.seed(), static_cast<std::uint64_t>(15));
+    EXPECT_EQ(runner.state().world.stats().money, 1200);
+  }
+
+  EXPECT_TRUE(printed.size() >= 2);
+  if (printed.size() >= 2) {
+    EXPECT_EQ(printed[0], std::string("out_0_0_15.ppm"));
+    EXPECT_EQ(printed[1], std::string("out_3_0_15.ppm"));
+  }
+}
+
+static void TestSuiteManifestDiscoverAndRunScenario()
+{
+  using namespace isocity;
+  namespace fs = std::filesystem;
+
+  // Create an isolated temp folder for the test.
+  const std::uintptr_t tag = reinterpret_cast<std::uintptr_t>(&g_failures);
+  fs::path tmp = fs::temp_directory_path() / ("procisocity_suite_test_" + std::to_string(tag));
+  std::error_code ec;
+  fs::remove_all(tmp, ec);
+  fs::create_directories(tmp, ec);
+  EXPECT_TRUE(!ec);
+
+  // --- Script scenario ---
+  const fs::path scriptPath = tmp / "smoke.isocity";
+  {
+    std::ofstream f(scriptPath, std::ios::binary);
+    EXPECT_TRUE(static_cast<bool>(f));
+    f << "size 8x8\n";
+    f << "seed 123\n";
+    f << "proc terrainScale 0\n";
+    f << "proc waterLevel -999\n";
+    f << "proc sandLevel -999\n";
+    f << "proc zoneChance 0\n";
+    f << "proc parkChance 0\n";
+    f << "generate\n";
+    f << "tick 2\n";
+  }
+
+  ScenarioCase scScript;
+  scScript.path = scriptPath.string();
+  scScript.kind = ScenarioKind::Script;
+
+  ScenarioRunOptions opt;
+  opt.quiet = true;
+  opt.runIndex = 7;
+  opt.scriptVars["hello"] = "world";
+
+  ScenarioRunOutputs out;
+  std::string err;
+  EXPECT_TRUE(RunScenario(scScript, opt, out, err));
+  EXPECT_TRUE(err.empty());
+  EXPECT_TRUE(out.world.width() == 8 && out.world.height() == 8);
+  EXPECT_EQ(out.tickStats.size(), static_cast<std::size_t>(2));
+  EXPECT_NE(out.finalHash, static_cast<std::uint64_t>(0));
+
+  // --- Replay scenario with a deliberately wrong hash assert ---
+  // Build a minimal replay file on disk.
+  const fs::path replayPath = tmp / "bad_assert.isoreplay";
+  {
+    ProcGenConfig pc;
+    pc.terrainScale = 0.0f;
+    pc.waterLevel = -999.0f;
+    pc.sandLevel = -999.0f;
+    pc.zoneChance = 0.0f;
+    pc.parkChance = 0.0f;
+
+    SimConfig sc;
+    World base = GenerateWorld(8, 8, 123, pc);
+
+    std::vector<std::uint8_t> baseBytes;
+    std::string saveErr;
+    EXPECT_TRUE(SaveWorldBinaryToBytes(base, pc, sc, baseBytes, saveErr));
+
+    Replay rp;
+    rp.version = 2;
+    rp.baseSave = std::move(baseBytes);
+    ReplayEvent e;
+    e.type = ReplayEventType::AssertHash;
+    e.expectedHash = 0x1234567890ABCDEFull; // intentionally wrong
+    e.includeStatsInHash = true;
+    e.label = "wrong";
+    rp.events.push_back(std::move(e));
+
+    std::string repErr;
+    EXPECT_TRUE(SaveReplayBinary(rp, replayPath.string(), repErr));
+  }
+
+  ScenarioCase scReplay;
+  scReplay.path = replayPath.string();
+  scReplay.kind = ScenarioKind::Replay;
+
+  ScenarioRunOptions strict;
+  strict.quiet = true;
+  strict.strictReplayAsserts = true;
+  strict.strictReplayPatches = true;
+
+  ScenarioRunOutputs outStrict;
+  std::string errStrict;
+  EXPECT_TRUE(!RunScenario(scReplay, strict, outStrict, errStrict));
+  EXPECT_TRUE(!errStrict.empty());
+
+  ScenarioRunOptions lax = strict;
+  lax.strictReplayAsserts = false;
+  ScenarioRunOutputs outLax;
+  std::string errLax;
+  EXPECT_TRUE(RunScenario(scReplay, lax, outLax, errLax));
+  EXPECT_TRUE(errLax.empty());
+  EXPECT_NE(outLax.finalHash, static_cast<std::uint64_t>(0));
+
+  // --- Manifest parsing ---
+  const fs::path manifestPath = tmp / "suite.txt";
+  {
+    std::ofstream f(manifestPath, std::ios::binary);
+    EXPECT_TRUE(static_cast<bool>(f));
+    f << "# test suite\n";
+    f << "script \"" << scriptPath.string() << "\"\n";
+    f << "replay \"" << replayPath.string() << "\"\n";
+  }
+
+  std::vector<ScenarioCase> manifestCases;
+  std::string mErr;
+  EXPECT_TRUE(LoadScenarioManifest(manifestPath.string(), manifestCases, mErr));
+  EXPECT_TRUE(mErr.empty());
+  EXPECT_EQ(manifestCases.size(), static_cast<std::size_t>(2));
+  if (manifestCases.size() == 2) {
+    EXPECT_EQ(manifestCases[0].kind, ScenarioKind::Script);
+    EXPECT_EQ(manifestCases[1].kind, ScenarioKind::Replay);
+  }
+
+  // --- Discovery ---
+  std::vector<ScenarioCase> discovered;
+  std::string dErr;
+  EXPECT_TRUE(DiscoverScenarios(tmp.string(), {".isocity", ".isoreplay"}, discovered, dErr));
+  EXPECT_TRUE(dErr.empty());
+  EXPECT_TRUE(discovered.size() >= 2);
+}
+
+
+void TestWorldTransformRotateMirrorCrop()
+{
+  const int srcW = 7;
+  const int srcH = 5;
+
+  World src(srcW, srcH, 123);
+  src.stats().day = 42;
+  src.stats().money = 1337;
+
+  for (int y = 0; y < srcH; ++y) {
+    for (int x = 0; x < srcW; ++x) {
+      Tile& t = src.at(x, y);
+      const int idx1d = y * srcW + x;
+
+      t.terrain = Terrain::Grass;
+      t.overlay = Overlay::Residential;
+      t.level = 1;
+      t.occupants = static_cast<std::uint16_t>(idx1d);
+      t.district = static_cast<std::uint8_t>(idx1d % 8);
+      t.variation = static_cast<std::uint8_t>((idx1d * 37) & 0xFF);
+      t.height = 0.01f * static_cast<float>(idx1d);
+    }
+  }
+
+  auto rotatedDims = [](int w, int h, int rotateDeg, int& outW, int& outH) {
+    if (rotateDeg == 90 || rotateDeg == 270) {
+      outW = h;
+      outH = w;
+    } else {
+      outW = w;
+      outH = h;
+    }
+  };
+
+  auto mapManual = [&](const WorldTransformConfig& cfg, int xOut, int yOut, int& xs, int& ys) {
+    int wRot = 0;
+    int hRot = 0;
+    rotatedDims(srcW, srcH, cfg.rotateDeg, wRot, hRot);
+
+    // Undo crop.
+    int xRot = xOut;
+    int yRot = yOut;
+    if (cfg.hasCrop) {
+      xRot += cfg.cropX;
+      yRot += cfg.cropY;
+    }
+
+    // Undo mirrors (mirrors are applied after rotation).
+    if (cfg.mirrorX) xRot = wRot - 1 - xRot;
+    if (cfg.mirrorY) yRot = hRot - 1 - yRot;
+
+    // Map rotated-space -> source.
+    switch (cfg.rotateDeg) {
+    case 0:
+      xs = xRot;
+      ys = yRot;
+      break;
+    case 90:
+      xs = yRot;
+      ys = srcH - 1 - xRot;
+      break;
+    case 180:
+      xs = srcW - 1 - xRot;
+      ys = srcH - 1 - yRot;
+      break;
+    case 270:
+      xs = srcW - 1 - yRot;
+      ys = xRot;
+      break;
+    default:
+      xs = ys = -1;
+      break;
+    }
+  };
+
+  auto runCase = [&](const WorldTransformConfig& cfg) {
+    std::string err;
+    World dst;
+    EXPECT_TRUE(TransformWorld(src, dst, cfg, err));
+    EXPECT_TRUE(err.empty());
+
+    // Stats should be copied through the transform.
+    EXPECT_EQ(dst.stats().day, 42);
+    EXPECT_EQ(dst.stats().money, 1337);
+
+    int wRot = 0;
+    int hRot = 0;
+    rotatedDims(srcW, srcH, cfg.rotateDeg, wRot, hRot);
+    const int expectedW = cfg.hasCrop ? cfg.cropW : wRot;
+    const int expectedH = cfg.hasCrop ? cfg.cropH : hRot;
+
+    EXPECT_EQ(dst.width(), expectedW);
+    EXPECT_EQ(dst.height(), expectedH);
+
+    for (int y = 0; y < expectedH; ++y) {
+      for (int x = 0; x < expectedW; ++x) {
+        int xs = 0;
+        int ys = 0;
+        mapManual(cfg, x, y, xs, ys);
+        EXPECT_TRUE(xs >= 0 && ys >= 0 && xs < srcW && ys < srcH);
+
+        const int expectedIdx = ys * srcW + xs;
+        const Tile& outT = dst.at(x, y);
+        EXPECT_EQ(static_cast<int>(outT.occupants), expectedIdx);
+        EXPECT_EQ(static_cast<int>(outT.district), expectedIdx % 8);
+        EXPECT_EQ(static_cast<int>(outT.variation), (expectedIdx * 37) & 0xFF);
+        EXPECT_NEAR(outT.height, 0.01f * static_cast<float>(expectedIdx), 1e-6f);
+      }
+    }
+  };
+
+  {
+    WorldTransformConfig cfg;
+    cfg.rotateDeg = 0;
+    runCase(cfg);
+  }
+  {
+    WorldTransformConfig cfg;
+    cfg.rotateDeg = 90;
+    runCase(cfg);
+  }
+  {
+    WorldTransformConfig cfg;
+    cfg.rotateDeg = 180;
+    runCase(cfg);
+  }
+  {
+    WorldTransformConfig cfg;
+    cfg.rotateDeg = 270;
+    runCase(cfg);
+  }
+  {
+    WorldTransformConfig cfg;
+    cfg.rotateDeg = 90;
+    cfg.mirrorX = true;
+    runCase(cfg);
+  }
+  {
+    WorldTransformConfig cfg;
+    cfg.rotateDeg = 270;
+    cfg.mirrorY = true;
+    runCase(cfg);
+  }
+  {
+    WorldTransformConfig cfg;
+    cfg.rotateDeg = 90;
+    cfg.mirrorX = true;
+    cfg.mirrorY = true;
+    cfg.hasCrop = true;
+    cfg.cropX = 1;
+    cfg.cropY = 2;
+    cfg.cropW = 3;
+    cfg.cropH = 2;
+    runCase(cfg);
+  }
+
+  // Invalid rotation.
+  {
+    WorldTransformConfig cfg;
+    cfg.rotateDeg = 45;
+    std::string err;
+    World dst;
+    EXPECT_TRUE(!TransformWorld(src, dst, cfg, err));
+    EXPECT_TRUE(!err.empty());
+  }
+}
+
+void TestMeshExportObjMtlBasic()
+{
+  using namespace isocity;
+
+  World w(2, 2, 123);
+
+  // (0,0) Grass
+  {
+    Tile& t = w.at(0, 0);
+    t.terrain = Terrain::Grass;
+    t.overlay = Overlay::None;
+    t.height = 0.0f;
+  }
+
+  // (1,0) Road
+  {
+    Tile& t = w.at(1, 0);
+    t.terrain = Terrain::Grass;
+    t.overlay = Overlay::Road;
+    t.height = 0.0f;
+  }
+
+  // (0,1) Water
+  {
+    Tile& t = w.at(0, 1);
+    t.terrain = Terrain::Water;
+    t.overlay = Overlay::None;
+    t.height = -0.5f;
+  }
+
+  // (1,1) Residential zone (one building)
+  {
+    Tile& t = w.at(1, 1);
+    t.terrain = Terrain::Grass;
+    t.overlay = Overlay::Residential;
+    t.level = 2;
+    t.occupants = 15;
+    t.variation = 0xA0; // affects building height slightly
+    t.height = 0.25f;
+  }
+
+  // Export without cliffs/buildings to get deterministic counts.
+  {
+    MeshExportConfig cfg;
+    cfg.mtlFileName = "test.mtl";
+    cfg.tileSize = 1.0f;
+    cfg.heightScale = 1.0f;
+    cfg.overlayOffset = 0.1f;
+    cfg.includeCliffs = false;
+    cfg.includeBuildings = false;
+
+    std::ostringstream obj;
+    std::ostringstream mtl;
+    MeshExportStats st;
+    std::string err;
+    EXPECT_TRUE(WriteWorldObjMtl(obj, mtl, w, cfg, &st, &err));
+    EXPECT_TRUE(err.empty());
+
+    EXPECT_EQ(st.vertices, 16ULL);
+    EXPECT_EQ(st.triangles, 8ULL);
+
+    const std::string objStr = obj.str();
+    const std::string mtlStr = mtl.str();
+    EXPECT_TRUE(objStr.find("mtllib test.mtl") != std::string::npos);
+    EXPECT_TRUE(objStr.find("usemtl mat_road") != std::string::npos);
+    EXPECT_TRUE(objStr.find("usemtl mat_water") != std::string::npos);
+    EXPECT_TRUE(objStr.find("usemtl mat_res") != std::string::npos);
+    EXPECT_TRUE(mtlStr.find("newmtl mat_grass") != std::string::npos);
+    EXPECT_TRUE(mtlStr.find("newmtl mat_cliff") != std::string::npos); // always emitted
+  }
+
+  // Export with buildings enabled and verify that it adds geometry.
+  {
+    MeshExportConfig cfg;
+    cfg.mtlFileName = "test.mtl";
+    cfg.tileSize = 1.0f;
+    cfg.heightScale = 1.0f;
+    cfg.overlayOffset = 0.1f;
+    cfg.includeCliffs = false;
+    cfg.includeBuildings = true;
+
+    std::ostringstream obj;
+    std::ostringstream mtl;
+    MeshExportStats st;
+    std::string err;
+    EXPECT_TRUE(WriteWorldObjMtl(obj, mtl, w, cfg, &st, &err));
+    EXPECT_TRUE(err.empty());
+
+    // 4 tiles => 16 vertices / 8 tris, plus one box building => 20 vertices / 10 tris.
+    EXPECT_EQ(st.vertices, 36ULL);
+    EXPECT_EQ(st.triangles, 18ULL);
+
+    const std::string objStr = obj.str();
+    EXPECT_TRUE(objStr.find("usemtl mat_building_res") != std::string::npos);
+  }
+}
+
 int main()
 {
   TestRoadAutoTilingMasks();
@@ -2871,12 +4056,14 @@ int main()
   TestRoadToEdgeMask();
   TestRoadGraphPlusIntersection();
   TestRoadGraphCornerCreatesNode();
+  TestRoadGraphExportMetricsAndJson();
   TestTrafficCommuteHeatmapSimple();
   TestTrafficPrefersHighSpeedRoadsWhenStepsTie();
   TestTrafficUnreachableAcrossDisconnectedEdgeComponents();
   TestGoodsIndustrySuppliesCommercial();
   TestGoodsImportsWhenNoIndustry();
   TestGoodsUnreachableDemandWhenNoImports();
+  TestTrafficAndGoodsAcceptPrecomputedZoneAccessMap();
 
   TestLandValueParkAmenityBoostsNearby();
   TestLandValueWaterAmenityIncreasesNearCoast();
@@ -2892,18 +4079,28 @@ int main()
   TestWorldDiffCounts();
   TestWorldPatchRoundTrip();
   TestWorldPatchRejectsMismatchedBaseHash();
+  TestWorldPatchInvertAndCompose();
+  TestConfigJsonIO();
   TestBlueprintCaptureApplyRotate();
+  TestBlueprintDiffCropAndTransform();
   TestReplayRoundTrip();
+  TestReplayHashAsserts();
   TestDistrictStatsCompute();
   TestAutoDistrictsSeparatesDisconnectedRoadComponents();
   TestAutoDistrictsFillAllTilesIsDeterministic();
   TestExportPpmLayers();
+  TestExportIsoOverview();
+  TestPpmReadWriteAndCompare();
+  TestMeshExportObjMtlBasic();
+  TestWorldTransformRotateMirrorCrop();
 
   TestZoneBuildingParcelsDeterministic();
   TestBrushRasterShapes();
   TestFloodFillRegions();
   TestAutoBuildDeterminism();
   TestScriptRunnerBasic();
+  TestScriptRunnerVarsAndExpr();
+  TestSuiteManifestDiscoverAndRunScenario();
 
 
   TestRoadPathfindingAStar();

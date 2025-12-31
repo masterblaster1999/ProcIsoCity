@@ -60,7 +60,8 @@ struct Consumer {
 } // namespace
 
 GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
-                            const std::vector<std::uint8_t>* precomputedRoadToEdge)
+                            const std::vector<std::uint8_t>* precomputedRoadToEdge,
+                            const ZoneAccessMap* precomputedZoneAccess)
 {
   GoodsResult out;
 
@@ -87,7 +88,16 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
 
   // Zone access: allows interior tiles of a connected zoned area to be reachable via a
   // road-adjacent boundary tile.
-  const ZoneAccessMap zoneAccess = BuildZoneAccessMap(world, roadToEdge);
+  ZoneAccessMap zoneAccessLocal;
+  const ZoneAccessMap* zoneAccess = nullptr;
+
+  if (precomputedZoneAccess && precomputedZoneAccess->w == w && precomputedZoneAccess->h == h &&
+      precomputedZoneAccess->roadIdx.size() == n) {
+    zoneAccess = precomputedZoneAccess;
+  } else {
+    zoneAccessLocal = BuildZoneAccessMap(world, roadToEdge);
+    zoneAccess = &zoneAccessLocal;
+  }
 
   auto isTraversableRoad = [&](int ridx) -> bool {
     if (ridx < 0 || static_cast<std::size_t>(ridx) >= n) return false;
@@ -112,8 +122,8 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
       if (t.level == 0) continue;
 
       const std::size_t zidx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
-      if (zidx >= zoneAccess.roadIdx.size()) continue;
-      if (zoneAccess.roadIdx[zidx] < 0) continue;
+      if (zidx >= zoneAccess->roadIdx.size()) continue;
+      if (zoneAccess->roadIdx[zidx] < 0) continue;
 
       // Prefer a directly-adjacent road if available; otherwise use the propagated access road.
       int ridx = -1;
@@ -121,7 +131,7 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
       if (PickAdjacentRoadTile(world, roadToEdge, x, y, road)) {
         ridx = road.y * w + road.x;
       } else {
-        ridx = zoneAccess.roadIdx[zidx];
+        ridx = zoneAccess->roadIdx[zidx];
       }
       if (!isTraversableRoad(ridx)) continue;
 
@@ -208,8 +218,8 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
       if (t.overlay != Overlay::Commercial) continue;
       if (t.level == 0) continue;
       const std::size_t zidx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
-      if (zidx >= zoneAccess.roadIdx.size()) continue;
-      if (zoneAccess.roadIdx[zidx] < 0) continue;
+      if (zidx >= zoneAccess->roadIdx.size()) continue;
+      if (zoneAccess->roadIdx[zidx] < 0) continue;
 
       const float raw = static_cast<float>(BaseCommercialDemand(static_cast<int>(t.level))) * cfg.demandScale;
       const int demand = std::max(0, static_cast<int>(std::lround(raw)));
@@ -220,7 +230,7 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
       if (PickAdjacentRoadTile(world, roadToEdge, x, y, road)) {
         ridx = road.y * w + road.x;
       } else {
-        ridx = zoneAccess.roadIdx[zidx];
+        ridx = zoneAccess->roadIdx[zidx];
       }
       if (!isTraversableRoad(ridx)) continue;
 

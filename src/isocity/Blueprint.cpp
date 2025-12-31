@@ -3,6 +3,7 @@
 #include "isocity/Compression.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -575,6 +576,261 @@ bool ApplyBlueprint(World& world, const Blueprint& bp, int dstX, int dstY,
 
   return true;
 }
+
+
+bool TransformBlueprint(const Blueprint& src, const BlueprintTransform& tr,
+                        Blueprint& outBlueprint, std::string& outError)
+{
+  outError.clear();
+  outBlueprint = Blueprint{};
+
+  if (src.width <= 0 || src.height <= 0) {
+    outError = "invalid blueprint";
+    return false;
+  }
+
+  std::string rotErr;
+  if (!ValidateRotation(tr.rotateDeg, rotErr)) {
+    outError = rotErr;
+    return false;
+  }
+
+  int newW = src.width;
+  int newH = src.height;
+  if (tr.rotateDeg == 90 || tr.rotateDeg == 270) {
+    newW = src.height;
+    newH = src.width;
+  }
+
+  const std::uint64_t areaSrc = static_cast<std::uint64_t>(src.width) * static_cast<std::uint64_t>(src.height);
+  const std::uint64_t areaDst = static_cast<std::uint64_t>(newW) * static_cast<std::uint64_t>(newH);
+  if (areaSrc > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) ||
+      areaDst > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
+    outError = "blueprint area too large";
+    return false;
+  }
+
+  outBlueprint.width = newW;
+  outBlueprint.height = newH;
+  outBlueprint.version = src.version;
+
+  outBlueprint.tiles.clear();
+  outBlueprint.tiles.reserve(src.tiles.size());
+
+  for (const auto& d : src.tiles) {
+    if (static_cast<std::uint64_t>(d.index) >= areaSrc) {
+      outError = "blueprint contains out-of-range tile index";
+      return false;
+    }
+
+    const int localX = static_cast<int>(d.index % static_cast<std::uint32_t>(src.width));
+    const int localY = static_cast<int>(d.index / static_cast<std::uint32_t>(src.width));
+
+    int tx = 0;
+    int ty = 0;
+    int tw = 0;
+    int th = 0;
+    TransformCoord(localX, localY, src.width, src.height, tr, tx, ty, tw, th);
+
+    // Sanity: transformed dimensions should match our precomputed (newW,newH).
+    if (tw != newW || th != newH) {
+      outError = "internal transform dimension mismatch";
+      return false;
+    }
+
+    const std::uint32_t newIdx = static_cast<std::uint32_t>(ty * newW + tx);
+
+    WorldPatchTileDelta nd = d;
+    nd.index = newIdx;
+    outBlueprint.tiles.push_back(nd);
+  }
+
+  std::sort(outBlueprint.tiles.begin(), outBlueprint.tiles.end(),
+            [](const WorldPatchTileDelta& a, const WorldPatchTileDelta& b) { return a.index < b.index; });
+
+  return true;
+}
+
+bool CropBlueprintToDeltasBounds(const Blueprint& src, Blueprint& outBlueprint,
+                                int& outOffsetX, int& outOffsetY,
+                                std::string& outError, int pad)
+{
+  outError.clear();
+  outBlueprint = Blueprint{};
+  outOffsetX = 0;
+  outOffsetY = 0;
+
+  if (src.width <= 0 || src.height <= 0) {
+    outError = "invalid blueprint";
+    return false;
+  }
+
+  if (pad < 0) pad = 0;
+
+  const std::uint64_t areaSrc = static_cast<std::uint64_t>(src.width) * static_cast<std::uint64_t>(src.height);
+  if (areaSrc > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
+    outError = "blueprint area too large";
+    return false;
+  }
+
+  if (src.tiles.empty()) {
+    // Keep a valid non-empty dimension so the blueprint stays representable.
+    outBlueprint.width = 1;
+    outBlueprint.height = 1;
+    outBlueprint.version = src.version;
+    outBlueprint.tiles.clear();
+    return true;
+  }
+
+  int minX = src.width - 1;
+  int minY = src.height - 1;
+  int maxX = 0;
+  int maxY = 0;
+
+  for (const auto& d : src.tiles) {
+    if (static_cast<std::uint64_t>(d.index) >= areaSrc) {
+      outError = "blueprint contains out-of-range tile index";
+      return false;
+    }
+    const int x = static_cast<int>(d.index % static_cast<std::uint32_t>(src.width));
+    const int y = static_cast<int>(d.index / static_cast<std::uint32_t>(src.width));
+    minX = std::min(minX, x);
+    minY = std::min(minY, y);
+    maxX = std::max(maxX, x);
+    maxY = std::max(maxY, y);
+  }
+
+  minX = std::max(0, minX - pad);
+  minY = std::max(0, minY - pad);
+  maxX = std::min(src.width - 1, maxX + pad);
+  maxY = std::min(src.height - 1, maxY + pad);
+
+  const int newW = std::max(1, maxX - minX + 1);
+  const int newH = std::max(1, maxY - minY + 1);
+
+  outBlueprint.width = newW;
+  outBlueprint.height = newH;
+  outBlueprint.version = src.version;
+
+  outBlueprint.tiles.clear();
+  outBlueprint.tiles.reserve(src.tiles.size());
+
+  for (const auto& d : src.tiles) {
+    const int x = static_cast<int>(d.index % static_cast<std::uint32_t>(src.width));
+    const int y = static_cast<int>(d.index / static_cast<std::uint32_t>(src.width));
+    if (x < minX || x > maxX || y < minY || y > maxY) continue;
+
+    const int nx = x - minX;
+    const int ny = y - minY;
+    const std::uint32_t nidx = static_cast<std::uint32_t>(ny * newW + nx);
+
+    WorldPatchTileDelta nd = d;
+    nd.index = nidx;
+    outBlueprint.tiles.push_back(nd);
+  }
+
+  std::sort(outBlueprint.tiles.begin(), outBlueprint.tiles.end(),
+            [](const WorldPatchTileDelta& a, const WorldPatchTileDelta& b) { return a.index < b.index; });
+
+  outOffsetX = minX;
+  outOffsetY = minY;
+  return true;
+}
+
+bool CaptureBlueprintDiffRect(const World& baseWorld, const World& targetWorld,
+                             int x0, int y0, int w, int h,
+                             Blueprint& outBlueprint, std::string& outError,
+                             const BlueprintDiffOptions& opt)
+{
+  outError.clear();
+  outBlueprint = Blueprint{};
+
+  if (baseWorld.width() != targetWorld.width() || baseWorld.height() != targetWorld.height()) {
+    outError = "world size mismatch";
+    return false;
+  }
+
+  if (w <= 0 || h <= 0) {
+    outError = "invalid rect size";
+    return false;
+  }
+
+  if (!baseWorld.inBounds(x0, y0) || !baseWorld.inBounds(x0 + w - 1, y0 + h - 1)) {
+    outError = "diff rect out of bounds";
+    return false;
+  }
+
+  if ((opt.fieldMask & ~kKnownTileMask) != 0) {
+    outError = "fieldMask contains unknown bits";
+    return false;
+  }
+
+  const std::uint8_t fieldMask = static_cast<std::uint8_t>(opt.fieldMask & kKnownTileMask);
+  if (fieldMask == 0) {
+    outError = "fieldMask is empty";
+    return false;
+  }
+
+  auto heightDiff = [&](float a, float b) -> bool {
+    if (opt.heightEpsilon > 0.0f) {
+      return std::fabs(a - b) > opt.heightEpsilon;
+    }
+    return a != b;
+  };
+
+  outBlueprint.width = w;
+  outBlueprint.height = h;
+  outBlueprint.version = kCurrentVersion;
+
+  outBlueprint.tiles.clear();
+  outBlueprint.tiles.reserve(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) / 4u);
+
+  const std::uint8_t terrainBit = static_cast<std::uint8_t>(TileFieldMask::Terrain);
+  const std::uint8_t overlayBit = static_cast<std::uint8_t>(TileFieldMask::Overlay);
+  const std::uint8_t heightBit = static_cast<std::uint8_t>(TileFieldMask::Height);
+  const std::uint8_t varBit = static_cast<std::uint8_t>(TileFieldMask::Variation);
+  const std::uint8_t levelBit = static_cast<std::uint8_t>(TileFieldMask::Level);
+  const std::uint8_t occBit = static_cast<std::uint8_t>(TileFieldMask::Occupants);
+  const std::uint8_t districtBit = static_cast<std::uint8_t>(TileFieldMask::District);
+
+  for (int ry = 0; ry < h; ++ry) {
+    for (int rx = 0; rx < w; ++rx) {
+      const int x = x0 + rx;
+      const int y = y0 + ry;
+      const Tile& a = baseWorld.at(x, y);
+      const Tile& b = targetWorld.at(x, y);
+
+      std::uint8_t m = 0;
+      if ((fieldMask & terrainBit) && a.terrain != b.terrain) m |= terrainBit;
+      if ((fieldMask & overlayBit) && a.overlay != b.overlay) m |= overlayBit;
+      if ((fieldMask & heightBit) && heightDiff(a.height, b.height)) m |= heightBit;
+      if ((fieldMask & varBit) && a.variation != b.variation) m |= varBit;
+      if ((fieldMask & levelBit) && a.level != b.level) m |= levelBit;
+      if ((fieldMask & occBit) && a.occupants != b.occupants) m |= occBit;
+      if ((fieldMask & districtBit) && a.district != b.district) m |= districtBit;
+
+      if (m == 0) continue;
+
+      WorldPatchTileDelta d;
+      d.index = static_cast<std::uint32_t>(ry * w + rx);
+      d.mask = m;
+      d.value = b;
+
+      if (opt.zeroOccupants && (m & occBit)) {
+        d.value.occupants = 0;
+      }
+
+      outBlueprint.tiles.push_back(d);
+    }
+  }
+
+  // Ensure deterministic ordering.
+  std::sort(outBlueprint.tiles.begin(), outBlueprint.tiles.end(),
+            [](const WorldPatchTileDelta& a, const WorldPatchTileDelta& b) { return a.index < b.index; });
+
+  return true;
+}
+
 
 bool SerializeBlueprintBinary(const Blueprint& bp, std::vector<std::uint8_t>& outBytes,
                               std::string& outError, BlueprintCompression compression)

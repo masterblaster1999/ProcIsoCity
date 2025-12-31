@@ -38,6 +38,106 @@ struct PpmImage {
   std::vector<std::uint8_t> rgb;
 };
 
+
+struct PpmDiffStats {
+  int width = 0;
+  int height = 0;
+
+  // Pixels compared (width*height).
+  std::uint64_t pixelsCompared = 0;
+
+  // Pixels whose absolute per-channel difference exceeded `threshold` for at least one channel.
+  std::uint64_t pixelsDifferent = 0;
+
+  // Max per-channel absolute difference over all pixels (0..255).
+  std::uint8_t maxAbsDiff = 0;
+
+  // Mean absolute difference and mean squared error over channels (denominator = pixelsCompared * 3).
+  double meanAbsDiff = 0.0;
+  double mse = 0.0;
+
+  // Peak signal-to-noise ratio in dB (computed from MSE). +inf when mse == 0.
+  double psnr = 0.0;
+};
+
+// Read a binary PPM (P6) file.
+// Supports:
+//  - whitespace-separated header tokens
+//  - comment lines starting with '#'
+//  - maxval != 255 (input will be scaled to 0..255)
+//
+// Returns true on success; on failure, outError contains a human-friendly error.
+bool ReadPpm(const std::string& path, PpmImage& outImg, std::string& outError);
+
+// Compare two PPM images.
+// - threshold: per-channel absolute tolerance (0 means exact).
+// - outDiff (optional): absolute-difference visualization (per-channel |a-b|; zeroed for <=threshold).
+//
+// Returns false only on invalid inputs (dimension mismatch, bad buffers, etc).
+// Use outStats.pixelsDifferent to determine match/mismatch.
+bool ComparePpm(const PpmImage& a, const PpmImage& b, PpmDiffStats& outStats, int threshold = 0,
+                PpmImage* outDiff = nullptr);
+
+
+// -----------------------------------------------------------------------------------------------
+// Isometric overview export (headless)
+//
+// This is intentionally separate from the raylib Renderer so CI/headless tooling can still
+// generate a readable city "screenshot" without external dependencies.
+// The output is still a PPM (P6) image.
+// -----------------------------------------------------------------------------------------------
+
+struct IsoOverviewConfig {
+  // Tile pixel size for the top diamond. Must be even numbers (so halfW/halfH are integers).
+  int tileW = 16;
+  int tileH = 8;
+
+  // Maximum elevation in pixels for tiles with height=1.0.
+  // 0 disables vertical relief.
+  int heightScalePx = 14;
+
+  // Extra border around the rendered bounds.
+  int marginPx = 8;
+
+  // If true, draw simple vertical "cliff" faces when a tile is higher than its east/south neighbor.
+  bool drawCliffs = true;
+
+  // If true, draw a thin outline around each tile top diamond.
+  bool drawGrid = false;
+
+  // Background color (RGB).
+  std::uint8_t bgR = 110;
+  std::uint8_t bgG = 160;
+  std::uint8_t bgB = 220;
+};
+
+struct IsoOverviewResult {
+  PpmImage image;
+
+  // Transform info (useful for debugging / tests).
+  int tileW = 0;
+  int tileH = 0;
+  int halfW = 0;
+  int halfH = 0;
+  int heightScalePx = 0;
+  int offsetX = 0; // add to iso-space coords to get image pixels
+  int offsetY = 0;
+};
+
+// Render an isometric overview image using the same layer coloring as RenderPpmLayer,
+// but projected into an isometric diamond grid.
+//
+// The returned result includes a transform so callers can map tile centers to image pixels
+// deterministically (useful for tests, picking, and annotation).
+IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const IsoOverviewConfig& cfg,
+                                   const LandValueResult* landValue = nullptr,
+                                   const TrafficResult* traffic = nullptr,
+                                   const GoodsResult* goods = nullptr);
+
+// Compute the pixel coordinate of a tile center in a rendered isometric overview image.
+// Returns false if the tile is out of bounds or the transform is invalid.
+bool IsoTileCenterToPixel(const World& world, const IsoOverviewResult& iso, int tx, int ty, int& outPx, int& outPy);
+
 // Parse a user-facing layer name (case-insensitive).
 // Examples:
 //   "terrain", "overlay", "height", "landvalue", "traffic", "goods_traffic", "goods_fill", "district"

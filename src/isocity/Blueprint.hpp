@@ -108,6 +108,54 @@ struct BlueprintApplyOptions {
 bool ApplyBlueprint(World& world, const Blueprint& bp, int dstX, int dstY,
                     const BlueprintApplyOptions& opt, std::string& outError);
 
+// --- Blueprint operations ---
+
+// Create a new blueprint by applying a geometric transform in blueprint space.
+//
+// This is useful for tooling (e.g., pre-rotating a stamp) and for verifying that
+// apply-time transforms behave as expected.
+bool TransformBlueprint(const Blueprint& src, const BlueprintTransform& tr,
+                        Blueprint& outBlueprint, std::string& outError);
+
+// Crop a blueprint to the minimal axis-aligned bounds that contain all tile deltas.
+//
+// The returned offsets (outOffsetX/Y) are the top-left corner of the crop region
+// in the source blueprint. When applying the cropped blueprint into a world, add
+// these offsets to your destination coordinate.
+//
+// If the source blueprint has no deltas, this produces a 1x1 empty blueprint and
+// returns offsets (0,0).
+bool CropBlueprintToDeltasBounds(const Blueprint& src, Blueprint& outBlueprint,
+                                 int& outOffsetX, int& outOffsetY,
+                                 std::string& outError, int pad = 0);
+
+// Options for capturing a blueprint that represents a *diff* between two worlds.
+struct BlueprintDiffOptions {
+  // Field mask used both for comparison and for emitted deltas.
+  // Only fields included here can appear in the resulting deltas.
+  std::uint8_t fieldMask = 0xFFu;
+
+  // When > 0, heights are considered equal if abs(a-b) <= heightEpsilon.
+  // When <= 0, heights are compared exactly.
+  float heightEpsilon = 0.0f;
+
+  // If true and Occupants is in fieldMask, store 0 occupants in the diff blueprint
+  // (layout-only diffs).
+  bool zeroOccupants = false;
+};
+
+// Capture a blueprint representing the differences between two worlds over a rectangle.
+//
+// The output blueprint dimensions are (w,h), and delta indices are relative to the
+// rectangle's origin.
+//
+// The two worlds must have identical dimensions.
+bool CaptureBlueprintDiffRect(const World& baseWorld, const World& targetWorld,
+                             int x0, int y0, int w, int h,
+                             Blueprint& outBlueprint, std::string& outError,
+                             const BlueprintDiffOptions& opt = {});
+
+
 // --- Binary format ---
 //
 // Header:

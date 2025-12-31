@@ -82,9 +82,11 @@ void PrintHelp()
       << "                 [--out <summary.json>] [--csv <ticks.csv>] [--save <save.bin>]\n"
       << "                 [--require-outside <0|1>] [--tax-res <N>] [--tax-com <N>] [--tax-ind <N>]\n"
       << "                 [--maint-road <N>] [--maint-park <N>]\n"
-      << "                 [--export-ppm <layer> <out.ppm>]... [--export-scale <N>] [--export-tiles-csv <tiles.csv>]\n"
+      << "                 [--export-ppm <layer> <out.ppm>]... [--export-scale <N>]\n"
+      << "                 [--export-iso <layer> <out.ppm>]... [--iso-tile <WxH>] [--iso-height <N>]\n"
+      << "                 [--iso-margin <N>] [--iso-grid <0|1>] [--iso-cliffs <0|1>] [--export-tiles-csv <tiles.csv>]\n"
       << "                 [--batch <N>]\n\n"
-      << "Export layers (for --export-ppm):\n"
+      << "Export layers (for --export-ppm / --export-iso):\n"
       << "  terrain overlay height landvalue traffic goods_traffic goods_fill district\n\n"
       << "Batch mode:\n"
       << "  - --batch N>1 runs N simulations with seeds (seed, seed+1, ...).\n"
@@ -181,6 +183,14 @@ int main(int argc, char** argv)
   std::vector<PpmExport> ppmExports;
   int exportScale = 1;
   std::string tilesCsvPath;
+
+  // Isometric overview exports (PPM, but projected as isometric diamonds)
+  struct IsoExport {
+    ExportLayer layer = ExportLayer::Overlay;
+    std::string path;
+  };
+  std::vector<IsoExport> isoExports;
+  IsoOverviewConfig isoCfg{};
 
   // Batch mode (optional): run multiple seeds in one invocation.
   int batchRuns = 1;
@@ -299,6 +309,77 @@ int main(int argc, char** argv)
         return 2;
       }
       ppmExports.push_back(PpmExport{layer, outPath});
+    } else if (arg == "--export-iso") {
+      std::string layerName;
+      std::string outPath;
+      if (!requireValue(i, layerName) || !requireValue(i, outPath)) {
+        std::cerr << "--export-iso requires: <layer> <out.ppm>\n";
+        return 2;
+      }
+      ExportLayer layer = ExportLayer::Overlay;
+      if (!ParseExportLayer(layerName, layer)) {
+        std::cerr << "Unknown export layer: " << layerName << "\n";
+        std::cerr << "Valid layers: terrain overlay height landvalue traffic goods_traffic goods_fill district\n";
+        return 2;
+      }
+      isoExports.push_back(IsoExport{layer, outPath});
+    } else if (arg == "--iso-tile") {
+      int tw = 0;
+      int th = 0;
+      if (!requireValue(i, val) || !ParseWxH(val, &tw, &th)) {
+        std::cerr << "--iso-tile requires format WxH (e.g. 16x8)\n";
+        return 2;
+      }
+      if ((tw % 2) != 0 || (th % 2) != 0) {
+        std::cerr << "--iso-tile requires even dimensions (so halfW/halfH are integers)\n";
+        return 2;
+      }
+      isoCfg.tileW = tw;
+      isoCfg.tileH = th;
+    } else if (arg == "--iso-height") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-height requires an integer\n";
+        return 2;
+      }
+      int hp = 0;
+      if (!ParseI32(val, &hp) || hp < 0) {
+        std::cerr << "--iso-height requires an integer >= 0\n";
+        return 2;
+      }
+      isoCfg.heightScalePx = hp;
+    } else if (arg == "--iso-margin") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-margin requires an integer\n";
+        return 2;
+      }
+      int mp = 0;
+      if (!ParseI32(val, &mp) || mp < 0) {
+        std::cerr << "--iso-margin requires an integer >= 0\n";
+        return 2;
+      }
+      isoCfg.marginPx = mp;
+    } else if (arg == "--iso-grid") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-grid requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--iso-grid requires 0 or 1\n";
+        return 2;
+      }
+      isoCfg.drawGrid = (b != 0);
+    } else if (arg == "--iso-cliffs") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-cliffs requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--iso-cliffs requires 0 or 1\n";
+        return 2;
+      }
+      isoCfg.drawCliffs = (b != 0);
     } else if (arg == "--export-scale") {
       if (!requireValue(i, val)) {
         std::cerr << "--export-scale requires an integer\n";
@@ -362,6 +443,9 @@ int main(int argc, char** argv)
     if (!checkTemplate(tilesCsvPath, "--export-tiles-csv")) return 2;
     for (const auto& e : ppmExports) {
       if (!checkTemplate(e.path, "--export-ppm")) return 2;
+    }
+    for (const auto& e : isoExports) {
+      if (!checkTemplate(e.path, "--export-iso")) return 2;
     }
   }
 
@@ -459,12 +543,17 @@ int main(int argc, char** argv)
     }
 
     // Optional derived-map exports (PPM images)
-    if (!ppmExports.empty()) {
+    if (!ppmExports.empty() || !isoExports.empty()) {
       bool needTraffic = false;
       bool needGoods = false;
       bool needLandValue = false;
 
       for (const auto& e : ppmExports) {
+        if (e.layer == ExportLayer::Traffic) needTraffic = true;
+        if (e.layer == ExportLayer::GoodsTraffic || e.layer == ExportLayer::GoodsFill) needGoods = true;
+        if (e.layer == ExportLayer::LandValue) needLandValue = true;
+      }
+      for (const auto& e : isoExports) {
         if (e.layer == ExportLayer::Traffic) needTraffic = true;
         if (e.layer == ExportLayer::GoodsTraffic || e.layer == ExportLayer::GoodsFill) needGoods = true;
         if (e.layer == ExportLayer::LandValue) needLandValue = true;
@@ -521,6 +610,26 @@ int main(int argc, char** argv)
         std::string err;
         if (!WritePpm(outP, img, err)) {
           std::cerr << "Failed to write PPM (" << ExportLayerName(e.layer) << "): " << outP << " (" << err << ")\n";
+          return 1;
+        }
+      }
+
+      for (const auto& e : isoExports) {
+        const std::string outP = expandPath(e.path, runIdx, actualSeed);
+        ensureParentDir(outP);
+
+        const IsoOverviewResult iso = RenderIsoOverview(world, e.layer, isoCfg,
+                                                        landValueRes ? &(*landValueRes) : nullptr,
+                                                        trafficRes ? &(*trafficRes) : nullptr,
+                                                        goodsRes ? &(*goodsRes) : nullptr);
+        if (iso.image.width <= 0 || iso.image.height <= 0) {
+          std::cerr << "Failed to render ISO overview (" << ExportLayerName(e.layer) << "): " << outP << "\n";
+          return 1;
+        }
+
+        std::string err;
+        if (!WritePpm(outP, iso.image, err)) {
+          std::cerr << "Failed to write ISO PPM (" << ExportLayerName(e.layer) << "): " << outP << " (" << err << ")\n";
           return 1;
         }
       }

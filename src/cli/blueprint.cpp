@@ -16,11 +16,14 @@ namespace {
 void PrintUsage()
 {
   std::cout
-      << "proc_isocity_blueprint - capture/apply rectangular tile stamps\n\n"
+      << "proc_isocity_blueprint - capture/apply/transform tile stamps\n\n"
       << "USAGE:\n"
       << "  proc_isocity_blueprint info <bp.isobp>\n"
       << "  proc_isocity_blueprint capture <save.bin> <x0> <y0> <w> <h> <out.isobp> [options]\n"
-      << "  proc_isocity_blueprint apply <save.bin> <bp.isobp> <dstX> <dstY> <out.bin> [options]\n\n"
+      << "  proc_isocity_blueprint apply <save.bin> <bp.isobp> <dstX> <dstY> <out.bin> [options]\n"
+      << "  proc_isocity_blueprint diff <base.bin> <target.bin> <out.isobp> [options]\n"
+      << "  proc_isocity_blueprint crop <bp.isobp> <out.isobp> [options]\n"
+      << "  proc_isocity_blueprint transform <bp.isobp> <out.isobp> [options]\n\n"
       << "CAPTURE options:\n"
       << "  --fields <list>       Comma list: terrain,overlay,height,variation,level,occupants,district\n"
       << "  --sparse 0|1          If 1, only include tiles with overlay!=None (requires overlay in --fields)\n"
@@ -34,7 +37,23 @@ void PrintUsage()
       << "  --mirrory 0|1         Mirror vertically after rotation\n"
       << "  --allow-oob 0|1       If 1, silently skip tiles that land out of bounds\n"
       << "  --force 0|1           If 0, error on non-road overlays placed on water\n"
-      << "  --recompute-roads 0|1 Recompute road auto-tiling masks after apply (default: 1)\n";
+      << "  --recompute-roads 0|1 Recompute road auto-tiling masks after apply (default: 1)\n\n"
+      << "DIFF options:\n"
+      << "  --fields <list>       Fields to compare & emit (default: overlay,level,district,variation)\n"
+      << "  --rect <x0> <y0> <w> <h>  Limit diff to a region (default: whole map)\n"
+      << "  --crop 0|1            If 1, crop to minimal delta bounds (default: 1)\n"
+      << "  --pad <N>             Extra padding tiles when cropping (default: 0)\n"
+      << "  --zero-occ 0|1        If 1, emit occupant=0 even if occupants differs (layout-only diffs)\n"
+      << "  --height-eps <E>      Height epsilon (default: 0 exact compare)\n"
+      << "  --compress none|sllz  Output compression (default: sllz)\n\n"
+      << "CROP options:\n"
+      << "  --pad <N>             Extra padding tiles around delta bounds (default: 0)\n"
+      << "  --compress none|sllz  Output compression (default: sllz)\n\n"
+      << "TRANSFORM options:\n"
+      << "  --rotate 0|90|180|270 Rotation (clockwise)\n"
+      << "  --mirrorx 0|1         Mirror horizontally after rotation\n"
+      << "  --mirrory 0|1         Mirror vertically after rotation\n"
+      << "  --compress none|sllz  Output compression (default: sllz)\n";
 }
 
 bool ParseInt(const std::string& s, int& out)
@@ -42,6 +61,19 @@ bool ParseInt(const std::string& s, int& out)
   try {
     std::size_t idx = 0;
     const int v = std::stoi(s, &idx, 10);
+    if (idx != s.size()) return false;
+    out = v;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool ParseFloat(const std::string& s, float& out)
+{
+  try {
+    std::size_t idx = 0;
+    const float v = std::stof(s, &idx);
     if (idx != s.size()) return false;
     out = v;
     return true;
@@ -178,6 +210,282 @@ int main(int argc, char** argv)
     std::cout << "  version: " << bp.version << "\n";
     std::cout << "  size:    " << bp.width << "x" << bp.height << "\n";
     std::cout << "  tiles:   " << bp.tiles.size() << " deltas\n";
+
+    // Also print delta bounds (useful for cropping decisions).
+    Blueprint cropped;
+    int offX = 0, offY = 0;
+    if (CropBlueprintToDeltasBounds(bp, cropped, offX, offY, err, 0)) {
+      if (!bp.tiles.empty()) {
+        std::cout << "  deltasBounds: x=" << offX << " y=" << offY
+                  << " w=" << cropped.width << " h=" << cropped.height << "\n";
+      }
+    }
+
+    return 0;
+  }
+
+  if (cmd == "transform") {
+    if (argc < 4) {
+      PrintUsage();
+      return 1;
+    }
+
+    const std::string inPath = argv[2];
+    const std::string outPath = argv[3];
+
+    BlueprintTransform tr;
+    tr.rotateDeg = 0;
+    tr.mirrorX = false;
+    tr.mirrorY = false;
+
+    BlueprintCompression comp = BlueprintCompression::SLLZ;
+
+    for (int i = 4; i < argc; ++i) {
+      const std::string k = argv[i];
+      if (k == "--rotate" && i + 1 < argc) {
+        int r = 0;
+        if (!ParseInt(argv[++i], r)) {
+          std::cerr << "ERROR: --rotate expects 0|90|180|270\n";
+          return 2;
+        }
+        tr.rotateDeg = r;
+      } else if (k == "--mirrorx" && i + 1 < argc) {
+        bool b = false;
+        if (!ParseBool01(argv[++i], b)) {
+          std::cerr << "ERROR: --mirrorx expects 0|1\n";
+          return 2;
+        }
+        tr.mirrorX = b;
+      } else if (k == "--mirrory" && i + 1 < argc) {
+        bool b = false;
+        if (!ParseBool01(argv[++i], b)) {
+          std::cerr << "ERROR: --mirrory expects 0|1\n";
+          return 2;
+        }
+        tr.mirrorY = b;
+      } else if (k == "--compress" && i + 1 < argc) {
+        if (!ParseCompression(argv[++i], comp)) {
+          std::cerr << "ERROR: --compress expects none|sllz\n";
+          return 2;
+        }
+      } else {
+        std::cerr << "ERROR: unknown option: " << k << "\n";
+        return 2;
+      }
+    }
+
+    Blueprint bp;
+    std::string err;
+    if (!LoadBlueprintBinary(bp, inPath, err)) {
+      std::cerr << "ERROR: failed to load blueprint: " << err << "\n";
+      return 2;
+    }
+
+    Blueprint out;
+    if (!TransformBlueprint(bp, tr, out, err)) {
+      std::cerr << "ERROR: transform failed: " << err << "\n";
+      return 2;
+    }
+
+    if (!SaveBlueprintBinary(out, outPath, err, comp)) {
+      std::cerr << "ERROR: failed to save blueprint: " << err << "\n";
+      return 2;
+    }
+
+    std::cout << "Wrote blueprint: " << outPath << " (" << out.width << "x" << out.height
+              << ", " << out.tiles.size() << " deltas, compression=" << BlueprintCompressionName(comp) << ")\n";
+    return 0;
+  }
+
+  if (cmd == "crop") {
+    if (argc < 4) {
+      PrintUsage();
+      return 1;
+    }
+
+    const std::string inPath = argv[2];
+    const std::string outPath = argv[3];
+
+    int pad = 0;
+    BlueprintCompression comp = BlueprintCompression::SLLZ;
+
+    for (int i = 4; i < argc; ++i) {
+      const std::string k = argv[i];
+      if (k == "--pad" && i + 1 < argc) {
+        if (!ParseInt(argv[++i], pad) || pad < 0) {
+          std::cerr << "ERROR: --pad expects a non-negative integer\n";
+          return 2;
+        }
+      } else if (k == "--compress" && i + 1 < argc) {
+        if (!ParseCompression(argv[++i], comp)) {
+          std::cerr << "ERROR: --compress expects none|sllz\n";
+          return 2;
+        }
+      } else {
+        std::cerr << "ERROR: unknown option: " << k << "\n";
+        return 2;
+      }
+    }
+
+    Blueprint bp;
+    std::string err;
+    if (!LoadBlueprintBinary(bp, inPath, err)) {
+      std::cerr << "ERROR: failed to load blueprint: " << err << "\n";
+      return 2;
+    }
+
+    Blueprint cropped;
+    int offX = 0, offY = 0;
+    if (!CropBlueprintToDeltasBounds(bp, cropped, offX, offY, err, pad)) {
+      std::cerr << "ERROR: crop failed: " << err << "\n";
+      return 2;
+    }
+
+    if (!SaveBlueprintBinary(cropped, outPath, err, comp)) {
+      std::cerr << "ERROR: failed to save blueprint: " << err << "\n";
+      return 2;
+    }
+
+    std::cout << "Wrote blueprint: " << outPath << " (" << cropped.width << "x" << cropped.height
+              << ", " << cropped.tiles.size() << " deltas, compression=" << BlueprintCompressionName(comp) << ")\n";
+    if (!bp.tiles.empty()) {
+      std::cout << "Crop offset: (" << offX << ", " << offY << ")\n";
+    }
+    return 0;
+  }
+
+  if (cmd == "diff") {
+    if (argc < 5) {
+      PrintUsage();
+      return 1;
+    }
+
+    const std::string basePath = argv[2];
+    const std::string targetPath = argv[3];
+    const std::string outPath = argv[4];
+
+    // Defaults.
+    BlueprintDiffOptions diffOpt;
+    diffOpt.fieldMask = static_cast<std::uint8_t>(TileFieldMask::Overlay) |
+                        static_cast<std::uint8_t>(TileFieldMask::Level) |
+                        static_cast<std::uint8_t>(TileFieldMask::District) |
+                        static_cast<std::uint8_t>(TileFieldMask::Variation);
+    diffOpt.heightEpsilon = 0.0f;
+    diffOpt.zeroOccupants = false;
+
+    bool doCrop = true;
+    int pad = 0;
+    bool rectProvided = false;
+    int x0 = 0, y0 = 0, w = 0, h = 0;
+
+    BlueprintCompression comp = BlueprintCompression::SLLZ;
+
+    for (int i = 5; i < argc; ++i) {
+      const std::string k = argv[i];
+      if (k == "--fields" && i + 1 < argc) {
+        std::uint8_t m = 0;
+        std::string perr;
+        if (!ParseFieldMaskList(argv[++i], m, perr)) {
+          std::cerr << "ERROR: " << perr << "\n";
+          return 2;
+        }
+        diffOpt.fieldMask = m;
+      } else if (k == "--rect" && i + 4 < argc) {
+        if (!ParseInt(argv[++i], x0) || !ParseInt(argv[++i], y0) || !ParseInt(argv[++i], w) || !ParseInt(argv[++i], h)) {
+          std::cerr << "ERROR: --rect expects 4 integers\n";
+          return 2;
+        }
+        rectProvided = true;
+      } else if (k == "--crop" && i + 1 < argc) {
+        bool b = true;
+        if (!ParseBool01(argv[++i], b)) {
+          std::cerr << "ERROR: --crop expects 0|1\n";
+          return 2;
+        }
+        doCrop = b;
+      } else if (k == "--pad" && i + 1 < argc) {
+        if (!ParseInt(argv[++i], pad) || pad < 0) {
+          std::cerr << "ERROR: --pad expects a non-negative integer\n";
+          return 2;
+        }
+      } else if (k == "--zero-occ" && i + 1 < argc) {
+        bool b = false;
+        if (!ParseBool01(argv[++i], b)) {
+          std::cerr << "ERROR: --zero-occ expects 0|1\n";
+          return 2;
+        }
+        diffOpt.zeroOccupants = b;
+      } else if (k == "--height-eps" && i + 1 < argc) {
+        float e = 0.0f;
+        if (!ParseFloat(argv[++i], e) || e < 0.0f) {
+          std::cerr << "ERROR: --height-eps expects a non-negative float\n";
+          return 2;
+        }
+        diffOpt.heightEpsilon = e;
+      } else if (k == "--compress" && i + 1 < argc) {
+        if (!ParseCompression(argv[++i], comp)) {
+          std::cerr << "ERROR: --compress expects none|sllz\n";
+          return 2;
+        }
+      } else {
+        std::cerr << "ERROR: unknown option: " << k << "\n";
+        return 2;
+      }
+    }
+
+    World baseWorld;
+    World targetWorld;
+    ProcGenConfig baseProc, targetProc;
+    SimConfig baseSim, targetSim;
+    std::string err;
+
+    if (!LoadWorldBinary(baseWorld, baseProc, baseSim, basePath, err)) {
+      std::cerr << "ERROR: failed to load base save: " << err << "\n";
+      return 2;
+    }
+    if (!LoadWorldBinary(targetWorld, targetProc, targetSim, targetPath, err)) {
+      std::cerr << "ERROR: failed to load target save: " << err << "\n";
+      return 2;
+    }
+
+    if (!rectProvided) {
+      x0 = 0;
+      y0 = 0;
+      w = baseWorld.width();
+      h = baseWorld.height();
+    }
+
+    Blueprint bp;
+    if (!CaptureBlueprintDiffRect(baseWorld, targetWorld, x0, y0, w, h, bp, err, diffOpt)) {
+      std::cerr << "ERROR: diff capture failed: " << err << "\n";
+      return 2;
+    }
+
+    int cropX = 0, cropY = 0;
+    Blueprint outBp = bp;
+    if (doCrop) {
+      Blueprint cropped;
+      if (!CropBlueprintToDeltasBounds(bp, cropped, cropX, cropY, err, pad)) {
+        std::cerr << "ERROR: crop failed: " << err << "\n";
+        return 2;
+      }
+      outBp = std::move(cropped);
+    }
+
+    if (!SaveBlueprintBinary(outBp, outPath, err, comp)) {
+      std::cerr << "ERROR: failed to save blueprint: " << err << "\n";
+      return 2;
+    }
+
+    std::cout << "Wrote blueprint: " << outPath << " (" << outBp.width << "x" << outBp.height
+              << ", " << outBp.tiles.size() << " deltas, compression=" << BlueprintCompressionName(comp) << ")\n";
+    if (doCrop && !bp.tiles.empty()) {
+      const int dstX = x0 + cropX;
+      const int dstY = y0 + cropY;
+      std::cout << "Suggested apply dst: (" << dstX << ", " << dstY << ")\n";
+      std::cout << "(Original region: x=" << x0 << " y=" << y0 << " w=" << w << " h=" << h << ")\n";
+    }
+
     return 0;
   }
 

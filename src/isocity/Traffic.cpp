@@ -106,7 +106,8 @@ void BuildCongestionExtraCostMilli(const World& world, const TrafficConfig& cfg,
 } // namespace
 
 TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg, float employedShare,
-                                   const std::vector<std::uint8_t>* precomputedRoadToEdge)
+                                   const std::vector<std::uint8_t>* precomputedRoadToEdge,
+                                   const ZoneAccessMap* precomputedZoneAccess)
 {
   TrafficResult r;
 
@@ -138,7 +139,16 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
 
   // Zone access: allows interior tiles of a connected zoned area to be reachable via a
   // road-adjacent boundary tile.
-  const ZoneAccessMap zoneAccess = BuildZoneAccessMap(world, roadToEdge);
+  ZoneAccessMap zoneAccessLocal;
+  const ZoneAccessMap* zoneAccess = nullptr;
+
+  if (precomputedZoneAccess && precomputedZoneAccess->w == w && precomputedZoneAccess->h == h &&
+      precomputedZoneAccess->roadIdx.size() == n) {
+    zoneAccess = precomputedZoneAccess;
+  } else {
+    zoneAccessLocal = BuildZoneAccessMap(world, roadToEdge);
+    zoneAccess = &zoneAccessLocal;
+  }
 
   // --- Collect job access points (sources) ---
   std::vector<std::uint8_t> isSource(n, 0);
@@ -157,8 +167,8 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
       if (isIndustrial && !cfg.includeIndustrialJobs) continue;
 
       const std::size_t zidx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
-      if (zidx >= zoneAccess.roadIdx.size()) continue;
-      const int accessRoad = zoneAccess.roadIdx[zidx];
+      if (zidx >= zoneAccess->roadIdx.size()) continue;
+      const int accessRoad = zoneAccess->roadIdx[zidx];
       if (accessRoad < 0) continue;
 
       // Preserve the older behavior for boundary tiles: if this job tile touches road tiles,
@@ -214,8 +224,8 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
       if (t.occupants == 0) continue;
 
       const std::size_t zidx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
-      if (zidx >= zoneAccess.roadIdx.size()) continue;
-      if (zoneAccess.roadIdx[zidx] < 0) continue;
+      if (zidx >= zoneAccess->roadIdx.size()) continue;
+      if (zoneAccess->roadIdx[zidx] < 0) continue;
 
       // Prefer a directly-adjacent road if available; otherwise use the propagated access road.
       int ridx = -1;
@@ -223,7 +233,7 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
       if (PickAdjacentRoadTile(world, roadToEdge, x, y, road)) {
         ridx = road.y * w + road.x;
       } else {
-        ridx = zoneAccess.roadIdx[zidx];
+        ridx = zoneAccess->roadIdx[zidx];
       }
       if (ridx < 0) continue;
 

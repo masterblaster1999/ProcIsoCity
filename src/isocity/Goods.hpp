@@ -7,6 +7,8 @@
 
 namespace isocity {
 
+struct ZoneAccessMap;
+
 // A small "goods flow" model:
 //  - Industrial zones produce goods (supply).
 //  - Commercial zones consume goods (demand).
@@ -60,7 +62,11 @@ struct GoodsResult {
 // If cfg.requireOutsideConnection is true, you can optionally supply a precomputed
 // road-to-edge mask (as produced by ComputeRoadsConnectedToEdge) to avoid
 // recomputing it.
+//
+// If you already computed a ZoneAccessMap for the same world + outside-connection rule,
+// you may also pass it to avoid rebuilding the zone access mapping.
 GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
-                            const std::vector<std::uint8_t>* precomputedRoadToEdge = nullptr);
+                            const std::vector<std::uint8_t>* precomputedRoadToEdge = nullptr,
+                            const ZoneAccessMap* precomputedZoneAccess = nullptr);
 
 } // namespace isocity

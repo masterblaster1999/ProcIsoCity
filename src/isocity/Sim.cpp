@@ -269,17 +269,46 @@ int Simulator::update(World& world, float dt, std::vector<Stats>* outTickStats)
 
 void Simulator::refreshDerivedStats(World& world) const
 {
+  refreshDerivedStatsInternal(world, nullptr, nullptr);
+}
+
+void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std::uint8_t>* precomputedRoadToEdge,
+                                            const ZoneAccessMap* precomputedZoneAccess) const
+{
   Stats& s = world.stats();
   const ScanResult scan = ScanWorld(world);
 
+  const int w = world.width();
+  const int h = world.height();
+  const std::size_t n = static_cast<std::size_t>(std::max(0, w)) * static_cast<std::size_t>(std::max(0, h));
+
   // Precompute which roads are connected to the map border ("outside connection").
-  std::vector<std::uint8_t> roadToEdge;
+  // When requireOutsideConnection is enabled, derived systems only consider road components
+  // that touch the map edge.
+  std::vector<std::uint8_t> roadToEdgeLocal;
+  const std::vector<std::uint8_t>* roadToEdge = nullptr;
   if (m_cfg.requireOutsideConnection) {
-    ComputeEdgeConnectedRoads(world, roadToEdge);
+    if (precomputedRoadToEdge && precomputedRoadToEdge->size() == n) {
+      roadToEdge = precomputedRoadToEdge;
+    } else {
+      ComputeEdgeConnectedRoads(world, roadToEdgeLocal);
+      roadToEdge = &roadToEdgeLocal;
+    }
   }
 
-  const std::vector<std::uint8_t>* edgeMask = m_cfg.requireOutsideConnection ? &roadToEdge : nullptr;
-  const ZoneAccessMap zoneAccess = BuildZoneAccessMap(world, edgeMask);
+  const std::vector<std::uint8_t>* edgeMask = m_cfg.requireOutsideConnection ? roadToEdge : nullptr;
+
+  // Zone access: allows interior tiles of a connected zoned area to be reachable via a
+  // road-adjacent boundary tile.
+  ZoneAccessMap zoneAccessLocal;
+  const ZoneAccessMap* zoneAccess = nullptr;
+  if (precomputedZoneAccess && precomputedZoneAccess->w == w && precomputedZoneAccess->h == h &&
+      precomputedZoneAccess->roadIdx.size() == n) {
+    zoneAccess = precomputedZoneAccess;
+  } else {
+    zoneAccessLocal = BuildZoneAccessMap(world, edgeMask);
+    zoneAccess = &zoneAccessLocal;
+  }
 
 
   // Only job tiles that are actually reachable should count as capacity.
@@ -290,7 +319,7 @@ void Simulator::refreshDerivedStats(World& world) const
     for (int x = 0; x < world.width(); ++x) {
       const Tile& t = world.at(x, y);
       if (t.overlay != Overlay::Commercial && t.overlay != Overlay::Industrial) continue;
-      if (!HasZoneAccess(zoneAccess, x, y)) continue;
+      if (!HasZoneAccess(*zoneAccess, x, y)) continue;
       jobsCapAccessible += JobsForTile(t);
     }
   }
@@ -314,8 +343,7 @@ void Simulator::refreshDerivedStats(World& world) const
   tc.congestionBeta = m_trafficModel.congestionBeta;
   tc.congestionCapacityScale = m_trafficModel.congestionCapacityScale;
   tc.congestionRatioClamp = m_trafficModel.congestionRatioClamp;
-  const TrafficResult traffic = ComputeCommuteTraffic(
-      world, tc, employedShare, m_cfg.requireOutsideConnection ? &roadToEdge : nullptr);
+  const TrafficResult traffic = ComputeCommuteTraffic(world, tc, employedShare, roadToEdge, zoneAccess);
 
   s.commuters = traffic.totalCommuters;
   s.commutersUnreachable = traffic.unreachableCommuters;
@@ -330,7 +358,7 @@ void Simulator::refreshDerivedStats(World& world) const
   // Goods/logistics model: route industrial output to commercial demand along roads.
   GoodsConfig gc;
   gc.requireOutsideConnection = m_cfg.requireOutsideConnection;
-  const GoodsResult goods = ComputeGoodsFlow(world, gc, m_cfg.requireOutsideConnection ? &roadToEdge : nullptr);
+  const GoodsResult goods = ComputeGoodsFlow(world, gc, roadToEdge, zoneAccess);
   s.goodsProduced = goods.goodsProduced;
   s.goodsDemand = goods.goodsDemand;
   s.goodsDelivered = goods.goodsDelivered;
@@ -344,8 +372,7 @@ void Simulator::refreshDerivedStats(World& world) const
   // display and for the simple tax model.
   LandValueConfig lvc;
   lvc.requireOutsideConnection = m_cfg.requireOutsideConnection;
-  const LandValueResult lv = ComputeLandValue(world, lvc, &traffic,
-                                              m_cfg.requireOutsideConnection ? &roadToEdge : nullptr);
+  const LandValueResult lv = ComputeLandValue(world, lvc, &traffic, roadToEdge);
   s.avgLandValue = AvgLandValueNonWater(world, lv);
 
   // Economy snapshot (does NOT mutate money here; that's handled in step()).
@@ -445,8 +472,7 @@ void Simulator::refreshDerivedStats(World& world) const
     (scan.population > 0) ? (static_cast<float>(taxRevenue) / static_cast<float>(scan.population)) : 0.0f;
 
   // Happiness: parks help (locally), unemployment hurts, and commutes/congestion add friction.
-  const float parkCoverage = ParkCoverageRatio(world, m_cfg.parkInfluenceRadius,
-                                              m_cfg.requireOutsideConnection ? &roadToEdge : nullptr);
+  const float parkCoverage = ParkCoverageRatio(world, m_cfg.parkInfluenceRadius, roadToEdge);
   const float parkBonus = std::min(0.25f, parkCoverage * 0.35f);
 
   const float unemployment = (scan.population > 0)
@@ -676,7 +702,7 @@ void Simulator::step(World& world)
   }
 
   // Recompute derived stats (traffic, goods, happiness, budget metrics) for the new state.
-  refreshDerivedStats(world);
+  refreshDerivedStatsInternal(world, edgeMask, &zoneAccess);
 
   // Include upgrade spending in the budget and apply the net change to money.
   s.upgradeCost = upgradeCost;

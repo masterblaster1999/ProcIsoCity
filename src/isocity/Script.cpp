@@ -76,13 +76,490 @@ static const char* ToolApplyResultName(ToolApplyResult r)
   }
 }
 
+static bool CheckedAddI64(std::int64_t a, std::int64_t b, std::int64_t* out)
+{
+  if (!out) return false;
+  const auto max = std::numeric_limits<std::int64_t>::max();
+  const auto min = std::numeric_limits<std::int64_t>::min();
+  if ((b > 0 && a > max - b) || (b < 0 && a < min - b)) return false;
+  *out = a + b;
+  return true;
+}
+
+static bool CheckedSubI64(std::int64_t a, std::int64_t b, std::int64_t* out)
+{
+  if (!out) return false;
+  const auto max = std::numeric_limits<std::int64_t>::max();
+  const auto min = std::numeric_limits<std::int64_t>::min();
+  if ((b > 0 && a < min + b) || (b < 0 && a > max + b)) return false;
+  *out = a - b;
+  return true;
+}
+
+static bool CheckedMulI64(std::int64_t a, std::int64_t b, std::int64_t* out)
+{
+  if (!out) return false;
+  const auto max = std::numeric_limits<std::int64_t>::max();
+  const auto min = std::numeric_limits<std::int64_t>::min();
+
+  if (a == 0 || b == 0) {
+    *out = 0;
+    return true;
+  }
+
+  if (a == -1) {
+    if (b == min) return false;
+    *out = -b;
+    return true;
+  }
+
+  if (b == -1) {
+    if (a == min) return false;
+    *out = -a;
+    return true;
+  }
+
+  if (a > 0) {
+    if (b > 0) {
+      if (a > max / b) return false;
+    } else {  // b < 0
+      if (b < min / a) return false;
+    }
+  } else {  // a < 0
+    if (b > 0) {
+      if (a < min / b) return false;
+    } else {  // b < 0
+      if (a < max / b) return false;
+    }
+  }
+
+  *out = a * b;
+  return true;
+}
+
+static bool CheckedDivI64(std::int64_t a, std::int64_t b, std::int64_t* out)
+{
+  if (!out) return false;
+  if (b == 0) return false;
+
+  const auto min = std::numeric_limits<std::int64_t>::min();
+  if (a == min && b == -1) return false;
+
+  *out = a / b;
+  return true;
+}
+
+static bool CheckedModI64(std::int64_t a, std::int64_t b, std::int64_t* out)
+{
+  if (!out) return false;
+  if (b == 0) return false;
+
+  const auto min = std::numeric_limits<std::int64_t>::min();
+  if (a == min && b == -1) {
+    // C++ defines this, but keep behavior consistent with CheckedDivI64.
+    return false;
+  }
+
+  *out = a % b;
+  return true;
+}
+
+static bool CheckedAddU64(std::uint64_t a, std::uint64_t b, std::uint64_t* out)
+{
+  if (!out) return false;
+  const auto max = std::numeric_limits<std::uint64_t>::max();
+  if (a > max - b) return false;
+  *out = a + b;
+  return true;
+}
+
+static bool CheckedSubU64(std::uint64_t a, std::uint64_t b, std::uint64_t* out)
+{
+  if (!out) return false;
+  if (a < b) return false;
+  *out = a - b;
+  return true;
+}
+
+static bool CheckedMulU64(std::uint64_t a, std::uint64_t b, std::uint64_t* out)
+{
+  if (!out) return false;
+  if (a == 0 || b == 0) {
+    *out = 0;
+    return true;
+  }
+  const auto max = std::numeric_limits<std::uint64_t>::max();
+  if (a > max / b) return false;
+  *out = a * b;
+  return true;
+}
+
+static bool CheckedDivU64(std::uint64_t a, std::uint64_t b, std::uint64_t* out)
+{
+  if (!out) return false;
+  if (b == 0) return false;
+  *out = a / b;
+  return true;
+}
+
+static bool CheckedModU64(std::uint64_t a, std::uint64_t b, std::uint64_t* out)
+{
+  if (!out) return false;
+  if (b == 0) return false;
+  *out = a % b;
+  return true;
+}
+
+static int hexDigit(char c)
+{
+  if (c >= '0' && c <= '9') return (c - '0');
+  if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+  if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+  return -1;
+}
+
+static bool ParseU64Literal(const std::string& s, std::size_t* posInOut, std::uint64_t* out)
+{
+  if (!posInOut) return false;
+  if (!out) return false;
+
+  std::size_t pos = *posInOut;
+  if (pos >= s.size()) return false;
+
+  int base = 10;
+  if (pos + 2 <= s.size() && s[pos] == '0' && (s[pos + 1] == 'x' || s[pos + 1] == 'X')) {
+    base = 16;
+    pos += 2;
+  }
+
+  bool any = false;
+  std::uint64_t v = 0;
+
+  const auto max = std::numeric_limits<std::uint64_t>::max();
+
+  while (pos < s.size()) {
+    const char c = s[pos];
+    int d = -1;
+
+    if (base == 10) {
+      if (c >= '0' && c <= '9') d = (c - '0');
+      else break;
+    } else {
+      d = hexDigit(c);
+      if (d < 0) break;
+    }
+
+    any = true;
+
+    // v = v * base + d (with overflow checking)
+    if (v > max / static_cast<std::uint64_t>(base)) return false;
+    v *= static_cast<std::uint64_t>(base);
+
+    if (v > max - static_cast<std::uint64_t>(d)) return false;
+    v += static_cast<std::uint64_t>(d);
+
+    ++pos;
+  }
+
+  if (!any) return false;
+  *posInOut = pos;
+  *out = v;
+  return true;
+}
+
+static bool EvalI64Expr(const std::string& s, std::int64_t* out)
+{
+  if (!out) return false;
+  if (s.empty()) return false;
+
+  struct Parser {
+    const std::string& s;
+    std::size_t pos = 0;
+
+    void skipWs()
+    {
+      while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) {
+        ++pos;
+      }
+    }
+
+    bool match(char c)
+    {
+      if (pos < s.size() && s[pos] == c) {
+        ++pos;
+        return true;
+      }
+      return false;
+    }
+
+    bool parseExpr(std::int64_t* out)
+    {
+      std::int64_t v = 0;
+      if (!parseTerm(&v)) return false;
+
+      while (true) {
+        skipWs();
+        if (match('+')) {
+          std::int64_t rhs = 0;
+          if (!parseTerm(&rhs)) return false;
+          if (!CheckedAddI64(v, rhs, &v)) return false;
+          continue;
+        }
+        if (match('-')) {
+          std::int64_t rhs = 0;
+          if (!parseTerm(&rhs)) return false;
+          if (!CheckedSubI64(v, rhs, &v)) return false;
+          continue;
+        }
+        break;
+      }
+
+      *out = v;
+      return true;
+    }
+
+    bool parseTerm(std::int64_t* out)
+    {
+      std::int64_t v = 0;
+      if (!parseFactor(&v)) return false;
+
+      while (true) {
+        skipWs();
+        if (match('*')) {
+          std::int64_t rhs = 0;
+          if (!parseFactor(&rhs)) return false;
+          if (!CheckedMulI64(v, rhs, &v)) return false;
+          continue;
+        }
+        if (match('/')) {
+          std::int64_t rhs = 0;
+          if (!parseFactor(&rhs)) return false;
+          if (!CheckedDivI64(v, rhs, &v)) return false;
+          continue;
+        }
+        if (match('%')) {
+          std::int64_t rhs = 0;
+          if (!parseFactor(&rhs)) return false;
+          if (!CheckedModI64(v, rhs, &v)) return false;
+          continue;
+        }
+        break;
+      }
+
+      *out = v;
+      return true;
+    }
+
+    bool parseFactor(std::int64_t* out)
+    {
+      skipWs();
+
+      if (match('+')) {
+        return parseFactor(out);
+      }
+
+      if (match('-')) {
+        std::int64_t v = 0;
+        if (!parseFactor(&v)) return false;
+
+        const auto min = std::numeric_limits<std::int64_t>::min();
+        if (v == min) return false;
+        *out = -v;
+        return true;
+      }
+
+      if (match('(')) {
+        std::int64_t v = 0;
+        if (!parseExpr(&v)) return false;
+        skipWs();
+        if (!match(')')) return false;
+        *out = v;
+        return true;
+      }
+
+      return parseNumber(out);
+    }
+
+    bool parseNumber(std::int64_t* out)
+    {
+      skipWs();
+      std::uint64_t mag = 0;
+      const std::size_t startPos = pos;
+      if (!ParseU64Literal(s, &pos, &mag)) {
+        pos = startPos;
+        return false;
+      }
+
+      const auto max = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+      if (mag > max) return false;
+
+      *out = static_cast<std::int64_t>(mag);
+      return true;
+    }
+
+    bool parse(std::int64_t* out)
+    {
+      pos = 0;
+      skipWs();
+      if (!parseExpr(out)) return false;
+      skipWs();
+      return pos == s.size();
+    }
+  };
+
+  Parser p{s};
+  std::int64_t v = 0;
+  if (!p.parse(&v)) return false;
+  *out = v;
+  return true;
+}
+
+static bool EvalU64Expr(const std::string& s, std::uint64_t* out)
+{
+  if (!out) return false;
+  if (s.empty()) return false;
+
+  struct Parser {
+    const std::string& s;
+    std::size_t pos = 0;
+
+    void skipWs()
+    {
+      while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) {
+        ++pos;
+      }
+    }
+
+    bool match(char c)
+    {
+      if (pos < s.size() && s[pos] == c) {
+        ++pos;
+        return true;
+      }
+      return false;
+    }
+
+    bool parseExpr(std::uint64_t* out)
+    {
+      std::uint64_t v = 0;
+      if (!parseTerm(&v)) return false;
+
+      while (true) {
+        skipWs();
+        if (match('+')) {
+          std::uint64_t rhs = 0;
+          if (!parseTerm(&rhs)) return false;
+          if (!CheckedAddU64(v, rhs, &v)) return false;
+          continue;
+        }
+        if (match('-')) {
+          std::uint64_t rhs = 0;
+          if (!parseTerm(&rhs)) return false;
+          if (!CheckedSubU64(v, rhs, &v)) return false;
+          continue;
+        }
+        break;
+      }
+
+      *out = v;
+      return true;
+    }
+
+    bool parseTerm(std::uint64_t* out)
+    {
+      std::uint64_t v = 0;
+      if (!parseFactor(&v)) return false;
+
+      while (true) {
+        skipWs();
+        if (match('*')) {
+          std::uint64_t rhs = 0;
+          if (!parseFactor(&rhs)) return false;
+          if (!CheckedMulU64(v, rhs, &v)) return false;
+          continue;
+        }
+        if (match('/')) {
+          std::uint64_t rhs = 0;
+          if (!parseFactor(&rhs)) return false;
+          if (!CheckedDivU64(v, rhs, &v)) return false;
+          continue;
+        }
+        if (match('%')) {
+          std::uint64_t rhs = 0;
+          if (!parseFactor(&rhs)) return false;
+          if (!CheckedModU64(v, rhs, &v)) return false;
+          continue;
+        }
+        break;
+      }
+
+      *out = v;
+      return true;
+    }
+
+    bool parseFactor(std::uint64_t* out)
+    {
+      skipWs();
+
+      if (match('+')) {
+        return parseFactor(out);
+      }
+
+      if (match('-')) {
+        // Unsigned expressions do not allow unary minus.
+        return false;
+      }
+
+      if (match('(')) {
+        std::uint64_t v = 0;
+        if (!parseExpr(&v)) return false;
+        skipWs();
+        if (!match(')')) return false;
+        *out = v;
+        return true;
+      }
+
+      return parseNumber(out);
+    }
+
+    bool parseNumber(std::uint64_t* out)
+    {
+      skipWs();
+      const std::size_t startPos = pos;
+      std::uint64_t v = 0;
+      if (!ParseU64Literal(s, &pos, &v)) {
+        pos = startPos;
+        return false;
+      }
+      *out = v;
+      return true;
+    }
+
+    bool parse(std::uint64_t* out)
+    {
+      pos = 0;
+      skipWs();
+      if (!parseExpr(out)) return false;
+      skipWs();
+      return pos == s.size();
+    }
+  };
+
+  Parser p{s};
+  std::uint64_t v = 0;
+  if (!p.parse(&v)) return false;
+  *out = v;
+  return true;
+}
+
 static bool ParseI32(const std::string& s, int* out)
 {
   if (!out) return false;
   if (s.empty()) return false;
-  char* end = nullptr;
-  const long v = std::strtol(s.c_str(), &end, 10);
-  if (!end || *end != '\0') return false;
+
+  std::int64_t v = 0;
+  if (!EvalI64Expr(s, &v)) return false;
+
   if (v < std::numeric_limits<int>::min() || v > std::numeric_limits<int>::max()) return false;
   *out = static_cast<int>(v);
   return true;
@@ -103,19 +580,7 @@ static bool ParseU64(const std::string& s, std::uint64_t* out)
 {
   if (!out) return false;
   if (s.empty()) return false;
-
-  int base = 10;
-  std::size_t offset = 0;
-  if (s.rfind("0x", 0) == 0 || s.rfind("0X", 0) == 0) {
-    base = 16;
-    offset = 2;
-  }
-
-  char* end = nullptr;
-  const unsigned long long v = std::strtoull(s.c_str() + offset, &end, base);
-  if (!end || *end != '\0') return false;
-  *out = static_cast<std::uint64_t>(v);
-  return true;
+  return EvalU64Expr(s, out);
 }
 
 static bool WriteStatsCsv(const std::string& path, const std::vector<Stats>& rows, std::string& outError)
@@ -613,17 +1078,7 @@ void ScriptRunner::emitError(const std::string& line) const
 
 std::string ScriptRunner::expandPathTemplate(const std::string& tmpl, int run) const
 {
-  auto replaceAll = [](std::string s, const std::string& from, const std::string& to) -> std::string {
-    if (from.empty()) return s;
-    std::size_t pos = 0;
-    while ((pos = s.find(from, pos)) != std::string::npos) {
-      s.replace(pos, from.size(), to);
-      pos += to.size();
-    }
-    return s;
-  };
-
-  std::string out = tmpl;
+  if (run < 0) run = m_ctx.runIndex;
 
   const std::uint64_t seed = m_ctx.hasWorld ? m_ctx.world.seed() : m_ctx.seed;
   const int w = m_ctx.hasWorld ? m_ctx.world.width() : m_ctx.w;
@@ -631,20 +1086,90 @@ std::string ScriptRunner::expandPathTemplate(const std::string& tmpl, int run) c
   const int day = m_ctx.hasWorld ? m_ctx.world.stats().day : 0;
   const int money = m_ctx.hasWorld ? m_ctx.world.stats().money : 0;
 
-  out = replaceAll(out, "{seed}", std::to_string(seed));
-  out = replaceAll(out, "{w}", std::to_string(w));
-  out = replaceAll(out, "{h}", std::to_string(h));
-  out = replaceAll(out, "{day}", std::to_string(day));
-  out = replaceAll(out, "{money}", std::to_string(money));
-  out = replaceAll(out, "{run}", std::to_string(run));
+  bool hashComputed = false;
+  std::uint64_t hashValue = 0;
+  auto getHash = [&]() -> std::uint64_t {
+    if (hashComputed) return hashValue;
+    hashComputed = true;
+    hashValue = m_ctx.hasWorld ? HashWorld(m_ctx.world, true) : 0;
+    return hashValue;
+  };
 
-  if (out.find("{hash}") != std::string::npos) {
-    std::uint64_t hv = 0;
-    if (m_ctx.hasWorld) hv = HashWorld(m_ctx.world, true);
-    out = replaceAll(out, "{hash}", HexU64(hv));
-  }
+  constexpr int kMaxDepth = 8;
 
-  return out;
+  auto expandRec = [&](const std::string& in, auto&& self, int depth) -> std::string {
+    if (depth > kMaxDepth) return in;
+
+    std::string out;
+    out.reserve(in.size() + 16);
+
+    for (std::size_t i = 0; i < in.size();) {
+      if (in[i] == '{') {
+        const std::size_t j = in.find('}', i + 1);
+        if (j != std::string::npos) {
+          const std::string rawKey = in.substr(i + 1, j - i - 1);
+          const std::string key = ToLower(rawKey);
+
+          // Built-ins (reserved)
+          if (key == "seed") {
+            out += std::to_string(seed);
+            i = j + 1;
+            continue;
+          }
+          if (key == "w") {
+            out += std::to_string(w);
+            i = j + 1;
+            continue;
+          }
+          if (key == "h") {
+            out += std::to_string(h);
+            i = j + 1;
+            continue;
+          }
+          if (key == "day") {
+            out += std::to_string(day);
+            i = j + 1;
+            continue;
+          }
+          if (key == "money") {
+            out += std::to_string(money);
+            i = j + 1;
+            continue;
+          }
+          if (key == "run") {
+            out += std::to_string(run);
+            i = j + 1;
+            continue;
+          }
+          if (key == "hash") {
+            out += HexU64(getHash());
+            i = j + 1;
+            continue;
+          }
+
+          // User vars (expanded recursively).
+          const auto it = m_ctx.vars.find(key);
+          if (it != m_ctx.vars.end()) {
+            out += self(it->second, self, depth + 1);
+            i = j + 1;
+            continue;
+          }
+
+          // Unknown token -> keep verbatim.
+          out.append(in, i, (j - i + 1));
+          i = j + 1;
+          continue;
+        }
+      }
+
+      out.push_back(in[i]);
+      ++i;
+    }
+
+    return out;
+  };
+
+  return expandRec(tmpl, expandRec, 0);
 }
 
 bool ScriptRunner::runFile(const std::string& path)
@@ -919,6 +1444,101 @@ bool ScriptRunner::runTextInternal(const std::string& text, const std::string& v
     if (t.empty()) continue;
 
     const std::string cmd = ToLower(t[0]);
+
+    // Expand {tokens} / {vars} in arguments (but keep raw template for `set` values).
+    for (std::size_t i = 1; i < t.size(); ++i) {
+      if (cmd == "set" && i == 2) continue;
+      t[i] = expandPathTemplate(t[i]);
+    }
+
+    auto isReservedVar = [](const std::string& k) -> bool {
+      return k == "seed" || k == "w" || k == "h" || k == "day" || k == "money" || k == "run" || k == "hash";
+    };
+
+    auto isValidVarName = [](const std::string& name) -> bool {
+      if (name.empty()) return false;
+      auto isStart = [](unsigned char c) { return (std::isalpha(c) != 0) || c == '_'; };
+      auto isChar = [](unsigned char c) { return (std::isalnum(c) != 0) || c == '_'; };
+      if (!isStart(static_cast<unsigned char>(name[0]))) return false;
+      for (std::size_t i = 1; i < name.size(); ++i) {
+        if (!isChar(static_cast<unsigned char>(name[i]))) return false;
+      }
+      return true;
+    };
+
+    if (cmd == "set") {
+      if (t.size() != 3) {
+        return fail(virtualPath, lineNo, "set expects: set <name> <value>");
+      }
+      const std::string name = ToLower(t[1]);
+      if (!isValidVarName(name)) {
+        return fail(virtualPath, lineNo, "set: invalid name (expected [A-Za-z_][A-Za-z0-9_]*)");
+      }
+      if (isReservedVar(name)) {
+        return fail(virtualPath, lineNo, "set: name is reserved (seed,w,h,day,money,run,hash)");
+      }
+      m_ctx.vars[name] = t[2];
+      emitInfo("set: " + name);
+      continue;
+    }
+
+    if (cmd == "unset") {
+      if (t.size() != 2) {
+        return fail(virtualPath, lineNo, "unset expects: unset <name>");
+      }
+      const std::string name = ToLower(t[1]);
+      m_ctx.vars.erase(name);
+      emitInfo("unset: " + name);
+      continue;
+    }
+
+    if (cmd == "add") {
+      if (t.size() != 3) {
+        return fail(virtualPath, lineNo, "add expects: add <name> <delta>");
+      }
+      const std::string name = ToLower(t[1]);
+      if (!isValidVarName(name)) {
+        return fail(virtualPath, lineNo, "add: invalid name (expected [A-Za-z_][A-Za-z0-9_]*)");
+      }
+      if (isReservedVar(name)) {
+        return fail(virtualPath, lineNo, "add: name is reserved (seed,w,h,day,money,run,hash)");
+      }
+      int delta = 0;
+      if (!ParseI32(t[2], &delta)) {
+        return fail(virtualPath, lineNo, "add expects integer delta (supports +,-,*,/,%, parentheses)");
+      }
+
+      int cur = 0;
+      const auto it = m_ctx.vars.find(name);
+      if (it != m_ctx.vars.end()) {
+        const std::string expanded = expandPathTemplate(it->second);
+        if (!ParseI32(expanded, &cur)) {
+          return fail(virtualPath, lineNo, "add: current variable value is not an integer");
+        }
+      }
+
+      const long long sum = static_cast<long long>(cur) + static_cast<long long>(delta);
+      m_ctx.vars[name] = std::to_string(sum);
+      emitInfo("add: " + name + "=" + std::to_string(sum));
+      continue;
+    }
+
+    if (cmd == "echo") {
+      std::ostringstream oss;
+      for (std::size_t i = 1; i < t.size(); ++i) {
+        if (i > 1) oss << ' ';
+        oss << t[i];
+      }
+      emitPrint(oss.str());
+      continue;
+    }
+
+    if (cmd == "vars") {
+      for (const auto& kv : m_ctx.vars) {
+        emitPrint(kv.first + "=" + expandPathTemplate(kv.second));
+      }
+      continue;
+    }
 
     if (cmd == "include") {
       if (t.size() != 2) {

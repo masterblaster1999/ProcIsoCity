@@ -1,5 +1,6 @@
 #include "isocity/Replay.hpp"
 
+#include "isocity/Hash.hpp"
 #include "isocity/SaveLoad.hpp"
 #include "isocity/WorldPatch.hpp"
 
@@ -14,7 +15,9 @@ namespace isocity {
 namespace {
 
 constexpr std::uint8_t kMagic[8] = {'I','S','O','R','E','P','L','\0'};
-constexpr std::uint32_t kReplayVersion = 1;
+constexpr std::uint32_t kReplayVersionV1 = 1;
+constexpr std::uint32_t kReplayVersionV2 = 2;
+constexpr std::uint32_t kReplayVersion = kReplayVersionV2;
 
 bool ReadExact(std::istream& in, void* dst, std::size_t n)
 {
@@ -52,6 +55,20 @@ bool WriteBytes(std::ostream& out, const std::vector<std::uint8_t>& bytes)
 {
   if (bytes.empty()) return true;
   return WriteExact(out, bytes.data(), bytes.size());
+}
+
+bool ReadString(std::istream& in, std::string& out, std::uint32_t n)
+{
+  out.clear();
+  if (n == 0) return true;
+  out.resize(n);
+  return ReadExact(in, out.data(), out.size());
+}
+
+bool WriteString(std::ostream& out, const std::string& s)
+{
+  if (s.empty()) return true;
+  return WriteExact(out, s.data(), s.size());
 }
 
 // Load an embedded save blob into a World.
@@ -96,7 +113,11 @@ bool SaveReplayBinary(const Replay& replay, const std::string& path, std::string
     return false;
   }
 
-  const std::uint32_t version = kReplayVersion;
+  const std::uint32_t version = (replay.version == 0) ? kReplayVersion : replay.version;
+  if (version != kReplayVersionV1 && version != kReplayVersionV2) {
+    outError = "Unsupported replay version (writer)";
+    return false;
+  }
   if (!WritePOD(out, version)) {
     outError = "Write failed (version)";
     return false;
@@ -112,6 +133,19 @@ bool SaveReplayBinary(const Replay& replay, const std::string& path, std::string
     return false;
   }
 
+  // v2 adds an explicit event count.
+  if (version == kReplayVersionV2) {
+    if (replay.events.size() > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+      outError = "Replay has too many events";
+      return false;
+    }
+    const std::uint32_t eventCount = static_cast<std::uint32_t>(replay.events.size());
+    if (!WritePOD(out, eventCount)) {
+      outError = "Write failed (event count)";
+      return false;
+    }
+  }
+
   for (const ReplayEvent& e : replay.events) {
     const std::uint8_t type = static_cast<std::uint8_t>(e.type);
     if (!WritePOD(out, type)) {
@@ -119,23 +153,69 @@ bool SaveReplayBinary(const Replay& replay, const std::string& path, std::string
       return false;
     }
 
-    if (e.type == ReplayEventType::Tick) {
-      if (!WritePOD(out, e.ticks)) {
-        outError = "Write failed (tick event)";
-        return false;
+    switch (e.type) {
+      case ReplayEventType::Tick: {
+        if (!WritePOD(out, e.ticks)) {
+          outError = "Write failed (tick event)";
+          return false;
+        }
+        break;
       }
-      continue;
-    }
-
-    const std::vector<std::uint8_t>& blob = (e.type == ReplayEventType::Patch) ? e.patch : e.snapshot;
-    if (blob.size() > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
-      outError = "Replay event blob is too large";
-      return false;
-    }
-    const std::uint32_t sz = static_cast<std::uint32_t>(blob.size());
-    if (!WritePOD(out, sz) || !WriteBytes(out, blob)) {
-      outError = "Write failed (event blob)";
-      return false;
+      case ReplayEventType::Patch:
+      case ReplayEventType::Snapshot: {
+        const std::vector<std::uint8_t>& blob = (e.type == ReplayEventType::Patch) ? e.patch : e.snapshot;
+        if (blob.size() > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+          outError = "Replay event blob is too large";
+          return false;
+        }
+        const std::uint32_t sz = static_cast<std::uint32_t>(blob.size());
+        if (!WritePOD(out, sz) || !WriteBytes(out, blob)) {
+          outError = "Write failed (event blob)";
+          return false;
+        }
+        break;
+      }
+      case ReplayEventType::Note: {
+        if (version != kReplayVersionV2) {
+          outError = "Replay Note events require replay v2";
+          return false;
+        }
+        if (e.note.size() > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+          outError = "Replay note string is too large";
+          return false;
+        }
+        const std::uint32_t sz = static_cast<std::uint32_t>(e.note.size());
+        if (!WritePOD(out, sz) || !WriteString(out, e.note)) {
+          outError = "Write failed (note event)";
+          return false;
+        }
+        break;
+      }
+      case ReplayEventType::AssertHash: {
+        if (version != kReplayVersionV2) {
+          outError = "Replay AssertHash events require replay v2";
+          return false;
+        }
+        if (!WritePOD(out, e.expectedHash)) {
+          outError = "Write failed (assert expected hash)";
+          return false;
+        }
+        const std::uint8_t flags = e.includeStatsInHash ? 1u : 0u;
+        if (!WritePOD(out, flags)) {
+          outError = "Write failed (assert flags)";
+          return false;
+        }
+        if (e.label.size() > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+          outError = "Replay assert label is too large";
+          return false;
+        }
+        const std::uint32_t sz = static_cast<std::uint32_t>(e.label.size());
+        if (!WritePOD(out, sz) || !WriteString(out, e.label)) {
+          outError = "Write failed (assert label)";
+          return false;
+        }
+        break;
+      }
     }
   }
 
@@ -169,7 +249,7 @@ bool LoadReplayBinary(Replay& outReplay, const std::string& path, std::string& o
     outError = "Read failed (version)";
     return false;
   }
-  if (version != kReplayVersion) {
+  if (version != kReplayVersionV1 && version != kReplayVersionV2) {
     outError = "Unsupported replay version";
     return false;
   }
@@ -189,12 +269,11 @@ bool LoadReplayBinary(Replay& outReplay, const std::string& path, std::string& o
     return false;
   }
 
-  // Events until EOF.
-  while (true) {
+  auto readOneEventV1 = [&](ReplayEvent& outEv) -> bool {
     std::uint8_t typeU8 = 0;
     in.read(reinterpret_cast<char*>(&typeU8), 1);
     if (in.eof()) {
-      break;
+      return false; // normal EOF
     }
     if (!in.good()) {
       outError = "Read failed (event type)";
@@ -235,6 +314,113 @@ bool LoadReplayBinary(Replay& outReplay, const std::string& path, std::string& o
       }
     }
 
+    outEv = std::move(e);
+    return true;
+  };
+
+  if (version == kReplayVersionV1) {
+    // v1: events until EOF.
+    while (true) {
+      ReplayEvent e;
+      if (!readOneEventV1(e)) {
+        if (outError.empty()) break; // clean EOF
+        return false;
+      }
+      outReplay.events.push_back(std::move(e));
+    }
+    return true;
+  }
+
+  // v2: explicit event count.
+  std::uint32_t eventCount = 0;
+  if (!ReadPOD(in, eventCount)) {
+    outError = "Read failed (event count)";
+    return false;
+  }
+
+  outReplay.events.reserve(eventCount);
+  for (std::uint32_t i = 0; i < eventCount; ++i) {
+    std::uint8_t typeU8 = 0;
+    if (!ReadPOD(in, typeU8)) {
+      outError = "Read failed (event type)";
+      return false;
+    }
+
+    const ReplayEventType type = static_cast<ReplayEventType>(typeU8);
+    if (type != ReplayEventType::Tick && type != ReplayEventType::Patch && type != ReplayEventType::Snapshot &&
+        type != ReplayEventType::Note && type != ReplayEventType::AssertHash) {
+      outError = "Unknown replay event type";
+      return false;
+    }
+
+    ReplayEvent e;
+    e.type = type;
+
+    switch (type) {
+      case ReplayEventType::Tick: {
+        if (!ReadPOD(in, e.ticks)) {
+          outError = "Read failed (tick event)";
+          return false;
+        }
+        break;
+      }
+      case ReplayEventType::Patch:
+      case ReplayEventType::Snapshot: {
+        std::uint32_t sz = 0;
+        if (!ReadPOD(in, sz)) {
+          outError = "Read failed (event blob size)";
+          return false;
+        }
+
+        std::vector<std::uint8_t> blob;
+        if (!ReadBytes(in, blob, sz)) {
+          outError = "Read failed (event blob)";
+          return false;
+        }
+
+        if (type == ReplayEventType::Patch) {
+          e.patch = std::move(blob);
+        } else {
+          e.snapshot = std::move(blob);
+        }
+        break;
+      }
+      case ReplayEventType::Note: {
+        std::uint32_t sz = 0;
+        if (!ReadPOD(in, sz)) {
+          outError = "Read failed (note size)";
+          return false;
+        }
+        if (!ReadString(in, e.note, sz)) {
+          outError = "Read failed (note bytes)";
+          return false;
+        }
+        break;
+      }
+      case ReplayEventType::AssertHash: {
+        if (!ReadPOD(in, e.expectedHash)) {
+          outError = "Read failed (assert expected hash)";
+          return false;
+        }
+        std::uint8_t flags = 0;
+        if (!ReadPOD(in, flags)) {
+          outError = "Read failed (assert flags)";
+          return false;
+        }
+        e.includeStatsInHash = (flags & 1u) != 0u;
+        std::uint32_t sz = 0;
+        if (!ReadPOD(in, sz)) {
+          outError = "Read failed (assert label size)";
+          return false;
+        }
+        if (!ReadString(in, e.label, sz)) {
+          outError = "Read failed (assert label bytes)";
+          return false;
+        }
+        break;
+      }
+    }
+
     outReplay.events.push_back(std::move(e));
   }
 
@@ -242,7 +428,7 @@ bool LoadReplayBinary(Replay& outReplay, const std::string& path, std::string& o
 }
 
 bool PlayReplay(const Replay& replay, World& outWorld, ProcGenConfig& outProcCfg, SimConfig& outSimCfg,
-                std::string& outError, bool strictPatches, std::vector<Stats>* outTickStats)
+                std::string& outError, bool strictPatches, bool strictAsserts, std::vector<Stats>* outTickStats)
 {
   outError.clear();
 
@@ -295,6 +481,24 @@ bool PlayReplay(const Replay& replay, World& outWorld, ProcGenConfig& outProcCfg
         sim = Simulator(outSimCfg);
         sim.resetTimer();
         if (outTickStats) outTickStats->push_back(outWorld.stats());
+        break;
+      }
+      case ReplayEventType::Note: {
+        // Metadata only.
+        break;
+      }
+      case ReplayEventType::AssertHash: {
+        if (!strictAsserts) break;
+
+        const std::uint64_t got = HashWorld(outWorld, e.includeStatsInHash);
+        if (got != e.expectedHash) {
+          std::ostringstream oss;
+          oss << "Replay assert failed at event " << i << ": expected 0x" << std::hex << e.expectedHash
+              << " got 0x" << got;
+          if (!e.label.empty()) oss << " (" << e.label << ")";
+          outError = oss.str();
+          return false;
+        }
         break;
       }
     }

@@ -144,12 +144,15 @@ void PrintHelp()
       << "proc_isocity_replay (deterministic replay journal tool)\n\n"
       << "Usage:\n"
       << "  proc_isocity_replay pack <base.bin> <target.bin> <out.isoreplay> [--no-proc] [--no-sim] [--no-stats] [--no-compress]\n"
+      << "                            [--note <text>]... [--assert-final-hash] [--assert-final-hash-raw]\n"
       << "  proc_isocity_replay info <replay.isoreplay>\n"
       << "  proc_isocity_replay play <replay.isoreplay> [--force] [--out <summary.json>] [--csv <ticks.csv>] [--save <final.bin>]\n"
+      << "                          [--ignore-asserts]\n"
       << "                          [--export-ppm <layer> <out.ppm>]... [--export-scale <N>] [--export-tiles-csv <tiles.csv>]\n\n"
       << "Notes:\n"
       << "  - Replay files embed a full base save plus a stream of Tick/Patch/Snapshot events.\n"
       << "  - --force disables strict patch hash checks during playback (useful for debugging).\n"
+      << "  - --ignore-asserts skips AssertHash events during playback.\n"
       << "  - Export layers: terrain overlay height landvalue traffic goods_traffic goods_fill district\n";
 }
 
@@ -184,6 +187,9 @@ int main(int argc, char** argv)
     bool includeSim = true;
     bool includeStats = true;
     WorldPatchCompression compression = WorldPatchCompression::SLLZ;
+    bool assertFinalHash = false;
+    bool assertFinalHashRaw = false;
+    std::vector<std::string> notes;
 
     for (int i = 5; i < argc; ++i) {
       const std::string a = argv[i];
@@ -191,6 +197,15 @@ int main(int argc, char** argv)
       else if (a == "--no-sim") includeSim = false;
       else if (a == "--no-stats") includeStats = false;
       else if (a == "--no-compress") compression = WorldPatchCompression::None;
+      else if (a == "--assert-final-hash") assertFinalHash = true;
+      else if (a == "--assert-final-hash-raw") assertFinalHashRaw = true;
+      else if (a == "--note") {
+        if (i + 1 >= argc) {
+          std::cerr << "--note requires a string\n";
+          return 1;
+        }
+        notes.push_back(argv[++i]);
+      }
       else {
         std::cerr << "Unknown option: " << a << "\n";
         return 1;
@@ -232,10 +247,30 @@ int main(int argc, char** argv)
       std::cerr << "Failed to read base save bytes: " << basePath << "\n";
       return 1;
     }
+
+    for (const std::string& n : notes) {
+      ReplayEvent evNote;
+      evNote.type = ReplayEventType::Note;
+      evNote.note = n;
+      replay.events.push_back(std::move(evNote));
+    }
+
     ReplayEvent ev;
     ev.type = ReplayEventType::Patch;
     ev.patch = std::move(patchBytes);
     replay.events.push_back(std::move(ev));
+
+    const bool wantAssert = assertFinalHash || assertFinalHashRaw;
+    if (wantAssert) {
+      ReplayEvent evAssert;
+      evAssert.type = ReplayEventType::AssertHash;
+      evAssert.includeStatsInHash = assertFinalHash;
+      // In the pack case we already have targetW in memory, so we can compute
+      // the expected value at authoring time.
+      evAssert.expectedHash = HashWorld(targetW, evAssert.includeStatsInHash);
+      evAssert.label = "final";
+      replay.events.push_back(std::move(evAssert));
+    }
 
     EnsureParentDir(outPath);
     if (!SaveReplayBinary(replay, outPath, err)) {
@@ -243,7 +278,7 @@ int main(int argc, char** argv)
       return 1;
     }
 
-    std::cout << "Wrote replay: " << outPath << " (1 patch event)\n";
+    std::cout << "Wrote replay: " << outPath << " (events=" << replay.events.size() << ")\n";
     return 0;
   }
 
@@ -264,6 +299,8 @@ int main(int argc, char** argv)
     std::size_t ticks = 0;
     std::size_t patches = 0;
     std::size_t snapshots = 0;
+    std::size_t notes = 0;
+    std::size_t asserts = 0;
     for (const ReplayEvent& e : replay.events) {
       if (e.type == ReplayEventType::Tick) {
         ticks += e.ticks;
@@ -271,13 +308,17 @@ int main(int argc, char** argv)
         patches++;
       } else if (e.type == ReplayEventType::Snapshot) {
         snapshots++;
+      } else if (e.type == ReplayEventType::Note) {
+        notes++;
+      } else if (e.type == ReplayEventType::AssertHash) {
+        asserts++;
       }
     }
 
     World world;
     ProcGenConfig proc;
     SimConfig sim;
-    if (!PlayReplay(replay, world, proc, sim, err, true)) {
+    if (!LoadWorldBinaryFromBytes(world, proc, sim, replay.baseSave, err)) {
       std::cerr << "Replay base load failed: " << err << "\n";
       return 1;
     }
@@ -286,7 +327,7 @@ int main(int argc, char** argv)
     std::cout << "  version: " << replay.version << "\n";
     std::cout << "  base save bytes: " << replay.baseSave.size() << "\n";
     std::cout << "  events: " << replay.events.size() << " (patches=" << patches << ", snapshots=" << snapshots
-              << ", totalTicks=" << ticks << ")\n";
+              << ", notes=" << notes << ", asserts=" << asserts << ", totalTicks=" << ticks << ")\n";
     std::cout << "  base world: " << world.width() << "x" << world.height() << "  seed=" << world.seed() << "  day="
               << world.stats().day << "\n";
     return 0;
@@ -305,6 +346,7 @@ int main(int argc, char** argv)
     std::string tilesCsvPath;
     int exportScale = 1;
     bool strict = true;
+    bool strictAsserts = true;
 
     struct PpmExport {
       ExportLayer layer = ExportLayer::Overlay;
@@ -316,6 +358,8 @@ int main(int argc, char** argv)
       const std::string a = argv[i];
       if (a == "--force") {
         strict = false;
+      } else if (a == "--ignore-asserts" || a == "--no-asserts") {
+        strictAsserts = false;
       } else if (a == "--out" || a == "--json") {
         if (i + 1 >= argc) {
           std::cerr << "--out requires a path\n";
@@ -383,7 +427,7 @@ int main(int argc, char** argv)
 
     std::vector<Stats> tickStats;
     std::vector<Stats>* tickPtr = outCsv.empty() ? nullptr : &tickStats;
-    if (!PlayReplay(replay, world, proc, sim, err, strict, tickPtr)) {
+    if (!PlayReplay(replay, world, proc, sim, err, strict, strictAsserts, tickPtr)) {
       std::cerr << "Replay failed: " << err << "\n";
       return 1;
     }

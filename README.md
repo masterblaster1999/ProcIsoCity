@@ -48,7 +48,7 @@ ctest --test-dir build-tests --output-on-failure
 
 - `PROCISOCITY_BUILD_APP` (default: ON) — build the interactive raylib app (`proc_isocity`).
 - `PROCISOCITY_BUILD_TESTS` (default: OFF) — build `proc_isocity_tests` and enable `ctest`.
-- `PROCISOCITY_BUILD_CLI` (default: ON) — build headless command-line tools (`proc_isocity_cli`, `proc_isocity_diff`, `proc_isocity_inspect`, `proc_isocity_patch`, `proc_isocity_script`, `proc_isocity_replay`, `proc_isocity_blueprint`).
+- `PROCISOCITY_BUILD_CLI` (default: ON) — build headless command-line tools (`proc_isocity_cli`, `proc_isocity_diff`, `proc_isocity_imagediff`, `proc_isocity_inspect`, `proc_isocity_config`, `proc_isocity_patch`, `proc_isocity_script`, `proc_isocity_replay`, `proc_isocity_blueprint`, `proc_isocity_suite`, `proc_isocity_transform`, `proc_isocity_roadgraph`, `proc_isocity_mesh`).
 - `PROCISOCITY_USE_SYSTEM_RAYLIB` (default: OFF) — when building the app, use a system raylib instead of FetchContent.
 
 ### Headless CLI tools (optional)
@@ -60,6 +60,10 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
   - per-tick CSV (`--csv`)
   - tile CSV (`--export-tiles-csv`)
   - PPM exports (`--export-ppm <layer> <out.ppm>`, repeatable) with optional upscaling (`--export-scale`)
+  - isometric overview PPM exports (`--export-iso <layer> <out.ppm>`, repeatable) with controls:
+    - `--iso-tile <WxH>` (default 16x8)
+    - `--iso-height <N>` (max elevation in pixels; 0 disables vertical relief)
+    - `--iso-margin <N>`, `--iso-grid <0|1>`, `--iso-cliffs <0|1>`
   - batch runs across multiple seeds (`--batch N`)
 
   Example:
@@ -67,13 +71,33 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
   ```bash
   ./build/proc_isocity_cli --seed 1 --size 128x128 --days 200 \
     --out out_{seed}.json --csv ticks_{seed}.csv \
-    --export-ppm overlay overlay_{seed}.ppm --export-scale 4 --batch 3
+    --export-ppm overlay overlay_{seed}.ppm --export-scale 4 \
+    --export-iso overlay iso_{seed}.ppm --iso-tile 16x8 --iso-height 14 --batch 3
   ```
 
 - `proc_isocity_diff`: compare two save files (deep tile diff + hash) and optionally write a color-coded diff map:
 
   ```bash
   ./build/proc_isocity_diff saveA.bin saveB.bin --ppm diff.ppm --scale 4
+  ```
+
+- `proc_isocity_imagediff`: compare two **PPM (P6)** images and optionally write an absolute-difference image.
+
+  ```bash
+  # Exit codes: 0 match, 1 differ, 2 error
+  ./build/proc_isocity_imagediff a.ppm b.ppm --out diff.ppm --threshold 0 --json diff.json
+  ```
+
+- `proc_isocity_roadgraph`: export a **compressed road network graph** (intersections/endpoints/corners) to DOT/JSON/CSV.
+  Also computes simple metrics (connected components, approximate weighted diameter) and can emit a debug PPM.
+
+  ```bash
+  # Export a loaded save
+  ./build/proc_isocity_roadgraph --load save.bin \
+    --dot roads.dot --json roads.json --nodes-csv road_nodes.csv --edges-csv road_edges.csv
+
+  # Generate a new world and emit a diameter highlight image
+  ./build/proc_isocity_roadgraph --seed 1 --size 128x128 --diameter-ppm diameter.ppm --ppm-scale 4
   ```
 
 - `proc_isocity_patch`: create/apply compact **binary patches** between two saves (great for regression artifacts or sharing a small repro):
@@ -85,6 +109,11 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
   # Apply it back onto the base save
   ./build/proc_isocity_patch apply saveA.bin out.isopatch saveA_patched.bin
 
+  # Generate an inverse patch (saveB -> saveA) using the original base save
+  ./build/proc_isocity_patch invert saveA.bin out.isopatch out_inverse.isopatch
+
+  # Compose multiple patches into one (saveA -> saveD)
+  ./build/proc_isocity_patch compose saveA.bin patch_AB.isopatch patch_BC.isopatch patch_CD.isopatch out_AD.isopatch
   ```
 
 - `proc_isocity_blueprint`: capture/apply **rectangular blueprints** (tile stamps) from/to saves. Supports
@@ -104,19 +133,77 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
     --mode stamp --rotate 90
   ```
 
+  More operations:
+
+  ```sh
+  # Create a *diff blueprint* (base -> target). By default this crops to the minimal bounds
+  # containing all changed tiles and prints a suggested destination for apply.
+  ./build/proc_isocity_blueprint diff saveA.bin saveB.bin delta.isobp \
+    --fields overlay,level,district,variation
+
+  # Crop any blueprint to its delta bounds (prints the crop offset).
+  ./build/proc_isocity_blueprint crop big.isobp cropped.isobp --pad 2
+
+  # Pre-transform a blueprint in blueprint-space (rotate/mirror), then apply without transforms.
+  ./build/proc_isocity_blueprint transform in.isobp out_rotated.isobp --rotate 90 --mirrorx 1
+  ```
+
+- `proc_isocity_transform`: rotate/mirror/crop an entire save (useful for generating variants or normalizing orientation).
+
+  ```bash
+  # Rotate 90° clockwise
+  ./build/proc_isocity_transform saveA.bin saveA_r90.bin --rotate 90
+
+  # Mirror + crop (crop is applied after rotate/mirror)
+  ./build/proc_isocity_transform saveA.bin saveA_sub.bin --mirror-x --crop 32 32 128 128
+  ```
+
+- `proc_isocity_roadgraph`: export a **compressed road network graph** (intersections/endpoints/corners) to DOT/JSON/CSV
+  and compute simple connectivity metrics (including an approximate weighted diameter).
+
+  ```bash
+  # Export DOT + JSON + CSVs for an existing save
+  ./build/proc_isocity_roadgraph --load saveA.bin \
+    --dot roadgraph.dot --json roadgraph.json \
+    --nodes-csv road_nodes.csv --edges-csv road_edges.csv
+
+  # Also render a one-pixel-per-tile debug PPM (nodes highlighted) and a diameter-highlight PPM
+  ./build/proc_isocity_roadgraph --load saveA.bin \
+    --ppm roadgraph.ppm --diameter-ppm diameter.ppm --ppm-scale 4
+
+  # Generate a world on the fly (no save required)
+  ./build/proc_isocity_roadgraph --seed 1 --size 128x128 --json g.json
+  ```
+
+- `proc_isocity_mesh`: export a save/world to **Wavefront OBJ + MTL** (simple 3D mesh) for debugging
+  and interoperability with 3D tools.
+
+  ```bash
+  # Export an existing save to OBJ/MTL
+  ./build/proc_isocity_mesh --load saveA.bin --obj saveA.obj
+
+  # Generate + simulate a new world, then export only a cropped subregion
+  ./build/proc_isocity_mesh --seed 42 --size 128x128 --days 120 --obj out.obj --crop 32 32 64 64
+  ```
+
 - `proc_isocity_replay`: pack/inspect/play deterministic **replay journals**.
 
   Replay files embed a full base save plus a stream of Tick/Patch/Snapshot events,
   so you can share a *single file* to reproduce a sequence of edits + simulation.
 
+  New in the latest replay format: optional **Note** and **AssertHash** events.
+  Notes are just metadata, and AssertHash lets you embed a deterministic checkpoint
+  (useful for CI / regression playback).
+
   ```bash
   # Pack a replay containing (base save) + (one patch that turns base -> target)
-  ./build/proc_isocity_replay pack saveA.bin saveB.bin out.isoreplay
+  ./build/proc_isocity_replay pack saveA.bin saveB.bin out.isoreplay \
+    --note "baseline->target" --assert-final-hash
 
   # Inspect the replay header
   ./build/proc_isocity_replay info out.isoreplay
 
-  # Play it back and emit artifacts
+  # Play it back and emit artifacts (use --ignore-asserts to skip hash checkpoints)
   ./build/proc_isocity_replay play out.isoreplay --out summary.json --csv ticks.csv --save final.bin
   ```
 
@@ -125,6 +212,19 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
   ```bash
   ./build/proc_isocity_inspect saveA.bin
   ./build/proc_isocity_inspect saveA.bin --verify-crc --json saveA_summary.json
+  ```
+
+- `proc_isocity_config`: dump/apply the embedded **ProcGenConfig** and **SimConfig** for a save file (JSON).
+
+  ```bash
+  # Dump combined config to a JSON file
+  ./build/proc_isocity_config dump saveA.bin --all config.json
+
+  # Apply overrides (merge) and write a new save
+  ./build/proc_isocity_config apply saveA.bin saveA_new.bin --sim sim_overrides.json
+
+  # Reset configs to defaults before applying overrides
+  ./build/proc_isocity_config apply saveA.bin saveA_reset.bin --reset-proc --reset-sim
   ```
 
 - `proc_isocity_script`: run a deterministic **edit/sim script** (useful for regression tests and repeatable scenarios).
@@ -159,6 +259,48 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
 
   ```bash
   ./build/proc_isocity_script scenario.txt --out summary.json --csv ticks.csv
+  ```
+
+  **New:** `proc_isocity_script` now supports **batch runs** and simple **script variables**.
+
+  - `--batch N` runs the same script `N` times (run index available as `{run}` in templates).
+  - `--seed S` sets the base seed (in batch mode, each run starts with seed `S + {run}` unless the script overrides it).
+  - `--define name=value` sets a script variable (available as `{name}`), useful for parameterized scripts.
+
+  Script helpers:
+
+  - `set <name> <value>`: define a variable (value is stored as a *template* and expanded when used).
+  - `add <name> <delta>`: add an integer delta to a variable (handy for counters).
+  - `unset <name>`: remove a variable.
+  - `echo <...>`: print an expanded line (useful for debugging).
+  - `vars`: print all current variables.
+
+  Most numeric arguments accept simple integer expressions, so you can write things like `seed 100+{run}` or `fill res 0 0 {w}-1 {h}-1 1`.
+
+- `proc_isocity_suite`: run a **suite** of scenarios (scripts and/or replays) and emit CI-friendly reports.
+
+  This is handy for automated regression checks in GitHub Actions or other CI systems: you can run
+  multiple scripts/replays, write a single JSON/JUnit summary, and optionally dump per-case artifacts.
+
+  Examples:
+
+  ```bash
+  # Run two scripts and one replay.
+  ./build/proc_isocity_suite scenarios/smoke.isocity scenarios/econ.isocity artifacts/repro.isoreplay \
+    --out-dir artifacts/suite_out --json-report artifacts/suite.json --junit artifacts/suite.xml
+
+  # Discover scenarios under a directory (only .isocity + .isoreplay by default).
+  ./build/proc_isocity_suite --discover scenarios --out-dir artifacts/suite_out
+
+  # Shard across CI workers (0-based): run only shard 1 of 4.
+  ./build/proc_isocity_suite --discover scenarios --shard 1/4 --junit artifacts/shard1.xml
+
+  # Golden image regression (snapshot testing):
+  #  - Create/update goldens (writes *.golden.*.ppm next to scenarios by default)
+  ./build/proc_isocity_suite --discover scenarios --golden --update-golden --golden-format iso --out-dir artifacts/suite_out
+
+  #  - Verify against committed goldens in CI (fails on mismatch)
+  ./build/proc_isocity_suite --discover scenarios --golden --golden-format iso --golden-threshold 0 --junit artifacts/suite.xml
   ```
 
 - `proc_isocity_autobuild`: run the deterministic **city bot** headlessly (generate or load a world, then grow it for N days).
