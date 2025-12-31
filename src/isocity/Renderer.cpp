@@ -42,6 +42,12 @@ inline Color Lerp(Color a, Color b, float t)
   return Color{ClampU8(r), ClampU8(g), ClampU8(bl), ClampU8(al)};
 }
 
+inline float Lerp(float a, float b, float t)
+{
+  t = std::clamp(t, 0.0f, 1.0f);
+  return a + (b - a) * t;
+}
+
 inline Color DistrictBaseColor(std::uint8_t d)
 {
   switch (d & 7u) {
@@ -440,8 +446,8 @@ inline void ShrinkDiamond(Vector2 out[4], const Vector2 in[4], float factor)
   }
 }
 
-inline Vector2 TileCornerAtMaxElevation(const Elevation& elev, int tx, int ty, float tileW,
-                                       float tileH, float baseElevPx, int cornerIndex)
+inline Vector2 TileCornerAtBaseElevation(int tx, int ty, float tileW, float tileH, float baseElevPx,
+                                        int cornerIndex)
 {
   Vector2 c = TileToWorldCenter(tx, ty, tileW, tileH);
   c.y -= baseElevPx;
@@ -492,7 +498,7 @@ inline void DrawIsoPrism(const Vector2 base[4], float heightPx, Color baseColor,
 
 } // namespace
 
-static void DrawMergedZoneBuildingAndIndicators(const ZoneBuildingParcel& p, const World& world, const Elevation& elev,
+static void DrawMergedZoneBuildingAndIndicators(const ZoneBuildingParcel& p, const World& world, const ElevationSettings& elev,
                                                float tileW, float tileH, float zoom, float timeSec)
 {
   if (!p.isMultiTile()) return;
@@ -558,10 +564,10 @@ static void DrawMergedZoneBuildingAndIndicators(const ZoneBuildingParcel& p, con
   const int y1 = p.y0 + ph - 1;
 
   Vector2 outer[4];
-  outer[0] = TileCornerAtMaxElevation(elev, x0, y0, tileW, tileH, baseElevPx, 0); // top
-  outer[1] = TileCornerAtMaxElevation(elev, x1, y0, tileW, tileH, baseElevPx, 1); // right
-  outer[2] = TileCornerAtMaxElevation(elev, x1, y1, tileW, tileH, baseElevPx, 2); // bottom
-  outer[3] = TileCornerAtMaxElevation(elev, x0, y1, tileW, tileH, baseElevPx, 3); // left
+  outer[0] = TileCornerAtBaseElevation(x0, y0, tileW, tileH, baseElevPx, 0); // top
+  outer[1] = TileCornerAtBaseElevation(x1, y0, tileW, tileH, baseElevPx, 1); // right
+  outer[2] = TileCornerAtBaseElevation(x1, y1, tileW, tileH, baseElevPx, 2); // bottom
+  outer[3] = TileCornerAtBaseElevation(x0, y1, tileW, tileH, baseElevPx, 3); // left
 
   // Inset the base for a nicer margin.
   // Larger parcels shrink slightly less so big footprints don't look overly thin.
@@ -726,21 +732,21 @@ static void DrawMergedZoneBuildingAndIndicators(const ZoneBuildingParcel& p, con
     anchorCenter.y -= baseElevPx;
 
     const float span = std::max(0.0f, maxDim - 1.0f);
-    const float y0 = anchorCenter.y - tileH * (0.18f + 0.07f * span);
+    const float yInd = anchorCenter.y - tileH * (0.18f + 0.07f * span);
 
     // Pips:
     const float pipR = 2.0f * invZoom;
     const float pipGap = 5.0f * invZoom;
     for (int i = 0; i < lvl; ++i) {
       const float px = anchorCenter.x - (static_cast<float>(lvl - 1) * 0.5f - static_cast<float>(i)) * pipGap;
-      DrawCircleV(Vector2{px, y0}, pipR, Color{0, 0, 0, 100});
+      DrawCircleV(Vector2{px, yInd}, pipR, Color{0, 0, 0, 100});
     }
 
     // Fill bar:
     const float barW = tileW * (0.42f + 0.12f * span) * invZoom;
     const float barH = 3.0f * invZoom;
     const float barX = anchorCenter.x - barW * 0.5f;
-    const float barY = y0 + 5.0f * invZoom;
+    const float barY = yInd + 5.0f * invZoom;
     DrawRectangleV(Vector2{barX, barY}, Vector2{barW, barH}, Color{0, 0, 0, 90});
     DrawRectangleV(Vector2{barX, barY}, Vector2{barW * occRatio, barH}, Color{255, 255, 255, 170});
   }
@@ -1605,8 +1611,8 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
   if (useMergedZoneBuildings) {
     // Parcels can extend up to 3 tiles beyond the visible rect (e.g., 4x2 / 4x1 footprints).
     // Extend the draw rect so parcel anchors aren't culled when only the NW portion is on-screen.
-    vis.x1 = std::min(vis.x1 + 3, w);
-    vis.y1 = std::min(vis.y1 + 3, h);
+    vis.maxX = std::min(vis.maxX + 3, w - 1);
+    vis.maxY = std::min(vis.maxY + 3, h - 1);
   }
 
   BeginMode2D(camera);
@@ -1732,14 +1738,14 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
                 const float pipGap = 5.0f * invZoom;
                 for (int i = 0; i < lvl; ++i) {
                   const float px = center.x - (static_cast<float>(lvl - 1) * 0.5f - static_cast<float>(i)) * pipGap;
-                  DrawCircleV(Vector2{px, y0}, pipR, Color{0, 0, 0, 100});
+                  DrawCircleV(Vector2{px, yInd}, pipR, Color{0, 0, 0, 100});
                 }
 
                 // Fill bar:
                 const float barW = tileW * 0.42f * invZoom;
                 const float barH = 3.0f * invZoom;
                 const float barX = center.x - barW * 0.5f;
-                const float barY = y0 + 5.0f * invZoom;
+                const float barY = yInd + 5.0f * invZoom;
                 DrawRectangleV(Vector2{barX, barY}, Vector2{barW, barH}, Color{0, 0, 0, 90});
                 DrawRectangleV(Vector2{barX, barY}, Vector2{barW * occRatio, barH}, Color{255, 255, 255, 170});
               }
@@ -1761,14 +1767,14 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
                 const float pipGap = 5.0f * invZoom;
                 for (int i = 0; i < lvl; ++i) {
                   const float px = center.x - (static_cast<float>(lvl - 1) * 0.5f - static_cast<float>(i)) * pipGap;
-                  DrawCircleV(Vector2{px, y0}, pipR, Color{0, 0, 0, 100});
+                  DrawCircleV(Vector2{px, yInd}, pipR, Color{0, 0, 0, 100});
                 }
 
                 // Fill bar:
                 const float barW = tileW * 0.42f * invZoom;
                 const float barH = 3.0f * invZoom;
                 const float barX = center.x - barW * 0.5f;
-                const float barY = y0 + 5.0f * invZoom;
+                const float barY = yInd + 5.0f * invZoom;
                 DrawRectangleV(Vector2{barX, barY}, Vector2{barW, barH}, Color{0, 0, 0, 90});
                 DrawRectangleV(Vector2{barX, barY}, Vector2{barW * occRatio, barH}, Color{255, 255, 255, 170});
               }
@@ -1790,14 +1796,14 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
                 const float pipGap = 5.0f * invZoom;
                 for (int i = 0; i < lvl; ++i) {
                   const float px = center.x - (static_cast<float>(lvl - 1) * 0.5f - static_cast<float>(i)) * pipGap;
-                  DrawCircleV(Vector2{px, y0}, pipR, Color{0, 0, 0, 100});
+                  DrawCircleV(Vector2{px, yInd}, pipR, Color{0, 0, 0, 100});
                 }
 
                 // Fill bar:
                 const float barW = tileW * 0.42f * invZoom;
                 const float barH = 3.0f * invZoom;
                 const float barX = center.x - barW * 0.5f;
-                const float barY = y0 + 5.0f * invZoom;
+                const float barY = yInd + 5.0f * invZoom;
                 DrawRectangleV(Vector2{barX, barY}, Vector2{barW, barH}, Color{0, 0, 0, 90});
                 DrawRectangleV(Vector2{barX, barY}, Vector2{barW * occRatio, barH}, Color{255, 255, 255, 170});
               }
@@ -2127,14 +2133,14 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
               const float pipGap = 5.0f * invZoom;
               for (int i = 0; i < lvl; ++i) {
                 const float px = center.x - (static_cast<float>(lvl - 1) * 0.5f - static_cast<float>(i)) * pipGap;
-                DrawCircleV(Vector2{px, y0}, pipR, Color{0, 0, 0, 100});
+                DrawCircleV(Vector2{px, yInd}, pipR, Color{0, 0, 0, 100});
               }
 
               // Fill bar:
               const float barW = tileW * 0.42f * invZoom;
               const float barH = 3.0f * invZoom;
               const float barX = center.x - barW * 0.5f;
-              const float barY = y0 + 5.0f * invZoom;
+              const float barY = yInd + 5.0f * invZoom;
               DrawRectangleV(Vector2{barX, barY}, Vector2{barW, barH}, Color{0, 0, 0, 90});
               DrawRectangleV(Vector2{barX, barY}, Vector2{barW * occRatio, barH}, Color{255, 255, 255, 170});
             }
@@ -2156,14 +2162,14 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
               const float pipGap = 5.0f * invZoom;
               for (int i = 0; i < lvl; ++i) {
                 const float px = center.x - (static_cast<float>(lvl - 1) * 0.5f - static_cast<float>(i)) * pipGap;
-                DrawCircleV(Vector2{px, y0}, pipR, Color{0, 0, 0, 100});
+                DrawCircleV(Vector2{px, yInd}, pipR, Color{0, 0, 0, 100});
               }
 
               // Fill bar:
               const float barW = tileW * 0.42f * invZoom;
               const float barH = 3.0f * invZoom;
               const float barX = center.x - barW * 0.5f;
-              const float barY = y0 + 5.0f * invZoom;
+              const float barY = yInd + 5.0f * invZoom;
               DrawRectangleV(Vector2{barX, barY}, Vector2{barW, barH}, Color{0, 0, 0, 90});
               DrawRectangleV(Vector2{barX, barY}, Vector2{barW * occRatio, barH}, Color{255, 255, 255, 170});
             }
@@ -2185,14 +2191,14 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
               const float pipGap = 5.0f * invZoom;
               for (int i = 0; i < lvl; ++i) {
                 const float px = center.x - (static_cast<float>(lvl - 1) * 0.5f - static_cast<float>(i)) * pipGap;
-                DrawCircleV(Vector2{px, y0}, pipR, Color{0, 0, 0, 100});
+                DrawCircleV(Vector2{px, yInd}, pipR, Color{0, 0, 0, 100});
               }
 
               // Fill bar:
               const float barW = tileW * 0.42f * invZoom;
               const float barH = 3.0f * invZoom;
               const float barX = center.x - barW * 0.5f;
-              const float barY = y0 + 5.0f * invZoom;
+              const float barY = yInd + 5.0f * invZoom;
               DrawRectangleV(Vector2{barX, barY}, Vector2{barW, barH}, Color{0, 0, 0, 90});
               DrawRectangleV(Vector2{barX, barY}, Vector2{barW * occRatio, barH}, Color{255, 255, 255, 170});
             }

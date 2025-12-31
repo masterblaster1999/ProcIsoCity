@@ -1698,10 +1698,6 @@ void Game::drawSaveMenuPanel(int screenW, int screenH)
 {
   if (!m_showSaveMenu) return;
 
-  const bool showDistrictOverlay = m_showDistrictOverlay || m_showDistrictPanel || (m_tool == Tool::District);
-  const int highlightDistrict = showDistrictOverlay ? (m_activeDistrict % kDistrictCount) : -1;
-  const bool showDistrictBorders = showDistrictOverlay && m_showDistrictBorders;
-
   const int panelW = 760;
   const int panelH = 420;
   const int x0 = (screenW - panelW) / 2;
