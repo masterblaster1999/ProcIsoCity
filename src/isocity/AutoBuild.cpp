@@ -5,6 +5,7 @@
 #include "isocity/Random.hpp"
 #include "isocity/Road.hpp"
 #include "isocity/Traffic.hpp"
+#include "isocity/ZoneAccess.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -193,6 +194,66 @@ static bool IsCandidateBuildTile(const World& world, int x, int y, const SimConf
   return true;
 }
 
+static Overlay ZoneOverlayForTool(Tool zoneTool)
+{
+  switch (zoneTool) {
+  case Tool::Residential: return Overlay::Residential;
+  case Tool::Commercial: return Overlay::Commercial;
+  case Tool::Industrial: return Overlay::Industrial;
+  default: return Overlay::None;
+  }
+}
+
+static bool HasAdjacentAccessibleZoneTile(const World& world, const ZoneAccessMap& za, Overlay zoneOverlay, int x, int y)
+{
+  if (zoneOverlay == Overlay::None) return false;
+  if (za.w != world.width() || za.h != world.height()) return false;
+  if (za.roadIdx.size() != static_cast<std::size_t>(za.w) * static_cast<std::size_t>(za.h)) return false;
+
+  const int w = za.w;
+  constexpr int dirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+  for (const auto& d : dirs) {
+    const int nx = x + d[0];
+    const int ny = y + d[1];
+    if (!world.inBounds(nx, ny)) continue;
+    const Tile& nt = world.at(nx, ny);
+    if (nt.overlay != zoneOverlay) continue;
+    const std::size_t idx = static_cast<std::size_t>(ny) * static_cast<std::size_t>(w) + static_cast<std::size_t>(nx);
+    if (idx >= za.roadIdx.size()) continue;
+    if (za.roadIdx[idx] >= 0) return true;
+  }
+  return false;
+}
+
+static bool IsCandidateZoneTile(const World& world, Overlay zoneOverlay, int x, int y, const SimConfig& simCfg,
+                               const AutoBuildConfig& cfg, const std::vector<std::uint8_t>* roadToEdge,
+                               const ZoneAccessMap* zoneAccess)
+{
+  if (!world.inBounds(x, y)) return false;
+  const Tile& t = world.at(x, y);
+  if (t.overlay != Overlay::None) return false;
+  if (t.terrain == Terrain::Water) return false;
+
+  // Allow interior zoning: a tile is a candidate if it would have road access once zoned.
+  if (!world.wouldZoneHaveRoadAccess(zoneOverlay, x, y)) return false;
+
+  // Optional outside-connection rule: the zone component must touch a road component
+  // that reaches the map edge.
+  if (simCfg.requireOutsideConnection && cfg.respectOutsideConnection) {
+    if (!roadToEdge || roadToEdge->empty()) return false;
+
+    // Direct adjacency to an edge-connected road is always acceptable.
+    if (HasAdjacentRoadConnectedToEdge(world, *roadToEdge, x, y)) return true;
+
+    // Otherwise, we only allow building if this tile is adjacent to an already-accessible
+    // zone tile of the same type (so the new tile inherits that access).
+    if (!zoneAccess) return false;
+    return HasAdjacentAccessibleZoneTile(world, *zoneAccess, zoneOverlay, x, y);
+  }
+
+  return true;
+}
+
 static bool PickBestZoneCandidate(const World& world, Tool zoneTool, const SimConfig& simCfg, const AutoBuildConfig& cfg,
                                  const std::vector<std::uint8_t>* roadToEdge, const LandValueResult* lv,
                                  int day, int& outX, int& outY)
@@ -202,6 +263,17 @@ static bool PickBestZoneCandidate(const World& world, Tool zoneTool, const SimCo
   if (w <= 0 || h <= 0) return false;
 
   const bool lvOk = (lv && lv->w == w && lv->h == h && lv->value.size() == static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
+
+  const Overlay zoneOverlay = ZoneOverlayForTool(zoneTool);
+  if (zoneOverlay == Overlay::None) return false;
+
+  // If the sim enforces an outside connection, precompute a zone access map that only
+  // considers edge-connected roads as valid access points.
+  const bool requireOutside = (simCfg.requireOutsideConnection && cfg.respectOutsideConnection);
+  ZoneAccessMap zoneAccess;
+  if (requireOutside && roadToEdge) {
+    zoneAccess = BuildZoneAccessMap(world, roadToEdge);
+  }
 
   int bestScore = std::numeric_limits<int>::min();
   std::uint32_t bestTie = 0xFFFFFFFFu;
@@ -215,7 +287,9 @@ static bool PickBestZoneCandidate(const World& world, Tool zoneTool, const SimCo
 
   for (int y = 1; y < h - 1; ++y) {
     for (int x = 1; x < w - 1; ++x) {
-      if (!IsCandidateBuildTile(world, x, y, simCfg, cfg, roadToEdge)) continue;
+      if (!IsCandidateZoneTile(world, zoneOverlay, x, y, simCfg, cfg, roadToEdge, requireOutside ? &zoneAccess : nullptr)) {
+        continue;
+      }
 
       const AdjCounts adj = CountAdj(world, x, y);
 

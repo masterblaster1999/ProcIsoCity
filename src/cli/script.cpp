@@ -69,6 +69,17 @@ static void PrintHelp()
     << "  unset <name>        Remove a variable.\n"
     << "  echo ...            Print expanded text to stdout.\n"
     << "  vars                Print current vars as name=value (expanded).\n";
+
+  std::cout
+    << "\nControl flow additions:\n"
+    << "  repeat <n>          Repeat a block N times. Terminate the block with `end`.\n"
+    << "  while <expr>        Run a block while expr is non-zero. Terminate with `end`.\n"
+    << "  if <expr>           Conditional block. Supports optional `else`. Terminate with `end`.\n"
+    << "  break               Exit the nearest repeat/while loop.\n"
+    << "  continue            Continue the nearest repeat/while loop.\n"
+    << "\nAssertions:\n"
+    << "  expect <expr>       Fail the script if expr evaluates to zero.\n"
+    << "\nExpr operators (C-like): + - * / %  == != < <= > >=  && || !\n";
 }
 
 static bool ParseU64(const std::string& s, std::uint64_t* out)

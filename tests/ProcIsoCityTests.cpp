@@ -101,16 +101,17 @@ namespace {
 
 using namespace isocity;
 
-bool FindEmptyAdjacentPair(const isocity::World& w, int& outX, int& outY)
+bool FindEmptyAdjacentPair(isocity::World& w, int& outX, int& outY)
 {
-  // Find (x,y) and (x+1,y) that are buildable and empty (Overlay::None).
+  // Find (x,y) and (x+1,y) that are buildable. ProcGen may pre-zone large portions of the map,
+  // so we proactively clear the chosen tiles to ensure we have a blank spot for tool application tests.
   for (int y = 1; y < w.height() - 1; ++y) {
     for (int x = 1; x < w.width() - 2; ++x) {
       if (!w.isBuildable(x, y) || !w.isBuildable(x + 1, y)) continue;
-      if (w.at(x, y).overlay != isocity::Overlay::None) continue;
-      if (w.at(x + 1, y).overlay != isocity::Overlay::None) continue;
       outX = x;
       outY = y;
+      w.setOverlay(isocity::Overlay::None, x, y);
+      w.setOverlay(isocity::Overlay::None, x + 1, y);
       return true;
     }
   }
@@ -141,6 +142,28 @@ void TestRoadAutoTilingMasks()
   w.bulldoze(3, 2);
   EXPECT_EQ(w.at(3, 2).overlay, Overlay::None);
   EXPECT_EQ(static_cast<int>(w.at(3, 3).variation & 0x0F), 2);
+}
+
+static void TestZonePlacementAllowsInteriorTilesInConnectedComponent()
+{
+  using namespace isocity;
+
+  World w(8, 8, 1);
+  w.stats().money = 10'000;
+
+  // Seed one road tile.
+  EXPECT_EQ(w.applyRoad(4, 4, 1), ToolApplyResult::Applied);
+
+  // Place a residential tile adjacent to the road (boundary tile).
+  EXPECT_EQ(w.applyTool(Tool::Residential, 4, 3), ToolApplyResult::Applied);
+
+  // Now place an interior tile that is NOT adjacent to a road, but is connected
+  // (via same-zone adjacency) to the road-adjacent boundary tile.
+  EXPECT_EQ(w.hasAdjacentRoad(4, 2), false);
+  EXPECT_EQ(w.applyTool(Tool::Residential, 4, 2), ToolApplyResult::Applied);
+
+  // A disconnected zone placement should still be rejected.
+  EXPECT_EQ(w.applyTool(Tool::Residential, 0, 0), ToolApplyResult::BlockedNoRoad);
 }
 
 void TestEditHistoryUndoRedo()
@@ -1467,6 +1490,113 @@ void TestRoadBuildPathPrefersExistingRoads()
   EXPECT_TRUE(visitedY3);
 }
 
+
+
+void TestRoadBuildPathMinimizesTurnsWhenStepsTie()
+{
+  using namespace isocity;
+
+  World w(5, 5, 2026u);
+
+  // Deterministic flat land, no pre-existing roads.
+  for (int y = 0; y < w.height(); ++y) {
+    for (int x = 0; x < w.width(); ++x) {
+      Tile& t = w.at(x, y);
+      t.terrain = Terrain::Grass;
+      t.overlay = Overlay::None;
+      t.level = 1;
+      t.occupants = 0;
+      t.height = 0.5f;
+      t.variation = 0;
+    }
+  }
+
+  RoadBuildPathConfig cfg{};
+  cfg.costModel = RoadBuildPathConfig::CostModel::NewTiles;
+  cfg.allowBridges = false;
+
+  std::vector<Point> path;
+  int cost = 0;
+  EXPECT_TRUE(FindRoadBuildPath(w, Point{1, 1}, Point{3, 3}, path, &cost, cfg));
+  EXPECT_TRUE(!path.empty());
+
+  // Manhattan distance is 4 => any optimal path should have 5 nodes.
+  EXPECT_EQ(static_cast<int>(path.size()), 5);
+
+  auto countTurns = [](const std::vector<Point>& p) -> int {
+    if (p.size() < 3) return 0;
+    int turns = 0;
+
+    int pdx = p[1].x - p[0].x;
+    int pdy = p[1].y - p[0].y;
+
+    for (std::size_t i = 2; i < p.size(); ++i) {
+      const int dx = p[i].x - p[i - 1].x;
+      const int dy = p[i].y - p[i - 1].y;
+
+      // Ensure 4-neighborhood.
+      EXPECT_TRUE(std::abs(dx) + std::abs(dy) == 1);
+
+      if (dx != pdx || dy != pdy) ++turns;
+      pdx = dx;
+      pdy = dy;
+    }
+    return turns;
+  };
+
+  // Optimal Manhattan paths must turn at least once when both dx and dy are non-zero.
+  // Among equal cost + equal step paths, the planner should choose a 1-turn path
+  // (an "L" shape) rather than a zig-zag.
+  EXPECT_EQ(countTurns(path), 1);
+}
+
+void TestRoadBuildPathBetweenSetsAccountsForStartTileCost()
+{
+  using namespace isocity;
+
+  World w(5, 5, 2027u);
+
+  // Deterministic flat land.
+  for (int y = 0; y < w.height(); ++y) {
+    for (int x = 0; x < w.width(); ++x) {
+      Tile& t = w.at(x, y);
+      t.terrain = Terrain::Grass;
+      t.overlay = Overlay::None;
+      t.level = 1;
+      t.occupants = 0;
+      t.height = 0.5f;
+      t.variation = 0;
+    }
+  }
+
+  // Existing road chain to the goal: (0,2)-(1,2)-(2,2)
+  w.setRoad(0, 2);
+  w.setRoad(1, 2);
+  w.setRoad(2, 2);
+
+  // Two candidate starts:
+  //  - A: already-road (cost 0) but farther (2 steps)
+  //  - B: empty tile adjacent to the goal (1 step) but would require building a new road tile (cost 1)
+  const std::vector<Point> starts{Point{0, 2}, Point{2, 1}};
+  const std::vector<Point> goals{Point{2, 2}};
+
+  RoadBuildPathConfig cfg{};
+  cfg.costModel = RoadBuildPathConfig::CostModel::NewTiles;
+
+  std::vector<Point> path;
+  int cost = 0;
+  EXPECT_TRUE(FindRoadBuildPathBetweenSets(w, starts, goals, path, &cost, cfg));
+  EXPECT_TRUE(!path.empty());
+
+  // Correct cost accounting should prefer the all-existing-road route (cost 0),
+  // even though the empty-tile start would yield fewer steps.
+  EXPECT_EQ(cost, 0);
+  EXPECT_EQ(path.front().x, 0);
+  EXPECT_EQ(path.front().y, 2);
+  EXPECT_EQ(path.back().x, 2);
+  EXPECT_EQ(path.back().y, 2);
+}
+
 void TestTrafficCommuteHeatmapSimple()
 {
   using namespace isocity;
@@ -1575,6 +1705,62 @@ void TestGoodsIndustrySuppliesCommercial()
   // Commercial tile should show full supply.
   const std::size_t commIdx = static_cast<std::size_t>(2) * static_cast<std::size_t>(w.width()) +
                               static_cast<std::size_t>(6);
+  EXPECT_TRUE(gr.commercialFill[commIdx] >= 250);
+}
+
+void TestGoodsSplitsDemandAcrossMultipleProducers()
+{
+  using namespace isocity;
+
+  // One commercial tile with demand greater than a single producer's supply.
+  // The goods model should satisfy demand by pulling from the next-nearest
+  // reachable producer instead of immediately marking it unreachable/importing.
+  //
+  // Road row is edge-connected so requireOutsideConnection can stay true.
+  World w(9, 5, 42u);
+  for (int x = 0; x < w.width(); ++x) {
+    w.setRoad(x, 3);
+  }
+
+  // Two industrial producers on the same road component.
+  w.setOverlay(Overlay::Industrial, 2, 2);
+  w.at(2, 2).level = 1; // supply = 12
+
+  w.setOverlay(Overlay::Industrial, 7, 2);
+  w.at(7, 2).level = 1; // supply = 12
+
+  // One commercial consumer in the middle.
+  w.setOverlay(Overlay::Commercial, 4, 2);
+  w.at(4, 2).level = 3; // demand = 24
+
+  GoodsConfig cfg;
+  cfg.requireOutsideConnection = true;
+  cfg.allowImports = false;
+  cfg.allowExports = false;
+
+  const GoodsResult gr = ComputeGoodsFlow(w, cfg);
+
+  EXPECT_EQ(gr.goodsProduced, 24);
+  EXPECT_EQ(gr.goodsDemand, 24);
+  EXPECT_EQ(gr.goodsDelivered, 24);
+  EXPECT_EQ(gr.goodsImported, 0);
+  EXPECT_EQ(gr.unreachableDemand, 0);
+  EXPECT_TRUE(gr.satisfaction > 0.999f);
+
+  auto idx = [&](int x, int y) -> std::size_t {
+    return static_cast<std::size_t>(y) * static_cast<std::size_t>(w.width()) + static_cast<std::size_t>(x);
+  };
+
+  // Traffic should show deliveries from both directions.
+  EXPECT_EQ(static_cast<int>(gr.roadGoodsTraffic[idx(2, 3)]), 12);
+  EXPECT_EQ(static_cast<int>(gr.roadGoodsTraffic[idx(3, 3)]), 12);
+  EXPECT_EQ(static_cast<int>(gr.roadGoodsTraffic[idx(4, 3)]), 24);
+  EXPECT_EQ(static_cast<int>(gr.roadGoodsTraffic[idx(5, 3)]), 12);
+  EXPECT_EQ(static_cast<int>(gr.roadGoodsTraffic[idx(6, 3)]), 12);
+  EXPECT_EQ(static_cast<int>(gr.roadGoodsTraffic[idx(7, 3)]), 12);
+
+  // Commercial tile should show full supply.
+  const std::size_t commIdx = idx(4, 2);
   EXPECT_TRUE(gr.commercialFill[commIdx] >= 250);
 }
 
@@ -1938,6 +2124,41 @@ void TestWorldHashDeterministicForSameSeed()
 
   EXPECT_TRUE(hc != ha);
 }
+
+void TestProcGenBlockZoningCreatesInteriorAccessibleZones()
+{
+  using namespace isocity;
+
+  ProcGenConfig cfg{};
+  cfg.zoneChance = 1.0f;
+  cfg.parkChance = 0.0f;
+  // Avoid water so the test is stable and focuses on zoning connectivity.
+  cfg.waterLevel = -1.0f;
+  cfg.sandLevel = -0.5f;
+  cfg.hubs = 3;
+  cfg.extraConnections = 1;
+
+  World w = GenerateWorld(32, 24, 0xCAFEBABEu, cfg);
+  const ZoneAccessMap za = BuildZoneAccessMap(w, nullptr);
+
+  bool found = false;
+  for (int y = 0; y < w.height() && !found; ++y) {
+    for (int x = 0; x < w.width() && !found; ++x) {
+      const Tile& t = w.at(x, y);
+      const bool isZone = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial || t.overlay == Overlay::Industrial);
+      if (!isZone) continue;
+      // We want an interior tile (not directly adjacent to a road) that is nevertheless accessible via
+      // same-zone connectivity to a road edge. This exercises ProcGen's block-aware inward growth.
+      if (w.hasAdjacentRoad(x, y)) continue;
+      if (HasZoneAccess(za, x, y)) {
+        found = true;
+      }
+    }
+  }
+
+  EXPECT_TRUE(found);
+}
+
 
 void TestProcGenErosionToggleAffectsHash()
 {
@@ -3673,6 +3894,104 @@ static void TestScriptRunnerVarsAndExpr()
   }
 }
 
+static void TestScriptRunnerControlFlowRepeatIfElse()
+{
+  using namespace isocity;
+
+  std::vector<std::string> printed;
+
+  ScriptRunner runner;
+  runner.setOptions(ScriptRunOptions{.quiet = true});
+  runner.setCallbacks(ScriptCallbacks{
+    .print = [&](const std::string& line) { printed.push_back(line); },
+    .info = [&](const std::string&) {},
+    .error = [&](const std::string&) {},
+  });
+
+  const std::string script =
+      "set x 0\n"
+      "repeat 5\n"
+      "  add x 1\n"
+      "end\n"
+      "echo {x}\n"
+      "set y 0\n"
+      "repeat 3\n"
+      "  if {y} == 1\n"
+      "    add y 10\n"
+      "  else\n"
+      "    add y 1\n"
+      "  end\n"
+      "end\n"
+      "echo {y}\n";
+
+  EXPECT_TRUE(runner.runText(script, "<unit_test_ctrl_flow>"));
+  EXPECT_EQ(printed.size(), static_cast<std::size_t>(2));
+  if (printed.size() >= 2) {
+    EXPECT_EQ(printed[0], std::string("5"));
+    EXPECT_EQ(printed[1], std::string("12"));
+  }
+}
+
+static void TestScriptRunnerControlFlowWhileBreakContinue()
+{
+  using namespace isocity;
+
+  std::vector<std::string> printed;
+
+  ScriptRunner runner;
+  runner.setOptions(ScriptRunOptions{.quiet = true});
+  runner.setCallbacks(ScriptCallbacks{
+    .print = [&](const std::string& line) { printed.push_back(line); },
+    .info = [&](const std::string&) {},
+    .error = [&](const std::string&) {},
+  });
+
+  const std::string script =
+      "set i 0\n"
+      "set sum 0\n"
+      "while {i} < 10\n"
+      "  add i 1\n"
+      "  if {i} % 2 == 0\n"
+      "    continue\n"
+      "  end\n"
+      "  add sum {i}\n"
+      "  if {sum} > 10\n"
+      "    break\n"
+      "  end\n"
+      "end\n"
+      "echo {i}\n"
+      "echo {sum}\n";
+
+  EXPECT_TRUE(runner.runText(script, "<unit_test_while_flow>"));
+  EXPECT_EQ(printed.size(), static_cast<std::size_t>(2));
+  if (printed.size() >= 2) {
+    EXPECT_EQ(printed[0], std::string("7"));
+    EXPECT_EQ(printed[1], std::string("16"));
+  }
+}
+
+static void TestScriptRunnerExpectFail()
+{
+  using namespace isocity;
+
+  ScriptRunner runner;
+  runner.setOptions(ScriptRunOptions{.quiet = true});
+  runner.setCallbacks(ScriptCallbacks{
+    .print = [&](const std::string&) {},
+    .info = [&](const std::string&) {},
+    .error = [&](const std::string&) {},
+  });
+
+  const std::string script =
+      "set x 5\n"
+      "expect {x} == 6\n"
+      "echo SHOULD_NOT_PRINT\n";
+
+  EXPECT_TRUE(!runner.runText(script, "<unit_test_expect_fail>"));
+  EXPECT_EQ(runner.lastErrorLine(), 2);
+  EXPECT_TRUE(runner.lastError().find("expect failed") != std::string::npos);
+}
+
 static void TestSuiteManifestDiscoverAndRunScenario()
 {
   using namespace isocity;
@@ -4643,6 +4962,7 @@ void TestPolicyOptimizerExhaustivePrefersLowMaintenanceWhenNoRevenue()
 int main()
 {
   TestRoadAutoTilingMasks();
+  TestZonePlacementAllowsInteriorTilesInConnectedComponent();
   TestEditHistoryUndoRedo();
   TestEditHistoryUndoRedoFixesRoadMasksLocally();
   TestEditHistoryUndoDoesNotRequireExactBaseState();
@@ -4668,6 +4988,7 @@ int main()
   TestTrafficPrefersHighSpeedRoadsWhenStepsTie();
   TestTrafficUnreachableAcrossDisconnectedEdgeComponents();
   TestGoodsIndustrySuppliesCommercial();
+  TestGoodsSplitsDemandAcrossMultipleProducers();
   TestGoodsImportsWhenNoIndustry();
   TestGoodsUnreachableDemandWhenNoImports();
   TestTrafficAndGoodsAcceptPrecomputedZoneAccessMap();
@@ -4681,6 +5002,7 @@ int main()
   TestJobAssignmentPrefersHighLandValueCommercial();
 
   TestWorldHashDeterministicForSameSeed();
+  TestProcGenBlockZoningCreatesInteriorAccessibleZones();
   TestProcGenErosionToggleAffectsHash();
   TestSimulationDeterministicHashAfterTicks();
   TestWorldDiffCounts();
@@ -4717,12 +5039,18 @@ int main()
   TestAutoBuildDeterminism();
   TestScriptRunnerBasic();
   TestScriptRunnerVarsAndExpr();
+  TestScriptRunnerControlFlowRepeatIfElse();
+  TestScriptRunnerControlFlowWhileBreakContinue();
+  TestScriptRunnerExpectFail();
   TestSuiteManifestDiscoverAndRunScenario();
 
 
   TestRoadPathfindingAStar();
   TestLandPathfindingAStarAvoidsWater();
   TestRoadBuildPathPrefersExistingRoads();
+  TestRoadBuildPathMinimizesTurnsWhenStepsTie();
+  TestRoadBuildPathBetweenSetsAccountsForStartTileCost();
+
   TestBridgeRoadsCanBeBuiltOnWater();
   TestRoadBuildPathAvoidsBridgesWhenLandAlternativeExists();
   TestRoadBuildPathMoneyAvoidsExpensiveBridge();

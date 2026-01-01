@@ -85,7 +85,7 @@ struct RoadBuildPathConfig {
 //  - terrain must be non-water unless cfg.allowBridges == true
 //
 // The path is optimized according to cfg.costModel, and ties are broken by
-// fewer steps and stable per-tile variation bits.
+// fewer steps, fewer turns, and stable per-tile variation bits.
 //
 // outPrimaryCost (if non-null) is:
 //  - cfg.costModel==NewTiles => number of tiles in the path that are not already roads

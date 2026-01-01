@@ -2,6 +2,7 @@
 
 #include "isocity/FlowField.hpp"
 #include "isocity/Pathfinding.hpp"
+#include "isocity/Road.hpp"
 #include "isocity/ZoneAccess.hpp"
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <queue>
 #include <vector>
 
 namespace isocity {
@@ -55,6 +57,22 @@ struct Consumer {
   int dist = -1; // steps along the chosen producer path
   int cost = -1; // travel-time cost (milli-steps)
   int owner = -1;
+};
+
+struct SearchNode {
+  int cost = 0;  // travel-time cost
+  int steps = 0; // road steps
+  int idx = 0;   // road tile index
+};
+
+struct SearchCmp {
+  bool operator()(const SearchNode& a, const SearchNode& b) const
+  {
+    // priority_queue is max-heap by default; return true if a should come after b.
+    if (a.cost != b.cost) return a.cost > b.cost;
+    if (a.steps != b.steps) return a.steps > b.steps;
+    return a.idx > b.idx;
+  }
 };
 
 } // namespace
@@ -259,7 +277,132 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
   });
 
   // --- Allocate goods ---
-  int deliveredTotal = 0;
+  // Map road tile index -> source index (in `sources`).
+  // This lets us quickly test if a visited road tile is a producer access point.
+  std::vector<int> sourceByRoadIdx(n, -1);
+  for (int si = 0; si < static_cast<int>(sources.size()); ++si) {
+    const int ridx = sources[static_cast<std::size_t>(si)].roadIdx;
+    if (ridx < 0 || static_cast<std::size_t>(ridx) >= n) continue;
+    sourceByRoadIdx[static_cast<std::size_t>(ridx)] = si;
+  }
+
+  // Scratch buffers for on-demand "next-nearest producer" searches.
+  // We avoid O(n) re-initialization by only resetting touched indices.
+  constexpr int INF = std::numeric_limits<int>::max() / 4;
+  std::vector<int> searchCost(n, INF);
+  std::vector<int> searchSteps(n, INF);
+  std::vector<int> searchParent(n, -1);
+  std::vector<int> touched;
+  touched.reserve(1024);
+
+  auto resetSearchScratch = [&]() {
+    for (int idx : touched) {
+      if (idx < 0 || static_cast<std::size_t>(idx) >= n) continue;
+      const std::size_t ui = static_cast<std::size_t>(idx);
+      searchCost[ui] = INF;
+      searchSteps[ui] = INF;
+      searchParent[ui] = -1;
+    }
+    touched.clear();
+  };
+
+  // Find the nearest (travel-time) source with remaining supply, starting from a road tile.
+  // On success, returns true and outputs:
+  //  - outSourceIndex: index into `sources`
+  //  - outSourceRoadIdx: the road tile idx where that source is anchored
+  // The `searchParent` array encodes the chosen path *back to start* (prev pointers).
+  auto findNearestSourceWithSupply = [&](int startRoadIdx, int& outSourceIndex, int& outSourceRoadIdx) -> bool {
+    outSourceIndex = -1;
+    outSourceRoadIdx = -1;
+
+    if (!isTraversableRoad(startRoadIdx)) return false;
+
+    resetSearchScratch();
+
+    std::priority_queue<SearchNode, std::vector<SearchNode>, SearchCmp> heap;
+
+    const std::size_t us = static_cast<std::size_t>(startRoadIdx);
+    searchCost[us] = 0;
+    searchSteps[us] = 0;
+    searchParent[us] = -1;
+    touched.push_back(startRoadIdx);
+    heap.push(SearchNode{0, 0, startRoadIdx});
+
+    // Deterministic neighbor order (matches FlowField).
+    constexpr int dirs[4][2] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}};
+
+    while (!heap.empty()) {
+      const SearchNode cur = heap.top();
+      heap.pop();
+
+      if (cur.idx < 0 || static_cast<std::size_t>(cur.idx) >= n) continue;
+      const std::size_t uu = static_cast<std::size_t>(cur.idx);
+      if (cur.cost != searchCost[uu] || cur.steps != searchSteps[uu]) continue;
+
+      const int srcIdx = sourceByRoadIdx[uu];
+      if (srcIdx >= 0 && srcIdx < static_cast<int>(sources.size()) && sources[static_cast<std::size_t>(srcIdx)].remaining > 0) {
+        outSourceIndex = srcIdx;
+        outSourceRoadIdx = cur.idx;
+        return true;
+      }
+
+      const int ux = cur.idx % w;
+      const int uy = cur.idx / w;
+
+      for (const auto& d : dirs) {
+        const int nx = ux + d[0];
+        const int ny = uy + d[1];
+        if (!world.inBounds(nx, ny)) continue;
+        const int nidx = ny * w + nx;
+        if (!isTraversableRoad(nidx)) continue;
+        if (nidx < 0 || static_cast<std::size_t>(nidx) >= n) continue;
+
+        const std::size_t nu = static_cast<std::size_t>(nidx);
+        int moveCost = RoadTravelTimeMilliForLevel(static_cast<int>(world.at(nx, ny).level));
+        const int nc = cur.cost + moveCost;
+        const int ns = cur.steps + 1;
+
+        bool improve = false;
+        if (nc < searchCost[nu]) {
+          improve = true;
+        } else if (nc == searchCost[nu] && ns < searchSteps[nu]) {
+          improve = true;
+        } else if (nc == searchCost[nu] && ns == searchSteps[nu]) {
+          const int oldParent = searchParent[nu];
+          if (oldParent < 0 || cur.idx < oldParent) {
+            improve = true;
+          }
+        }
+
+        if (!improve) continue;
+
+        if (searchCost[nu] == INF) {
+          touched.push_back(nidx);
+        }
+        searchCost[nu] = nc;
+        searchSteps[nu] = ns;
+        searchParent[nu] = cur.idx;
+
+        heap.push(SearchNode{nc, ns, nidx});
+      }
+    }
+
+    return false;
+  };
+
+  // Add goods traffic along a path encoded by a "prev" parent map (node -> previous node).
+  // `endIdx` is typically a source road tile; walking parents eventually reaches start (-1).
+  auto addAlongPrevChain = [&](int endIdx, const std::vector<int>& prev, int amount) {
+    if (amount <= 0) return;
+    int cur = endIdx;
+    int guard = 0;
+    while (cur != -1 && guard++ < static_cast<int>(n) + 8) {
+      if (cur < 0 || static_cast<std::size_t>(cur) >= n) break;
+      const std::size_t ui = static_cast<std::size_t>(cur);
+      out.roadGoodsTraffic[ui] = SatAddU16(out.roadGoodsTraffic[ui], static_cast<std::uint32_t>(amount));
+      cur = prev[ui];
+    }
+  };
 
   for (const Consumer& c : consumers) {
     int remaining = c.demand;
@@ -275,6 +418,31 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
         delivered += give;
         addAlongParentChain(c.roadIdx, prodField.parent, give);
       }
+    }
+
+    // If the nearest producer runs out, fall back to the next-nearest reachable producers
+    // (deterministic travel-time Dijkstra) before importing.
+    while (remaining > 0 && !sources.empty()) {
+      int srcIdx = -1;
+      int srcRoadIdx = -1;
+      if (!findNearestSourceWithSupply(c.roadIdx, srcIdx, srcRoadIdx)) break;
+      if (srcIdx < 0 || srcIdx >= static_cast<int>(sources.size())) break;
+
+      Source& src = sources[static_cast<std::size_t>(srcIdx)];
+      const int give = std::min(src.remaining, remaining);
+      if (give <= 0) {
+        // Defensive: should be impossible (findNearestSourceWithSupply checks remaining>0).
+        src.remaining = 0;
+        continue;
+      }
+
+      src.remaining -= give;
+      remaining -= give;
+      delivered += give;
+
+      // `searchParent` stores prev pointers back to the consumer road tile.
+      // Adding along the reverse chain still marks the same road tiles.
+      addAlongPrevChain(srcRoadIdx, searchParent, give);
     }
 
     // Import any remaining demand from the edge if allowed.
@@ -294,7 +462,6 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
     }
 
     out.goodsDelivered += delivered;
-    deliveredTotal += delivered;
 
     // Commercial tile fill ratio for overlays.
     const float ratio = (c.demand > 0)
@@ -331,8 +498,6 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
     if (v > maxT) maxT = v;
   }
   out.maxRoadGoodsTraffic = maxT;
-
-  (void)deliveredTotal;
 
   return out;
 }

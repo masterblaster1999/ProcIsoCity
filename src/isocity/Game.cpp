@@ -2655,7 +2655,7 @@ void Game::endPaintStroke()
     };
 
     if (m_strokeFeedback.noMoney) add("not enough money");
-    if (m_strokeFeedback.noRoad) add("need adjacent road");
+    if (m_strokeFeedback.noRoad) add("need road access");
     if (m_strokeFeedback.water) add("can't build on water");
     if (m_strokeFeedback.occupied) add("tile occupied");
 

@@ -3,6 +3,8 @@
 #include "isocity/Road.hpp"
 
 #include <algorithm>
+#include <cstddef>
+#include <vector>
 
 namespace isocity {
 
@@ -87,6 +89,99 @@ bool World::hasAdjacentRoad(int x, int y) const
     const int ny = y + d[1];
     if (!inBounds(nx, ny)) continue;
     if (at(nx, ny).overlay == Overlay::Road) return true;
+  }
+
+  return false;
+}
+
+bool World::wouldZoneHaveRoadAccess(Overlay zoneOverlay, int x, int y) const
+{
+  if (!inBounds(x, y)) return false;
+
+  // Only meaningful for zoning overlays.
+  if (zoneOverlay != Overlay::Residential && zoneOverlay != Overlay::Commercial && zoneOverlay != Overlay::Industrial) {
+    return false;
+  }
+
+  const Tile& t0 = at(x, y);
+
+  // Zoning is not allowed on water (bridges are roads only).
+  if (t0.terrain == Terrain::Water) return false;
+
+  // Callers generally ensure this, but keep the helper safe.
+  if (t0.overlay != Overlay::None && t0.overlay != zoneOverlay) return false;
+
+  // Fast path: direct road adjacency.
+  if (hasAdjacentRoad(x, y)) return true;
+
+  // If we don't touch any existing same-zone tile, then this would create a new
+  // disconnected component (no road access).
+  constexpr int dirs[4][2] = {
+      {1, 0},
+      {-1, 0},
+      {0, 1},
+      {0, -1},
+  };
+
+  bool hasNeighborZone = false;
+  for (const auto& d : dirs) {
+    const int nx = x + d[0];
+    const int ny = y + d[1];
+    if (!inBounds(nx, ny)) continue;
+    const Tile& nt = at(nx, ny);
+    if (nt.terrain == Terrain::Water) continue;
+    if (nt.overlay == zoneOverlay) {
+      hasNeighborZone = true;
+      break;
+    }
+  }
+  if (!hasNeighborZone) return false;
+
+  const int w = m_w;
+  const int h = m_h;
+  if (w <= 0 || h <= 0) return false;
+
+  const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+  std::vector<std::uint8_t> visited(n, 0);
+  std::vector<int> queue;
+  queue.reserve(256);
+
+  auto idxOf = [&](int tx, int ty) -> int { return ty * w + tx; };
+
+  const int start = idxOf(x, y);
+  if (start < 0 || static_cast<std::size_t>(start) >= visited.size()) return false;
+  visited[static_cast<std::size_t>(start)] = 1;
+  queue.push_back(start);
+
+  std::size_t qHead = 0;
+  while (qHead < queue.size()) {
+    const int cur = queue[qHead++];
+    const int cx = cur % w;
+    const int cy = cur / w;
+
+    // If any tile in the connected zone component touches a road, the component
+    // is considered accessible.
+    if (hasAdjacentRoad(cx, cy)) return true;
+
+    for (const auto& d : dirs) {
+      const int nx = cx + d[0];
+      const int ny = cy + d[1];
+      if (!inBounds(nx, ny)) continue;
+      const int ni = idxOf(nx, ny);
+      if (ni < 0) continue;
+      const std::size_t ui = static_cast<std::size_t>(ni);
+      if (ui >= visited.size()) continue;
+      if (visited[ui]) continue;
+
+      // Traverse existing zone tiles of the same overlay. The start tile is
+      // treated as zoned (even if it's currently empty) and is already queued.
+      const Tile& nt = at(nx, ny);
+      if (nt.terrain == Terrain::Water) continue;
+      if (nt.overlay != zoneOverlay) continue;
+
+      visited[ui] = 1;
+      queue.push_back(ni);
+    }
   }
 
   return false;
@@ -274,12 +369,17 @@ ToolApplyResult World::applyTool(Tool tool, int x, int y)
   case Tool::Residential:
   case Tool::Commercial:
   case Tool::Industrial: {
-    // Zones require road access.
-    if (!hasAdjacentRoad(x, y)) return ToolApplyResult::BlockedNoRoad;
-
     Overlay zone = Overlay::Residential;
     if (tool == Tool::Commercial) zone = Overlay::Commercial;
     if (tool == Tool::Industrial) zone = Overlay::Industrial;
+
+    // Don't overwrite other overlays; bulldoze first.
+    if (t.overlay != Overlay::None && t.overlay != zone) return ToolApplyResult::BlockedOccupied;
+
+    // Zones require road access, but we allow multi-tile zoning blocks:
+    // a tile is placeable if it is adjacent to a road OR it connects to an
+    // existing same-zone component that touches a road.
+    if (!wouldZoneHaveRoadAccess(zone, x, y)) return ToolApplyResult::BlockedNoRoad;
 
     if (t.overlay == zone) {
       // Upgrade with repeated placement.
@@ -288,8 +388,6 @@ ToolApplyResult World::applyTool(Tool tool, int x, int y)
       t.level++;
       return ToolApplyResult::Applied;
     }
-
-    if (t.overlay != Overlay::None) return ToolApplyResult::BlockedOccupied; // Don't overwrite other overlays.
 
     if (!spend(5)) return ToolApplyResult::InsufficientFunds;
     setOverlay(zone, x, y);

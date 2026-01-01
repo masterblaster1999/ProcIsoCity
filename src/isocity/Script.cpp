@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -547,6 +548,303 @@ static bool EvalU64Expr(const std::string& s, std::uint64_t* out)
 
   Parser p{s};
   std::uint64_t v = 0;
+  if (!p.parse(&v)) return false;
+  *out = v;
+  return true;
+}
+
+// A permissive, C-like expression evaluator used for control flow (`if`/`while`/`expect`).
+//
+// The result is an i64 value, where comparisons/logical operators yield 0 or 1.
+// Supported operators (C-like precedence):
+//  - logical:     ||  &&  !
+//  - comparison:  ==  !=  <  <=  >  >=
+//  - arithmetic:  +  -  *  /  %  (unary +/-)
+// Parentheses are supported. Integers are decimal or 0x... hex.
+static bool EvalI64LogicExpr(const std::string& s, std::int64_t* out)
+{
+  if (!out) return false;
+  if (s.empty()) return false;
+
+  struct Parser {
+    const std::string& s;
+    std::size_t pos = 0;
+
+    void skipWs()
+    {
+      while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) {
+        ++pos;
+      }
+    }
+
+    bool matchChar(char c)
+    {
+      if (pos < s.size() && s[pos] == c) {
+        ++pos;
+        return true;
+      }
+      return false;
+    }
+
+    bool matchStr(const char* lit)
+    {
+      const std::size_t n = std::strlen(lit);
+      if (pos + n > s.size()) return false;
+      for (std::size_t i = 0; i < n; ++i) {
+        if (s[pos + i] != lit[i]) return false;
+      }
+      pos += n;
+      return true;
+    }
+
+    // Grammar:
+    //  expr := or
+    //  or := and ( '||' and )*
+    //  and := eq ( '&&' eq )*
+    //  eq := rel ( ('==' | '!=') rel )*
+    //  rel := add ( ('<=' | '>=' | '<' | '>') add )*
+    //  add := mul ( ('+' | '-') mul )*
+    //  mul := unary ( ('*' | '/' | '%') unary )*
+    //  unary := ('+' | '-' | '!') unary | primary
+    //  primary := number | '(' expr ')'
+
+    bool parseExpr(std::int64_t* out)
+    {
+      return parseOr(out);
+    }
+
+    bool parseOr(std::int64_t* out)
+    {
+      std::int64_t v = 0;
+      if (!parseAnd(&v)) return false;
+
+      while (true) {
+        skipWs();
+        if (matchStr("||")) {
+          std::int64_t rhs = 0;
+          if (!parseAnd(&rhs)) return false;
+          v = ((v != 0) || (rhs != 0)) ? 1 : 0;
+          continue;
+        }
+        break;
+      }
+
+      *out = v;
+      return true;
+    }
+
+    bool parseAnd(std::int64_t* out)
+    {
+      std::int64_t v = 0;
+      if (!parseEq(&v)) return false;
+
+      while (true) {
+        skipWs();
+        if (matchStr("&&")) {
+          std::int64_t rhs = 0;
+          if (!parseEq(&rhs)) return false;
+          v = ((v != 0) && (rhs != 0)) ? 1 : 0;
+          continue;
+        }
+        break;
+      }
+
+      *out = v;
+      return true;
+    }
+
+    bool parseEq(std::int64_t* out)
+    {
+      std::int64_t v = 0;
+      if (!parseRel(&v)) return false;
+
+      while (true) {
+        skipWs();
+        if (matchStr("==")) {
+          std::int64_t rhs = 0;
+          if (!parseRel(&rhs)) return false;
+          v = (v == rhs) ? 1 : 0;
+          continue;
+        }
+        if (matchStr("!=")) {
+          std::int64_t rhs = 0;
+          if (!parseRel(&rhs)) return false;
+          v = (v != rhs) ? 1 : 0;
+          continue;
+        }
+        break;
+      }
+
+      *out = v;
+      return true;
+    }
+
+    bool parseRel(std::int64_t* out)
+    {
+      std::int64_t v = 0;
+      if (!parseAdd(&v)) return false;
+
+      while (true) {
+        skipWs();
+        if (matchStr("<=")) {
+          std::int64_t rhs = 0;
+          if (!parseAdd(&rhs)) return false;
+          v = (v <= rhs) ? 1 : 0;
+          continue;
+        }
+        if (matchStr(">=")) {
+          std::int64_t rhs = 0;
+          if (!parseAdd(&rhs)) return false;
+          v = (v >= rhs) ? 1 : 0;
+          continue;
+        }
+        if (matchChar('<')) {
+          std::int64_t rhs = 0;
+          if (!parseAdd(&rhs)) return false;
+          v = (v < rhs) ? 1 : 0;
+          continue;
+        }
+        if (matchChar('>')) {
+          std::int64_t rhs = 0;
+          if (!parseAdd(&rhs)) return false;
+          v = (v > rhs) ? 1 : 0;
+          continue;
+        }
+        break;
+      }
+
+      *out = v;
+      return true;
+    }
+
+    bool parseAdd(std::int64_t* out)
+    {
+      std::int64_t v = 0;
+      if (!parseMul(&v)) return false;
+
+      while (true) {
+        skipWs();
+        if (matchChar('+')) {
+          std::int64_t rhs = 0;
+          if (!parseMul(&rhs)) return false;
+          if (!CheckedAddI64(v, rhs, &v)) return false;
+          continue;
+        }
+        if (matchChar('-')) {
+          std::int64_t rhs = 0;
+          if (!parseMul(&rhs)) return false;
+          if (!CheckedSubI64(v, rhs, &v)) return false;
+          continue;
+        }
+        break;
+      }
+
+      *out = v;
+      return true;
+    }
+
+    bool parseMul(std::int64_t* out)
+    {
+      std::int64_t v = 0;
+      if (!parseUnary(&v)) return false;
+
+      while (true) {
+        skipWs();
+        if (matchChar('*')) {
+          std::int64_t rhs = 0;
+          if (!parseUnary(&rhs)) return false;
+          if (!CheckedMulI64(v, rhs, &v)) return false;
+          continue;
+        }
+        if (matchChar('/')) {
+          std::int64_t rhs = 0;
+          if (!parseUnary(&rhs)) return false;
+          if (!CheckedDivI64(v, rhs, &v)) return false;
+          continue;
+        }
+        if (matchChar('%')) {
+          std::int64_t rhs = 0;
+          if (!parseUnary(&rhs)) return false;
+          if (!CheckedModI64(v, rhs, &v)) return false;
+          continue;
+        }
+        break;
+      }
+
+      *out = v;
+      return true;
+    }
+
+    bool parseUnary(std::int64_t* out)
+    {
+      skipWs();
+
+      if (matchChar('+')) {
+        return parseUnary(out);
+      }
+
+      if (matchChar('-')) {
+        std::int64_t v = 0;
+        if (!parseUnary(&v)) return false;
+        const auto min = std::numeric_limits<std::int64_t>::min();
+        if (v == min) return false;
+        *out = -v;
+        return true;
+      }
+
+      if (matchChar('!')) {
+        std::int64_t v = 0;
+        if (!parseUnary(&v)) return false;
+        *out = (v == 0) ? 1 : 0;
+        return true;
+      }
+
+      return parsePrimary(out);
+    }
+
+    bool parsePrimary(std::int64_t* out)
+    {
+      skipWs();
+      if (matchChar('(')) {
+        std::int64_t v = 0;
+        if (!parseExpr(&v)) return false;
+        skipWs();
+        if (!matchChar(')')) return false;
+        *out = v;
+        return true;
+      }
+      return parseNumber(out);
+    }
+
+    bool parseNumber(std::int64_t* out)
+    {
+      skipWs();
+      std::uint64_t mag = 0;
+      const std::size_t startPos = pos;
+      if (!ParseU64Literal(s, &pos, &mag)) {
+        pos = startPos;
+        return false;
+      }
+
+      const auto max = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+      if (mag > max) return false;
+
+      *out = static_cast<std::int64_t>(mag);
+      return true;
+    }
+
+    bool parse(std::int64_t* out)
+    {
+      pos = 0;
+      skipWs();
+      if (!parseExpr(out)) return false;
+      skipWs();
+      return pos == s.size();
+    }
+  };
+
+  Parser p{s};
+  std::int64_t v = 0;
   if (!p.parse(&v)) return false;
   *out = v;
   return true;
@@ -1427,20 +1725,153 @@ bool ScriptRunner::runTextInternal(const std::string& text, const std::string& v
     return fail(virtualPath, 1, "include depth limit exceeded");
   }
 
-  std::istringstream iss(text);
-  std::string line;
-  int lineNo = 0;
+  // ---- Parse the script into stable, executable lines (comment/blank lines removed) ----
+  struct ScriptLine {
+    int lineNo = 0;
+    std::vector<std::string> tokens;
+  };
 
-  while (std::getline(iss, line)) {
-    lineNo++;
+  std::vector<ScriptLine> lines;
+  {
+    std::istringstream iss(text);
+    std::string line;
+    int lineNo = 0;
+    while (std::getline(iss, line)) {
+      lineNo++;
 
-    // Strip comments.
-    const std::size_t hashPos = line.find('#');
-    if (hashPos != std::string::npos) line = line.substr(0, hashPos);
-    line = Trim(line);
-    if (line.empty()) continue;
+      // Strip comments.
+      const std::size_t hashPos = line.find('#');
+      if (hashPos != std::string::npos) line = line.substr(0, hashPos);
+      line = Trim(line);
+      if (line.empty()) continue;
 
-    std::vector<std::string> t = SplitWS(line);
+      std::vector<std::string> t = SplitWS(line);
+      if (t.empty()) continue;
+
+      lines.push_back(ScriptLine{lineNo, std::move(t)});
+    }
+  }
+
+  // ---- Precompute block structure for control flow ----
+  enum class CtrlKind : std::uint8_t {
+    None = 0,
+    Repeat,
+    While,
+    If,
+    Else,
+    End,
+  };
+
+  struct CtrlInfo {
+    CtrlKind kind = CtrlKind::None;
+    int endIndex = -1;   // repeat/while/if/else -> matching end
+    int elseIndex = -1;  // if -> else line (optional)
+  };
+
+  std::vector<CtrlInfo> ctrl(lines.size());
+
+  struct BlockEntry {
+    CtrlKind kind = CtrlKind::None;
+    int startIndex = -1;
+    int elseIndex = -1;
+  };
+
+  std::vector<BlockEntry> blockStack;
+  blockStack.reserve(32);
+
+  for (int i = 0; i < static_cast<int>(lines.size()); ++i) {
+    const auto& t = lines[static_cast<std::size_t>(i)].tokens;
+    if (t.empty()) continue;
+
+    const std::string cmd = ToLower(t[0]);
+
+    if (cmd == "repeat") {
+      ctrl[static_cast<std::size_t>(i)].kind = CtrlKind::Repeat;
+      blockStack.push_back(BlockEntry{CtrlKind::Repeat, i, -1});
+      continue;
+    }
+    if (cmd == "while") {
+      ctrl[static_cast<std::size_t>(i)].kind = CtrlKind::While;
+      blockStack.push_back(BlockEntry{CtrlKind::While, i, -1});
+      continue;
+    }
+    if (cmd == "if") {
+      ctrl[static_cast<std::size_t>(i)].kind = CtrlKind::If;
+      blockStack.push_back(BlockEntry{CtrlKind::If, i, -1});
+      continue;
+    }
+    if (cmd == "else") {
+      ctrl[static_cast<std::size_t>(i)].kind = CtrlKind::Else;
+
+      if (blockStack.empty() || blockStack.back().kind != CtrlKind::If) {
+        return fail(virtualPath, lines[static_cast<std::size_t>(i)].lineNo, "else without matching if");
+      }
+      if (blockStack.back().elseIndex != -1) {
+        return fail(virtualPath, lines[static_cast<std::size_t>(i)].lineNo, "else already used for this if");
+      }
+      blockStack.back().elseIndex = i;
+      continue;
+    }
+    if (cmd == "end") {
+      ctrl[static_cast<std::size_t>(i)].kind = CtrlKind::End;
+
+      if (blockStack.empty()) {
+        return fail(virtualPath, lines[static_cast<std::size_t>(i)].lineNo, "end without matching block start");
+      }
+
+      const BlockEntry top = blockStack.back();
+      blockStack.pop_back();
+
+      // Match start -> end.
+      ctrl[static_cast<std::size_t>(top.startIndex)].endIndex = i;
+
+      // Match if -> else/end.
+      if (top.kind == CtrlKind::If) {
+        ctrl[static_cast<std::size_t>(top.startIndex)].elseIndex = top.elseIndex;
+        if (top.elseIndex != -1) {
+          ctrl[static_cast<std::size_t>(top.elseIndex)].endIndex = i;
+        }
+      }
+
+      continue;
+    }
+  }
+
+  if (!blockStack.empty()) {
+    const BlockEntry top = blockStack.back();
+    const int startLineNo = lines[static_cast<std::size_t>(top.startIndex)].lineNo;
+    const std::string startCmd = ToLower(lines[static_cast<std::size_t>(top.startIndex)].tokens[0]);
+    return fail(virtualPath, startLineNo, "missing end for block: " + startCmd);
+  }
+
+  auto joinTokens = [](const std::vector<std::string>& t, std::size_t start) {
+    std::string out;
+    for (std::size_t i = start; i < t.size(); ++i) {
+      if (i > start) out.push_back(' ');
+      out += t[i];
+    }
+    return out;
+  };
+
+  struct LoopFrame {
+    enum class Kind : std::uint8_t { Repeat = 0, While };
+    Kind kind = Kind::Repeat;
+    int startIndex = 0;   // index of the repeat/while line
+    int endIndex = 0;     // index of the matching end line
+    int remaining = 0;    // repeat only
+  };
+
+  std::vector<LoopFrame> loopStack;
+  loopStack.reserve(16);
+
+  // ---- Execute with a movable instruction pointer (enables loops/conditionals) ----
+  int ip = 0;
+  while (ip < static_cast<int>(lines.size())) {
+    const int cur = ip;
+    ip = cur + 1;  // default: advance to next executable line
+
+    const int lineNo = lines[static_cast<std::size_t>(cur)].lineNo;
+    std::vector<std::string> t = lines[static_cast<std::size_t>(cur)].tokens;
     if (t.empty()) continue;
 
     const std::string cmd = ToLower(t[0]);
@@ -1465,6 +1896,165 @@ bool ScriptRunner::runTextInternal(const std::string& text, const std::string& v
       }
       return true;
     };
+
+    // ---- Control flow ----
+    if (cmd == "repeat") {
+      if (t.size() < 2) {
+        return fail(virtualPath, lineNo, "repeat expects: repeat <countExpr>");
+      }
+      const int endIndex = ctrl[static_cast<std::size_t>(cur)].endIndex;
+      if (endIndex < 0) {
+        return fail(virtualPath, lineNo, "repeat missing matching end");
+      }
+      const std::string expr = joinTokens(t, 1);
+      int n = 0;
+      if (!ParseI32(expr, &n) || n < 0) {
+        return fail(virtualPath, lineNo, "repeat: invalid non-negative count expression");
+      }
+      if (n == 0) {
+        ip = endIndex + 1;
+        continue;
+      }
+      loopStack.push_back(LoopFrame{LoopFrame::Kind::Repeat, cur, endIndex, n});
+      continue;
+    }
+
+    if (cmd == "while") {
+      if (t.size() < 2) {
+        return fail(virtualPath, lineNo, "while expects: while <conditionExpr>");
+      }
+      const int endIndex = ctrl[static_cast<std::size_t>(cur)].endIndex;
+      if (endIndex < 0) {
+        return fail(virtualPath, lineNo, "while missing matching end");
+      }
+
+      const bool isRecheck = (!loopStack.empty() && loopStack.back().kind == LoopFrame::Kind::While && loopStack.back().startIndex == cur);
+
+      const std::string expr = joinTokens(t, 1);
+      std::int64_t v = 0;
+      if (!EvalI64LogicExpr(expr, &v)) {
+        return fail(virtualPath, lineNo, "while: invalid condition expression");
+      }
+      const bool cond = (v != 0);
+
+      if (!cond) {
+        if (isRecheck) {
+          loopStack.pop_back();
+        }
+        ip = endIndex + 1;
+        continue;
+      }
+
+      if (!isRecheck) {
+        loopStack.push_back(LoopFrame{LoopFrame::Kind::While, cur, endIndex, 0});
+      }
+      continue;
+    }
+
+    if (cmd == "if") {
+      if (t.size() < 2) {
+        return fail(virtualPath, lineNo, "if expects: if <conditionExpr>");
+      }
+      const int endIndex = ctrl[static_cast<std::size_t>(cur)].endIndex;
+      if (endIndex < 0) {
+        return fail(virtualPath, lineNo, "if missing matching end");
+      }
+
+      const std::string expr = joinTokens(t, 1);
+      std::int64_t v = 0;
+      if (!EvalI64LogicExpr(expr, &v)) {
+        return fail(virtualPath, lineNo, "if: invalid condition expression");
+      }
+      const bool cond = (v != 0);
+      if (cond) {
+        continue;  // fall through into then-block
+      }
+
+      const int elseIndex = ctrl[static_cast<std::size_t>(cur)].elseIndex;
+      if (elseIndex >= 0) {
+        ip = elseIndex + 1;
+      } else {
+        ip = endIndex + 1;
+      }
+      continue;
+    }
+
+    if (cmd == "else") {
+      if (t.size() != 1) {
+        return fail(virtualPath, lineNo, "else expects: else");
+      }
+      const int endIndex = ctrl[static_cast<std::size_t>(cur)].endIndex;
+      if (endIndex < 0) {
+        return fail(virtualPath, lineNo, "else missing matching end");
+      }
+      // We only execute `else` when the if-branch ran; skip the else-block.
+      ip = endIndex + 1;
+      continue;
+    }
+
+    if (cmd == "end") {
+      if (t.size() != 1) {
+        return fail(virtualPath, lineNo, "end expects: end");
+      }
+
+      if (!loopStack.empty() && loopStack.back().endIndex == cur) {
+        LoopFrame& lf = loopStack.back();
+        if (lf.kind == LoopFrame::Kind::Repeat) {
+          lf.remaining--;
+          if (lf.remaining > 0) {
+            ip = lf.startIndex + 1;
+            continue;
+          }
+          loopStack.pop_back();
+          continue;
+        }
+        if (lf.kind == LoopFrame::Kind::While) {
+          ip = lf.startIndex;
+          continue;
+        }
+      }
+
+      continue;
+    }
+
+    if (cmd == "break") {
+      if (t.size() != 1) {
+        return fail(virtualPath, lineNo, "break expects: break");
+      }
+      if (loopStack.empty()) {
+        return fail(virtualPath, lineNo, "break used outside a loop");
+      }
+      const LoopFrame lf = loopStack.back();
+      loopStack.pop_back();
+      ip = lf.endIndex + 1;
+      continue;
+    }
+
+    if (cmd == "continue") {
+      if (t.size() != 1) {
+        return fail(virtualPath, lineNo, "continue expects: continue");
+      }
+      if (loopStack.empty()) {
+        return fail(virtualPath, lineNo, "continue used outside a loop");
+      }
+      ip = loopStack.back().endIndex;
+      continue;
+    }
+
+    if (cmd == "expect") {
+      if (t.size() < 2) {
+        return fail(virtualPath, lineNo, "expect expects: expect <conditionExpr>");
+      }
+      const std::string expr = joinTokens(t, 1);
+      std::int64_t v = 0;
+      if (!EvalI64LogicExpr(expr, &v)) {
+        return fail(virtualPath, lineNo, "expect: invalid condition expression");
+      }
+      if (v == 0) {
+        return fail(virtualPath, lineNo, "expect failed: " + expr);
+      }
+      continue;
+    }
 
     if (cmd == "set") {
       if (t.size() != 3) {

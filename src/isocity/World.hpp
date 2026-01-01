@@ -161,6 +161,18 @@ public:
   bool isEmptyLand(int x, int y) const;  // buildable and overlay == None
   bool hasAdjacentRoad(int x, int y) const;
 
+  // Returns true if tile (x,y) would have road access *if* it were zoned as the
+  // specified overlay.
+  //
+  // This is used to support multi-tile zoning blocks:
+  //   - A zone tile may be placed if it is adjacent to a road, OR
+  //   - it connects (4-neighborhood) to an existing zone component of the same
+  //     type that touches a road.
+  //
+  // Callers should ensure (x,y) is buildable land and either empty or already
+  // zoned as the same overlay (i.e., a legal target for the zone tool).
+  bool wouldZoneHaveRoadAccess(Overlay zoneOverlay, int x, int y) const;
+
   // Player actions / tools.
   ToolApplyResult applyTool(Tool tool, int x, int y);
 

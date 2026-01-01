@@ -12,7 +12,9 @@ struct ZoneAccessMap;
 // A small "goods flow" model:
 //  - Industrial zones produce goods (supply).
 //  - Commercial zones consume goods (demand).
-//  - Goods are routed along roads to the nearest producer (multi-source BFS).
+//  - Goods are routed along roads to nearby producers (travel-time weighted).
+//    If the nearest producer can't fully satisfy demand, we deterministically
+//    fall back to the next-nearest reachable producer(s) before importing.
 //  - Optional imports/exports use the map edge as a trade partner.
 //
 // This is intentionally lightweight: it's a deterministic, tile-based heuristic

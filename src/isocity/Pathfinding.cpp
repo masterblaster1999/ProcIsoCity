@@ -238,6 +238,7 @@ bool FindLandPathAStar(const World& world, Point start, Point goal, std::vector<
   return false;
 }
 
+
 bool FindRoadBuildPath(const World& world, Point start, Point goal, std::vector<Point>& outPath,
                        int* outPrimaryCost, const RoadBuildPathConfig& cfg)
 {
@@ -257,67 +258,12 @@ bool FindRoadBuildPath(const World& world, Point start, Point goal, std::vector<
 
   const int targetLevel = ClampRoadLevel(cfg.targetLevel);
 
-  auto computePrimaryCost = [&](const std::vector<Point>& path) -> int {
-    int cost = 0;
-    for (const Point& p : path) {
-      if (!world.inBounds(p.x, p.y)) continue;
-      const Tile& t = world.at(p.x, p.y);
-      if (cfg.costModel == RoadBuildPathConfig::CostModel::NewTiles) {
-        if (t.overlay != Overlay::Road) ++cost;
-      } else {
-        const bool isBridge = (t.terrain == Terrain::Water);
-        if (t.overlay == Overlay::Road) {
-          cost += RoadPlacementCost(static_cast<int>(t.level), targetLevel, /*alreadyRoad=*/true, isBridge);
-        } else if (t.overlay == Overlay::None) {
-          cost += RoadPlacementCost(1, targetLevel, /*alreadyRoad=*/false, isBridge);
-        }
-      }
-    }
-    return cost;
-  };
-
-  // Trivial.
-  if (startIdx == goalIdx) {
-    outPath.push_back(start);
-    if (outPrimaryCost) *outPrimaryCost = computePrimaryCost(outPath);
-    return true;
-  }
-
   constexpr int kInf = std::numeric_limits<int>::max() / 4;
 
-  // We use Dijkstra (A* with 0 heuristic). Cost of entering a tile depends on cfg.costModel:
-  //  - NewTiles: 0 if it's already a road, 1 if it's empty (needs a new road)
-  //  - Money:    exact build/upgrade money cost to reach targetLevel (includes bridges)
-  // and we tie-break by fewer steps, then stable per-tile variation bits.
-  std::vector<int> bestCost(n, kInf);
-  std::vector<int> bestSteps(n, kInf);
-  std::vector<int> cameFrom(n, -1);
-
-  struct Node {
-    int idx = 0;
-    int cost = 0;
-    int steps = 0;
-    std::uint8_t tie = 0;
-  };
-  struct Cmp {
-    bool operator()(const Node& a, const Node& b) const
-    {
-      if (a.cost != b.cost) return a.cost > b.cost;
-      if (a.steps != b.steps) return a.steps > b.steps;
-      if (a.tie != b.tie) return a.tie > b.tie;
-      return a.idx > b.idx;
-    }
-  };
-
-  auto tieVal = [&](int idx) -> std::uint8_t {
-    const int x = idx % w;
-    const int y = idx / w;
-    return world.at(x, y).variation;
-  };
-
-  auto tileEnterCost = [&](int x, int y) -> int {
+  auto tileCost = [&](int x, int y) -> int {
     if (!world.inBounds(x, y)) return kInf;
     const Tile& t = world.at(x, y);
+
     if (cfg.costModel == RoadBuildPathConfig::CostModel::NewTiles) {
       return (t.overlay == Overlay::Road) ? 0 : 1;
     }
@@ -330,11 +276,81 @@ bool FindRoadBuildPath(const World& world, Point start, Point goal, std::vector<
     return RoadPlacementCost(1, targetLevel, /*alreadyRoad=*/false, isBridge);
   };
 
+  auto computePrimaryCost = [&](const std::vector<Point>& path) -> int {
+    int cost = 0;
+    for (const Point& p : path) {
+      const int c = tileCost(p.x, p.y);
+      if (c >= kInf) continue;
+      cost += c;
+    }
+    return cost;
+  };
+
+  // Trivial.
+  if (startIdx == goalIdx) {
+    outPath.push_back(start);
+    if (outPrimaryCost) *outPrimaryCost = computePrimaryCost(outPath);
+    return true;
+  }
+
+  // Dijkstra on an expanded state space (tile, incoming-direction) so we can tie-break
+  // equal-cost/equal-step solutions by fewer turns.
+  //
+  // Optimization order:
+  //   1) primary cost (new tiles OR money cost)
+  //   2) steps (tile edges)
+  //   3) turns (direction changes)
+  //   4) stable per-tile variation bits
+  // This yields straighter, more "human" road plans while preserving the cost semantics.
+  constexpr int kDirNone = 4;
+  constexpr int kDirCount = 5;
+
+  const std::size_t ns = n * static_cast<std::size_t>(kDirCount);
+  std::vector<int> bestCost(ns, kInf);
+  std::vector<int> bestSteps(ns, kInf);
+  std::vector<int> bestTurns(ns, kInf);
+  std::vector<int> cameFrom(ns, -1);
+
+  struct Node {
+    int state = 0; // idx*kDirCount + dir
+    int cost = 0;
+    int steps = 0;
+    int turns = 0;
+    std::uint8_t tie = 0;
+  };
+  struct Cmp {
+    bool operator()(const Node& a, const Node& b) const
+    {
+      if (a.cost != b.cost) return a.cost > b.cost;
+      if (a.steps != b.steps) return a.steps > b.steps;
+      if (a.turns != b.turns) return a.turns > b.turns;
+      if (a.tie != b.tie) return a.tie > b.tie;
+      return a.state > b.state;
+    }
+  };
+
+  auto tieVal = [&](int tileIdx) -> std::uint8_t {
+    const int x = tileIdx % w;
+    const int y = tileIdx / w;
+    return world.at(x, y).variation;
+  };
+
+  auto better = [&](int c, int s, int t, int oc, int os, int ot) -> bool {
+    if (c != oc) return c < oc;
+    if (s != os) return s < os;
+    return t < ot;
+  };
+
   std::priority_queue<Node, std::vector<Node>, Cmp> open;
 
-  bestCost[static_cast<std::size_t>(startIdx)] = 0;
-  bestSteps[static_cast<std::size_t>(startIdx)] = 0;
-  open.push(Node{startIdx, 0, 0, tieVal(startIdx)});
+  const int startState = startIdx * kDirCount + kDirNone;
+  const int startCost = tileCost(start.x, start.y);
+  if (startCost >= kInf) return false;
+
+  bestCost[static_cast<std::size_t>(startState)] = startCost;
+  bestSteps[static_cast<std::size_t>(startState)] = 0;
+  bestTurns[static_cast<std::size_t>(startState)] = 0;
+  open.push(Node{startState, startCost, 0, 0, tieVal(startIdx)});
 
   constexpr int dirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
 
@@ -342,43 +358,59 @@ bool FindRoadBuildPath(const World& world, Point start, Point goal, std::vector<
     const Node cur = open.top();
     open.pop();
 
-    const std::size_t ucur = static_cast<std::size_t>(cur.idx);
-    if (cur.cost != bestCost[ucur] || cur.steps != bestSteps[ucur]) continue; // stale
+    const std::size_t ucur = static_cast<std::size_t>(cur.state);
+    if (cur.cost != bestCost[ucur] || cur.steps != bestSteps[ucur] || cur.turns != bestTurns[ucur]) continue; // stale
 
-    if (cur.idx == goalIdx) {
-      ReconstructPath(goalIdx, startIdx, w, cameFrom, outPath);
+    const int curTileIdx = cur.state / kDirCount;
+    const int curDir = cur.state % kDirCount;
+
+    if (curTileIdx == goalIdx) {
+      // Reconstruct path by following state parents.
+      outPath.clear();
+      int s = cur.state;
+      while (s != -1) {
+        const int idx = s / kDirCount;
+        outPath.push_back(Point{idx % w, idx / w});
+        s = cameFrom[static_cast<std::size_t>(s)];
+      }
+      std::reverse(outPath.begin(), outPath.end());
       if (outPrimaryCost) *outPrimaryCost = computePrimaryCost(outPath);
       return !outPath.empty();
     }
 
-    const int cx = cur.idx % w;
-    const int cy = cur.idx / w;
+    const int cx = curTileIdx % w;
+    const int cy = curTileIdx / w;
 
-    for (const auto& d : dirs) {
-      const int nx = cx + d[0];
-      const int ny = cy + d[1];
+    for (int d = 0; d < 4; ++d) {
+      const int nx = cx + dirs[d][0];
+      const int ny = cy + dirs[d][1];
       if (!IsRoadBuildable(world, nx, ny, cfg)) continue;
 
-      const int nidx = Idx(nx, ny, w);
-      const std::size_t unidx = static_cast<std::size_t>(nidx);
+      const int nTileIdx = Idx(nx, ny, w);
+      const int nState = nTileIdx * kDirCount + d;
+      const std::size_t un = static_cast<std::size_t>(nState);
 
-      const int stepCost = tileEnterCost(nx, ny);
+      const int stepCost = tileCost(nx, ny);
       if (stepCost >= kInf) continue;
 
       const int nCost = cur.cost + stepCost;
       const int nSteps = cur.steps + 1;
+      const int nTurns = cur.turns + ((curDir != kDirNone && d != curDir) ? 1 : 0);
 
-      if (nCost < bestCost[unidx] || (nCost == bestCost[unidx] && nSteps < bestSteps[unidx])) {
-        bestCost[unidx] = nCost;
-        bestSteps[unidx] = nSteps;
-        cameFrom[unidx] = cur.idx;
-        open.push(Node{nidx, nCost, nSteps, tieVal(nidx)});
+      if (better(nCost, nSteps, nTurns, bestCost[un], bestSteps[un], bestTurns[un])) {
+        bestCost[un] = nCost;
+        bestSteps[un] = nSteps;
+        bestTurns[un] = nTurns;
+        cameFrom[un] = cur.state;
+        open.push(Node{nState, nCost, nSteps, nTurns, tieVal(nTileIdx)});
       }
     }
   }
 
   return false;
 }
+
+
 
 bool FindRoadBuildPathBetweenSets(const World& world,
                                  const std::vector<Point>& starts,
@@ -415,6 +447,12 @@ bool FindRoadBuildPathBetweenSets(const World& world,
 
   if (startIdxs.empty() || goalIdxs.empty()) return false;
 
+  // De-dup for determinism / less work.
+  std::sort(startIdxs.begin(), startIdxs.end());
+  startIdxs.erase(std::unique(startIdxs.begin(), startIdxs.end()), startIdxs.end());
+  std::sort(goalIdxs.begin(), goalIdxs.end());
+  goalIdxs.erase(std::unique(goalIdxs.begin(), goalIdxs.end()), goalIdxs.end());
+
   // Prepare goal mask for O(1) membership checks.
   std::vector<std::uint8_t> isGoal(n, 0);
   for (const int gi : goalIdxs) {
@@ -423,37 +461,52 @@ bool FindRoadBuildPathBetweenSets(const World& world,
 
   const int targetLevel = ClampRoadLevel(cfg.targetLevel);
 
+  constexpr int kInf = std::numeric_limits<int>::max() / 4;
+
+  auto tileCost = [&](int x, int y) -> int {
+    if (!world.inBounds(x, y)) return kInf;
+    const Tile& t = world.at(x, y);
+
+    if (cfg.costModel == RoadBuildPathConfig::CostModel::NewTiles) {
+      return (t.overlay == Overlay::Road) ? 0 : 1;
+    }
+
+    const bool isBridge = (t.terrain == Terrain::Water);
+    if (t.overlay == Overlay::Road) {
+      return RoadPlacementCost(static_cast<int>(t.level), targetLevel, /*alreadyRoad=*/true, isBridge);
+    }
+    // overlay==None by buildability rules
+    return RoadPlacementCost(1, targetLevel, /*alreadyRoad=*/false, isBridge);
+  };
+
   auto computePrimaryCost = [&](const std::vector<Point>& path) -> int {
     int cost = 0;
     for (const Point& p : path) {
-      if (!world.inBounds(p.x, p.y)) continue;
-      const Tile& t = world.at(p.x, p.y);
-      if (cfg.costModel == RoadBuildPathConfig::CostModel::NewTiles) {
-        if (t.overlay != Overlay::Road) ++cost;
-      } else {
-        const bool isBridge = (t.terrain == Terrain::Water);
-        if (t.overlay == Overlay::Road) {
-          cost += RoadPlacementCost(static_cast<int>(t.level), targetLevel, /*alreadyRoad=*/true, isBridge);
-        } else if (t.overlay == Overlay::None) {
-          cost += RoadPlacementCost(1, targetLevel, /*alreadyRoad=*/false, isBridge);
-        }
-      }
+      const int c = tileCost(p.x, p.y);
+      if (c >= kInf) continue;
+      cost += c;
     }
     return cost;
   };
 
   // Quick win: any start is already a goal.
+  // Pick the minimal-cost tile (then lowest idx) so maxPrimaryCost works correctly.
   int bestTrivialIdx = -1;
+  int bestTrivialCost = kInf;
   for (const int si : startIdxs) {
     if (si < 0 || static_cast<std::size_t>(si) >= n) continue;
-    if (isGoal[static_cast<std::size_t>(si)]) {
-      if (bestTrivialIdx < 0 || si < bestTrivialIdx) bestTrivialIdx = si;
+    if (!isGoal[static_cast<std::size_t>(si)]) continue;
+
+    const int x = si % w;
+    const int y = si / w;
+    const int c = tileCost(x, y);
+    if (c < bestTrivialCost || (c == bestTrivialCost && (bestTrivialIdx < 0 || si < bestTrivialIdx))) {
+      bestTrivialIdx = si;
+      bestTrivialCost = c;
     }
   }
   if (bestTrivialIdx >= 0) {
-    const int x = bestTrivialIdx % w;
-    const int y = bestTrivialIdx / w;
-    outPath.push_back(Point{x, y});
+    outPath.push_back(Point{bestTrivialIdx % w, bestTrivialIdx / w});
     if (outPrimaryCost) *outPrimaryCost = computePrimaryCost(outPath);
     if (maxPrimaryCost >= 0 && outPrimaryCost && *outPrimaryCost > maxPrimaryCost) {
       outPath.clear();
@@ -483,17 +536,22 @@ bool FindRoadBuildPathBetweenSets(const World& world,
     return std::binary_search(blocked->begin(), blocked->end(), key);
   };
 
-  constexpr int kInf = std::numeric_limits<int>::max() / 4;
+  // Multi-source Dijkstra on (tile, incoming-direction) states.
+  // Optimization order matches FindRoadBuildPath().
+  constexpr int kDirNone = 4;
+  constexpr int kDirCount = 5;
 
-  // Multi-source Dijkstra (A* with 0 heuristic), identical semantics to FindRoadBuildPath.
-  std::vector<int> bestCost(n, kInf);
-  std::vector<int> bestSteps(n, kInf);
-  std::vector<int> cameFrom(n, -1);
+  const std::size_t ns = n * static_cast<std::size_t>(kDirCount);
+  std::vector<int> bestCost(ns, kInf);
+  std::vector<int> bestSteps(ns, kInf);
+  std::vector<int> bestTurns(ns, kInf);
+  std::vector<int> cameFrom(ns, -1);
 
   struct Node {
-    int idx = 0;
+    int state = 0;
     int cost = 0;
     int steps = 0;
+    int turns = 0;
     std::uint8_t tie = 0;
   };
   struct Cmp {
@@ -501,104 +559,116 @@ bool FindRoadBuildPathBetweenSets(const World& world,
     {
       if (a.cost != b.cost) return a.cost > b.cost;
       if (a.steps != b.steps) return a.steps > b.steps;
+      if (a.turns != b.turns) return a.turns > b.turns;
       if (a.tie != b.tie) return a.tie > b.tie;
-      return a.idx > b.idx;
+      return a.state > b.state;
     }
   };
 
-  auto tieVal = [&](int idx) -> std::uint8_t {
-    const int x = idx % w;
-    const int y = idx / w;
+  auto tieVal = [&](int tileIdx) -> std::uint8_t {
+    const int x = tileIdx % w;
+    const int y = tileIdx / w;
     return world.at(x, y).variation;
   };
 
-  auto tileEnterCost = [&](int x, int y) -> int {
-    if (!world.inBounds(x, y)) return kInf;
-    const Tile& t = world.at(x, y);
-    if (cfg.costModel == RoadBuildPathConfig::CostModel::NewTiles) {
-      return (t.overlay == Overlay::Road) ? 0 : 1;
-    }
-
-    const bool isBridge = (t.terrain == Terrain::Water);
-    if (t.overlay == Overlay::Road) {
-      return RoadPlacementCost(static_cast<int>(t.level), targetLevel, /*alreadyRoad=*/true, isBridge);
-    }
-    // overlay==None by buildability rules
-    return RoadPlacementCost(1, targetLevel, /*alreadyRoad=*/false, isBridge);
+  auto better = [&](int c, int s, int t, int oc, int os, int ot) -> bool {
+    if (c != oc) return c < oc;
+    if (s != os) return s < os;
+    return t < ot;
   };
 
   std::priority_queue<Node, std::vector<Node>, Cmp> open;
 
+  // Seed all starts (direction = none). Include the start tile's own build/upgrade cost.
   for (const int si : startIdxs) {
     if (si < 0 || static_cast<std::size_t>(si) >= n) continue;
-    if (bestCost[static_cast<std::size_t>(si)] > 0 || bestSteps[static_cast<std::size_t>(si)] > 0) {
-      bestCost[static_cast<std::size_t>(si)] = 0;
-      bestSteps[static_cast<std::size_t>(si)] = 0;
-      cameFrom[static_cast<std::size_t>(si)] = -1;
-      open.push(Node{si, 0, 0, tieVal(si)});
+
+    const int sx = si % w;
+    const int sy = si / w;
+    const int sCost = tileCost(sx, sy);
+    if (sCost >= kInf) continue;
+    if (maxPrimaryCost >= 0 && sCost > maxPrimaryCost) continue;
+
+    const int sState = si * kDirCount + kDirNone;
+    const std::size_t us = static_cast<std::size_t>(sState);
+
+    if (better(sCost, 0, 0, bestCost[us], bestSteps[us], bestTurns[us])) {
+      bestCost[us] = sCost;
+      bestSteps[us] = 0;
+      bestTurns[us] = 0;
+      cameFrom[us] = -1;
+      open.push(Node{sState, sCost, 0, 0, tieVal(si)});
     }
   }
 
+  if (open.empty()) return false;
+
   constexpr int dirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
 
-  int foundGoalIdx = -1;
+  int foundGoalState = -1;
+
   while (!open.empty()) {
     const Node cur = open.top();
     open.pop();
 
-    const std::size_t ucur = static_cast<std::size_t>(cur.idx);
-    if (cur.cost != bestCost[ucur] || cur.steps != bestSteps[ucur]) continue; // stale
+    const std::size_t ucur = static_cast<std::size_t>(cur.state);
+    if (cur.cost != bestCost[ucur] || cur.steps != bestSteps[ucur] || cur.turns != bestTurns[ucur]) continue; // stale
 
     // Budget/cost cutoff.
     if (maxPrimaryCost >= 0 && cur.cost > maxPrimaryCost) continue;
 
-    if (isGoal[ucur]) {
-      foundGoalIdx = cur.idx;
+    const int curTileIdx = cur.state / kDirCount;
+    const int curDir = cur.state % kDirCount;
+
+    if (isGoal[static_cast<std::size_t>(curTileIdx)]) {
+      foundGoalState = cur.state;
       break;
     }
 
-    const int cx = cur.idx % w;
-    const int cy = cur.idx / w;
+    const int cx = curTileIdx % w;
+    const int cy = curTileIdx / w;
 
-    for (const auto& d : dirs) {
-      const int nx = cx + d[0];
-      const int ny = cy + d[1];
+    for (int d = 0; d < 4; ++d) {
+      const int nx = cx + dirs[d][0];
+      const int ny = cy + dirs[d][1];
       if (!IsRoadBuildable(world, nx, ny, cfg)) continue;
 
-      const int nidx = Idx(nx, ny, w);
-      const std::size_t unidx = static_cast<std::size_t>(nidx);
+      const int nTileIdx = Idx(nx, ny, w);
+      if (isBlockedMove(curTileIdx, nTileIdx)) continue;
 
-      if (isBlockedMove(cur.idx, nidx)) continue;
-
-      const int stepCost = tileEnterCost(nx, ny);
+      const int stepCost = tileCost(nx, ny);
       if (stepCost >= kInf) continue;
 
       const int nCost = cur.cost + stepCost;
       const int nSteps = cur.steps + 1;
+      const int nTurns = cur.turns + ((curDir != kDirNone && d != curDir) ? 1 : 0);
 
       if (maxPrimaryCost >= 0 && nCost > maxPrimaryCost) continue;
 
-      if (nCost < bestCost[unidx] || (nCost == bestCost[unidx] && nSteps < bestSteps[unidx])) {
-        bestCost[unidx] = nCost;
-        bestSteps[unidx] = nSteps;
-        cameFrom[unidx] = cur.idx;
-        open.push(Node{nidx, nCost, nSteps, tieVal(nidx)});
+      const int nState = nTileIdx * kDirCount + d;
+      const std::size_t un = static_cast<std::size_t>(nState);
+
+      if (better(nCost, nSteps, nTurns, bestCost[un], bestSteps[un], bestTurns[un])) {
+        bestCost[un] = nCost;
+        bestSteps[un] = nSteps;
+        bestTurns[un] = nTurns;
+        cameFrom[un] = cur.state;
+        open.push(Node{nState, nCost, nSteps, nTurns, tieVal(nTileIdx)});
       }
     }
   }
 
-  if (foundGoalIdx < 0) return false;
+  if (foundGoalState < 0) return false;
 
   // Reconstruct to the multi-source root (cameFrom == -1).
-  {
-    outPath.clear();
-    int cur = foundGoalIdx;
-    while (cur != -1) {
-      outPath.push_back(Point{cur % w, cur / w});
-      cur = cameFrom[static_cast<std::size_t>(cur)];
-    }
-    std::reverse(outPath.begin(), outPath.end());
+  outPath.clear();
+  int s = foundGoalState;
+  while (s != -1) {
+    const int idx = s / kDirCount;
+    outPath.push_back(Point{idx % w, idx / w});
+    s = cameFrom[static_cast<std::size_t>(s)];
   }
+  std::reverse(outPath.begin(), outPath.end());
 
   if (outPrimaryCost) *outPrimaryCost = computePrimaryCost(outPath);
 
@@ -610,6 +680,7 @@ bool FindRoadBuildPathBetweenSets(const World& world,
 
   return !outPath.empty();
 }
+
 
 bool FindRoadPathToEdge(const World& world, Point start, std::vector<Point>& outPath, int* outCost)
 {
