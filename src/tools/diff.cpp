@@ -270,11 +270,11 @@ int main(int argc, char** argv)
     }
 
     std::string err;
-    if (!WritePpm(outPpm, img, err)) {
-      std::cerr << "Failed to write PPM: " << outPpm << " (" << err << ")\n";
+    if (!WriteImageAuto(outPpm, img, err)) {
+      std::cerr << "Failed to write image: " << outPpm << " (" << err << ")\n";
       return 1;
     }
-    std::cout << "\nWrote diff PPM: " << outPpm << "\n";
+    std::cout << "\nWrote diff image: " << outPpm << "\n";
   }
 
   // Non-zero exit code is useful for CI/regression scripts.

@@ -45,7 +45,9 @@ endfunction()
 
 # ---- Core library (no raylib dependency) ----
 add_library(isocity_core
+  src/isocity/Checksum.cpp
   src/isocity/Compression.cpp
+  src/isocity/GltfExport.cpp
   src/isocity/Suite.cpp
   src/isocity/Blueprint.cpp
   src/isocity/MeshExport.cpp
@@ -70,6 +72,7 @@ add_library(isocity_core
   src/isocity/ZoneAccess.cpp
   src/isocity/SaveLoad.cpp
   src/isocity/Export.cpp
+  src/isocity/ImageIO.cpp
   src/isocity/Hash.cpp
   src/isocity/EditHistory.cpp
   src/isocity/Pathfinding.cpp

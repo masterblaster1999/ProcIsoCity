@@ -1,4 +1,5 @@
 #include "isocity/MeshExport.hpp"
+#include "isocity/GltfExport.hpp"
 
 #include "isocity/Hash.hpp"
 #include "isocity/ProcGen.hpp"
@@ -99,10 +100,10 @@ std::string HexU64(std::uint64_t v)
 void PrintHelp()
 {
   std::cout
-      << "proc_isocity_mesh (Wavefront OBJ/MTL exporter)\n\n"
+      << "proc_isocity_mesh (mesh exporter: OBJ/MTL, glTF, GLB)\n\n"
       << "Usage:\n"
       << "  proc_isocity_mesh (--load <save.bin> | --seed <u64> --size <WxH>) [--days <N>]\n"
-      << "                   --obj <out.obj> [--mtl <out.mtl>]\n"
+      << "                   [--obj <out.obj> [--mtl <out.mtl>]] [--gltf <out.gltf>] [--glb <out.glb>]\n"
       << "                   [--tile-size <F>] [--height-scale <F>] [--overlay-offset <F>]\n"
       << "                   [--cliffs <0|1>] [--cliff-threshold <F>]\n"
       << "                   [--buildings <0|1>]\n"
@@ -138,6 +139,8 @@ int main(int argc, char** argv)
 
   std::string objPath;
   std::string mtlPath;
+  std::string gltfPath;
+  std::string glbPath;
 
   MeshExportConfig meshCfg{};
 
@@ -182,6 +185,18 @@ int main(int argc, char** argv)
         return 2;
       }
       objPath = val;
+    } else if (arg == "--gltf") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--gltf requires a path\n";
+        return 2;
+      }
+      gltfPath = val;
+    } else if (arg == "--glb") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--glb requires a path\n";
+        return 2;
+      }
+      glbPath = val;
     } else if (arg == "--mtl") {
       if (!requireValue(i, val)) {
         std::cerr << "--mtl requires a path\n";
@@ -244,12 +259,12 @@ int main(int argc, char** argv)
     }
   }
 
-  if (objPath.empty()) {
-    std::cerr << "--obj is required\n";
+  if (objPath.empty() && gltfPath.empty() && glbPath.empty()) {
+    std::cerr << "at least one output is required: --obj, --gltf, or --glb\n";
     return 2;
   }
 
-  if (mtlPath.empty()) {
+  if (!objPath.empty() && mtlPath.empty()) {
     // Derive a default: <obj>.mtl or replace extension.
     try {
       std::filesystem::path p(objPath);
@@ -293,16 +308,54 @@ int main(int argc, char** argv)
     meshCfg.objectName = "world_" + HexU64(HashWorld(world));
   }
 
-  MeshExportStats st;
-  if (!ExportWorldObjMtl(objPath, mtlPath, world, meshCfg, &st, &err)) {
-    std::cerr << "ExportWorldObjMtl failed: " << err << "\n";
-    return 1;
+  // Export requested formats.
+  // NOTE: Each exporter currently builds its mesh independently. This keeps code paths
+  // simple and deterministic. If this becomes a bottleneck for large worlds, we can
+  // refactor to share a mesh build step.
+
+  if (!objPath.empty()) {
+    MeshExportStats st;
+    if (!ExportWorldObjMtl(objPath, mtlPath, world, meshCfg, &st, &err)) {
+      std::cerr << "ExportWorldObjMtl failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << "wrote: " << objPath << "\n";
+    std::cout << "wrote: " << mtlPath << "\n";
+    std::cout << "mesh(OBJ): vertices=" << st.vertices << " triangles=" << st.triangles << "\n";
   }
 
-  std::cout << "wrote: " << objPath << "\n";
-  std::cout << "wrote: " << mtlPath << "\n";
+  if (!gltfPath.empty()) {
+    MeshExportStats st;
+    if (!ExportWorldGltf(gltfPath, world, meshCfg, &st, &err)) {
+      std::cerr << "ExportWorldGltf failed: " << err << "\n";
+      return 1;
+    }
+
+    // Derive the .bin path the same way the exporter does, for logging.
+    std::filesystem::path p(gltfPath);
+    std::filesystem::path binPath = p;
+    if (binPath.has_extension()) {
+      binPath.replace_extension(".bin");
+    } else {
+      binPath += ".bin";
+    }
+
+    std::cout << "wrote: " << gltfPath << "\n";
+    std::cout << "wrote: " << binPath.string() << "\n";
+    std::cout << "mesh(glTF): vertices=" << st.vertices << " triangles=" << st.triangles << "\n";
+  }
+
+  if (!glbPath.empty()) {
+    MeshExportStats st;
+    if (!ExportWorldGlb(glbPath, world, meshCfg, &st, &err)) {
+      std::cerr << "ExportWorldGlb failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << "wrote: " << glbPath << "\n";
+    std::cout << "mesh(GLB): vertices=" << st.vertices << " triangles=" << st.triangles << "\n";
+  }
+
   std::cout << "world: " << world.width() << "x" << world.height() << " seed=" << world.seed() << "\n";
   std::cout << "hash: " << HexU64(HashWorld(world)) << "\n";
-  std::cout << "mesh: vertices=" << st.vertices << " triangles=" << st.triangles << "\n";
   return 0;
 }

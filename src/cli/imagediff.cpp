@@ -13,7 +13,7 @@
 
 namespace {
 
-std::string Trim(const std::string& s)
+[[maybe_unused]] std::string Trim(const std::string& s)
 {
   std::size_t a = 0;
   while (a < s.size() && std::isspace(static_cast<unsigned char>(s[a]))) ++a;
@@ -34,7 +34,7 @@ bool ParseI32(const std::string& s, int* out)
   return true;
 }
 
-std::string HexU64(std::uint64_t v)
+[[maybe_unused]] std::string HexU64(std::uint64_t v)
 {
   std::ostringstream oss;
   oss << "0x" << std::hex << std::setw(16) << std::setfill('0') << v;
@@ -67,15 +67,15 @@ std::string EscapeJson(const std::string& s)
 void PrintHelp()
 {
   std::cout
-      << "proc_isocity_imagediff (PPM comparison tool)\n\n"
+      << "proc_isocity_imagediff (PPM/PNG comparison tool)\n\n"
       << "Usage:\n"
-      << "  proc_isocity_imagediff <A.ppm> <B.ppm> [options]\n\n"
+      << "  proc_isocity_imagediff <A.ppm|A.png> <B.ppm|B.png> [options]\n\n"
       << "Exit codes:\n"
       << "  0  images match (within threshold)\n"
       << "  1  images differ\n"
       << "  2  error (bad args or IO)\n\n"
       << "Options:\n"
-      << "  --out <diff.ppm>           Write an absolute-difference visualization as PPM (P6).\n"
+      << "  --out <diff.ppm|diff.png>  Write an absolute-difference visualization (PPM/PNG).\n"
       << "  --threshold <N>            Per-channel tolerance (0..255). Default: 0\n"
       << "  --json <out.json>          Write a JSON summary of diff stats.\n"
       << "  --quiet                    Suppress stdout summary (errors still print).\n"
@@ -163,12 +163,12 @@ int main(int argc, char** argv)
   PpmImage b;
   std::string err;
 
-  if (!ReadPpm(pathA, a, err)) {
-    std::cerr << "ReadPpm failed for A: " << err << "\n";
+  if (!ReadImageAuto(pathA, a, err)) {
+    std::cerr << "ReadImage failed for A: " << err << "\n";
     return 2;
   }
-  if (!ReadPpm(pathB, b, err)) {
-    std::cerr << "ReadPpm failed for B: " << err << "\n";
+  if (!ReadImageAuto(pathB, b, err)) {
+    std::cerr << "ReadImage failed for B: " << err << "\n";
     return 2;
   }
 
@@ -203,8 +203,8 @@ int main(int argc, char** argv)
 
   // Write diff image if requested.
   if (!outDiffPath.empty()) {
-    if (!WritePpm(outDiffPath, diffImg, err)) {
-      std::cerr << "WritePpm failed for diff output: " << err << "\n";
+    if (!WriteImageAuto(outDiffPath, diffImg, err)) {
+      std::cerr << "WriteImage failed for diff output: " << err << "\n";
       return 2;
     }
   }

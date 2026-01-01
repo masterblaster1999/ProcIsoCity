@@ -166,7 +166,7 @@ static void PrintHelp()
       << "Usage:\n"
       << "  proc_isocity_diff <A.bin> <B.bin> [options]\n\n"
       << "Options:\n"
-      << "  --ppm <out.ppm>            Write a diff visualization as a binary PPM (P6).\n"
+      << "  --ppm <out.ppm|out.png>    Write a diff visualization (PPM/PNG).\n"
       << "  --scale <N>                Upscale the PPM by N (nearest-neighbor). Default: 1\n"
       << "  --height-eps <eps>          Float tolerance for Tile::height diffs. Default: 1e-6\n"
       << "  --layer <name>              What to highlight in the diff PPM. Default: combined\n"
@@ -715,8 +715,8 @@ int main(int argc, char** argv)
   if (!opt.outPpm.empty()) {
     PpmImage img = RenderDiffPpm(a, b, opt);
     std::string ppmErr;
-    if (!WritePpm(opt.outPpm, img, ppmErr)) {
-      std::cerr << "failed to write PPM: " << ppmErr << "\n";
+    if (!WriteImageAuto(opt.outPpm, img, ppmErr)) {
+      std::cerr << "failed to write image: " << ppmErr << "\n";
       return 1;
     }
   }

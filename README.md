@@ -175,15 +175,25 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
   ./build/proc_isocity_roadgraph --seed 1 --size 128x128 --json g.json
   ```
 
-- `proc_isocity_mesh`: export a save/world to **Wavefront OBJ + MTL** (simple 3D mesh) for debugging
-  and interoperability with 3D tools.
+- `proc_isocity_mesh`: export a save/world to a simple 3D mesh for debugging/interoperability:
+  - **Wavefront OBJ + MTL**
+  - **glTF 2.0** (`.gltf` + sibling `.bin`) and **GLB** (`.glb`)
 
   ```bash
   # Export an existing save to OBJ/MTL
   ./build/proc_isocity_mesh --load saveA.bin --obj saveA.obj
 
+  # Export an existing save to GLB (single-file glTF)
+  ./build/proc_isocity_mesh --load saveA.bin --glb saveA.glb
+
+  # Export glTF JSON + BIN (writes saveA.gltf + saveA.bin)
+  ./build/proc_isocity_mesh --load saveA.bin --gltf saveA.gltf
+
   # Generate + simulate a new world, then export only a cropped subregion
   ./build/proc_isocity_mesh --seed 42 --size 128x128 --days 120 --obj out.obj --crop 32 32 64 64
+
+  # You can also request multiple outputs in one run (e.g. OBJ + GLB)
+  ./build/proc_isocity_mesh --load saveA.bin --obj saveA.obj --glb saveA.glb
   ```
 
 - `proc_isocity_replay`: pack/inspect/play deterministic **replay journals**.

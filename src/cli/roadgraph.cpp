@@ -82,7 +82,7 @@ void PrintHelp()
       << "                       [--dot <out.dot>] [--json <out.json>]\n"
       << "                       [--nodes-csv <out.csv>] [--edges-csv <out.csv>]\n"
       << "                       [--include-tiles <0|1>] [--color-components <0|1>]\n"
-      << "                       [--ppm <out.ppm>] [--diameter-ppm <out.ppm>] [--ppm-scale <N>]\n\n"
+      << "                       [--ppm <out.ppm|out.png>] [--diameter-ppm <out.ppm|out.png>] [--ppm-scale <N>]\n\n"
       << "Notes:\n"
       << "  - If --load is omitted, a world is generated from (--seed, --size).\n"
       << "  - --include-tiles may produce large JSON/CSV files on big maps.\n"
@@ -270,21 +270,21 @@ int main(int argc, char** argv)
     std::cout << "wrote edges csv -> " << edgesCsvPath << "\n";
   }
 
-  auto writePpm = [&](const std::string& path, const std::vector<Point>* highlight) -> bool {
+  auto writeImage = [&](const std::string& path, const std::vector<Point>* highlight) -> bool {
     if (path.empty()) return true;
     PpmImage img = RenderRoadGraphDebugPpm(world, g, ExportLayer::Overlay, highlight);
     if (ppmScale > 1) img = ScaleNearest(img, ppmScale);
     std::string we;
-    if (!WritePpm(path, img, we)) {
-      std::cerr << "PPM export failed: " << we << "\n";
+    if (!WriteImageAuto(path, img, we)) {
+      std::cerr << "image export failed: " << we << "\n";
       return false;
     }
-    std::cout << "wrote ppm -> " << path << "\n";
+    std::cout << "wrote image -> " << path << "\n";
     return true;
   };
 
   if (!ppmPath.empty()) {
-    if (!writePpm(ppmPath, nullptr)) return 2;
+    if (!writeImage(ppmPath, nullptr)) return 2;
   }
 
   if (!diameterPpmPath.empty()) {
@@ -293,7 +293,7 @@ int main(int argc, char** argv)
       std::cerr << "Failed to expand diameter path to tiles (graph may be empty)\n";
       tiles.clear();
     }
-    if (!writePpm(diameterPpmPath, &tiles)) return 2;
+    if (!writeImage(diameterPpmPath, &tiles)) return 2;
   }
 
   return 0;

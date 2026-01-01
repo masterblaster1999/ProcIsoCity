@@ -203,7 +203,7 @@ void PrintHelp()
       << "  proc_isocity_autobuild --days <N> [--load <save.bin>] [--save <out.bin>] [--out <summary.json>] [--csv <ticks.csv>]\n"
       << "                      [--size WxH --seed <u64> [--empty]]\n"
       << "                      [--money <N>] [--bot <key> <value>]...\n"
-      << "                      [--export-ppm <layer> <out.ppm>]... [--export-scale <N>] [--export-tiles-csv <tiles.csv>]\n\n"
+      << "                      [--export-ppm <layer> <out.ppm|out.png>]... [--export-scale <N>] [--export-tiles-csv <tiles.csv>]\n\n"
       << "Notes:\n"
       << "  - If --load is omitted, a world is generated from --size/--seed (or defaults).\n"
       << "  - --empty creates a flat grass world instead of procedural generation.\n"
@@ -421,7 +421,7 @@ int main(int argc, char** argv)
     }
   }
 
-  // Exports (PPM).
+  // Exports (PPM/PNG).
   if (!exports.empty()) {
     // Compute derived fields once.
     TrafficConfig tc;
@@ -449,8 +449,8 @@ int main(int argc, char** argv)
       const PpmImage img = (exportScale > 1) ? ScaleNearest(raw, exportScale) : raw;
 
       std::string errPpm;
-      if (!WritePpm(outFile, img, errPpm)) {
-        std::cerr << "PPM export failed: " << outFile << " : " << errPpm << "\n";
+      if (!WriteImageAuto(outFile, img, errPpm)) {
+        std::cerr << "image export failed: " << outFile << " : " << errPpm << "\n";
         return 1;
       }
     }

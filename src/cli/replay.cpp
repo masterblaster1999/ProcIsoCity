@@ -148,7 +148,7 @@ void PrintHelp()
       << "  proc_isocity_replay info <replay.isoreplay>\n"
       << "  proc_isocity_replay play <replay.isoreplay> [--force] [--out <summary.json>] [--csv <ticks.csv>] [--save <final.bin>]\n"
       << "                          [--ignore-asserts]\n"
-      << "                          [--export-ppm <layer> <out.ppm>]... [--export-scale <N>] [--export-tiles-csv <tiles.csv>]\n\n"
+      << "                          [--export-ppm <layer> <out.ppm|out.png>]... [--export-scale <N>] [--export-tiles-csv <tiles.csv>]\n\n"
       << "Notes:\n"
       << "  - Replay files embed a full base save plus a stream of Tick/Patch/Snapshot events.\n"
       << "  - --force disables strict patch hash checks during playback (useful for debugging).\n"
@@ -513,8 +513,8 @@ int main(int argc, char** argv)
                                       goods ? &(*goods) : nullptr);
         if (exportScale > 1) img = ScaleNearest(img, exportScale);
         EnsureParentDir(e.path);
-        if (!WritePpm(e.path, img, err)) {
-          std::cerr << "Failed to write PPM: " << e.path;
+        if (!WriteImageAuto(e.path, img, err)) {
+          std::cerr << "Failed to write image: " << e.path;
           if (!err.empty()) std::cerr << " (" << err << ")";
           std::cerr << "\n";
           return 1;

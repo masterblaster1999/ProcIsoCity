@@ -1,5 +1,6 @@
 #include "isocity/SaveLoad.hpp"
 
+#include "isocity/Checksum.hpp"
 #include "isocity/Compression.hpp"
 #include "isocity/ProcGen.hpp"
 #include "isocity/Sim.hpp"
@@ -38,31 +39,6 @@ constexpr std::uint32_t kVersionCurrent = kVersionV9;
 // Notes:
 // - We compute CRC32 over the entire file contents *excluding* the final CRC field.
 // - The CRC32 is stored as a uint32_t appended to the end of the file.
-const std::uint32_t* Crc32Table()
-{
-  static std::uint32_t table[256];
-  static bool init = false;
-  if (!init) {
-    for (std::uint32_t i = 0; i < 256; ++i) {
-      std::uint32_t c = i;
-      for (int bit = 0; bit < 8; ++bit) {
-        c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-      }
-      table[i] = c;
-    }
-    init = true;
-  }
-  return table;
-}
-
-std::uint32_t Crc32Update(std::uint32_t crc, const std::uint8_t* data, std::size_t size)
-{
-  const std::uint32_t* table = Crc32Table();
-  for (std::size_t i = 0; i < size; ++i) {
-    crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
-  }
-  return crc;
-}
 
 
 struct Crc32OStreamWriter {

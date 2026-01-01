@@ -82,8 +82,8 @@ void PrintHelp()
       << "                 [--out <summary.json>] [--csv <ticks.csv>] [--save <save.bin>]\n"
       << "                 [--require-outside <0|1>] [--tax-res <N>] [--tax-com <N>] [--tax-ind <N>]\n"
       << "                 [--maint-road <N>] [--maint-park <N>]\n"
-      << "                 [--export-ppm <layer> <out.ppm>]... [--export-scale <N>]\n"
-      << "                 [--export-iso <layer> <out.ppm>]... [--iso-tile <WxH>] [--iso-height <N>]\n"
+      << "                 [--export-ppm <layer> <out.ppm|out.png>]... [--export-scale <N>]\n"
+      << "                 [--export-iso <layer> <out.ppm|out.png>]... [--iso-tile <WxH>] [--iso-height <N>]\n"
       << "                 [--iso-margin <N>] [--iso-grid <0|1>] [--iso-cliffs <0|1>] [--export-tiles-csv <tiles.csv>]\n"
       << "                 [--batch <N>]\n\n"
       << "Export layers (for --export-ppm / --export-iso):\n"
@@ -91,7 +91,7 @@ void PrintHelp()
       << "Batch mode:\n"
       << "  - --batch N>1 runs N simulations with seeds (seed, seed+1, ...).\n"
       << "  - To write per-run files, include {seed} or {run} in any output path.\n"
-      << "    Example: --out out_{seed}.json  --export-ppm overlay map_{seed}.ppm\n\n"
+      << "    Example: --out out_{seed}.json  --export-ppm overlay map_{seed}.png\n\n"
       << "Notes:\n"
       << "  - If --load is provided, the world + ProcGenConfig + SimConfig are loaded from the save.\n"
       << "  - Otherwise, a new world is generated from (--seed, --size).\n"
@@ -608,8 +608,8 @@ int main(int argc, char** argv)
         if (exportScale > 1) img = ScaleNearest(img, exportScale);
 
         std::string err;
-        if (!WritePpm(outP, img, err)) {
-          std::cerr << "Failed to write PPM (" << ExportLayerName(e.layer) << "): " << outP << " (" << err << ")\n";
+        if (!WriteImageAuto(outP, img, err)) {
+          std::cerr << "Failed to write image (" << ExportLayerName(e.layer) << "): " << outP << " (" << err << ")\n";
           return 1;
         }
       }
@@ -628,8 +628,8 @@ int main(int argc, char** argv)
         }
 
         std::string err;
-        if (!WritePpm(outP, iso.image, err)) {
-          std::cerr << "Failed to write ISO PPM (" << ExportLayerName(e.layer) << "): " << outP << " (" << err << ")\n";
+        if (!WriteImageAuto(outP, iso.image, err)) {
+          std::cerr << "Failed to write ISO image (" << ExportLayerName(e.layer) << "): " << outP << " (" << err << ")\n";
           return 1;
         }
       }

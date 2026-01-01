@@ -2402,7 +2402,7 @@ bool ScriptRunner::runTextInternal(const std::string& text, const std::string& v
 
       const std::string p = expandPathTemplate(t[2]);
       std::string err;
-      if (!WritePpm(p, img, err)) {
+      if (!WriteImageAuto(p, img, err)) {
         return fail(virtualPath, lineNo, "export_ppm failed: " + err);
       }
 

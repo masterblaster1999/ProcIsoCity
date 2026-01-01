@@ -54,7 +54,7 @@ bool ParseI32(const std::string& s, int* out)
   return true;
 }
 
-bool ParseU8(const std::string& s, std::uint8_t* out)
+[[maybe_unused]] bool ParseU8(const std::string& s, std::uint8_t* out)
 {
   if (!out) return false;
   int v = 0;
@@ -186,9 +186,10 @@ void PrintHelp()
       << "  --verbose                    Print script output (default is quiet).\n"
       << "\n"
       << "Golden image regression (snapshot testing):\n"
-      << "  --golden                     Compare a rendered PPM against a golden snapshot.\n"
+      << "  --golden                     Compare a rendered image (PPM/PNG) against a golden snapshot.\n"
       << "  --update-golden              Create/overwrite golden snapshots instead of failing.\n"
       << "  --golden-dir <dir>            Base directory for goldens (default: next to scenario file).\n"
+      << "  --golden-ext <ppm|png>        Golden image file extension. Default: ppm\n"
       << "  --golden-format <top|iso>     Render format for goldens. Default: top\n"
       << "  --golden-layer <layer>        Layer to render. Default: overlay\n"
       << "  --golden-scale <N>            Scale factor for top-down golden renders. Default: 1\n"
@@ -213,6 +214,9 @@ struct GoldenConfig {
 
   // If empty, snapshots are written next to the scenario file.
   std::string goldenDir;
+
+  // Golden image extension ("ppm" or "png").
+  std::string goldenExt = "ppm";
 
   isocity::IsoOverviewConfig isoCfg{};
 };
@@ -271,7 +275,13 @@ fs::path ComputeGoldenPath(const isocity::ScenarioCase& sc, const GoldenConfig& 
   std::ostringstream suffix;
   suffix << ".golden";
   if (g.iso) suffix << ".iso";
-  suffix << "." << isocity::ExportLayerName(g.layer) << ".ppm";
+  {
+    std::string ext = g.goldenExt;
+    if (!ext.empty() && ext[0] == '.') ext = ext.substr(1);
+    for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (ext.empty()) ext = "ppm";
+    suffix << "." << isocity::ExportLayerName(g.layer) << "." << ext;
+  }
 
   fs::path out = base;
   out += suffix.str();
@@ -309,20 +319,28 @@ bool WriteGoldenArtifacts(const fs::path& caseDir, const GoldenConfig& cfg, cons
 {
   outErr.clear();
 
-  // golden_actual.ppm
+  std::string ext = cfg.goldenExt;
+  if (!ext.empty() && ext[0] == '.') ext = ext.substr(1);
+  ext = ToLower(ext);
+  if (ext.empty()) ext = "ppm";
+
+  const fs::path actualPath = caseDir / (std::string("golden_actual.") + ext);
+  const fs::path diffPath = caseDir / (std::string("golden_diff.") + ext);
+
+  // golden_actual
   {
     std::string err;
-    if (!isocity::WritePpm((caseDir / "golden_actual.ppm").string(), actual, err)) {
-      outErr = "failed to write golden_actual.ppm: " + err;
+    if (!isocity::WriteImageAuto(actualPath.string(), actual, err)) {
+      outErr = "failed to write golden_actual: " + err;
       return false;
     }
   }
 
-  // golden_diff.ppm
+  // golden_diff
   if (diffImg && !diffImg->rgb.empty() && diffImg->width > 0 && diffImg->height > 0) {
     std::string err;
-    if (!isocity::WritePpm((caseDir / "golden_diff.ppm").string(), *diffImg, err)) {
-      outErr = "failed to write golden_diff.ppm: " + err;
+    if (!isocity::WriteImageAuto(diffPath.string(), *diffImg, err)) {
+      outErr = "failed to write golden_diff: " + err;
       return false;
     }
   }
@@ -601,6 +619,20 @@ int main(int argc, char** argv)
       }
       golden.enabled = true;
       golden.goldenDir = val;
+    } else if (arg == "--golden-ext") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--golden-ext requires ppm|png\n";
+        return 2;
+      }
+      golden.enabled = true;
+      std::string v = ToLower(Trim(val));
+      if (!v.empty() && v[0] == '.') v = v.substr(1);
+      if (v == "ppm" || v == "png") {
+        golden.goldenExt = v;
+      } else {
+        std::cerr << "invalid --golden-ext (expected ppm|png): " << val << "\n";
+        return 2;
+      }
     } else if (arg == "--golden-format") {
       if (!requireValue(i, val)) {
         std::cerr << "--golden-format requires top|iso\n";
@@ -837,7 +869,7 @@ int main(int argc, char** argv)
 
           if (goldenExists) {
             std::string readErr;
-            if (isocity::ReadPpm(goldenPath.string(), expected, readErr)) {
+            if (isocity::ReadImageAuto(goldenPath.string(), expected, readErr)) {
               isocity::PpmDiffStats st{};
               if (isocity::ComparePpm(expected, actual, st, golden.threshold, nullptr)) {
                 cr.golden.stats = st;
@@ -860,7 +892,7 @@ int main(int argc, char** argv)
               cr.golden.error = "failed to create golden directory: " + goldenPath.parent_path().string() + " (" + ec.message() + ")";
             } else {
               std::string werr;
-              if (!isocity::WritePpm(goldenPath.string(), actual, werr)) {
+              if (!isocity::WriteImageAuto(goldenPath.string(), actual, werr)) {
                 cr.golden.ok = false;
                 cr.golden.matched = false;
                 cr.golden.error = "failed to update golden: " + werr;
@@ -884,7 +916,7 @@ int main(int argc, char** argv)
             cr.golden.error = "missing golden image: " + goldenPath.string() + " (run with --update-golden to create)";
           } else {
             std::string readErr;
-            if (!isocity::ReadPpm(goldenPath.string(), expected, readErr)) {
+            if (!isocity::ReadImageAuto(goldenPath.string(), expected, readErr)) {
               cr.golden.ok = false;
               cr.golden.matched = false;
               cr.golden.error = "failed to read golden image: " + readErr;

@@ -78,6 +78,38 @@ bool ReadPpm(const std::string& path, PpmImage& outImg, std::string& outError);
 bool ComparePpm(const PpmImage& a, const PpmImage& b, PpmDiffStats& outStats, int threshold = 0,
                 PpmImage* outDiff = nullptr);
 
+// -----------------------------------------------------------------------------------------------
+// PNG IO (minimal, dependency-free)
+// -----------------------------------------------------------------------------------------------
+
+// Write a truecolor 8-bit PNG.
+//
+// The encoder is intentionally minimal:
+//  - Color type 2 (RGB), bit depth 8
+//  - Filter 0 (None)
+//  - DEFLATE stream uses "stored" (uncompressed) blocks for simplicity
+//
+// Returns true on success; on failure, outError contains a human-friendly error.
+bool WritePng(const std::string& path, const PpmImage& img, std::string& outError);
+
+// Read a PNG produced by WritePng.
+//
+// The decoder supports a small subset of PNG:
+//  - Color type 2 (RGB), bit depth 8, no interlace
+//  - Filter 0 (None)
+//  - Zlib stream with stored (uncompressed) blocks
+//
+// It is sufficient for deterministic snapshot artifacts and internal tooling.
+bool ReadPng(const std::string& path, PpmImage& outImg, std::string& outError);
+
+// Convenience helpers for CLI/tools: read/write either PPM or PNG.
+//
+// Format selection:
+//  - based on filename extension (.ppm/.pnm/.png)
+//  - falls back to probing the file magic when reading
+bool ReadImageAuto(const std::string& path, PpmImage& outImg, std::string& outError);
+bool WriteImageAuto(const std::string& path, const PpmImage& img, std::string& outError);
+
 
 // -----------------------------------------------------------------------------------------------
 // Isometric overview export (headless)

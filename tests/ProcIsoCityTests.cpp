@@ -14,6 +14,7 @@
 #include "isocity/Compression.hpp"
 #include "isocity/Export.hpp"
 #include "isocity/MeshExport.hpp"
+#include "isocity/GltfExport.hpp"
 #include "isocity/Script.hpp"
 #include "isocity/Suite.hpp"
 #include "isocity/AutoBuild.hpp"
@@ -2298,6 +2299,30 @@ void TestPpmReadWriteAndCompare()
   EXPECT_EQ(read.height, 2);
   EXPECT_TRUE(read.rgb == img.rgb);
 
+  // --- Round trip PNG (minimal encoder/decoder) ---
+  const fs::path pathPng = tmp / "a.png";
+  EXPECT_TRUE(WritePng(pathPng.string(), img, err));
+  EXPECT_TRUE(err.empty());
+
+  PpmImage readPng{};
+  EXPECT_TRUE(ReadPng(pathPng.string(), readPng, err));
+  EXPECT_TRUE(err.empty());
+  EXPECT_EQ(readPng.width, 2);
+  EXPECT_EQ(readPng.height, 2);
+  EXPECT_TRUE(readPng.rgb == img.rgb);
+
+  // --- Auto format helpers (extension or magic) ---
+  const fs::path pathAuto = tmp / "auto.png";
+  EXPECT_TRUE(WriteImageAuto(pathAuto.string(), img, err));
+  EXPECT_TRUE(err.empty());
+
+  PpmImage readAuto{};
+  EXPECT_TRUE(ReadImageAuto(pathAuto.string(), readAuto, err));
+  EXPECT_TRUE(err.empty());
+  EXPECT_EQ(readAuto.width, 2);
+  EXPECT_EQ(readAuto.height, 2);
+  EXPECT_TRUE(readAuto.rgb == img.rgb);
+
   // --- Compare with a single-channel change ---
   PpmImage img2 = img;
   img2.rgb[0] = 10; // bump red on pixel (0,0)
@@ -4033,6 +4058,118 @@ void TestMeshExportObjMtlBasic()
   }
 }
 
+void TestGltfExportBasic()
+{
+  using namespace isocity;
+
+  // Use the same tiny world setup as the OBJ exporter test.
+  World w(2, 2, 123);
+  w.at(0, 0).terrain = Terrain::Grass;
+  w.at(0, 0).overlay = Overlay::None;
+  w.at(0, 0).height = 0.0f;
+
+  w.at(1, 0).terrain = Terrain::Grass;
+  w.at(1, 0).overlay = Overlay::Road;
+  w.at(1, 0).height = 0.0f;
+
+  w.at(0, 1).terrain = Terrain::Water;
+  w.at(0, 1).overlay = Overlay::None;
+  w.at(0, 1).height = -0.5f;
+
+  w.at(1, 1).terrain = Terrain::Grass;
+  w.at(1, 1).overlay = Overlay::Residential;
+  w.at(1, 1).level = 2;
+  w.at(1, 1).occupants = 15;
+  w.at(1, 1).variation = 0xA0;
+  w.at(1, 1).height = 0.25f;
+
+  MeshExportConfig cfg;
+  cfg.tileSize = 1.0f;
+  cfg.heightScale = 1.0f;
+  cfg.overlayOffset = 0.1f;
+  cfg.includeCliffs = false;
+  cfg.includeBuildings = false;
+
+  static int tag = 0;
+  ++tag;
+  const fs::path tmpDir = fs::temp_directory_path();
+
+  // --- .gltf + .bin ---
+  {
+    const fs::path gltfPath = tmpDir / ("isocity_gltf_test_" + std::to_string(tag) + ".gltf");
+    const fs::path binPath = fs::path(gltfPath).replace_extension(".bin");
+
+    MeshExportStats st;
+    std::string err;
+    EXPECT_TRUE(ExportWorldGltf(gltfPath.string(), w, cfg, &st, &err));
+    EXPECT_TRUE(err.empty());
+    EXPECT_TRUE(fs::exists(gltfPath));
+    EXPECT_TRUE(fs::exists(binPath));
+
+    EXPECT_EQ(st.vertices, 16ULL);
+    EXPECT_EQ(st.triangles, 8ULL);
+
+    // Basic sanity: JSON references the .bin and includes required POSITION min/max.
+    std::ifstream f(gltfPath, std::ios::binary);
+    EXPECT_TRUE(static_cast<bool>(f));
+    std::ostringstream oss;
+    oss << f.rdbuf();
+    const std::string json = oss.str();
+    EXPECT_TRUE(json.find("\"version\":\"2.0\"") != std::string::npos);
+    EXPECT_TRUE(json.find(binPath.filename().string()) != std::string::npos);
+    EXPECT_TRUE(json.find("\"POSITION\":0") != std::string::npos);
+    EXPECT_TRUE(json.find("\"min\":[") != std::string::npos);
+    EXPECT_TRUE(json.find("\"max\":[") != std::string::npos);
+
+    const std::uintmax_t binSize = fs::file_size(binPath);
+    EXPECT_TRUE(json.find("\"byteLength\":" + std::to_string(binSize)) != std::string::npos);
+  }
+
+  // --- .glb ---
+  {
+    const fs::path glbPath = tmpDir / ("isocity_gltf_test_" + std::to_string(tag) + ".glb");
+
+    MeshExportStats st;
+    std::string err;
+    EXPECT_TRUE(ExportWorldGlb(glbPath.string(), w, cfg, &st, &err));
+    EXPECT_TRUE(err.empty());
+    EXPECT_TRUE(fs::exists(glbPath));
+
+    EXPECT_EQ(st.vertices, 16ULL);
+    EXPECT_EQ(st.triangles, 8ULL);
+
+    // Validate the basic GLB container structure:
+    // - header magic/version/length
+    // - JSON chunk marker
+    std::ifstream f(glbPath, std::ios::binary);
+    EXPECT_TRUE(static_cast<bool>(f));
+
+    auto readU32LE = [&](std::uint32_t& out) -> bool {
+      std::uint8_t b[4] = {0, 0, 0, 0};
+      f.read(reinterpret_cast<char*>(b), 4);
+      if (!f) return false;
+      out = static_cast<std::uint32_t>(b[0]) | (static_cast<std::uint32_t>(b[1]) << 8) |
+            (static_cast<std::uint32_t>(b[2]) << 16) | (static_cast<std::uint32_t>(b[3]) << 24);
+      return true;
+    };
+
+    std::uint32_t magic = 0, version = 0, length = 0;
+    EXPECT_TRUE(readU32LE(magic));
+    EXPECT_TRUE(readU32LE(version));
+    EXPECT_TRUE(readU32LE(length));
+
+    EXPECT_EQ(magic, 0x46546C67u); // 'glTF'
+    EXPECT_EQ(version, 2u);
+    EXPECT_EQ(static_cast<std::uintmax_t>(length), fs::file_size(glbPath));
+
+    std::uint32_t jsonChunkLen = 0, jsonChunkType = 0;
+    EXPECT_TRUE(readU32LE(jsonChunkLen));
+    EXPECT_TRUE(readU32LE(jsonChunkType));
+    EXPECT_EQ(jsonChunkType, 0x4E4F534Au); // 'JSON'
+    EXPECT_TRUE((jsonChunkLen % 4u) == 0u);
+  }
+}
+
 int main()
 {
   TestRoadAutoTilingMasks();
@@ -4092,6 +4229,7 @@ int main()
   TestExportIsoOverview();
   TestPpmReadWriteAndCompare();
   TestMeshExportObjMtlBasic();
+  TestGltfExportBasic();
   TestWorldTransformRotateMirrorCrop();
 
   TestZoneBuildingParcelsDeterministic();
