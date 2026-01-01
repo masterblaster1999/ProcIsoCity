@@ -52,8 +52,12 @@ add_library(isocity_core
   src/isocity/Blueprint.cpp
   src/isocity/MeshExport.cpp
   src/isocity/RoadGraphExport.cpp
+  src/isocity/RoadGraphTrafficExport.cpp
   src/isocity/Districting.cpp
   src/isocity/FloodFill.cpp
+  src/isocity/CityBlocks.cpp
+  src/isocity/CityBlockGraph.cpp
+  src/isocity/BlockDistricting.cpp
   src/isocity/Script.cpp
   src/isocity/AutoBuild.cpp
   src/isocity/Replay.cpp
@@ -77,6 +81,13 @@ add_library(isocity_core
   src/isocity/EditHistory.cpp
   src/isocity/Pathfinding.cpp
   src/isocity/RoadGraph.cpp
+  src/isocity/RoadGraphTraffic.cpp
+  src/isocity/RoadGraphResilience.cpp
+  src/isocity/RoadGraphCentrality.cpp
+  src/isocity/RoadGraphCentralityExport.cpp
+  src/isocity/RoadUpgradePlanner.cpp
+  src/isocity/PolicyOptimizer.cpp
+  src/isocity/PolicyOptimizerExport.cpp
   src/isocity/ZoneParcels.cpp
   src/isocity/Json.cpp
   src/isocity/ConfigIO.cpp
@@ -301,6 +312,82 @@ if (PROCISOCITY_BUILD_CLI)
   target_link_libraries(proc_isocity_roadgraph PRIVATE isocity_core)
 
   procisocity_set_strict_warnings(proc_isocity_roadgraph)
+
+  # Road centrality tool (headless): betweenness centrality on the compressed road graph.
+  add_executable(proc_isocity_roadcentrality
+    src/cli/roadcentrality.cpp
+  )
+
+  target_include_directories(proc_isocity_roadcentrality PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_roadcentrality PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_roadcentrality)
+
+  # Traffic graph export tool (headless): compute commute traffic and aggregate onto the road graph.
+  add_executable(proc_isocity_trafficgraph
+    src/cli/trafficgraph.cpp
+  )
+
+  target_include_directories(proc_isocity_trafficgraph PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_trafficgraph PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_trafficgraph)
+
+  # Road upgrades tool (headless): propose road-level upgrades under a budget based on combined flows.
+  add_executable(proc_isocity_roadupgrades
+    src/cli/roadupgrades.cpp
+  )
+
+  target_include_directories(proc_isocity_roadupgrades PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_roadupgrades PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_roadupgrades)
+
+  # Policy optimizer tool (headless): search tax/maintenance policy space under an objective.
+  add_executable(proc_isocity_policyopt
+    src/cli/policyopt.cpp
+  )
+
+  target_include_directories(proc_isocity_policyopt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_policyopt PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_policyopt)
+
+
+
+
+  # Road resilience tool (headless): identify bridge edges/articulation nodes and suggest bypass roads.
+  add_executable(proc_isocity_roadresilience
+    src/cli/roadresilience.cpp
+  )
+
+  target_include_directories(proc_isocity_roadresilience PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_roadresilience PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_roadresilience)
+
+
+
+  # City blocks tool (headless): extract road-separated land blocks and export metrics.
+  add_executable(proc_isocity_blocks
+    src/cli/blocks.cpp
+  )
+
+  target_include_directories(proc_isocity_blocks PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_blocks PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_blocks)
+
+  # Block-based district assignment tool.
+  add_executable(proc_isocity_blockdistricts
+    src/cli/blockdistricts.cpp
+  )
+
+  target_include_directories(proc_isocity_blockdistricts PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_blockdistricts PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_blockdistricts)
+
 
 
   # Mesh exporter (headless): export a save/world to Wavefront OBJ+MTL for debugging/interop.

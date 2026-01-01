@@ -48,7 +48,7 @@ ctest --test-dir build-tests --output-on-failure
 
 - `PROCISOCITY_BUILD_APP` (default: ON) — build the interactive raylib app (`proc_isocity`).
 - `PROCISOCITY_BUILD_TESTS` (default: OFF) — build `proc_isocity_tests` and enable `ctest`.
-- `PROCISOCITY_BUILD_CLI` (default: ON) — build headless command-line tools (`proc_isocity_cli`, `proc_isocity_diff`, `proc_isocity_imagediff`, `proc_isocity_inspect`, `proc_isocity_config`, `proc_isocity_patch`, `proc_isocity_script`, `proc_isocity_replay`, `proc_isocity_blueprint`, `proc_isocity_suite`, `proc_isocity_transform`, `proc_isocity_roadgraph`, `proc_isocity_mesh`).
+- `PROCISOCITY_BUILD_CLI` (default: ON) — build headless command-line tools (`proc_isocity_cli`, `proc_isocity_diff`, `proc_isocity_imagediff`, `proc_isocity_inspect`, `proc_isocity_config`, `proc_isocity_patch`, `proc_isocity_script`, `proc_isocity_replay`, `proc_isocity_blueprint`, `proc_isocity_suite`, `proc_isocity_transform`, `proc_isocity_roadgraph`, `proc_isocity_roadcentrality`, `proc_isocity_blocks`, `proc_isocity_mesh`).
 - `PROCISOCITY_USE_SYSTEM_RAYLIB` (default: OFF) — when building the app, use a system raylib instead of FetchContent.
 
 ### Headless CLI tools (optional)
@@ -98,6 +98,119 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
 
   # Generate a new world and emit a diameter highlight image
   ./build/proc_isocity_roadgraph --seed 1 --size 128x128 --diameter-ppm diameter.ppm --ppm-scale 4
+  ```
+
+
+- `proc_isocity_roadcentrality`: compute **betweenness centrality** on the compressed `RoadGraph` (both nodes and edges)
+  to highlight structural bottlenecks in the road network (independent of simulated traffic). Exports DOT/JSON/CSV and can
+  emit a one-pixel-per-tile highlight image (PPM/PNG by extension).
+
+  ```bash
+  # Centrality on a loaded save, travel-time weighted
+  ./build/proc_isocity_roadcentrality --load save.bin --weight-mode time \
+    --json centrality.json --dot centrality.dot \
+    --nodes-csv centrality_nodes.csv --edges-csv centrality_edges.csv \
+    --ppm centrality.png --ppm-scale 4 --top-nodes 25 --top-edges 50
+
+  # Approximate betweenness by sampling sources (deterministic)
+  ./build/proc_isocity_roadcentrality --seed 1 --size 128x128 --max-sources 128 --json cent_sample.json
+  ```
+
+
+- `proc_isocity_trafficgraph`: compute a **commute traffic heatmap** (per road tile) and aggregate it onto the
+  compressed `RoadGraph` (nodes/edges) so you can analyze congestion at the segment level. Exports DOT/JSON/CSV and can
+  emit traffic heatmap + "top congested edges" highlight images (PPM/PNG by extension).
+
+  ```bash
+  # Generate a world, simulate 60 days to populate zones, then export graph + images
+  ./build/proc_isocity_trafficgraph --seed 1 --size 128x128 --days 60     --json trafficgraph.json --dot trafficgraph.dot --nodes-csv tg_nodes.csv --edges-csv tg_edges.csv     --heatmap traffic.png --highlight top_congested.png --scale 4
+
+  # Enable congestion-aware routing for the commute assignment
+  ./build/proc_isocity_trafficgraph --seed 2 --size 128x128 --days 60     --congestion-aware 1 --passes 6 --alpha 0.15 --beta 4.0     --json trafficgraph_congestion.json
+  ```
+
+
+- `proc_isocity_roadupgrades`: plan **road level upgrades** (street→avenue→highway) under a budget, based on a
+  combined per-road-tile flow map:
+  - **commute traffic** (from `Traffic`)
+  - optional **goods shipments** traffic (from `Goods`)
+
+  You can optimize for either:
+  - **congestion relief** (reduce per-tile excess flow above capacity)
+  - **travel time savings** (flow-weighted milli-time saved)
+  - a **hybrid** of the two
+
+  Exports JSON/CSV, can emit a highlight image, can export a DOT road graph colored by combined utilization, and can
+  write a new save with the upgrades applied (tooling-only; it does not charge money).
+
+  ```bash
+  # Generate a world, simulate 60 days, then pick upgrades under a budget and export artifacts
+  ./build/proc_isocity_roadupgrades --seed 1 --size 128x128 --days 60 \
+    --budget 250 --objective congestion --min-util 1.0 \
+    --json upgrades.json --edges-csv upgrades_edges.csv --tiles-csv upgrades_tiles.csv \
+    --dot upgrades_flow.dot --highlight upgrades.png --scale 4
+
+  # Optimize for travel-time savings and write a save with the upgrades applied
+  ./build/proc_isocity_roadupgrades --load save.bin --objective time --budget 500 \
+    --json upgrades_time.json --write-save save_upgraded.bin
+  ```
+
+
+
+- `proc_isocity_policyopt`: headless **policy optimizer** that searches citywide taxes + maintenance to maximize an
+  objective (money / growth / balanced / happiness) by repeatedly simulating `--eval-days` from a fixed baseline.
+  Outputs JSON + CSV + an iteration trace, and can write a new save with the best policy applied.
+
+  ```bash
+  # Tune a loaded save for a balanced objective and emit analysis artifacts
+  ./build/proc_isocity_policyopt --load save.bin --days 30 --eval-days 60 --objective balanced \
+    --json policyopt.json --csv policyopt_top.csv --trace policyopt_trace.csv
+
+  # Brute-force small ranges (exhaustive) and write a save with the best policy
+  ./build/proc_isocity_policyopt --load save.bin --method exhaustive --eval-days 30 \
+    --tax-res 0..4 --tax-com 0..6 --tax-ind 0..6 --maint-road 0..3 --maint-park 0..3 \
+    --objective money --write-save save_best_policy.bin
+  ```
+
+- `proc_isocity_roadresilience`: analyze **road network vulnerability** on the compressed `RoadGraph` by finding:
+  - **bridge edges** (cut-edges): removing the segment disconnects the network
+  - **articulation nodes** (cut-vertices): removing the intersection disconnects the network
+
+  Optionally, it suggests **bypass roads** for the top bridge edges by running a multi-source road-build path search that
+  reconnects the two sides *without* using the bridge segment. Exports JSON/CSV and can emit highlight images.
+
+  ```bash
+  # Generate a world, simulate 60 days, then export a resilience report + images
+  ./build/proc_isocity_roadresilience --seed 1 --size 128x128 --days 60     --json resilience.json --bridges-csv bridges.csv --articulations-csv articulations.csv     --highlight-bridges bridges.png --highlight-bypasses bypasses.png --scale 4
+
+  # Optimize bypass suggestions by money cost and write out a save with the best bypass applied
+  ./build/proc_isocity_roadresilience --load save.bin     --bypass-money 1 --bypass-target-level 2 --bypass-allow-bridges 0     --json resilience_money.json --write-best-save save_with_bypass.bin
+  ```
+
+- `proc_isocity_blocks`: extract **road-separated land blocks** (components of non-road, non-water tiles)
+  and export summary metrics to JSON/CSV. Also emits an optional debug PPM label image.
+
+  ```bash
+  ./build/proc_isocity_blocks --seed 1 --size 128x128 \
+    --json blocks.json --csv blocks.csv --tile-csv block_ids.csv \
+    --ppm blocks.ppm --ppm-scale 4
+  ```
+
+
+- `proc_isocity_blockdistricts`: assign **administrative districts** using the city-block adjacency graph.
+  This yields neighborhood-like, block-contiguous districts (as opposed to the road-network-centered
+  auto-districting). Exports a report to JSON/CSV/DOT and can write a new save with the districts applied.
+
+  ```bash
+  # Generate a world, assign 6 districts, export a DOT graph and a district overlay image
+  ./build/proc_isocity_blockdistricts --seed 1 --size 128x128 \
+    --districts 6 --fill-roads 1 \
+    --json blockdistricts.json --dot blockdistricts.dot \
+    --blocks-csv blockdistricts_blocks.csv --edges-csv blockdistricts_edges.csv \
+    --district-ppm districts.png --scale 4
+
+  # Apply block districts to an existing save and write out a new save
+  ./build/proc_isocity_blockdistricts --load save.bin --districts 8 --write-save save_with_districts.bin
   ```
 
 - `proc_isocity_patch`: create/apply compact **binary patches** between two saves (great for regression artifacts or sharing a small repro):
@@ -173,6 +286,16 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
 
   # Generate a world on the fly (no save required)
   ./build/proc_isocity_roadgraph --seed 1 --size 128x128 --json g.json
+  ```
+
+- `proc_isocity_roadcentrality`: compute **betweenness centrality** on the compressed `RoadGraph` (nodes + edges).
+  Exports DOT/JSON/CSV and can emit a one-pixel-per-tile highlight image.
+
+  ```bash
+  ./build/proc_isocity_roadcentrality --load saveA.bin --weight-mode time \
+    --json centrality.json --dot centrality.dot \
+    --nodes-csv cent_nodes.csv --edges-csv cent_edges.csv \
+    --ppm centrality.png --ppm-scale 4
   ```
 
 - `proc_isocity_mesh`: export a save/world to a simple 3D mesh for debugging/interoperability:

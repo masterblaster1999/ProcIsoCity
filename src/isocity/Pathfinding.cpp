@@ -380,6 +380,237 @@ bool FindRoadBuildPath(const World& world, Point start, Point goal, std::vector<
   return false;
 }
 
+bool FindRoadBuildPathBetweenSets(const World& world,
+                                 const std::vector<Point>& starts,
+                                 const std::vector<Point>& goals,
+                                 std::vector<Point>& outPath,
+                                 int* outPrimaryCost,
+                                 const RoadBuildPathConfig& cfg,
+                                 const std::vector<std::uint64_t>* blockedDirectedMoves,
+                                 int maxPrimaryCost)
+{
+  outPath.clear();
+  if (outPrimaryCost) *outPrimaryCost = 0;
+
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return false;
+
+  const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+
+  // Filter/validate start & goal sets.
+  std::vector<int> startIdxs;
+  std::vector<int> goalIdxs;
+  startIdxs.reserve(starts.size());
+  goalIdxs.reserve(goals.size());
+
+  for (const Point& p : starts) {
+    if (!IsRoadBuildable(world, p.x, p.y, cfg)) continue;
+    startIdxs.push_back(Idx(p.x, p.y, w));
+  }
+  for (const Point& p : goals) {
+    if (!IsRoadBuildable(world, p.x, p.y, cfg)) continue;
+    goalIdxs.push_back(Idx(p.x, p.y, w));
+  }
+
+  if (startIdxs.empty() || goalIdxs.empty()) return false;
+
+  // Prepare goal mask for O(1) membership checks.
+  std::vector<std::uint8_t> isGoal(n, 0);
+  for (const int gi : goalIdxs) {
+    if (gi >= 0 && static_cast<std::size_t>(gi) < n) isGoal[static_cast<std::size_t>(gi)] = 1;
+  }
+
+  const int targetLevel = ClampRoadLevel(cfg.targetLevel);
+
+  auto computePrimaryCost = [&](const std::vector<Point>& path) -> int {
+    int cost = 0;
+    for (const Point& p : path) {
+      if (!world.inBounds(p.x, p.y)) continue;
+      const Tile& t = world.at(p.x, p.y);
+      if (cfg.costModel == RoadBuildPathConfig::CostModel::NewTiles) {
+        if (t.overlay != Overlay::Road) ++cost;
+      } else {
+        const bool isBridge = (t.terrain == Terrain::Water);
+        if (t.overlay == Overlay::Road) {
+          cost += RoadPlacementCost(static_cast<int>(t.level), targetLevel, /*alreadyRoad=*/true, isBridge);
+        } else if (t.overlay == Overlay::None) {
+          cost += RoadPlacementCost(1, targetLevel, /*alreadyRoad=*/false, isBridge);
+        }
+      }
+    }
+    return cost;
+  };
+
+  // Quick win: any start is already a goal.
+  int bestTrivialIdx = -1;
+  for (const int si : startIdxs) {
+    if (si < 0 || static_cast<std::size_t>(si) >= n) continue;
+    if (isGoal[static_cast<std::size_t>(si)]) {
+      if (bestTrivialIdx < 0 || si < bestTrivialIdx) bestTrivialIdx = si;
+    }
+  }
+  if (bestTrivialIdx >= 0) {
+    const int x = bestTrivialIdx % w;
+    const int y = bestTrivialIdx / w;
+    outPath.push_back(Point{x, y});
+    if (outPrimaryCost) *outPrimaryCost = computePrimaryCost(outPath);
+    if (maxPrimaryCost >= 0 && outPrimaryCost && *outPrimaryCost > maxPrimaryCost) {
+      outPath.clear();
+      *outPrimaryCost = 0;
+      return false;
+    }
+    return true;
+  }
+
+  // Normalize/prepare blocked directed moves.
+  const std::vector<std::uint64_t>* blocked = blockedDirectedMoves;
+  std::vector<std::uint64_t> blockedLocal;
+  if (blocked && !blocked->empty() && !std::is_sorted(blocked->begin(), blocked->end())) {
+    blockedLocal = *blocked;
+    std::sort(blockedLocal.begin(), blockedLocal.end());
+    blockedLocal.erase(std::unique(blockedLocal.begin(), blockedLocal.end()), blockedLocal.end());
+    blocked = &blockedLocal;
+  }
+
+  auto packMove = [&](int fromIdx, int toIdx) -> std::uint64_t {
+    return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(fromIdx)) << 32) |
+           static_cast<std::uint64_t>(static_cast<std::uint32_t>(toIdx));
+  };
+  auto isBlockedMove = [&](int fromIdx, int toIdx) -> bool {
+    if (!blocked || blocked->empty()) return false;
+    const std::uint64_t key = packMove(fromIdx, toIdx);
+    return std::binary_search(blocked->begin(), blocked->end(), key);
+  };
+
+  constexpr int kInf = std::numeric_limits<int>::max() / 4;
+
+  // Multi-source Dijkstra (A* with 0 heuristic), identical semantics to FindRoadBuildPath.
+  std::vector<int> bestCost(n, kInf);
+  std::vector<int> bestSteps(n, kInf);
+  std::vector<int> cameFrom(n, -1);
+
+  struct Node {
+    int idx = 0;
+    int cost = 0;
+    int steps = 0;
+    std::uint8_t tie = 0;
+  };
+  struct Cmp {
+    bool operator()(const Node& a, const Node& b) const
+    {
+      if (a.cost != b.cost) return a.cost > b.cost;
+      if (a.steps != b.steps) return a.steps > b.steps;
+      if (a.tie != b.tie) return a.tie > b.tie;
+      return a.idx > b.idx;
+    }
+  };
+
+  auto tieVal = [&](int idx) -> std::uint8_t {
+    const int x = idx % w;
+    const int y = idx / w;
+    return world.at(x, y).variation;
+  };
+
+  auto tileEnterCost = [&](int x, int y) -> int {
+    if (!world.inBounds(x, y)) return kInf;
+    const Tile& t = world.at(x, y);
+    if (cfg.costModel == RoadBuildPathConfig::CostModel::NewTiles) {
+      return (t.overlay == Overlay::Road) ? 0 : 1;
+    }
+
+    const bool isBridge = (t.terrain == Terrain::Water);
+    if (t.overlay == Overlay::Road) {
+      return RoadPlacementCost(static_cast<int>(t.level), targetLevel, /*alreadyRoad=*/true, isBridge);
+    }
+    // overlay==None by buildability rules
+    return RoadPlacementCost(1, targetLevel, /*alreadyRoad=*/false, isBridge);
+  };
+
+  std::priority_queue<Node, std::vector<Node>, Cmp> open;
+
+  for (const int si : startIdxs) {
+    if (si < 0 || static_cast<std::size_t>(si) >= n) continue;
+    if (bestCost[static_cast<std::size_t>(si)] > 0 || bestSteps[static_cast<std::size_t>(si)] > 0) {
+      bestCost[static_cast<std::size_t>(si)] = 0;
+      bestSteps[static_cast<std::size_t>(si)] = 0;
+      cameFrom[static_cast<std::size_t>(si)] = -1;
+      open.push(Node{si, 0, 0, tieVal(si)});
+    }
+  }
+
+  constexpr int dirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+
+  int foundGoalIdx = -1;
+  while (!open.empty()) {
+    const Node cur = open.top();
+    open.pop();
+
+    const std::size_t ucur = static_cast<std::size_t>(cur.idx);
+    if (cur.cost != bestCost[ucur] || cur.steps != bestSteps[ucur]) continue; // stale
+
+    // Budget/cost cutoff.
+    if (maxPrimaryCost >= 0 && cur.cost > maxPrimaryCost) continue;
+
+    if (isGoal[ucur]) {
+      foundGoalIdx = cur.idx;
+      break;
+    }
+
+    const int cx = cur.idx % w;
+    const int cy = cur.idx / w;
+
+    for (const auto& d : dirs) {
+      const int nx = cx + d[0];
+      const int ny = cy + d[1];
+      if (!IsRoadBuildable(world, nx, ny, cfg)) continue;
+
+      const int nidx = Idx(nx, ny, w);
+      const std::size_t unidx = static_cast<std::size_t>(nidx);
+
+      if (isBlockedMove(cur.idx, nidx)) continue;
+
+      const int stepCost = tileEnterCost(nx, ny);
+      if (stepCost >= kInf) continue;
+
+      const int nCost = cur.cost + stepCost;
+      const int nSteps = cur.steps + 1;
+
+      if (maxPrimaryCost >= 0 && nCost > maxPrimaryCost) continue;
+
+      if (nCost < bestCost[unidx] || (nCost == bestCost[unidx] && nSteps < bestSteps[unidx])) {
+        bestCost[unidx] = nCost;
+        bestSteps[unidx] = nSteps;
+        cameFrom[unidx] = cur.idx;
+        open.push(Node{nidx, nCost, nSteps, tieVal(nidx)});
+      }
+    }
+  }
+
+  if (foundGoalIdx < 0) return false;
+
+  // Reconstruct to the multi-source root (cameFrom == -1).
+  {
+    outPath.clear();
+    int cur = foundGoalIdx;
+    while (cur != -1) {
+      outPath.push_back(Point{cur % w, cur / w});
+      cur = cameFrom[static_cast<std::size_t>(cur)];
+    }
+    std::reverse(outPath.begin(), outPath.end());
+  }
+
+  if (outPrimaryCost) *outPrimaryCost = computePrimaryCost(outPath);
+
+  if (maxPrimaryCost >= 0 && outPrimaryCost && *outPrimaryCost > maxPrimaryCost) {
+    outPath.clear();
+    *outPrimaryCost = 0;
+    return false;
+  }
+
+  return !outPath.empty();
+}
+
 bool FindRoadPathToEdge(const World& world, Point start, std::vector<Point>& outPath, int* outCost)
 {
   outPath.clear();

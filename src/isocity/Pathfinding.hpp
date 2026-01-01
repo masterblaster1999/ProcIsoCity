@@ -93,4 +93,29 @@ struct RoadBuildPathConfig {
 bool FindRoadBuildPath(const World& world, Point start, Point goal, std::vector<Point>& outPath,
                        int* outPrimaryCost = nullptr, const RoadBuildPathConfig& cfg = {});
 
+// Multi-source / multi-target road-building path search.
+//
+// Finds the best road-build path from ANY tile in `starts` to ANY tile in `goals`.
+//
+// This is a generalization of FindRoadBuildPath() used by higher-level tooling
+// (eg. road network resilience analysis) where you want to reconnect two *sets*
+// of nodes without having to try every pair.
+//
+// Optional features:
+//  - blockedDirectedMoves: if provided, forbids traversing specific directed
+//    moves between adjacent tiles. Keys must use:
+//        idx = y*world.width() + x
+//        key = ((uint64_t)fromIdx << 32) | (uint32_t)toIdx
+//    The vector is expected to be sorted (the function will still behave
+//    correctly if it isn't, but may copy/sort internally).
+//  - maxPrimaryCost: if >= 0, aborts if the best path would exceed this cost.
+bool FindRoadBuildPathBetweenSets(const World& world,
+                                 const std::vector<Point>& starts,
+                                 const std::vector<Point>& goals,
+                                 std::vector<Point>& outPath,
+                                 int* outPrimaryCost = nullptr,
+                                 const RoadBuildPathConfig& cfg = {},
+                                 const std::vector<std::uint64_t>* blockedDirectedMoves = nullptr,
+                                 int maxPrimaryCost = -1);
+
 } // namespace isocity

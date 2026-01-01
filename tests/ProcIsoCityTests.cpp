@@ -2,6 +2,11 @@
 #include "isocity/Pathfinding.hpp"
 #include "isocity/RoadGraph.hpp"
 #include "isocity/RoadGraphExport.hpp"
+#include "isocity/RoadGraphTraffic.hpp"
+#include "isocity/RoadGraphResilience.hpp"
+#include "isocity/RoadGraphCentrality.hpp"
+#include "isocity/RoadUpgradePlanner.hpp"
+#include "isocity/PolicyOptimizer.hpp"
 #include "isocity/ProcGen.hpp"
 #include "isocity/SaveLoad.hpp"
 #include "isocity/ConfigIO.hpp"
@@ -22,6 +27,9 @@
 #include "isocity/Districting.hpp"
 #include "isocity/Brush.hpp"
 #include "isocity/ZoneParcels.hpp"
+#include "isocity/CityBlocks.hpp"
+#include "isocity/CityBlockGraph.hpp"
+#include "isocity/BlockDistricting.hpp"
 #include "isocity/ZoneMetrics.hpp"
 #include "isocity/ZoneAccess.hpp"
 #include "isocity/Blueprint.hpp"
@@ -4170,6 +4178,468 @@ void TestGltfExportBasic()
   }
 }
 
+
+static void TestCityBlocksBasic()
+{
+  using namespace isocity;
+
+  World world(5, 5, 1);
+  for (int y = 0; y < 5; ++y) {
+    world.setRoad(2, y);
+  }
+
+  const CityBlocksResult r = BuildCityBlocks(world);
+
+  EXPECT_TRUE(r.blocks.size() == 2);
+  EXPECT_TRUE(r.blocks[0].id == 0);
+  EXPECT_TRUE(r.blocks[1].id == 1);
+
+  EXPECT_TRUE(r.blocks[0].area == 10);
+  EXPECT_TRUE(r.blocks[1].area == 10);
+
+  EXPECT_TRUE(r.blocks[0].roadEdges == 5);
+  EXPECT_TRUE(r.blocks[1].roadEdges == 5);
+
+  EXPECT_TRUE(r.blocks[0].outsideEdges == 9);
+  EXPECT_TRUE(r.blocks[1].outsideEdges == 9);
+
+  EXPECT_TRUE(r.blocks[0].roadAdjTiles == 5);
+  EXPECT_TRUE(r.blocks[1].roadAdjTiles == 5);
+
+  // Spot-check tileToBlock mapping on the first row.
+  EXPECT_TRUE(r.tileToBlock[0] == 0);  // (0,0)
+  EXPECT_TRUE(r.tileToBlock[1] == 0);  // (1,0)
+  EXPECT_TRUE(r.tileToBlock[2] == -1); // (2,0) road
+  EXPECT_TRUE(r.tileToBlock[3] == 1);  // (3,0)
+  EXPECT_TRUE(r.tileToBlock[4] == 1);  // (4,0)
+
+}
+
+
+static void TestCityBlockGraphFrontageAndAdjacency()
+{
+  using namespace isocity;
+
+  World world(5, 5, 1);
+
+  // Split the map into 2 blocks with a vertical road column. Set road level to 2 so
+  // we can validate the per-level aggregation.
+  for (int y = 0; y < 5; ++y) {
+    world.setRoad(2, y);
+    world.at(2, y).level = 2;
+  }
+
+  const CityBlockGraphResult g = BuildCityBlockGraph(world);
+
+  EXPECT_TRUE(g.blocks.blocks.size() == 2);
+  EXPECT_TRUE(g.edges.size() == 1);
+  EXPECT_TRUE(g.frontage.size() == 2);
+
+  EXPECT_TRUE(g.edges[0].a == 0);
+  EXPECT_TRUE(g.edges[0].b == 1);
+  EXPECT_TRUE(g.edges[0].touchingRoadTiles == 5);
+  EXPECT_TRUE(g.edges[0].touchingRoadTilesByLevel[2] == 5);
+
+  EXPECT_TRUE(g.frontage[0].roadEdgesByLevel[2] == 5);
+  EXPECT_TRUE(g.frontage[1].roadEdgesByLevel[2] == 5);
+
+  EXPECT_TRUE(g.frontage[0].roadAdjTilesByLevel[2] == 5);
+  EXPECT_TRUE(g.frontage[1].roadAdjTilesByLevel[2] == 5);
+}
+
+
+static void TestBlockDistrictingDisconnectedComponents()
+{
+  using namespace isocity;
+
+  World world(5, 3, 1);
+
+  // Create a water barrier column that splits the land into two disconnected blocks.
+  for (int y = 0; y < 3; ++y) {
+    world.at(2, y).terrain = Terrain::Water;
+    world.at(2, y).overlay = Overlay::None;
+  }
+
+  BlockDistrictConfig cfg;
+  cfg.districts = 2;
+  cfg.fillRoadTiles = false;
+  cfg.includeWater = false;
+
+  const BlockDistrictResult r = AssignDistrictsByBlocks(world, cfg);
+
+  EXPECT_TRUE(r.districtsUsed == 2);
+  EXPECT_TRUE(r.seedBlockId.size() == 2);
+  EXPECT_TRUE(r.blockToDistrict.size() == 2);
+
+  // Left land should be district 0; right land should be district 1.
+  for (int y = 0; y < 3; ++y) {
+    EXPECT_TRUE(world.at(0, y).district == 0);
+    EXPECT_TRUE(world.at(1, y).district == 0);
+    EXPECT_TRUE(world.at(3, y).district == 1);
+    EXPECT_TRUE(world.at(4, y).district == 1);
+
+    // Water stays unchanged (default district 0).
+    EXPECT_TRUE(world.at(2, y).district == 0);
+  }
+}
+
+void TestRoadGraphTrafficAggregationSimpleLine()
+{
+  using namespace isocity;
+
+  World world(5, 1, 1);
+  for (int x = 0; x < 5; ++x) {
+    world.setRoad(x, 0);
+  }
+
+  const RoadGraph g = BuildRoadGraph(world);
+  EXPECT_TRUE(g.nodes.size() == 2);
+  EXPECT_TRUE(g.edges.size() == 1);
+
+  TrafficResult tr;
+  tr.roadTraffic.assign(5u, 0);
+  tr.roadTraffic[0] = 10;
+  tr.roadTraffic[1] = 20;
+  tr.roadTraffic[2] = 30;
+  tr.roadTraffic[3] = 40;
+  tr.roadTraffic[4] = 50;
+  tr.maxTraffic = 50;
+
+  RoadGraphTrafficConfig cfg;
+  cfg.baseTileCapacity = 10;
+  cfg.useRoadLevelCapacity = false;
+
+  const RoadGraphTrafficResult agg = AggregateTrafficOnRoadGraph(world, g, tr, cfg);
+  EXPECT_TRUE(agg.nodes.size() == 2);
+  EXPECT_TRUE(agg.edges.size() == 1);
+
+  const RoadGraphTrafficEdgeStats& es = agg.edges[0];
+  EXPECT_TRUE(es.tileCount == 5);
+  EXPECT_TRUE(es.interiorTileCount == 3);
+
+  EXPECT_TRUE(es.sumTrafficInterior == 90u); // 20+30+40
+  EXPECT_TRUE(es.maxTrafficInterior == 40);
+
+  EXPECT_TRUE(es.sumCapacityInterior == 30u); // 3 tiles * 10
+  EXPECT_TRUE(es.congestedTilesInterior == 3);
+  EXPECT_TRUE(es.excessTrafficInterior == 60u); // (20-10)+(30-10)+(40-10)
+
+  // maxUtilInterior should be 40/10 = 4.0
+  EXPECT_TRUE(es.maxUtilInterior > 3.99 && es.maxUtilInterior < 4.01);
+
+  // Node endpoints should carry endpoint traffic.
+  EXPECT_TRUE(agg.nodes[0].traffic == 10);
+  EXPECT_TRUE(agg.nodes[1].traffic == 50);
+  EXPECT_TRUE(agg.nodes[0].capacity == 10);
+  EXPECT_TRUE(agg.nodes[1].capacity == 10);
+  EXPECT_TRUE(agg.nodes[0].util > 0.99 && agg.nodes[0].util < 1.01);
+  EXPECT_TRUE(agg.nodes[1].util > 4.99 && agg.nodes[1].util < 5.01);
+}
+
+
+void TestRoadUpgradePlannerPrefersAvenueUpgradeWhenCostBenefitIsBetter()
+{
+  using namespace isocity;
+
+  // Straight road line with heavy flow. Upgrading to level 2 yields a better
+  // excess-reduction-per-cost ratio than upgrading directly to level 3.
+  World world(6, 1, 1);
+  for (int x = 0; x < 6; ++x) {
+    world.setRoad(x, 0);
+    world.at(x, 0).level = 1;
+  }
+  world.recomputeRoadMasks();
+
+  const RoadGraph g = BuildRoadGraph(world);
+  EXPECT_TRUE(g.nodes.size() == 2);
+  EXPECT_TRUE(g.edges.size() == 1);
+
+  const int w = world.width();
+  const int h = world.height();
+  const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+
+  std::vector<std::uint32_t> flow(n, 0);
+  for (int x = 0; x < 6; ++x) flow[static_cast<std::size_t>(x)] = 60; // heavy traffic
+
+  RoadUpgradePlannerConfig cfg;
+  cfg.baseTileCapacity = 28;
+  cfg.useRoadLevelCapacity = true;
+  cfg.upgradeEndpoints = false; // interior-only
+  cfg.maxTargetLevel = 3;
+  cfg.minUtilConsider = 0.0;
+  cfg.budget = -1;
+  cfg.objective = RoadUpgradeObjective::Congestion;
+
+  const RoadUpgradePlan plan = PlanRoadUpgrades(world, g, flow, cfg);
+
+  EXPECT_TRUE(plan.edges.size() == 1);
+  EXPECT_TRUE(plan.edges[0].targetLevel == 2);
+  EXPECT_TRUE(plan.totalCost == 8); // 4 interior tiles * (level1->2 delta cost=2)
+  EXPECT_TRUE(plan.totalExcessReduced == 88u);
+
+  World upgraded = world;
+  ApplyRoadUpgradePlan(upgraded, plan);
+
+  // Interior tiles (x=1..4) upgraded to level 2; endpoints unchanged.
+  EXPECT_TRUE(upgraded.at(0, 0).level == 1);
+  EXPECT_TRUE(upgraded.at(5, 0).level == 1);
+  for (int x = 1; x <= 4; ++x) {
+    EXPECT_TRUE(upgraded.at(x, 0).level == 2);
+  }
+}
+
+
+
+
+void TestRoadGraphResilienceFindsBridgesAndArticulations()
+{
+  using namespace isocity;
+
+  // Build a simple T intersection:
+  //
+  // (0,0)---(1,0)---(2,0)
+  //           |
+  //         (1,1)
+  //
+  // The compressed road graph should have 4 nodes and 3 edges (a tree).
+  // All 3 edges are bridges. The intersection at (1,0) is the only articulation node.
+  World world(3, 2, 1);
+  world.setRoad(0, 0);
+  world.setRoad(1, 0);
+  world.setRoad(2, 0);
+  world.setRoad(1, 1);
+  world.recomputeRoadMasks();
+
+  const RoadGraph rg = BuildRoadGraph(world);
+  EXPECT_TRUE(rg.nodes.size() == 4);
+  EXPECT_TRUE(rg.edges.size() == 3);
+
+  const RoadGraphResilienceResult res = ComputeRoadGraphResilience(rg);
+
+  EXPECT_TRUE(res.bridgeEdges.size() == 3);
+  EXPECT_TRUE(res.articulationNodes.size() == 1);
+
+  // Nodes are discovered in scan order: (0,0)=0, (1,0)=1, (2,0)=2, (1,1)=3.
+  EXPECT_TRUE(res.isArticulationNode.size() == rg.nodes.size());
+  EXPECT_TRUE(res.isArticulationNode[1] == 1);
+
+  EXPECT_TRUE(res.isBridgeEdge.size() == rg.edges.size());
+  EXPECT_TRUE(res.isBridgeEdge[0] == 1);
+  EXPECT_TRUE(res.isBridgeEdge[1] == 1);
+  EXPECT_TRUE(res.isBridgeEdge[2] == 1);
+}
+
+void TestRoadGraphCentralityStarGraph()
+{
+  using namespace isocity;
+
+  // Star graph with 4 leaves:
+  //   1
+  //   |
+  // 2-0-3
+  //   |
+  //   4
+  //
+  // Undirected betweenness:
+  //  - center node 0: C(4,2) = 6
+  //  - leaf nodes: 0
+  //  - each edge (0-i): paths (0,i) + (i,otherLeaves) => 1 + 3 = 4
+
+  RoadGraph g;
+  g.nodes.resize(5);
+  g.edges.resize(4);
+
+  g.nodes[0].pos = Point{0, 0};
+  g.nodes[1].pos = Point{0, 1};
+  g.nodes[2].pos = Point{-1, 0};
+  g.nodes[3].pos = Point{1, 0};
+  g.nodes[4].pos = Point{0, -1};
+
+  auto addEdge = [&](int ei, int a, int b) {
+    g.edges[static_cast<std::size_t>(ei)].a = a;
+    g.edges[static_cast<std::size_t>(ei)].b = b;
+    g.edges[static_cast<std::size_t>(ei)].length = 1;
+    g.edges[static_cast<std::size_t>(ei)].tiles = {g.nodes[static_cast<std::size_t>(a)].pos,
+                                                   g.nodes[static_cast<std::size_t>(b)].pos};
+    g.nodes[static_cast<std::size_t>(a)].edges.push_back(ei);
+    g.nodes[static_cast<std::size_t>(b)].edges.push_back(ei);
+  };
+
+  addEdge(0, 0, 1);
+  addEdge(1, 0, 2);
+  addEdge(2, 0, 3);
+  addEdge(3, 0, 4);
+
+  RoadGraphCentralityConfig cfg;
+  cfg.weightMode = RoadGraphEdgeWeightMode::Steps;
+  cfg.maxSources = 0;
+  cfg.scaleSampleToFull = true;
+  cfg.undirected = true;
+  cfg.normalizeBetweenness = true;
+  cfg.closenessComponentScale = true;
+
+  const RoadGraphCentralityResult r = ComputeRoadGraphCentrality(g, cfg, nullptr);
+
+  EXPECT_TRUE(r.nodeBetweenness.size() == 5);
+  EXPECT_TRUE(r.edgeBetweenness.size() == 4);
+  EXPECT_TRUE(r.nodeBetweenness[0] > 5.99 && r.nodeBetweenness[0] < 6.01);
+  for (int i = 1; i < 5; ++i) {
+    EXPECT_TRUE(std::abs(r.nodeBetweenness[static_cast<std::size_t>(i)]) < 1e-9);
+  }
+
+  for (int ei = 0; ei < 4; ++ei) {
+    EXPECT_TRUE(r.edgeBetweenness[static_cast<std::size_t>(ei)] > 3.99 &&
+                r.edgeBetweenness[static_cast<std::size_t>(ei)] < 4.01);
+  }
+
+  EXPECT_TRUE(r.nodeBetweennessNorm.size() == 5);
+  EXPECT_TRUE(r.edgeBetweennessNorm.size() == 4);
+  EXPECT_TRUE(r.nodeBetweennessNorm[0] > 0.999 && r.nodeBetweennessNorm[0] < 1.001);
+  for (int i = 1; i < 5; ++i) {
+    EXPECT_TRUE(std::abs(r.nodeBetweennessNorm[static_cast<std::size_t>(i)]) < 1e-9);
+  }
+  // For n=5 undirected, edge normalization factor is 2/(n(n-1)) = 0.1 => 4 * 0.1 = 0.4
+  for (int ei = 0; ei < 4; ++ei) {
+    EXPECT_TRUE(r.edgeBetweennessNorm[static_cast<std::size_t>(ei)] > 0.399 &&
+                r.edgeBetweennessNorm[static_cast<std::size_t>(ei)] < 0.401);
+  }
+
+  // Closeness/harmonic are only computed when all sources are processed.
+  EXPECT_TRUE(r.nodeCloseness.size() == 5);
+  EXPECT_TRUE(r.nodeHarmonicCloseness.size() == 5);
+
+  EXPECT_TRUE(r.nodeCloseness[0] > 0.999 && r.nodeCloseness[0] < 1.001);
+  EXPECT_TRUE(r.nodeHarmonicCloseness[0] > 3.999 && r.nodeHarmonicCloseness[0] < 4.001);
+
+  // Leaves: sumDist=7 => closeness=4/7 ~= 0.5714, harmonic=1 + 3*(1/2) = 2.5
+  for (int i = 1; i < 5; ++i) {
+    EXPECT_TRUE(r.nodeCloseness[static_cast<std::size_t>(i)] > 0.571 &&
+                r.nodeCloseness[static_cast<std::size_t>(i)] < 0.572);
+    EXPECT_TRUE(r.nodeHarmonicCloseness[static_cast<std::size_t>(i)] > 2.499 &&
+                r.nodeHarmonicCloseness[static_cast<std::size_t>(i)] < 2.501);
+  }
+}
+
+void TestRoadBuildPathBetweenSetsRespectsBlockedMoves()
+{
+  using namespace isocity;
+
+  // A straight road line:
+  // (0,1)-(1,1)-(2,1)-(3,1)-(4,1)
+  // Block the move between (2,1) and (3,1); the planner should detour by building 2 new tiles.
+  World world(5, 3, 1);
+  for (int x = 0; x < 5; ++x) {
+    world.setRoad(x, 1);
+  }
+  world.recomputeRoadMasks();
+
+  const int w = world.width();
+  const int fromIdx = 1 * w + 2;
+  const int toIdx = 1 * w + 3;
+
+  const std::uint64_t k1 = (static_cast<std::uint64_t>(static_cast<std::uint32_t>(fromIdx)) << 32) |
+                           static_cast<std::uint64_t>(static_cast<std::uint32_t>(toIdx));
+  const std::uint64_t k2 = (static_cast<std::uint64_t>(static_cast<std::uint32_t>(toIdx)) << 32) |
+                           static_cast<std::uint64_t>(static_cast<std::uint32_t>(fromIdx));
+
+  std::vector<std::uint64_t> blocked{ k1, k2 };
+  std::sort(blocked.begin(), blocked.end());
+
+  std::vector<Point> starts{ Point{0, 1} };
+  std::vector<Point> goals{ Point{4, 1} };
+
+  RoadBuildPathConfig cfg{};
+  cfg.costModel = RoadBuildPathConfig::CostModel::NewTiles;
+
+  std::vector<Point> path;
+  int cost = 0;
+  const bool ok = FindRoadBuildPathBetweenSets(world, starts, goals, path, &cost, cfg, &blocked);
+
+  EXPECT_TRUE(ok);
+  EXPECT_TRUE(!path.empty());
+  EXPECT_TRUE(path.front().x == 0 && path.front().y == 1);
+  EXPECT_TRUE(path.back().x == 4 && path.back().y == 1);
+
+  // Minimal detour around a single blocked edge requires 2 new tiles.
+  EXPECT_TRUE(cost == 2);
+
+  // Ensure the blocked move never appears in the returned path.
+  for (std::size_t i = 0; i + 1 < path.size(); ++i) {
+    const Point a = path[i];
+    const Point b = path[i + 1];
+    EXPECT_TRUE(!(a.x == 2 && a.y == 1 && b.x == 3 && b.y == 1));
+    EXPECT_TRUE(!(a.x == 3 && a.y == 1 && b.x == 2 && b.y == 1));
+  }
+}
+
+
+void TestPolicyOptimizerExhaustivePrefersLowMaintenanceWhenNoRevenue()
+{
+  using namespace isocity;
+
+  World world(16, 16, 123);
+
+  // Ensure a simple all-land baseline so policy differences show up only in maintenance.
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      Tile& t = world.at(x, y);
+      t.terrain = Terrain::Grass;
+      t.overlay = Overlay::None;
+      t.level = 1;
+      t.occupants = 0;
+    }
+  }
+
+  // A small road + park footprint with no zones (no tax revenue).
+  for (int x = 2; x <= 13; ++x) {
+    Tile& t = world.at(x, 8);
+    t.overlay = Overlay::Road;
+    t.level = 1;
+  }
+  for (int y = 3; y <= 12; ++y) {
+    Tile& t = world.at(8, y);
+    t.overlay = Overlay::Road;
+    t.level = 1;
+  }
+  world.at(10, 10).overlay = Overlay::Park;
+
+  SimConfig baseCfg;
+  Simulator sim(baseCfg);
+  sim.refreshDerivedStats(world);
+
+  PolicySearchSpace space;
+  space.taxResMin = 0;
+  space.taxResMax = 2;
+  space.taxComMin = 0;
+  space.taxComMax = 2;
+  space.taxIndMin = 0;
+  space.taxIndMax = 2;
+  space.maintRoadMin = 0;
+  space.maintRoadMax = 3;
+  space.maintParkMin = 0;
+  space.maintParkMax = 3;
+
+  PolicyOptimizerConfig cfg;
+  cfg.method = PolicyOptMethod::Exhaustive;
+  cfg.evalDays = 1;
+  cfg.maxExhaustiveCandidates = 100000;
+  cfg.topK = 8;
+  cfg.objective = {};
+  cfg.objective.wMoneyDelta = 1.0;
+  cfg.objective.minHappiness = 0.0;
+
+  PolicyOptimizationResult r = OptimizePolicies(world, baseCfg, space, cfg);
+
+  // With no tax revenue, the optimal policy is to minimize maintenance.
+  EXPECT_EQ(r.best.policy.maintenanceRoad, 0);
+  EXPECT_EQ(r.best.policy.maintenancePark, 0);
+
+  // Taxes don't matter in this setup; tie-break picks the lexicographically smallest policy.
+  EXPECT_EQ(r.best.policy.taxResidential, 0);
+  EXPECT_EQ(r.best.policy.taxCommercial, 0);
+  EXPECT_EQ(r.best.policy.taxIndustrial, 0);
+}
+
 int main()
 {
   TestRoadAutoTilingMasks();
@@ -4235,6 +4705,15 @@ int main()
   TestZoneBuildingParcelsDeterministic();
   TestBrushRasterShapes();
   TestFloodFillRegions();
+  TestCityBlocksBasic();
+  TestCityBlockGraphFrontageAndAdjacency();
+  TestBlockDistrictingDisconnectedComponents();
+  TestRoadGraphTrafficAggregationSimpleLine();
+  TestRoadUpgradePlannerPrefersAvenueUpgradeWhenCostBenefitIsBetter();
+  TestPolicyOptimizerExhaustivePrefersLowMaintenanceWhenNoRevenue();
+  TestRoadGraphResilienceFindsBridgesAndArticulations();
+  TestRoadGraphCentralityStarGraph();
+  TestRoadBuildPathBetweenSetsRespectsBlockedMoves();
   TestAutoBuildDeterminism();
   TestScriptRunnerBasic();
   TestScriptRunnerVarsAndExpr();
