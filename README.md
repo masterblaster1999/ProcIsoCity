@@ -130,6 +130,63 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
   ```
 
 
+- `proc_isocity_goodsgraph`: compute a **goods shipments traffic heatmap** (per road tile) and aggregate it onto the
+  compressed `RoadGraph` (nodes/edges) so you can analyze **supply chain pressure** at the segment level.
+  In addition to DOT/JSON/CSV, it can export an **origin-destination (OD)** list between road access points
+  (local industrial→commercial deliveries, edge imports, edge exports) as CSV and as **GeoJSON desire lines**.
+
+  ```bash
+  # Generate a world, simulate 60 days, then export goods flow + OD
+  ./build/proc_isocity_goodsgraph --seed 1 --size 128x128 --days 60 \
+    --json goodsgraph.json --dot goodsgraph.dot --nodes-csv gg_nodes.csv --edges-csv gg_edges.csv \
+    --heatmap goods_traffic.png --fillmap goods_fill.png --highlight goods_top_edges.png --scale 4 \
+    --od-csv goods_od.csv --od-geojson goods_od.geojson --od-top 250 --od-min-amount 4
+
+  # Analyze an existing save, with imports disabled (stress local industry)
+  ./build/proc_isocity_goodsgraph --load save.bin --allow-imports 0 \
+    --json goods_local.json --heatmap goods_local.png
+  ```
+
+
+- `proc_isocity_parkopt`: suggest **new park placements** that best serve underserved zones.
+  Demand can be weighted by **zone tiles** or by **occupants**, and distance is computed along the road network
+  (either raw road steps or travel-time). The tool can export a JSON/CSV ranked list, render an annotated overlay,
+  and optionally write a new save with the proposed parks applied (tooling-only; it does not charge money).
+
+  ```bash
+  # Generate a world, simulate 60 days, then suggest 12 parks and export artifacts
+  ./build/proc_isocity_parkopt --seed 1 --size 128x128 --days 60 --add 12 \
+    --json parkopt.json --csv parkopt.csv \
+    --annotate parkopt.png --heat-before park_access_before.png --heat-after park_access_after.png
+
+  # Improve an existing save and write a new save file with parks placed
+  ./build/proc_isocity_parkopt --load save.bin --add 8 --save save_more_parks.bin
+  ```
+
+
+- `proc_isocity_floodrisk`: headless **flood/ponding risk** analysis on the terrain heightfield.
+  It combines two complementary models:
+  - **Sea-level flooding**: connectivity-based coastal inundation mask + depth.
+  - **Depression filling (Priority-Flood)**: how much water would pond in terrain sinks before spilling.
+
+  Exports masks/depth maps (PPM/PNG by extension), GeoJSON polygons per flood/depression region, and a JSON summary.
+  It can optionally write a new save where flooded/ponded tiles are converted to `Terrain::Water` (tooling-only).
+
+  ```bash
+  # Coastal flood at sea level 0.45
+  ./build/proc_isocity_floodrisk --seed 1 --size 128x128 --mode sea --sea-level 0.45 \
+    --sea-mask sea.png --sea-depth sea_depth.png --sea-annotate sea_overlay.png \
+    --sea-geojson sea.geojson --json sea_report.json
+
+  # Ponding potential (Priority-Flood) on an existing save; only keep ponds deeper than 0.01
+  ./build/proc_isocity_floodrisk --load save.bin --mode depressions --dep-min-depth 0.01 \
+    --dep-depth ponds.png --dep-annotate ponds_overlay.png --dep-geojson ponds.geojson --json ponds_report.json
+
+  # Apply sea-flooded tiles as water and write a new save
+  ./build/proc_isocity_floodrisk --load save.bin --mode sea --sea-level 0.45 --apply sea --save save_flooded.bin
+  ```
+
+
 - `proc_isocity_roadupgrades`: plan **road level upgrades** (street→avenue→highway) under a budget, based on a
   combined per-road-tile flow map:
   - **commute traffic** (from `Traffic`)

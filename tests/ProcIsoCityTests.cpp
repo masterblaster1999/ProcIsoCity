@@ -13,11 +13,18 @@
 #include "isocity/Sim.hpp"
 #include "isocity/Traffic.hpp"
 #include "isocity/Goods.hpp"
+#include "isocity/ParkOptimizer.hpp"
 #include "isocity/LandValue.hpp"
 #include "isocity/Replay.hpp"
 #include "isocity/Hash.hpp"
 #include "isocity/Compression.hpp"
 #include "isocity/Export.hpp"
+#include "isocity/Isochrone.hpp"
+#include "isocity/Heightmap.hpp"
+#include "isocity/Contours.hpp"
+#include "isocity/DepressionFill.hpp"
+#include "isocity/FloodRisk.hpp"
+#include "isocity/Hydrology.hpp"
 #include "isocity/MeshExport.hpp"
 #include "isocity/GltfExport.hpp"
 #include "isocity/Script.hpp"
@@ -28,6 +35,7 @@
 #include "isocity/Brush.hpp"
 #include "isocity/ZoneParcels.hpp"
 #include "isocity/CityBlocks.hpp"
+#include "isocity/Vectorize.hpp"
 #include "isocity/CityBlockGraph.hpp"
 #include "isocity/BlockDistricting.hpp"
 #include "isocity/ZoneMetrics.hpp"
@@ -1165,6 +1173,55 @@ void TestZoneAccessMapAllowsInteriorTilesViaZoneConnectivity()
   EXPECT_EQ(road.y, 1);
 }
 
+void TestIsochroneTileAccessCostsRespectInteriorZoneAccess()
+{
+  using namespace isocity;
+
+  // Road spine across the map with a 2x2 residential block above it.
+  // The top row of the block is interior (no direct road adjacency) and must
+  // be mapped via ZoneAccessMap.
+  World w(5, 5, 1u);
+
+  for (int x = 0; x < w.width(); ++x) {
+    w.setRoad(x, 2);
+  }
+
+  // Bottom row (adjacent) can be applied normally.
+  EXPECT_EQ(w.applyTool(Tool::Residential, 2, 1), ToolApplyResult::Applied);
+  EXPECT_EQ(w.applyTool(Tool::Residential, 3, 1), ToolApplyResult::Applied);
+
+  // Top interior row: stamp directly.
+  w.setOverlay(Overlay::Residential, 2, 0);
+  w.setOverlay(Overlay::Residential, 3, 0);
+
+  std::vector<std::uint8_t> roadToEdge;
+  ComputeRoadsConnectedToEdge(w, roadToEdge);
+
+  // Source at the left edge.
+  const int sourceIdx = 2 * w.width() + 0;
+
+  RoadIsochroneConfig cfg;
+  cfg.requireOutsideConnection = true;
+  cfg.weightMode = IsochroneWeightMode::TravelTime;
+
+  const RoadIsochroneField rf = BuildRoadIsochroneField(w, std::vector<int>{sourceIdx}, cfg, &roadToEdge);
+
+  TileAccessCostConfig tcfg;
+  tcfg.includeRoadTiles = true;
+  tcfg.includeZones = true;
+  tcfg.includeNonZonesAdjacentToRoad = false;
+  tcfg.includeWater = false;
+  tcfg.accessStepCostMilli = 0;
+  tcfg.useZoneAccessMap = true;
+
+  const std::vector<int> tc = BuildTileAccessCostField(w, rf, tcfg, &roadToEdge);
+
+  // Travel time along a level-1 road is 1000 per edge.
+  // From (0,2) to (2,2) is 2 edges => 2000.
+  const std::size_t idxInterior = static_cast<std::size_t>(0) * static_cast<std::size_t>(w.width()) + 2u; // (2,0)
+  EXPECT_EQ(tc[idxInterior], 2000);
+}
+
 void TestRoadPathfindingToEdge()
 {
   using namespace isocity;
@@ -1706,6 +1763,55 @@ void TestGoodsIndustrySuppliesCommercial()
   const std::size_t commIdx = static_cast<std::size_t>(2) * static_cast<std::size_t>(w.width()) +
                               static_cast<std::size_t>(6);
   EXPECT_TRUE(gr.commercialFill[commIdx] >= 250);
+}
+
+void TestGoodsFlowDebugOdCapturesLocalDeliveries()
+{
+  using namespace isocity;
+
+  // Same setup as TestGoodsIndustrySuppliesCommercial, but request debug OD output.
+  World w(9, 5, 1u);
+  for (int x = 0; x < 9; ++x) {
+    w.setRoad(x, 3);
+  }
+
+  w.setOverlay(Overlay::Industrial, 2, 2);
+  w.at(2, 2).level = 1;
+
+  w.setOverlay(Overlay::Commercial, 6, 2);
+  w.at(6, 2).level = 1;
+
+  GoodsConfig cfg;
+  cfg.requireOutsideConnection = true;
+  cfg.allowImports = false;
+  cfg.allowExports = false;
+
+  GoodsFlowDebug dbg;
+  const GoodsResult gr = ComputeGoodsFlow(w, cfg, nullptr, nullptr, &dbg);
+
+  EXPECT_EQ(dbg.w, w.width());
+  EXPECT_EQ(dbg.h, w.height());
+
+  // One aggregated local delivery edge: (2,3) -> (6,3) with amount 8.
+  const int srcIdx = 3 * w.width() + 2;
+  const int dstIdx = 3 * w.width() + 6;
+
+  bool found = false;
+  for (const GoodsOdEdge& e : dbg.od) {
+    if (e.type != GoodsOdType::Local) continue;
+    if (e.srcRoadIdx != srcIdx || e.dstRoadIdx != dstIdx) continue;
+    found = true;
+    EXPECT_EQ(e.amount, 8);
+    EXPECT_EQ(e.minSteps, 4);
+    EXPECT_EQ(e.maxSteps, 4);
+    EXPECT_EQ(e.totalSteps, static_cast<std::uint64_t>(8u * 4u));
+    EXPECT_TRUE(e.minCostMilli > 0);
+    EXPECT_TRUE(e.maxCostMilli >= e.minCostMilli);
+    EXPECT_EQ(e.totalCostMilli, static_cast<std::uint64_t>(e.amount) * static_cast<std::uint64_t>(e.minCostMilli));
+  }
+
+  EXPECT_TRUE(found);
+  EXPECT_EQ(gr.goodsDelivered, 8);
 }
 
 void TestGoodsSplitsDemandAcrossMultipleProducers()
@@ -2583,6 +2689,329 @@ void TestPpmReadWriteAndCompare()
 }
 
 
+
+
+void TestHeightmapApplyReclassifyAndBulldoze()
+{
+  using namespace isocity;
+
+  World w(2, 2, 1);
+
+  // Start with land everywhere.
+  for (int y = 0; y < w.height(); ++y) {
+    for (int x = 0; x < w.width(); ++x) {
+      Tile& t = w.at(x, y);
+      t.terrain = Terrain::Grass;
+      t.overlay = Overlay::None;
+      t.height = 1.0f;
+      t.level = 1;
+      t.occupants = 0;
+    }
+  }
+
+  // Place a zone (should be bulldozed if the tile becomes water) and a road (bridge allowed).
+  w.setOverlay(Overlay::Residential, 0, 0);
+  w.setOverlay(Overlay::Road, 1, 0);
+
+  // 2x2 grayscale image:
+  //  (0,0)=0   -> water
+  //  (1,0)=0   -> water (road should remain)
+  //  (0,1)=255 -> grass
+  //  (1,1)=128 -> sand
+  PpmImage img;
+  img.width = 2;
+  img.height = 2;
+  img.rgb = {
+      0,   0,   0,   0,   0,   0,
+      255, 255, 255, 128, 128, 128,
+  };
+
+  HeightmapApplyConfig cfg;
+  cfg.resample = HeightmapResample::None;
+  cfg.flipX = false;
+  cfg.flipY = false;
+  cfg.invert = false;
+  cfg.heightScale = 1.0f;
+  cfg.heightOffset = 0.0f;
+  cfg.clamp01 = true;
+  cfg.reclassifyTerrain = true;
+  cfg.waterLevel = 0.20f;
+  cfg.sandLevel = 0.60f;
+  cfg.bulldozeNonRoadOverlaysOnWater = true;
+
+  HeightmapApplyStats st;
+  std::string err;
+  EXPECT_TRUE(ApplyHeightmap(w, img, cfg, err, &st));
+  EXPECT_TRUE(err.empty());
+
+  EXPECT_TRUE(w.at(0, 0).terrain == Terrain::Water);
+  EXPECT_TRUE(w.at(0, 0).overlay == Overlay::None);
+
+  EXPECT_TRUE(w.at(1, 0).terrain == Terrain::Water);
+  EXPECT_TRUE(w.at(1, 0).overlay == Overlay::Road);
+
+  EXPECT_TRUE(w.at(0, 1).terrain == Terrain::Grass);
+  EXPECT_TRUE(w.at(1, 1).terrain == Terrain::Sand);
+
+  EXPECT_EQ(st.overlaysCleared, 1ULL);
+}
+
+void TestHeightmapApplyResampleNearest()
+{
+  using namespace isocity;
+
+  World w(3, 2, 1);
+  for (int y = 0; y < w.height(); ++y) {
+    for (int x = 0; x < w.width(); ++x) {
+      Tile& t = w.at(x, y);
+      t.terrain = Terrain::Grass;
+      t.overlay = Overlay::None;
+      t.height = 0.0f;
+    }
+  }
+
+  // 1x1 white image should upsample to all-ones with nearest.
+  PpmImage img;
+  img.width = 1;
+  img.height = 1;
+  img.rgb = {255, 255, 255};
+
+  HeightmapApplyConfig cfg;
+  cfg.resample = HeightmapResample::Nearest;
+  cfg.reclassifyTerrain = false;
+
+  std::string err;
+  EXPECT_TRUE(ApplyHeightmap(w, img, cfg, err, nullptr));
+  EXPECT_TRUE(err.empty());
+
+  for (int y = 0; y < w.height(); ++y) {
+    for (int x = 0; x < w.width(); ++x) {
+      EXPECT_TRUE(std::abs(w.at(x, y).height - 1.0f) < 1e-6f);
+    }
+  }
+}
+
+
+
+void TestHydrologyFlowDirAndAccumulation()
+{
+  using namespace isocity;
+
+  // 3x3 deterministic heightfield with a single sink at (2,2).
+  // Heights decrease mostly to the right, then downward on the last column.
+  const int w = 3;
+  const int h = 3;
+  std::vector<float> heights = {
+      6.0f, 4.0f, 2.0f,
+      5.0f, 3.0f, 1.0f,
+      4.0f, 2.0f, 0.0f,
+  };
+
+  HydrologyField f = BuildHydrologyField(heights, w, h);
+  EXPECT_EQ(f.w, w);
+  EXPECT_EQ(f.h, h);
+  EXPECT_EQ(static_cast<int>(f.dir.size()), w * h);
+  EXPECT_EQ(static_cast<int>(f.accum.size()), w * h);
+
+  // Flow directions (linear indices) expected:
+  // (0,0)->(1,0)  (1,0)->(2,0)  (2,0)->(2,1)
+  // (0,1)->(1,1)  (1,1)->(2,1)  (2,1)->(2,2)
+  // (0,2)->(1,2)  (1,2)->(2,2)  (2,2)->sink
+  auto I = [&](int x, int y) { return y * w + x; };
+
+  EXPECT_EQ(f.dir[I(0, 0)], I(1, 0));
+  EXPECT_EQ(f.dir[I(1, 0)], I(2, 0));
+  EXPECT_EQ(f.dir[I(2, 0)], I(2, 1));
+  EXPECT_EQ(f.dir[I(0, 1)], I(1, 1));
+  EXPECT_EQ(f.dir[I(1, 1)], I(2, 1));
+  EXPECT_EQ(f.dir[I(2, 1)], I(2, 2));
+  EXPECT_EQ(f.dir[I(0, 2)], I(1, 2));
+  EXPECT_EQ(f.dir[I(1, 2)], I(2, 2));
+  EXPECT_EQ(f.dir[I(2, 2)], -1);
+
+  // Accumulation expected:
+  // sink (2,2) receives all 9 cells.
+  EXPECT_EQ(f.accum[I(2, 2)], 9);
+  EXPECT_EQ(f.maxAccum, 9);
+
+  // Confluence at (2,1): receives from (2,0) chain and (1,1) chain.
+  EXPECT_EQ(f.accum[I(2, 1)], 6);
+
+  BasinSegmentation basins = SegmentBasins(f.dir, w, h);
+  EXPECT_EQ(static_cast<int>(basins.basins.size()), 1);
+  EXPECT_EQ(basins.basins[0].sinkX, 2);
+  EXPECT_EQ(basins.basins[0].sinkY, 2);
+  EXPECT_EQ(basins.basins[0].area, 9);
+
+  for (int v : basins.basinId) {
+    EXPECT_EQ(v, 0);
+  }
+}
+
+
+
+
+
+
+
+void TestDepressionFillPriorityFloodSimpleBowl()
+{
+  using namespace isocity;
+
+  const int w = 3;
+  const int h = 3;
+  const std::vector<float> heights = {
+      1.0f, 1.0f, 1.0f,
+      1.0f, 0.0f, 1.0f,
+      1.0f, 1.0f, 1.0f,
+  };
+
+  const DepressionFillResult r = FillDepressionsPriorityFlood(heights, w, h);
+  EXPECT_EQ(r.w, w);
+  EXPECT_EQ(r.h, h);
+  EXPECT_EQ(static_cast<int>(r.filled.size()), w * h);
+  EXPECT_EQ(static_cast<int>(r.depth.size()), w * h);
+
+  const auto I = [&](int x, int y) { return y * w + x; };
+
+  // Center cell should fill to the spill height (1.0).
+  EXPECT_NEAR(r.filled[I(1, 1)], 1.0f, 1e-6f);
+  EXPECT_NEAR(r.depth[I(1, 1)], 1.0f, 1e-6f);
+
+  EXPECT_EQ(r.filledCells, 1);
+  EXPECT_NEAR(r.maxDepth, 1.0f, 1e-6f);
+  EXPECT_NEAR(r.volume, 1.0, 1e-6);
+}
+
+void TestDepressionFillRespectsLowEdgeOutlet()
+{
+  using namespace isocity;
+
+  const int w = 3;
+  const int h = 3;
+  const std::vector<float> heights = {
+      1.0f, 1.0f, 1.0f,
+      1.0f, 0.0f, 0.2f,
+      1.0f, 1.0f, 1.0f,
+  };
+
+  // The low right-edge outlet (2,1) should limit how high the center is filled.
+  const DepressionFillResult r = FillDepressionsPriorityFlood(heights, w, h);
+  const auto I = [&](int x, int y) { return y * w + x; };
+
+  EXPECT_NEAR(r.filled[I(1, 1)], 0.2f, 1e-6f);
+  EXPECT_NEAR(r.depth[I(1, 1)], 0.2f, 1e-6f);
+}
+
+void TestSeaFloodEdgeConnectivity()
+{
+  using namespace isocity;
+
+  const int w = 3;
+  const int h = 3;
+  const std::vector<float> heights = {
+      1.0f, 1.0f, 1.0f,
+      1.0f, 0.0f, 1.0f,
+      1.0f, 1.0f, 1.0f,
+  };
+
+  SeaFloodConfig cfg;
+  cfg.requireEdgeConnection = true;
+
+  // No boundary cell is floodable, so connectivity-based flooding shouldn't flood the center.
+  const SeaFloodResult r = ComputeSeaLevelFlood(heights, w, h, 0.5f, cfg);
+  EXPECT_EQ(r.floodedCells, 0);
+
+  cfg.requireEdgeConnection = false;
+  const SeaFloodResult r2 = ComputeSeaLevelFlood(heights, w, h, 0.5f, cfg);
+  EXPECT_EQ(r2.floodedCells, 1);
+
+  const auto I = [&](int x, int y) { return y * w + x; };
+  EXPECT_TRUE(r2.flooded[I(1, 1)] != 0);
+  EXPECT_NEAR(r2.depth[I(1, 1)], 0.5f, 1e-6f);
+}
+
+void TestLabelComponentsAboveThresholdSimple()
+{
+  using namespace isocity;
+
+  const int w = 4;
+  const int h = 4;
+  const std::vector<float> v = {
+      0.0f, 0.0f, 0.0f, 0.0f,
+      0.0f, 1.0f, 1.0f, 0.0f,
+      0.0f, 0.0f, 1.0f, 0.0f,
+      0.0f, 2.0f, 0.0f, 0.0f,
+  };
+
+  const ThresholdComponents comps = LabelComponentsAboveThreshold(v, w, h, 0.5f, false);
+  EXPECT_EQ(static_cast<int>(comps.components.size()), 2);
+
+  // First component: the 3-tile L-shape.
+  EXPECT_EQ(comps.components[0].label, 1);
+  EXPECT_EQ(comps.components[0].area, 3);
+  EXPECT_NEAR(comps.components[0].maxValue, 1.0f, 1e-6f);
+
+  // Second component: the single (1,3) tile.
+  EXPECT_EQ(comps.components[1].label, 2);
+  EXPECT_EQ(comps.components[1].area, 1);
+  EXPECT_NEAR(comps.components[1].maxValue, 2.0f, 1e-6f);
+}
+
+void TestContoursMarchingSquaresDiamondLoop()
+{
+  using namespace isocity;
+
+  // Corner grid (3x3) corresponds to a 2x2 tile cell area.
+  // We set only the center vertex high, creating a closed diamond contour at level 0.5.
+  const int cw = 3;
+  const int ch = 3;
+  std::vector<double> corner(static_cast<std::size_t>(cw) * static_cast<std::size_t>(ch), 0.0);
+  auto Idx = [&](int x, int y) { return y * cw + x; };
+  corner[static_cast<std::size_t>(Idx(1, 1))] = 1.0;
+
+  std::vector<double> levels = {0.5};
+
+  ContourConfig cfg;
+  cfg.quantize = 1e-6;
+  cfg.useAsymptoticDecider = true;
+  cfg.simplifyTolerance = 0.0;
+  cfg.minPoints = 2;
+
+  std::string err;
+  const std::vector<ContourLevel> res = ExtractContours(corner, cw, ch, levels, cfg, &err);
+  EXPECT_TRUE(err.empty());
+  EXPECT_EQ(static_cast<int>(res.size()), 1);
+
+  EXPECT_TRUE(std::abs(res[0].level - 0.5) < 1e-12);
+
+  int closedCount = 0;
+  const ContourPolyline* loop = nullptr;
+  for (const ContourPolyline& ln : res[0].lines) {
+    if (ln.closed) {
+      closedCount++;
+      loop = &ln;
+    }
+  }
+  EXPECT_EQ(closedCount, 1);
+  EXPECT_TRUE(loop != nullptr);
+
+  EXPECT_TRUE(loop->pts.size() >= 5);
+  EXPECT_TRUE(loop->pts.front() == loop->pts.back());
+
+  auto HasPoint = [&](double x, double y) {
+    for (const FPoint& p : loop->pts) {
+      if (std::abs(p.x - x) < 1e-6 && std::abs(p.y - y) < 1e-6) return true;
+    }
+    return false;
+  };
+
+  // Diamond around the center vertex.
+  EXPECT_TRUE(HasPoint(1.0, 0.5));
+  EXPECT_TRUE(HasPoint(0.5, 1.0));
+  EXPECT_TRUE(HasPoint(1.0, 1.5));
+  EXPECT_TRUE(HasPoint(1.5, 1.0));
+}
 
 
 void TestDistrictStatsCompute()
@@ -4385,6 +4814,126 @@ void TestMeshExportObjMtlBasic()
   }
 }
 
+void TestMeshExportObjMtlMergeTopSurfaces()
+{
+  using namespace isocity;
+
+  World w(4, 1, 123);
+  for (int x = 0; x < w.width(); ++x) {
+    Tile& t = w.at(x, 0);
+    t.terrain = Terrain::Grass;
+    t.overlay = Overlay::None;
+    t.height = 0.0f;
+  }
+
+  MeshExportConfig cfg;
+  cfg.mtlFileName = "test.mtl";
+  cfg.tileSize = 1.0f;
+  cfg.heightScale = 1.0f;
+  cfg.overlayOffset = 0.1f;
+  cfg.includeCliffs = false;
+  cfg.includeBuildings = false;
+  cfg.mergeTopSurfaces = true;
+
+  std::ostringstream obj;
+  std::ostringstream mtl;
+  MeshExportStats st;
+  std::string err;
+  EXPECT_TRUE(WriteWorldObjMtl(obj, mtl, w, cfg, &st, &err));
+  EXPECT_TRUE(err.empty());
+
+  // 4 grass tiles in a line should merge into a single quad.
+  EXPECT_EQ(st.vertices, 4ULL);
+  EXPECT_EQ(st.triangles, 2ULL);
+  EXPECT_TRUE(obj.str().find("usemtl mat_grass") != std::string::npos);
+}
+
+void TestMeshExportObjMtlMergeBuildings()
+{
+  using namespace isocity;
+
+  // Find a deterministic seed where the parcel builder merges two adjacent
+  // Residential tiles into a single 2x1 parcel.
+  std::uint64_t seedFound = 0;
+  ZoneBuildingParcels parcels;
+  for (std::uint64_t seed = 1; seed <= 4096; ++seed) {
+    World w(2, 1, seed);
+    for (int x = 0; x < 2; ++x) {
+      Tile& t = w.at(x, 0);
+      t.terrain = Terrain::Grass;
+      t.overlay = Overlay::Residential;
+      t.level = 2;
+      t.occupants = 10;
+      t.variation = 0xA0;
+      t.height = 0.0f;
+    }
+
+    BuildZoneBuildingParcels(w, parcels);
+    if (parcels.parcels.size() == 1 && parcels.parcels[0].w == 2 && parcels.parcels[0].h == 1) {
+      seedFound = seed;
+      break;
+    }
+  }
+
+  EXPECT_TRUE(seedFound != 0);
+  if (seedFound == 0) {
+    return;
+  }
+
+  World w(2, 1, seedFound);
+  for (int x = 0; x < 2; ++x) {
+    Tile& t = w.at(x, 0);
+    t.terrain = Terrain::Grass;
+    t.overlay = Overlay::Residential;
+    t.level = 2;
+    t.occupants = 10;
+    t.variation = 0xA0;
+    t.height = 0.0f;
+  }
+
+  MeshExportConfig cfg;
+  cfg.mtlFileName = "test.mtl";
+  cfg.tileSize = 1.0f;
+  cfg.heightScale = 1.0f;
+  cfg.overlayOffset = 0.1f;
+  cfg.includeTopSurfaces = false;
+  cfg.includeCliffs = false;
+  cfg.includeBuildings = true;
+
+  // First, verify the legacy per-tile behavior.
+  {
+    cfg.mergeBuildings = false;
+
+    std::ostringstream obj;
+    std::ostringstream mtl;
+    MeshExportStats st;
+    std::string err;
+    EXPECT_TRUE(WriteWorldObjMtl(obj, mtl, w, cfg, &st, &err));
+    EXPECT_TRUE(err.empty());
+
+    // 2 tiles => 2 independent box buildings.
+    // Each building is 5 quads => 20 vertices / 10 tris.
+    EXPECT_EQ(st.vertices, 40ULL);
+    EXPECT_EQ(st.triangles, 20ULL);
+  }
+
+  // Now enable mergeBuildings and confirm the parcel collapses into one building.
+  {
+    cfg.mergeBuildings = true;
+
+    std::ostringstream obj;
+    std::ostringstream mtl;
+    MeshExportStats st;
+    std::string err;
+    EXPECT_TRUE(WriteWorldObjMtl(obj, mtl, w, cfg, &st, &err));
+    EXPECT_TRUE(err.empty());
+
+    EXPECT_EQ(st.vertices, 20ULL);
+    EXPECT_EQ(st.triangles, 10ULL);
+    EXPECT_TRUE(obj.str().find("usemtl mat_building_res") != std::string::npos);
+  }
+}
+
 void TestGltfExportBasic()
 {
   using namespace isocity;
@@ -4532,6 +5081,51 @@ static void TestCityBlocksBasic()
   EXPECT_TRUE(r.tileToBlock[3] == 1);  // (3,0)
   EXPECT_TRUE(r.tileToBlock[4] == 1);  // (4,0)
 
+}
+
+static double SignedAreaTest(const std::vector<isocity::IPoint>& ring)
+{
+  if (ring.size() < 4) return 0.0;
+  long long acc = 0;
+  for (std::size_t i = 0; i + 1 < ring.size(); ++i) {
+    acc += static_cast<long long>(ring[i].x) * static_cast<long long>(ring[i + 1].y) -
+           static_cast<long long>(ring[i + 1].x) * static_cast<long long>(ring[i].y);
+  }
+  return static_cast<double>(acc) * 0.5;
+}
+
+static void TestVectorizeLabelGridWithHole()
+{
+  using namespace isocity;
+
+  // 3x3 label grid with a 1-tile "lake" hole in the center.
+  const int w = 3;
+  const int h = 3;
+  std::vector<int> labels(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), 1);
+  labels[static_cast<std::size_t>(1) * static_cast<std::size_t>(w) + 1] = -1;
+
+  std::vector<LabeledGeometry> out;
+  VectorizeStats st;
+  std::string err;
+  EXPECT_TRUE(VectorizeLabelGridToPolygons(labels, w, h, -1, out, &st, &err));
+  EXPECT_TRUE(err.empty());
+
+  EXPECT_EQ(out.size(), static_cast<std::size_t>(1));
+  EXPECT_EQ(out[0].label, 1);
+  EXPECT_EQ(out[0].geom.polygons.size(), static_cast<std::size_t>(1));
+
+  const VectorPolygon& poly = out[0].geom.polygons[0];
+  EXPECT_TRUE(!poly.outer.empty());
+  EXPECT_EQ(poly.outer.front(), poly.outer.back());
+  EXPECT_EQ(poly.outer.size(), static_cast<std::size_t>(5)); // rectangle 0,0 .. 3,3
+
+  EXPECT_EQ(poly.holes.size(), static_cast<std::size_t>(1));
+  EXPECT_EQ(poly.holes[0].front(), poly.holes[0].back());
+  EXPECT_EQ(poly.holes[0].size(), static_cast<std::size_t>(5)); // square 1,1 .. 2,2
+
+  // Validate areas (sign depends on orientation; magnitudes should match).
+  EXPECT_NEAR(std::abs(SignedAreaTest(poly.outer)), 9.0, 1e-9);
+  EXPECT_NEAR(std::abs(SignedAreaTest(poly.holes[0])), 1.0, 1e-9);
 }
 
 
@@ -4891,6 +5485,52 @@ void TestRoadBuildPathBetweenSetsRespectsBlockedMoves()
   }
 }
 
+void TestParkOptimizerSuggestsParksInUnderservedAreas()
+{
+  using namespace isocity;
+
+  // A simple 7x5 world with a horizontal road spine and two residential clusters.
+  // We place an existing park near the left cluster, then ask the optimizer to add 1 park.
+  // The greedy score should pick the right cluster as it is farthest (and has demand).
+
+  World world(7, 5, 123);
+  world.stats().money = 100000;
+
+  // Road spine at y=2 from x=0..6 (touches the map edge, so it satisfies the outside rule).
+  for (int x = 0; x < world.width(); ++x) {
+    EXPECT_EQ(world.applyRoad(x, 2, 1), ToolApplyResult::Applied);
+  }
+
+  // Existing park near the left.
+  EXPECT_EQ(world.applyTool(Tool::Park, 1, 1), ToolApplyResult::Applied);
+
+  // Residential demand near the right.
+  EXPECT_EQ(world.applyTool(Tool::Residential, 4, 1), ToolApplyResult::Applied);
+  EXPECT_EQ(world.applyTool(Tool::Residential, 5, 1), ToolApplyResult::Applied);
+  world.at(4, 1).occupants = 100;
+  world.at(5, 1).occupants = 100;
+
+  ParkOptimizerConfig cfg;
+  cfg.requireOutsideConnection = true;
+  cfg.weightMode = IsochroneWeightMode::Steps;
+  cfg.demandMode = ParkDemandMode::Occupants;
+  cfg.includeResidential = true;
+  cfg.includeCommercial = false;
+  cfg.includeIndustrial = false;
+  cfg.parksToAdd = 1;
+
+  const ParkOptimizerResult r = SuggestParkPlacements(world, cfg);
+  EXPECT_EQ(r.placements.size(), static_cast<std::size_t>(1));
+
+  // Expect the suggested park to be placed adjacent to the right-side access road.
+  // The candidate search order is N,E,S,W; since (5,1) is occupied by a zone and (6,2) is road,
+  // the chosen buildable park tile adjacent to road (5,2) is (5,3).
+  EXPECT_EQ(r.placements[0].accessRoad.x, 5);
+  EXPECT_EQ(r.placements[0].accessRoad.y, 2);
+  EXPECT_EQ(r.placements[0].parkTile.x, 5);
+  EXPECT_EQ(r.placements[0].parkTile.y, 3);
+}
+
 
 void TestPolicyOptimizerExhaustivePrefersLowMaintenanceWhenNoRevenue()
 {
@@ -4977,6 +5617,7 @@ int main()
   TestSaveLoadDetectsCorruption();
   TestOutsideConnectionAffectsZoneAccess();
   TestZoneAccessMapAllowsInteriorTilesViaZoneConnectivity();
+  TestIsochroneTileAccessCostsRespectInteriorZoneAccess();
   TestSimulatorStepInvariants();
   TestEmploymentCountsOnlyAccessibleJobs();
   TestRoadPathfindingToEdge();
@@ -4988,6 +5629,7 @@ int main()
   TestTrafficPrefersHighSpeedRoadsWhenStepsTie();
   TestTrafficUnreachableAcrossDisconnectedEdgeComponents();
   TestGoodsIndustrySuppliesCommercial();
+  TestGoodsFlowDebugOdCapturesLocalDeliveries();
   TestGoodsSplitsDemandAcrossMultipleProducers();
   TestGoodsImportsWhenNoIndustry();
   TestGoodsUnreachableDemandWhenNoImports();
@@ -5020,7 +5662,17 @@ int main()
   TestExportPpmLayers();
   TestExportIsoOverview();
   TestPpmReadWriteAndCompare();
+  TestHeightmapApplyReclassifyAndBulldoze();
+  TestHeightmapApplyResampleNearest();
+  TestHydrologyFlowDirAndAccumulation();
+  TestDepressionFillPriorityFloodSimpleBowl();
+  TestDepressionFillRespectsLowEdgeOutlet();
+  TestSeaFloodEdgeConnectivity();
+  TestLabelComponentsAboveThresholdSimple();
+  TestContoursMarchingSquaresDiamondLoop();
   TestMeshExportObjMtlBasic();
+  TestMeshExportObjMtlMergeTopSurfaces();
+  TestMeshExportObjMtlMergeBuildings();
   TestGltfExportBasic();
   TestWorldTransformRotateMirrorCrop();
 
@@ -5028,6 +5680,7 @@ int main()
   TestBrushRasterShapes();
   TestFloodFillRegions();
   TestCityBlocksBasic();
+  TestVectorizeLabelGridWithHole();
   TestCityBlockGraphFrontageAndAdjacency();
   TestBlockDistrictingDisconnectedComponents();
   TestRoadGraphTrafficAggregationSimpleLine();
@@ -5036,6 +5689,7 @@ int main()
   TestRoadGraphResilienceFindsBridgesAndArticulations();
   TestRoadGraphCentralityStarGraph();
   TestRoadBuildPathBetweenSetsRespectsBlockedMoves();
+  TestParkOptimizerSuggestsParksInUnderservedAreas();
   TestAutoBuildDeterminism();
   TestScriptRunnerBasic();
   TestScriptRunnerVarsAndExpr();

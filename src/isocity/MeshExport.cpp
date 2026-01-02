@@ -1,68 +1,23 @@
 #include "isocity/MeshExport.hpp"
 
-#include "isocity/ZoneMetrics.hpp"
+#include "isocity/WorldMeshBuilder.hpp"
 
 #include <algorithm>
-#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <ios>
-#include <limits>
 #include <ostream>
-#include <sstream>
 #include <string>
 
 namespace isocity {
 
 namespace {
 
-struct V3 {
-  float x = 0.0f;
-  float y = 0.0f;
-  float z = 0.0f;
-};
-
 inline float ClampF(float v, float lo, float hi)
 {
   return std::max(lo, std::min(hi, v));
-}
-
-inline int ClampI(int v, int lo, int hi)
-{
-  return std::max(lo, std::min(hi, v));
-}
-
-const char* SurfaceMaterialForTile(const Tile& t)
-{
-  // Overlays take precedence so exports are visually legible.
-  switch (t.overlay) {
-    case Overlay::Road: return "mat_road";
-    case Overlay::Residential: return "mat_res";
-    case Overlay::Commercial: return "mat_com";
-    case Overlay::Industrial: return "mat_ind";
-    case Overlay::Park: return "mat_park";
-    case Overlay::None: break;
-  }
-
-  switch (t.terrain) {
-    case Terrain::Water: return "mat_water";
-    case Terrain::Sand: return "mat_sand";
-    case Terrain::Grass: return "mat_grass";
-  }
-
-  return "mat_grass";
-}
-
-const char* BuildingMaterialForTile(const Tile& t)
-{
-  switch (t.overlay) {
-    case Overlay::Residential: return "mat_building_res";
-    case Overlay::Commercial: return "mat_building_com";
-    case Overlay::Industrial: return "mat_building_ind";
-    default: return "mat_building";
-  }
 }
 
 void WriteMaterial(std::ostream& mtl, const char* name, float r, float g, float b)
@@ -94,7 +49,7 @@ struct ObjWriter {
     obj << "usemtl " << name << "\n";
   }
 
-  std::uint64_t AddVertex(const V3& v)
+  std::uint64_t AddVertex(const MeshV3& v)
   {
     obj << "v " << std::fixed << std::setprecision(6) << v.x << ' ' << v.y << ' ' << v.z << "\n";
     if (stats) stats->vertices++;
@@ -107,7 +62,7 @@ struct ObjWriter {
     if (stats) stats->triangles++;
   }
 
-  void AddQuad(const V3& a, const V3& b, const V3& c, const V3& d)
+  void AddQuad(const MeshV3& a, const MeshV3& b, const MeshV3& c, const MeshV3& d)
   {
     const std::uint64_t i0 = AddVertex(a);
     const std::uint64_t i1 = AddVertex(b);
@@ -118,46 +73,19 @@ struct ObjWriter {
   }
 };
 
-bool ValidateAndComputeBounds(const World& world, const MeshExportConfig& cfg,
-                              int& outX0, int& outY0, int& outX1, int& outY1,
-                              int& outOriginX, int& outOriginY,
-                              std::string* outError)
-{
-  const int w = world.width();
-  const int h = world.height();
-  if (w <= 0 || h <= 0) {
-    if (outError) *outError = "world has invalid dimensions";
-    return false;
+class ObjSink final : public IMeshSink {
+public:
+  explicit ObjSink(ObjWriter& w) : writer_(w) {}
+
+  void addQuad(const MeshQuad& q) override
+  {
+    writer_.UseMaterial(ObjMaterialName(q.material));
+    writer_.AddQuad(q.a, q.b, q.c, q.d);
   }
 
-  int x0 = 0;
-  int y0 = 0;
-  int x1 = w;
-  int y1 = h;
-
-  if (cfg.hasCrop) {
-    if (cfg.cropW <= 0 || cfg.cropH <= 0) {
-      if (outError) *outError = "cropW/cropH must be positive";
-      return false;
-    }
-    x0 = ClampI(cfg.cropX, 0, w);
-    y0 = ClampI(cfg.cropY, 0, h);
-    x1 = ClampI(cfg.cropX + cfg.cropW, 0, w);
-    y1 = ClampI(cfg.cropY + cfg.cropH, 0, h);
-    if (x1 <= x0 || y1 <= y0) {
-      if (outError) *outError = "crop rectangle is empty after clamping";
-      return false;
-    }
-  }
-
-  outX0 = x0;
-  outY0 = y0;
-  outX1 = x1;
-  outY1 = y1;
-  outOriginX = (cfg.hasCrop && cfg.originAtCrop) ? x0 : 0;
-  outOriginY = (cfg.hasCrop && cfg.originAtCrop) ? y0 : 0;
-  return true;
-}
+private:
+  ObjWriter& writer_;
+};
 
 } // namespace
 
@@ -167,16 +95,12 @@ bool WriteWorldObjMtl(std::ostream& objOut, std::ostream& mtlOut, const World& w
   if (outError) outError->clear();
   if (outStats) *outStats = {};
 
+  // Validate config early so we don't write partial outputs on error.
   int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
   int originX = 0, originY = 0;
-  if (!ValidateAndComputeBounds(world, cfg, x0, y0, x1, y1, originX, originY, outError)) {
+  if (!ComputeMeshExportBounds(world, cfg, x0, y0, x1, y1, originX, originY, outError)) {
     return false;
   }
-
-  const float tileSize = (cfg.tileSize > 0.0f) ? cfg.tileSize : 1.0f;
-  const float hScale = cfg.heightScale;
-  const float overlayOff = cfg.overlayOffset;
-  const float cliffThr = std::max(0.0f, cfg.cliffThreshold);
 
   // --- MTL ---
   // Keep materials stable: same names across versions, so downstream tooling can cache.
@@ -208,120 +132,10 @@ bool WriteWorldObjMtl(std::ostream& objOut, std::ostream& mtlOut, const World& w
   objOut << "o " << objName << "\n";
 
   ObjWriter w(objOut, outStats);
+  ObjSink sink(w);
 
-  // --- Top surfaces ---
-  if (cfg.includeTopSurfaces) {
-    for (int y = y0; y < y1; ++y) {
-      for (int x = x0; x < x1; ++x) {
-        const Tile& t = world.at(x, y);
-        const float baseH = t.height * hScale;
-        const float topY = baseH + ((t.overlay != Overlay::None) ? overlayOff : 0.0f);
-
-        const float fx0 = static_cast<float>(x - originX) * tileSize;
-        const float fx1 = static_cast<float>(x + 1 - originX) * tileSize;
-        const float fz0 = static_cast<float>(y - originY) * tileSize;
-        const float fz1 = static_cast<float>(y + 1 - originY) * tileSize;
-
-        w.UseMaterial(SurfaceMaterialForTile(t));
-        w.AddQuad(V3{fx0, topY, fz0}, V3{fx1, topY, fz0}, V3{fx1, topY, fz1}, V3{fx0, topY, fz1});
-      }
-    }
-  }
-
-  // --- Cliffs (vertical walls on height discontinuities) ---
-  if (cfg.includeCliffs) {
-    w.UseMaterial("mat_cliff");
-
-    auto hAt = [&](int x, int y) -> float {
-      if (!world.inBounds(x, y)) return 0.0f;
-      return world.at(x, y).height * hScale;
-    };
-
-    for (int y = y0; y < y1; ++y) {
-      for (int x = x0; x < x1; ++x) {
-        const float h0 = hAt(x, y);
-
-        const float fx0 = static_cast<float>(x - originX) * tileSize;
-        const float fx1 = static_cast<float>(x + 1 - originX) * tileSize;
-        const float fz0 = static_cast<float>(y - originY) * tileSize;
-        const float fz1 = static_cast<float>(y + 1 - originY) * tileSize;
-
-        // Right boundary (x+1).
-        if (x + 1 < x1) {
-          const float h1 = hAt(x + 1, y);
-          const float dh = h0 - h1;
-          if (std::fabs(dh) > cliffThr) {
-            const float top = std::max(h0, h1);
-            const float bot = std::min(h0, h1);
-            const float xp = fx1;
-            // Wall runs along Z.
-            w.AddQuad(V3{xp, top, fz0}, V3{xp, top, fz1}, V3{xp, bot, fz1}, V3{xp, bot, fz0});
-          }
-        }
-
-        // Bottom boundary (y+1).
-        if (y + 1 < y1) {
-          const float h1 = hAt(x, y + 1);
-          const float dh = h0 - h1;
-          if (std::fabs(dh) > cliffThr) {
-            const float top = std::max(h0, h1);
-            const float bot = std::min(h0, h1);
-            const float zp = fz1;
-            // Wall runs along X.
-            w.AddQuad(V3{fx0, top, zp}, V3{fx1, top, zp}, V3{fx1, bot, zp}, V3{fx0, bot, zp});
-          }
-        }
-      }
-    }
-  }
-
-  // --- Buildings ---
-  if (cfg.includeBuildings) {
-    const float footprint = ClampF(cfg.buildingFootprint, 0.20f, 0.95f);
-    const float margin = 0.5f * (1.0f - footprint) * tileSize;
-
-    for (int y = y0; y < y1; ++y) {
-      for (int x = x0; x < x1; ++x) {
-        const Tile& t = world.at(x, y);
-        if (t.overlay != Overlay::Residential && t.overlay != Overlay::Commercial && t.overlay != Overlay::Industrial) {
-          continue;
-        }
-
-        const float baseH = t.height * hScale;
-        const float baseY = baseH + overlayOff + 0.001f;
-
-        const int cap = CapacityForTile(t);
-        const float occ = (cap > 0) ? ClampF(static_cast<float>(t.occupants) / static_cast<float>(cap), 0.0f, 1.0f) : 0.0f;
-
-        const int lvl = ClampZoneLevel(static_cast<int>(t.level));
-        const float var01 = static_cast<float>((t.variation >> 4) & 0x0Fu) / 15.0f;
-        const float height = tileSize * (cfg.buildingBaseHeight + cfg.buildingPerLevelHeight * static_cast<float>(lvl) +
-                                         cfg.buildingOccHeight * occ + 0.25f * var01);
-
-        const float fx0 = static_cast<float>(x - originX) * tileSize + margin;
-        const float fx1 = static_cast<float>(x + 1 - originX) * tileSize - margin;
-        const float fz0 = static_cast<float>(y - originY) * tileSize + margin;
-        const float fz1 = static_cast<float>(y + 1 - originY) * tileSize - margin;
-
-        const float y0b = baseY;
-        const float y1b = baseY + std::max(0.05f * tileSize, height);
-
-        w.UseMaterial(BuildingMaterialForTile(t));
-
-        // Roof (top face).
-        w.AddQuad(V3{fx0, y1b, fz0}, V3{fx1, y1b, fz0}, V3{fx1, y1b, fz1}, V3{fx0, y1b, fz1});
-
-        // Sides.
-        // North (z0)
-        w.AddQuad(V3{fx0, y1b, fz0}, V3{fx1, y1b, fz0}, V3{fx1, y0b, fz0}, V3{fx0, y0b, fz0});
-        // South (z1)
-        w.AddQuad(V3{fx0, y1b, fz1}, V3{fx1, y1b, fz1}, V3{fx1, y0b, fz1}, V3{fx0, y0b, fz1});
-        // West (x0)
-        w.AddQuad(V3{fx0, y1b, fz0}, V3{fx0, y1b, fz1}, V3{fx0, y0b, fz1}, V3{fx0, y0b, fz0});
-        // East (x1)
-        w.AddQuad(V3{fx1, y1b, fz0}, V3{fx1, y1b, fz1}, V3{fx1, y0b, fz1}, V3{fx1, y0b, fz0});
-      }
-    }
+  if (!BuildWorldMeshQuads(world, cfg, sink, outError)) {
+    return false;
   }
 
   // Flush errors.

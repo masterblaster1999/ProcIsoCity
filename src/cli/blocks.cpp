@@ -1,7 +1,9 @@
 #include "isocity/CityBlocks.hpp"
 #include "isocity/Export.hpp"
+#include "isocity/GeoJsonExport.hpp"
 #include "isocity/ProcGen.hpp"
 #include "isocity/SaveLoad.hpp"
+#include "isocity/Vectorize.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -89,6 +91,7 @@ void PrintHelp()
       << "Usage:\n"
       << "  proc_isocity_blocks [--load <save.bin>] [--seed <u64>] [--size <WxH>]\n"
       << "                    [--json <out.json>] [--csv <out.csv>] [--tile-csv <out.csv>]\n"
+      << "                    [--geojson <out.geojson>]\n"
       << "                    [--ppm <out.ppm>] [--ppm-scale <N>]\n\n"
       << "Inputs:\n"
       << "  --load <save.bin>   Load a save file (overrides --seed/--size).\n"
@@ -98,6 +101,7 @@ void PrintHelp()
       << "  --json <out.json>       Write a JSON summary.\n"
       << "  --csv <out.csv>         Write a per-block CSV summary.\n"
       << "  --tile-csv <out.csv>    Write a per-tile block-id CSV grid (-1 for road/water).\n"
+      << "  --geojson <out.geojson> Write GeoJSON polygons per block (tile-corner coords).\n"
       << "  --ppm <out.ppm>         Write a debug PPM label image.\n"
       << "  --ppm-scale <N>         Upscale factor for PPM (nearest; default: 4).\n";
 }
@@ -237,6 +241,71 @@ bool WritePpmLabels(const std::string& path, const isocity::World& world, const 
   return true;
 }
 
+bool WriteGeoJson(const std::string& path, const isocity::World& world, const isocity::CityBlocksResult& r)
+{
+  using namespace isocity;
+
+  std::ofstream f(path);
+  if (!f) return false;
+
+  std::vector<LabeledGeometry> geoms;
+  VectorizeStats st;
+  std::string err;
+  if (!VectorizeLabelGridToPolygons(r.tileToBlock, r.w, r.h, -1, geoms, &st, &err)) {
+    std::cerr << "Failed to vectorize blocks: " << err << "\n";
+    return false;
+  }
+
+  // Features are keyed by block id.
+  // The vectorizer outputs a sorted label list; we'll walk it with an index.
+  std::size_t gi = 0;
+
+  f << "{\n";
+  f << "  \"type\": \"FeatureCollection\",\n";
+  f << "  \"name\": \"blocks\",\n";
+  f << "  \"properties\": {\"width\": " << r.w << ", \"height\": " << r.h << ", \"seed\": " << world.seed()
+    << "},\n";
+  f << "  \"features\": [\n";
+
+  bool firstFeature = true;
+  for (const CityBlock& b : r.blocks) {
+    // Find geometry for this block id.
+    while (gi < geoms.size() && geoms[gi].label < b.id) gi++;
+    const VectorMultiPolygon* mp = nullptr;
+    if (gi < geoms.size() && geoms[gi].label == b.id) mp = &geoms[gi].geom;
+    if (!mp || mp->polygons.empty()) continue;
+
+    if (!firstFeature) f << ",\n";
+    firstFeature = false;
+
+    f << "    {\n";
+    f << "      \"type\": \"Feature\",\n";
+    f << "      \"properties\": {";
+    f << "\"id\": " << b.id;
+    f << ", \"area\": " << b.area;
+    f << ", \"bounds\": [" << b.minX << "," << b.minY << "," << b.maxX << "," << b.maxY << "]";
+    f << ", \"roadEdges\": " << b.roadEdges;
+    f << ", \"waterEdges\": " << b.waterEdges;
+    f << ", \"outsideEdges\": " << b.outsideEdges;
+    f << ", \"roadAdjTiles\": " << b.roadAdjTiles;
+    f << ", \"parks\": " << b.parks;
+    f << ", \"residential\": " << b.residential;
+    f << ", \"commercial\": " << b.commercial;
+    f << ", \"industrial\": " << b.industrial;
+    f << ", \"other\": " << b.other;
+    f << "},\n";
+
+    f << "      \"geometry\": ";
+    WriteGeoJsonGeometry(f, *mp);
+    f << "\n";
+    f << "    }";
+  }
+
+  f << "\n  ]\n";
+  f << "}\n";
+  return true;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -247,6 +316,7 @@ int main(int argc, char** argv)
   std::string jsonPath;
   std::string csvPath;
   std::string tileCsvPath;
+  std::string geojsonPath;
   std::string ppmPath;
 
   std::uint64_t seed = 1;
@@ -299,6 +369,11 @@ int main(int argc, char** argv)
         std::cerr << "--tile-csv requires a path\n";
         return 2;
       }
+    } else if (arg == "--geojson") {
+      if (!requireValue(i, geojsonPath)) {
+        std::cerr << "--geojson requires a path\n";
+        return 2;
+      }
     } else if (arg == "--ppm") {
       if (!requireValue(i, ppmPath)) {
         std::cerr << "--ppm requires a path\n";
@@ -318,8 +393,8 @@ int main(int argc, char** argv)
   }
 
   // Default outputs if none specified.
-  if (jsonPath.empty() && csvPath.empty() && tileCsvPath.empty() && ppmPath.empty()) {
-    std::cerr << "No outputs specified. Use --json/--csv/--tile-csv/--ppm.\n";
+  if (jsonPath.empty() && csvPath.empty() && tileCsvPath.empty() && geojsonPath.empty() && ppmPath.empty()) {
+    std::cerr << "No outputs specified. Use --json/--csv/--tile-csv/--geojson/--ppm.\n";
     PrintHelp();
     return 2;
   }
@@ -358,6 +433,13 @@ int main(int argc, char** argv)
   if (!tileCsvPath.empty()) {
     if (!WriteTileCsv(tileCsvPath, r)) {
       std::cerr << "Failed to write tile CSV: " << tileCsvPath << "\n";
+      return 2;
+    }
+  }
+
+  if (!geojsonPath.empty()) {
+    if (!WriteGeoJson(geojsonPath, world, r)) {
+      std::cerr << "Failed to write GeoJSON: " << geojsonPath << "\n";
       return 2;
     }
   }

@@ -1,10 +1,9 @@
 #include "isocity/GltfExport.hpp"
 
 #include "isocity/Json.hpp"
-#include "isocity/ZoneMetrics.hpp"
+#include "isocity/WorldMeshBuilder.hpp"
 
 #include <algorithm>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -21,78 +20,9 @@ namespace isocity {
 
 namespace {
 
-struct V3 {
-  float x = 0.0f;
-  float y = 0.0f;
-  float z = 0.0f;
-};
-
-struct N3 {
-  float x = 0.0f;
-  float y = 1.0f;
-  float z = 0.0f;
-};
-
-struct C4 {
-  std::uint8_t r = 255;
-  std::uint8_t g = 255;
-  std::uint8_t b = 255;
-  std::uint8_t a = 255;
-};
-
-inline float ClampF(float v, float lo, float hi) { return std::max(lo, std::min(hi, v)); }
-
-inline int ClampI(int v, int lo, int hi) { return std::max(lo, std::min(hi, v)); }
-
-inline std::uint8_t ToU8(float f01)
-{
-  const float c = ClampF(f01, 0.0f, 1.0f);
-  const int v = static_cast<int>(std::lround(c * 255.0f));
-  return static_cast<std::uint8_t>(ClampI(v, 0, 255));
-}
-
-inline C4 RGB(float r, float g, float b)
-{
-  return C4{ToU8(r), ToU8(g), ToU8(b), 255};
-}
-
-C4 SurfaceColorForTile(const Tile& t)
-{
-  // Match the OBJ exporter palette so outputs are visually consistent.
-  switch (t.overlay) {
-    case Overlay::Road: return RGB(0.20f, 0.20f, 0.22f);
-    case Overlay::Residential: return RGB(0.25f, 0.80f, 0.35f);
-    case Overlay::Commercial: return RGB(0.25f, 0.55f, 0.95f);
-    case Overlay::Industrial: return RGB(0.95f, 0.55f, 0.20f);
-    case Overlay::Park: return RGB(0.15f, 0.85f, 0.15f);
-    case Overlay::None: break;
-  }
-
-  switch (t.terrain) {
-    case Terrain::Water: return RGB(0.10f, 0.35f, 0.90f);
-    case Terrain::Sand: return RGB(0.85f, 0.80f, 0.45f);
-    case Terrain::Grass: return RGB(0.20f, 0.70f, 0.20f);
-  }
-
-  return RGB(0.20f, 0.70f, 0.20f);
-}
-
-C4 CliffColor() { return RGB(0.45f, 0.35f, 0.25f); }
-
-C4 BuildingColorForTile(const Tile& t)
-{
-  switch (t.overlay) {
-    case Overlay::Residential: return RGB(0.70f, 0.90f, 0.75f);
-    case Overlay::Commercial: return RGB(0.65f, 0.75f, 0.95f);
-    case Overlay::Industrial: return RGB(0.95f, 0.75f, 0.55f);
-    default: break;
-  }
-  return RGB(0.75f, 0.75f, 0.75f);
-}
-
 struct MeshArrays {
-  std::vector<float> pos;      // x,y,z
-  std::vector<float> nrm;      // x,y,z
+  std::vector<float> pos;        // x,y,z
+  std::vector<float> nrm;        // x,y,z
   std::vector<std::uint8_t> col; // r,g,b,a (normalized)
   std::vector<std::uint32_t> idx;
 
@@ -103,7 +33,7 @@ struct MeshArrays {
   float maxY = -std::numeric_limits<float>::infinity();
   float maxZ = -std::numeric_limits<float>::infinity();
 
-  void addVertex(const V3& p, const N3& n, const C4& c)
+  void addVertex(const MeshV3& p, const MeshN3& n, const MeshC4& c)
   {
     pos.push_back(p.x);
     pos.push_back(p.y);
@@ -126,13 +56,14 @@ struct MeshArrays {
     maxZ = std::max(maxZ, p.z);
   }
 
-  void addQuad(const V3& a, const V3& b, const V3& c, const V3& d, const N3& n, const C4& color)
+  void addQuad(const MeshQuad& q)
   {
     const std::uint32_t base = static_cast<std::uint32_t>(pos.size() / 3);
-    addVertex(a, n, color);
-    addVertex(b, n, color);
-    addVertex(c, n, color);
-    addVertex(d, n, color);
+
+    addVertex(q.a, q.n, q.color);
+    addVertex(q.b, q.n, q.color);
+    addVertex(q.c, q.n, q.color);
+    addVertex(q.d, q.n, q.color);
 
     // Match OBJ winding: (0,1,2) and (0,2,3)
     idx.push_back(base + 0);
@@ -144,178 +75,27 @@ struct MeshArrays {
   }
 };
 
-bool ValidateAndComputeBounds(const World& world, const MeshExportConfig& cfg,
-                              int& outX0, int& outY0, int& outX1, int& outY1,
-                              int& outOriginX, int& outOriginY,
-                              std::string* outError)
-{
-  const int w = world.width();
-  const int h = world.height();
-  if (w <= 0 || h <= 0) {
-    if (outError) *outError = "world has invalid dimensions";
-    return false;
-  }
+class GltfMeshSink final : public IMeshSink {
+public:
+  explicit GltfMeshSink(MeshArrays& arrays) : arrays_(arrays) {}
 
-  int x0 = 0;
-  int y0 = 0;
-  int x1 = w;
-  int y1 = h;
+  void addQuad(const MeshQuad& q) override { arrays_.addQuad(q); }
 
-  if (cfg.hasCrop) {
-    if (cfg.cropW <= 0 || cfg.cropH <= 0) {
-      if (outError) *outError = "cropW/cropH must be positive";
-      return false;
-    }
-    x0 = ClampI(cfg.cropX, 0, w);
-    y0 = ClampI(cfg.cropY, 0, h);
-    x1 = ClampI(cfg.cropX + cfg.cropW, 0, w);
-    y1 = ClampI(cfg.cropY + cfg.cropH, 0, h);
-    if (x1 <= x0 || y1 <= y0) {
-      if (outError) *outError = "crop rectangle is empty after clamping";
-      return false;
-    }
-  }
-
-  outX0 = x0;
-  outY0 = y0;
-  outX1 = x1;
-  outY1 = y1;
-  outOriginX = (cfg.hasCrop && cfg.originAtCrop) ? x0 : 0;
-  outOriginY = (cfg.hasCrop && cfg.originAtCrop) ? y0 : 0;
-  return true;
-}
+private:
+  MeshArrays& arrays_;
+};
 
 MeshArrays BuildMeshArrays(const World& world, const MeshExportConfig& cfg, MeshExportStats* outStats)
 {
   if (outStats) *outStats = {};
 
-  int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
-  int originX = 0, originY = 0;
-  std::string err;
-  // Validation done by caller; this is just to get bounds.
-  (void)ValidateAndComputeBounds(world, cfg, x0, y0, x1, y1, originX, originY, &err);
-
-  const float tileSize = (cfg.tileSize > 0.0f) ? cfg.tileSize : 1.0f;
-  const float hScale = cfg.heightScale;
-  const float overlayOff = cfg.overlayOffset;
-  const float cliffThr = std::max(0.0f, cfg.cliffThreshold);
-
   MeshArrays m;
+  GltfMeshSink sink(m);
 
-  // --- Top surfaces ---
-  if (cfg.includeTopSurfaces) {
-    const N3 up{0.0f, 1.0f, 0.0f};
-    for (int y = y0; y < y1; ++y) {
-      for (int x = x0; x < x1; ++x) {
-        const Tile& t = world.at(x, y);
-        const float baseH = t.height * hScale;
-        const float topY = baseH + ((t.overlay != Overlay::None) ? overlayOff : 0.0f);
-
-        const float fx0 = static_cast<float>(x - originX) * tileSize;
-        const float fx1 = static_cast<float>(x + 1 - originX) * tileSize;
-        const float fz0 = static_cast<float>(y - originY) * tileSize;
-        const float fz1 = static_cast<float>(y + 1 - originY) * tileSize;
-
-        const C4 c = SurfaceColorForTile(t);
-        m.addQuad(V3{fx0, topY, fz0}, V3{fx1, topY, fz0}, V3{fx1, topY, fz1}, V3{fx0, topY, fz1}, up, c);
-      }
-    }
-  }
-
-  // --- Cliffs ---
-  if (cfg.includeCliffs) {
-    const C4 c = CliffColor();
-
-    auto hAt = [&](int x, int y) -> float {
-      if (!world.inBounds(x, y)) return 0.0f;
-      return world.at(x, y).height * hScale;
-    };
-
-    for (int y = y0; y < y1; ++y) {
-      for (int x = x0; x < x1; ++x) {
-        const float h0 = hAt(x, y);
-
-        const float fx0 = static_cast<float>(x - originX) * tileSize;
-        const float fx1 = static_cast<float>(x + 1 - originX) * tileSize;
-        const float fz0 = static_cast<float>(y - originY) * tileSize;
-        const float fz1 = static_cast<float>(y + 1 - originY) * tileSize;
-
-        // Right boundary (x+1): vertical wall at X=fx1.
-        if (x + 1 < x1) {
-          const float h1 = hAt(x + 1, y);
-          const float dh = h0 - h1;
-          if (std::fabs(dh) > cliffThr) {
-            const float top = std::max(h0, h1);
-            const float bot = std::min(h0, h1);
-            const float xp = fx1;
-            const N3 n{(dh > 0.0f) ? 1.0f : -1.0f, 0.0f, 0.0f};
-            m.addQuad(V3{xp, top, fz0}, V3{xp, top, fz1}, V3{xp, bot, fz1}, V3{xp, bot, fz0}, n, c);
-          }
-        }
-
-        // Bottom boundary (y+1): vertical wall at Z=fz1.
-        if (y + 1 < y1) {
-          const float h1 = hAt(x, y + 1);
-          const float dh = h0 - h1;
-          if (std::fabs(dh) > cliffThr) {
-            const float top = std::max(h0, h1);
-            const float bot = std::min(h0, h1);
-            const float zp = fz1;
-            const N3 n{0.0f, 0.0f, (dh > 0.0f) ? 1.0f : -1.0f};
-            m.addQuad(V3{fx0, top, zp}, V3{fx1, top, zp}, V3{fx1, bot, zp}, V3{fx0, bot, zp}, n, c);
-          }
-        }
-      }
-    }
-  }
-
-  // --- Buildings ---
-  if (cfg.includeBuildings) {
-    const float footprint = ClampF(cfg.buildingFootprint, 0.20f, 0.95f);
-    const float margin = 0.5f * (1.0f - footprint) * tileSize;
-
-    for (int y = y0; y < y1; ++y) {
-      for (int x = x0; x < x1; ++x) {
-        const Tile& t = world.at(x, y);
-        if (t.overlay != Overlay::Residential && t.overlay != Overlay::Commercial && t.overlay != Overlay::Industrial) {
-          continue;
-        }
-
-        const float baseH = t.height * hScale;
-        const float baseY = baseH + overlayOff + 0.001f;
-
-        const int cap = CapacityForTile(t);
-        const float occ = (cap > 0) ? ClampF(static_cast<float>(t.occupants) / static_cast<float>(cap), 0.0f, 1.0f) : 0.0f;
-
-        const int lvl = ClampZoneLevel(static_cast<int>(t.level));
-        const float var01 = static_cast<float>((t.variation >> 4) & 0x0Fu) / 15.0f;
-        const float height = tileSize * (cfg.buildingBaseHeight + cfg.buildingPerLevelHeight * static_cast<float>(lvl) +
-                                         cfg.buildingOccHeight * occ + 0.25f * var01);
-
-        const float fx0 = static_cast<float>(x - originX) * tileSize + margin;
-        const float fx1 = static_cast<float>(x + 1 - originX) * tileSize - margin;
-        const float fz0 = static_cast<float>(y - originY) * tileSize + margin;
-        const float fz1 = static_cast<float>(y + 1 - originY) * tileSize - margin;
-
-        const float y0b = baseY;
-        const float y1b = baseY + std::max(0.05f * tileSize, height);
-
-        const C4 c = BuildingColorForTile(t);
-
-        // Roof.
-        m.addQuad(V3{fx0, y1b, fz0}, V3{fx1, y1b, fz0}, V3{fx1, y1b, fz1}, V3{fx0, y1b, fz1}, N3{0.0f, 1.0f, 0.0f}, c);
-
-        // North (z0)
-        m.addQuad(V3{fx0, y1b, fz0}, V3{fx1, y1b, fz0}, V3{fx1, y0b, fz0}, V3{fx0, y0b, fz0}, N3{0.0f, 0.0f, -1.0f}, c);
-        // South (z1)
-        m.addQuad(V3{fx0, y1b, fz1}, V3{fx1, y1b, fz1}, V3{fx1, y0b, fz1}, V3{fx0, y0b, fz1}, N3{0.0f, 0.0f, 1.0f}, c);
-        // West (x0)
-        m.addQuad(V3{fx0, y1b, fz0}, V3{fx0, y1b, fz1}, V3{fx0, y0b, fz1}, V3{fx0, y0b, fz0}, N3{-1.0f, 0.0f, 0.0f}, c);
-        // East (x1)
-        m.addQuad(V3{fx1, y1b, fz0}, V3{fx1, y1b, fz1}, V3{fx1, y0b, fz1}, V3{fx1, y0b, fz0}, N3{1.0f, 0.0f, 0.0f}, c);
-      }
-    }
-  }
+  // If this fails, cfg is invalid (most commonly bad crop). The caller already
+  // validated via ComputeMeshExportBounds, but we keep this defensive.
+  std::string err;
+  (void)BuildWorldMeshQuads(world, cfg, sink, &err);
 
   if (outStats) {
     outStats->vertices = static_cast<std::uint64_t>(m.pos.size() / 3);
@@ -597,7 +377,7 @@ bool ExportWorldGltf(const std::string& gltfPath, const World& world,
 
   int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
   int originX = 0, originY = 0;
-  if (!ValidateAndComputeBounds(world, cfg, x0, y0, x1, y1, originX, originY, outError)) {
+  if (!ComputeMeshExportBounds(world, cfg, x0, y0, x1, y1, originX, originY, outError)) {
     return false;
   }
   (void)x0;
@@ -646,7 +426,7 @@ bool ExportWorldGlb(const std::string& glbPath, const World& world,
 
   int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
   int originX = 0, originY = 0;
-  if (!ValidateAndComputeBounds(world, cfg, x0, y0, x1, y1, originX, originY, outError)) {
+  if (!ComputeMeshExportBounds(world, cfg, x0, y0, x1, y1, originX, originY, outError)) {
     return false;
   }
   (void)x0;

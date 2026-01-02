@@ -40,6 +40,23 @@ struct MeshExportConfig {
   // This is purely visual and avoids z-fighting when importing into engines.
   float overlayOffset = 0.02f;
 
+  // Optional height quantization applied during export (after heightScale).
+  //
+  // This snaps terrain heights to a fixed step size, which can:
+  //  - reduce mesh complexity when used with mergeTopSurfaces
+  //  - make exported geometry more "blocky" / stylized (terraced)
+  //
+  // Units are OBJ/glTF units (after applying heightScale).
+  // Set to 0 to disable quantization (default).
+  float heightQuantization = 0.0f;
+
+  // If true, merge adjacent top-surface tiles that share the same exported
+  // material and quantized height into larger quads.
+  //
+  // This can dramatically reduce vertex/triangle count for flat regions.
+  // It does not currently merge cliffs or buildings.
+  bool mergeTopSurfaces = false;
+
   // Include the per-tile top surfaces (terrain and/or overlays).
   bool includeTopSurfaces = true;
 
@@ -50,6 +67,19 @@ struct MeshExportConfig {
   // Include simple buildings (axis-aligned boxes) on zone tiles.
   bool includeBuildings = true;
 
+  // If true, attempt to merge adjacent zone tiles into a single building volume
+  // based on ZoneBuildingParcels.
+  //
+  // Notes:
+  //  - Only parcels that are fully inside the export bounds are merged.
+  //  - Parcels are merged only when their base terrain height is flat after
+  //    applying heightScale and optional heightQuantization.
+  //  - Parcels that cannot be merged fall back to per-tile boxes.
+  //
+  // This reduces vertex/triangle counts dramatically for dense neighborhoods
+  // and makes exported buildings match the renderer's parcelization behavior.
+  bool mergeBuildings = false;
+
   // Building footprint as a fraction of tileSize (0..1).
   float buildingFootprint = 0.60f;
 
@@ -57,6 +87,14 @@ struct MeshExportConfig {
   float buildingBaseHeight = 0.35f;
   float buildingPerLevelHeight = 0.45f;
   float buildingOccHeight = 0.35f;
+
+  // Optional extra height (in multiples of tileSize) applied based on building
+  // footprint area.
+  //
+  // When exporting merged building parcels, larger footprints generally look
+  // better when they become taller. The boost uses log2(areaTiles) so single-tile
+  // buildings are unchanged.
+  float buildingAreaHeight = 0.15f;
 
   // Optional crop rectangle (tile-space) to export only a subregion.
   bool hasCrop = false;

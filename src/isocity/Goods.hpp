@@ -59,6 +59,68 @@ struct GoodsResult {
   int maxRoadGoodsTraffic = 0;
 };
 
+// Optional debug/analysis output for goods flow.
+//
+// This is intended for headless tooling (CLI, regression tests, GIS exports), not for
+// the core simulation. It is only populated when explicitly requested.
+//
+// Indices are road tile indices in the world grid: idx = y*w + x.
+enum class GoodsOdType : std::uint8_t {
+  Local = 0,
+  Import = 1,
+  Export = 2,
+};
+
+inline const char* GoodsOdTypeName(GoodsOdType t)
+{
+  switch (t) {
+    case GoodsOdType::Local:
+      return "local";
+    case GoodsOdType::Import:
+      return "import";
+    case GoodsOdType::Export:
+      return "export";
+  }
+  return "local";
+}
+
+struct GoodsOdEdge {
+  // Road tile index of the origin and destination. These are always valid road tiles.
+  int srcRoadIdx = -1;
+  int dstRoadIdx = -1;
+
+  // Total units shipped along this OD pair.
+  int amount = 0;
+
+  // Route metrics.
+  //
+  // When aggregating, we keep totals (amount-weighted) so callers can compute
+  // mean distance/time, as well as min/max.
+  //
+  // Units:
+  //  - steps: road steps (edges)
+  //  - costMilli: travel-time cost in milli-steps (street step == 1000)
+  std::uint64_t totalSteps = 0;
+  std::uint64_t totalCostMilli = 0;
+
+  int minSteps = -1;
+  int maxSteps = -1;
+  int minCostMilli = -1;
+  int maxCostMilli = -1;
+
+  GoodsOdType type = GoodsOdType::Local;
+};
+
+struct GoodsFlowDebug {
+  int w = 0;
+  int h = 0;
+
+  // Aggregated origin-destination flows between road access points.
+  //
+  // Note: this is aggregated by endpoints, not by exact route geometry.
+  std::vector<GoodsOdEdge> od;
+};
+
 // Compute the current goods flow. This is pure/derived (does not mutate the world).
 //
 // If cfg.requireOutsideConnection is true, you can optionally supply a precomputed
@@ -69,6 +131,7 @@ struct GoodsResult {
 // you may also pass it to avoid rebuilding the zone access mapping.
 GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
                             const std::vector<std::uint8_t>* precomputedRoadToEdge = nullptr,
-                            const ZoneAccessMap* precomputedZoneAccess = nullptr);
+                            const ZoneAccessMap* precomputedZoneAccess = nullptr,
+                            GoodsFlowDebug* outDebug = nullptr);
 
 } // namespace isocity

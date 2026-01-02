@@ -48,14 +48,17 @@ add_library(isocity_core
   src/isocity/Checksum.cpp
   src/isocity/Compression.cpp
   src/isocity/GltfExport.cpp
+  src/isocity/GeoJsonExport.cpp
   src/isocity/Suite.cpp
   src/isocity/Blueprint.cpp
   src/isocity/MeshExport.cpp
+  src/isocity/WorldMeshBuilder.cpp
   src/isocity/RoadGraphExport.cpp
   src/isocity/RoadGraphTrafficExport.cpp
   src/isocity/Districting.cpp
   src/isocity/FloodFill.cpp
   src/isocity/CityBlocks.cpp
+  src/isocity/Vectorize.cpp
   src/isocity/CityBlockGraph.cpp
   src/isocity/BlockDistricting.cpp
   src/isocity/Script.cpp
@@ -67,16 +70,23 @@ add_library(isocity_core
   src/isocity/WorldTransform.cpp
   src/isocity/ProcGen.cpp
   src/isocity/Erosion.cpp
+  src/isocity/DepressionFill.cpp
+  src/isocity/FloodRisk.cpp
+  src/isocity/Hydrology.cpp
+  src/isocity/Contours.cpp
+  src/isocity/Isochrone.cpp
   src/isocity/Sim.cpp
   src/isocity/FlowField.cpp
   src/isocity/Traffic.cpp
   src/isocity/Goods.cpp
+  src/isocity/ParkOptimizer.cpp
   src/isocity/LandValue.cpp
   src/isocity/DistrictStats.cpp
   src/isocity/ZoneAccess.cpp
   src/isocity/SaveLoad.cpp
   src/isocity/Export.cpp
   src/isocity/ImageIO.cpp
+  src/isocity/Heightmap.cpp
   src/isocity/Hash.cpp
   src/isocity/EditHistory.cpp
   src/isocity/Pathfinding.cpp
@@ -303,6 +313,50 @@ if (PROCISOCITY_BUILD_CLI)
   procisocity_set_strict_warnings(proc_isocity_transform)
 
 
+  # Heightmap tool (headless): import/export raster heightmaps.
+  add_executable(proc_isocity_heightmap
+    src/cli/heightmap.cpp
+  )
+
+  target_include_directories(proc_isocity_heightmap PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_heightmap PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_heightmap)
+
+  # Hydrology tool (headless): analyze terrain flow accumulation / rivers / basins.
+  add_executable(proc_isocity_hydrology
+    src/cli/hydrology.cpp
+  )
+
+  target_include_directories(proc_isocity_hydrology PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_hydrology PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_hydrology)
+
+  # Contours tool (headless): extract topographic contour lines and terrain analysis rasters.
+  add_executable(proc_isocity_contours
+    src/cli/contours.cpp
+  )
+
+  target_include_directories(proc_isocity_contours PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_contours PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_contours)
+
+
+  # Isochrone tool (headless): accessibility heatmaps + isochrone polygons.
+  add_executable(proc_isocity_isochrone
+    src/cli/isochrone.cpp
+  )
+
+  target_include_directories(proc_isocity_isochrone PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_isochrone PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_isochrone)
+
+
+
+
   # Road graph export tool (headless): export compressed road network graphs to DOT/JSON/CSV.
   add_executable(proc_isocity_roadgraph
     src/cli/roadgraph.cpp
@@ -312,6 +366,16 @@ if (PROCISOCITY_BUILD_CLI)
   target_link_libraries(proc_isocity_roadgraph PRIVATE isocity_core)
 
   procisocity_set_strict_warnings(proc_isocity_roadgraph)
+
+  # Pathfinding tool (headless): query paths on the road/land grid and road-build planner.
+  add_executable(proc_isocity_path
+    src/cli/path.cpp
+  )
+
+  target_include_directories(proc_isocity_path PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_path PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_path)
 
   # Road centrality tool (headless): betweenness centrality on the compressed road graph.
   add_executable(proc_isocity_roadcentrality
@@ -332,6 +396,37 @@ if (PROCISOCITY_BUILD_CLI)
   target_link_libraries(proc_isocity_trafficgraph PRIVATE isocity_core)
 
   procisocity_set_strict_warnings(proc_isocity_trafficgraph)
+
+  # Goods graph export tool (headless): compute goods flow, aggregate onto road graph, and export OD.
+  add_executable(proc_isocity_goodsgraph
+    src/cli/goodsgraph.cpp
+  )
+
+  target_include_directories(proc_isocity_goodsgraph PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_goodsgraph PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_goodsgraph)
+
+  # Park placement tool (headless): suggest new parks based on underserved demand.
+  add_executable(proc_isocity_parkopt
+    src/cli/parkopt.cpp
+  )
+
+  target_include_directories(proc_isocity_parkopt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_parkopt PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_parkopt)
+
+
+  # Flood/ponding tool (headless): sea-level inundation + Priority-Flood depression depth.
+  add_executable(proc_isocity_floodrisk
+    src/cli/floodrisk.cpp
+  )
+
+  target_include_directories(proc_isocity_floodrisk PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_floodrisk PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_floodrisk)
 
   # Road upgrades tool (headless): propose road-level upgrades under a budget based on combined flows.
   add_executable(proc_isocity_roadupgrades
@@ -409,6 +504,16 @@ if (PROCISOCITY_BUILD_CLI)
   target_link_libraries(proc_isocity_imagediff PRIVATE isocity_core)
 
   procisocity_set_strict_warnings(proc_isocity_imagediff)
+
+  # District report tool (headless): per-district stats + GeoJSON/SVG vector exports.
+  add_executable(proc_isocity_districtreport
+    src/cli/districtreport.cpp
+  )
+
+  target_include_directories(proc_isocity_districtreport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_districtreport PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_districtreport)
 
 endif()
 

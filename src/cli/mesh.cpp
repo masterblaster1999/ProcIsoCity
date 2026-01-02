@@ -105,8 +105,9 @@ void PrintHelp()
       << "  proc_isocity_mesh (--load <save.bin> | --seed <u64> --size <WxH>) [--days <N>]\n"
       << "                   [--obj <out.obj> [--mtl <out.mtl>]] [--gltf <out.gltf>] [--glb <out.glb>]\n"
       << "                   [--tile-size <F>] [--height-scale <F>] [--overlay-offset <F>]\n"
+      << "                   [--merge-top-surfaces <0|1>] [--height-quantize <F>]\n"
       << "                   [--cliffs <0|1>] [--cliff-threshold <F>]\n"
-      << "                   [--buildings <0|1>]\n"
+      << "                   [--buildings <0|1>] [--merge-buildings <0|1>] [--building-area-height <F>]\n"
       << "                   [--crop <x> <y> <w> <h>] [--origin-at-crop <0|1>]\n\n"
       << "Exit codes:\n"
       << "  0  success\n"
@@ -218,6 +219,16 @@ int main(int argc, char** argv)
         std::cerr << "--overlay-offset requires a float\n";
         return 2;
       }
+    } else if (arg == "--merge-top-surfaces" || arg == "--merge-top") {
+      if (!requireValue(i, val) || !ParseBool01(val, &meshCfg.mergeTopSurfaces)) {
+        std::cerr << arg << " requires 0|1\n";
+        return 2;
+      }
+    } else if (arg == "--height-quantize" || arg == "--height-quantization") {
+      if (!requireValue(i, val) || !ParseF32(val, &meshCfg.heightQuantization) || meshCfg.heightQuantization < 0.0f) {
+        std::cerr << arg << " requires a non-negative float\n";
+        return 2;
+      }
     } else if (arg == "--cliffs") {
       if (!requireValue(i, val) || !ParseBool01(val, &meshCfg.includeCliffs)) {
         std::cerr << "--cliffs requires 0|1\n";
@@ -231,6 +242,16 @@ int main(int argc, char** argv)
     } else if (arg == "--buildings") {
       if (!requireValue(i, val) || !ParseBool01(val, &meshCfg.includeBuildings)) {
         std::cerr << "--buildings requires 0|1\n";
+        return 2;
+      }
+    } else if (arg == "--merge-buildings" || arg == "--merge-building-parcels") {
+      if (!requireValue(i, val) || !ParseBool01(val, &meshCfg.mergeBuildings)) {
+        std::cerr << arg << " requires 0|1\n";
+        return 2;
+      }
+    } else if (arg == "--building-area-height") {
+      if (!requireValue(i, val) || !ParseF32(val, &meshCfg.buildingAreaHeight) || meshCfg.buildingAreaHeight < 0.0f) {
+        std::cerr << "--building-area-height requires a non-negative float\n";
         return 2;
       }
     } else if (arg == "--crop") {
@@ -309,9 +330,8 @@ int main(int argc, char** argv)
   }
 
   // Export requested formats.
-  // NOTE: Each exporter currently builds its mesh independently. This keeps code paths
-  // simple and deterministic. If this becomes a bottleneck for large worlds, we can
-  // refactor to share a mesh build step.
+  // NOTE: OBJ and glTF now share a common mesh build path (WorldMeshBuilder) so options like
+  // --merge-top-surfaces apply consistently across formats.
 
   if (!objPath.empty()) {
     MeshExportStats st;

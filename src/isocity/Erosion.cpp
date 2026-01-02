@@ -1,4 +1,5 @@
 #include "isocity/Erosion.hpp"
+#include "isocity/Hydrology.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -67,76 +68,17 @@ static void ApplyThermal(std::vector<float>& h, int w, int hgt, int iters, float
   }
 }
 
-static void ComputeFlowDir(const std::vector<float>& h, int w, int hgt, std::vector<int>& outDir)
-{
-  outDir.assign(static_cast<std::size_t>(w) * static_cast<std::size_t>(hgt), -1);
-  if (w <= 0 || hgt <= 0) return;
-
-  // 4-neighborhood for simplicity.
-  constexpr int dx4[4] = {1, -1, 0, 0};
-  constexpr int dy4[4] = {0, 0, 1, -1};
-
-  for (int y = 0; y < hgt; ++y) {
-    for (int x = 0; x < w; ++x) {
-      const float cur = h[idx(x, y, w)];
-      float bestH = cur;
-      int best = -1;
-
-      // Deterministic tie-break: check neighbors in fixed order.
-      for (int k = 0; k < 4; ++k) {
-        const int nx = x + dx4[k];
-        const int ny = y + dy4[k];
-        if (nx < 0 || nx >= w || ny < 0 || ny >= hgt) continue;
-        const float nh = h[idx(nx, ny, w)];
-        if (nh < bestH) {
-          bestH = nh;
-          best = ny * w + nx;
-        }
-      }
-
-      // If no strictly-lower neighbor, keep as sink.
-      outDir[idx(x, y, w)] = best;
-    }
-  }
-}
-
-static void FlowAccumulation(const std::vector<float>& h, int w, int hgt,
-                             const std::vector<int>& dir, std::vector<int>& outAccum)
-{
-  outAccum.assign(static_cast<std::size_t>(w) * static_cast<std::size_t>(hgt), 1);
-  if (w <= 0 || hgt <= 0) return;
-
-  // Sort indices by height descending (higher contributes to lower).
-  std::vector<int> order;
-  order.reserve(static_cast<std::size_t>(w) * static_cast<std::size_t>(hgt));
-  for (int i = 0; i < w * hgt; ++i) order.push_back(i);
-
-  std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
-    const float ha = h[static_cast<std::size_t>(a)];
-    const float hb = h[static_cast<std::size_t>(b)];
-    if (ha == hb) return a < b;
-    return ha > hb;
-  });
-
-  for (int i : order) {
-    const int to = dir[static_cast<std::size_t>(i)];
-    if (to < 0) continue;
-    outAccum[static_cast<std::size_t>(to)] += outAccum[static_cast<std::size_t>(i)];
-  }
-}
-
 static void ApplyRivers(std::vector<float>& h, int w, int hgt, const ErosionConfig& cfg)
 {
   if (w <= 0 || hgt <= 0) return;
 
+  // Use the shared hydrology helpers so tooling and erosion match.
   std::vector<int> dir;
-  ComputeFlowDir(h, w, hgt, dir);
+  ComputeFlowDir4(h, w, hgt, dir);
 
   std::vector<int> accum;
-  FlowAccumulation(h, w, hgt, dir, accum);
-
   int maxA = 1;
-  for (int a : accum) maxA = std::max(maxA, a);
+  ComputeFlowAccumulation(h, w, hgt, dir, accum, &maxA);
 
   int minA = cfg.riverMinAccum;
   if (minA <= 0) {

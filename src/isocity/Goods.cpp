@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <limits>
 #include <queue>
+#include <unordered_map>
 #include <vector>
 
 namespace isocity {
@@ -77,9 +78,30 @@ struct SearchCmp {
 
 } // namespace
 
+struct GoodsOdKey {
+  int src = -1;
+  int dst = -1;
+  GoodsOdType type = GoodsOdType::Local;
+
+  bool operator==(const GoodsOdKey& o) const { return src == o.src && dst == o.dst && type == o.type; }
+};
+
+struct GoodsOdKeyHash {
+  std::size_t operator()(const GoodsOdKey& k) const
+  {
+    // Mix: [type:8][src:32][dst:32], then hash as u64.
+    const std::uint64_t t = static_cast<std::uint64_t>(static_cast<std::uint8_t>(k.type));
+    const std::uint64_t a = static_cast<std::uint64_t>(static_cast<std::uint32_t>(k.src));
+    const std::uint64_t b = static_cast<std::uint64_t>(static_cast<std::uint32_t>(k.dst));
+    const std::uint64_t v = (t << 56) ^ (a << 32) ^ b;
+    return std::hash<std::uint64_t>{}(v);
+  }
+};
+
 GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
                             const std::vector<std::uint8_t>* precomputedRoadToEdge,
-                            const ZoneAccessMap* precomputedZoneAccess)
+                            const ZoneAccessMap* precomputedZoneAccess,
+                            GoodsFlowDebug* outDebug)
 {
   GoodsResult out;
 
@@ -90,6 +112,78 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
   const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
   out.roadGoodsTraffic.assign(n, 0);
   out.commercialFill.assign(n, 255);
+
+  // Optional OD debug aggregation.
+  if (outDebug) {
+    outDebug->w = w;
+    outDebug->h = h;
+    outDebug->od.clear();
+  }
+
+  std::unordered_map<GoodsOdKey, std::size_t, GoodsOdKeyHash> odIndex;
+  if (outDebug) {
+    odIndex.reserve(2048);
+  }
+
+  auto addOd = [&](int srcRoadIdx, int dstRoadIdx, int amount, int steps, int costMilli, GoodsOdType type) {
+    if (!outDebug) return;
+    if (amount <= 0) return;
+    if (srcRoadIdx < 0 || dstRoadIdx < 0) return;
+    if (static_cast<std::size_t>(srcRoadIdx) >= n || static_cast<std::size_t>(dstRoadIdx) >= n) return;
+
+    const GoodsOdKey key{srcRoadIdx, dstRoadIdx, type};
+
+    auto it = odIndex.find(key);
+    if (it == odIndex.end()) {
+      GoodsOdEdge e;
+      e.srcRoadIdx = srcRoadIdx;
+      e.dstRoadIdx = dstRoadIdx;
+      e.amount = amount;
+      e.type = type;
+
+      if (steps >= 0) {
+        e.totalSteps = static_cast<std::uint64_t>(amount) * static_cast<std::uint64_t>(steps);
+        e.minSteps = steps;
+        e.maxSteps = steps;
+      }
+      if (costMilli >= 0) {
+        e.totalCostMilli = static_cast<std::uint64_t>(amount) * static_cast<std::uint64_t>(costMilli);
+        e.minCostMilli = costMilli;
+        e.maxCostMilli = costMilli;
+      }
+
+      outDebug->od.push_back(e);
+      odIndex.emplace(key, outDebug->od.size() - 1u);
+      return;
+    }
+
+    GoodsOdEdge& e = outDebug->od[it->second];
+    e.amount += amount;
+
+    if (steps >= 0) {
+      e.totalSteps += static_cast<std::uint64_t>(amount) * static_cast<std::uint64_t>(steps);
+      if (e.minSteps < 0 || steps < e.minSteps) e.minSteps = steps;
+      if (e.maxSteps < 0 || steps > e.maxSteps) e.maxSteps = steps;
+    }
+    if (costMilli >= 0) {
+      e.totalCostMilli += static_cast<std::uint64_t>(amount) * static_cast<std::uint64_t>(costMilli);
+      if (e.minCostMilli < 0 || costMilli < e.minCostMilli) e.minCostMilli = costMilli;
+      if (e.maxCostMilli < 0 || costMilli > e.maxCostMilli) e.maxCostMilli = costMilli;
+    }
+  };
+
+  auto traceRoot = [&](int startIdx, const std::vector<int>& parent) -> int {
+    if (startIdx < 0 || static_cast<std::size_t>(startIdx) >= n) return -1;
+    int cur = startIdx;
+    int last = -1;
+    int guard = 0;
+    while (cur != -1 && guard++ < static_cast<int>(n) + 8) {
+      if (cur < 0 || static_cast<std::size_t>(cur) >= n) break;
+      last = cur;
+      cur = parent[static_cast<std::size_t>(cur)];
+    }
+    return last;
+  };
 
   // Outside connection mask.
   std::vector<std::uint8_t> roadToEdgeLocal;
@@ -310,10 +404,15 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
   // On success, returns true and outputs:
   //  - outSourceIndex: index into `sources`
   //  - outSourceRoadIdx: the road tile idx where that source is anchored
+  //  - outCostMilli: travel-time cost from start to the chosen source
+  //  - outSteps: road steps from start to the chosen source
   // The `searchParent` array encodes the chosen path *back to start* (prev pointers).
-  auto findNearestSourceWithSupply = [&](int startRoadIdx, int& outSourceIndex, int& outSourceRoadIdx) -> bool {
+  auto findNearestSourceWithSupply = [&](int startRoadIdx, int& outSourceIndex, int& outSourceRoadIdx,
+                                        int& outCostMilli, int& outSteps) -> bool {
     outSourceIndex = -1;
     outSourceRoadIdx = -1;
+    outCostMilli = -1;
+    outSteps = -1;
 
     if (!isTraversableRoad(startRoadIdx)) return false;
 
@@ -343,6 +442,8 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
       if (srcIdx >= 0 && srcIdx < static_cast<int>(sources.size()) && sources[static_cast<std::size_t>(srcIdx)].remaining > 0) {
         outSourceIndex = srcIdx;
         outSourceRoadIdx = cur.idx;
+        outCostMilli = cur.cost;
+        outSteps = cur.steps;
         return true;
       }
 
@@ -417,6 +518,9 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
         remaining -= give;
         delivered += give;
         addAlongParentChain(c.roadIdx, prodField.parent, give);
+
+        // Debug OD: source access road -> consumer access road.
+        addOd(src.roadIdx, c.roadIdx, give, c.dist, c.cost, GoodsOdType::Local);
       }
     }
 
@@ -425,7 +529,9 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
     while (remaining > 0 && !sources.empty()) {
       int srcIdx = -1;
       int srcRoadIdx = -1;
-      if (!findNearestSourceWithSupply(c.roadIdx, srcIdx, srcRoadIdx)) break;
+      int srcCost = -1;
+      int srcSteps = -1;
+      if (!findNearestSourceWithSupply(c.roadIdx, srcIdx, srcRoadIdx, srcCost, srcSteps)) break;
       if (srcIdx < 0 || srcIdx >= static_cast<int>(sources.size())) break;
 
       Source& src = sources[static_cast<std::size_t>(srcIdx)];
@@ -443,6 +549,9 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
       // `searchParent` stores prev pointers back to the consumer road tile.
       // Adding along the reverse chain still marks the same road tiles.
       addAlongPrevChain(srcRoadIdx, searchParent, give);
+
+      // Debug OD: chosen source access road -> consumer access road.
+      addOd(srcRoadIdx, c.roadIdx, give, srcSteps, srcCost, GoodsOdType::Local);
     }
 
     // Import any remaining demand from the edge if allowed.
@@ -453,6 +562,12 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
         remaining = 0;
         delivered += imp;
         out.goodsImported += imp;
+
+        // Debug OD: edge access road -> consumer access road.
+        const int root = (!edgeField.parent.empty()) ? traceRoot(c.roadIdx, edgeField.parent) : -1;
+        const int steps = (!edgeField.dist.empty()) ? edgeField.dist[static_cast<std::size_t>(c.roadIdx)] : -1;
+        addOd(root, c.roadIdx, imp, steps, ed, GoodsOdType::Import);
+
         addAlongParentChain(c.roadIdx, edgeField.parent, imp);
       }
     }
@@ -481,6 +596,12 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
       if (ed < 0) continue;
 
       out.goodsExported += src.remaining;
+
+      // Debug OD: producer access road -> edge access road.
+      const int root = (!edgeField.parent.empty()) ? traceRoot(src.roadIdx, edgeField.parent) : -1;
+      const int steps = (!edgeField.dist.empty()) ? edgeField.dist[static_cast<std::size_t>(src.roadIdx)] : -1;
+      addOd(src.roadIdx, root, src.remaining, steps, ed, GoodsOdType::Export);
+
       addAlongParentChain(src.roadIdx, edgeField.parent, src.remaining);
     }
   }

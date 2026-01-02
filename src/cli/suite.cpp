@@ -5,7 +5,9 @@
 #include "isocity/SaveLoad.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
@@ -13,8 +15,10 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -176,6 +180,7 @@ void PrintHelp()
       << "  --discover <dir>            Recursively discover scenarios in a directory (repeatable).\n"
       << "  --ext <ext>                 Extension filter for --discover (repeatable). Default: .isocity and .isoreplay\n"
       << "  --shard <i>/<n>              Run only shard i of n (0-based).\n"
+      << "  --jobs <N>                  Run up to N cases in parallel (0 = auto). Default: 1\n"
       << "  --define k=v                Inject a script variable (repeatable).\n"
       << "  --ignore-replay-asserts      Ignore AssertHash events when running replays.\n"
       << "  --lax-replay-patches         Do not require patch base hashes to match when playing replays.\n"
@@ -184,6 +189,7 @@ void PrintHelp()
       << "  --junit <file>               Write a JUnit XML report (useful for CI).\n"
       << "  --fail-fast                  Stop on first failure.\n"
       << "  --verbose                    Print script output (default is quiet).\n"
+      << "  --timing                     Print per-case and total timing information.\n"
       << "\n"
       << "Golden image regression (snapshot testing):\n"
       << "  --golden                     Compare a rendered image (PPM/PNG) against a golden snapshot.\n"
@@ -237,6 +243,12 @@ struct CaseResult {
   bool ok = false;
   std::string error;
   std::uint64_t hash = 0;
+
+  // Wall-clock time spent running this case (including golden compare/update and artifact writes).
+  double seconds = 0.0;
+
+  // Non-fatal warnings encountered while producing artifacts.
+  std::vector<std::string> warnings;
 
   GoldenResult golden;
 };
@@ -497,6 +509,164 @@ bool WriteCaseArtifacts(const fs::path& caseDir, const isocity::ScenarioRunOutpu
   return true;
 }
 
+CaseResult ProcessCase(std::size_t index, const isocity::ScenarioCase& sc, const isocity::ScenarioRunOptions& baseOpt,
+                       const GoldenConfig& golden, const std::string& outDir)
+{
+  using Clock = std::chrono::steady_clock;
+  const auto t0 = Clock::now();
+
+  isocity::ScenarioRunOutputs out;
+  std::string runErr;
+
+  isocity::ScenarioRunOptions runOpt = baseOpt;
+  runOpt.runIndex = static_cast<int>(index);
+  const bool runOk = isocity::RunScenario(sc, runOpt, out, runErr);
+
+  CaseResult cr;
+  cr.sc = sc;
+  cr.hash = out.finalHash;
+  cr.error = runErr;
+
+  fs::path caseDir;
+  const bool wantArtifacts = !outDir.empty() && runOk;
+  if (wantArtifacts) {
+    const fs::path base = fs::path(outDir);
+    const fs::path name = SanitizeName(fs::path(sc.path).stem().string());
+    std::ostringstream sub;
+    sub << std::setw(4) << std::setfill('0') << index << "_" << name;
+    caseDir = base / sub.str();
+
+    std::string artErr;
+    if (!WriteCaseArtifacts(caseDir, out, sc, artErr)) {
+      cr.warnings.push_back("artifact write failed: " + artErr);
+    }
+  }
+
+  // Golden compare/update (optional).
+  if (runOk && golden.enabled) {
+    cr.golden.attempted = true;
+
+    isocity::PpmImage actual;
+    std::string rerr;
+    if (!RenderGoldenImage(out, golden, actual, rerr)) {
+      cr.golden.ok = false;
+      cr.golden.matched = false;
+      cr.golden.error = "golden render failed: " + rerr;
+    } else {
+      const fs::path goldenPath = ComputeGoldenPath(sc, golden);
+      cr.golden.goldenPath = goldenPath.string();
+
+      std::error_code fec;
+      const bool goldenExists = fs::exists(goldenPath, fec) && fs::is_regular_file(goldenPath, fec);
+
+      isocity::PpmImage expected;
+      isocity::PpmImage diff;
+
+      if (golden.update) {
+        // Update mode: write snapshot if missing or different.
+        bool needsWrite = !goldenExists;
+
+        if (goldenExists) {
+          std::string readErr;
+          if (isocity::ReadImageAuto(goldenPath.string(), expected, readErr)) {
+            isocity::PpmDiffStats st{};
+            if (isocity::ComparePpm(expected, actual, st, golden.threshold, nullptr)) {
+              cr.golden.stats = st;
+              cr.golden.hasStats = true;
+              needsWrite = (st.pixelsDifferent != 0);
+            } else {
+              needsWrite = true;
+            }
+          } else {
+            needsWrite = true;
+          }
+        }
+
+        if (needsWrite) {
+          std::error_code ec;
+          fs::create_directories(goldenPath.parent_path(), ec);
+          if (ec) {
+            cr.golden.ok = false;
+            cr.golden.matched = false;
+            cr.golden.error = "failed to create golden directory: " + goldenPath.parent_path().string() + " (" + ec.message() + ")";
+          } else {
+            std::string werr;
+            if (!isocity::WriteImageAuto(goldenPath.string(), actual, werr)) {
+              cr.golden.ok = false;
+              cr.golden.matched = false;
+              cr.golden.error = "failed to update golden: " + werr;
+            } else {
+              cr.golden.updated = true;
+              cr.golden.matched = true;
+              cr.golden.ok = true;
+            }
+          }
+        } else {
+          cr.golden.updated = false;
+          cr.golden.matched = true;
+          cr.golden.ok = true;
+        }
+
+      } else {
+        // Compare mode.
+        if (!goldenExists) {
+          cr.golden.ok = false;
+          cr.golden.matched = false;
+          cr.golden.error = "missing golden image: " + goldenPath.string() + " (run with --update-golden to create)";
+        } else {
+          std::string readErr;
+          if (!isocity::ReadImageAuto(goldenPath.string(), expected, readErr)) {
+            cr.golden.ok = false;
+            cr.golden.matched = false;
+            cr.golden.error = "failed to read golden image: " + readErr;
+          } else {
+            isocity::PpmDiffStats st{};
+            isocity::PpmImage* diffPtr = wantArtifacts ? &diff : nullptr;
+            if (!isocity::ComparePpm(expected, actual, st, golden.threshold, diffPtr)) {
+              cr.golden.ok = false;
+              cr.golden.matched = false;
+              cr.golden.error = "golden compare failed (dimension mismatch or invalid buffers)";
+            } else {
+              cr.golden.stats = st;
+              cr.golden.hasStats = true;
+
+              if (st.pixelsDifferent != 0) {
+                cr.golden.ok = false;
+                cr.golden.matched = false;
+                cr.golden.error = "golden mismatch: " + FormatPpmDiffSummary(st);
+              } else {
+                cr.golden.ok = true;
+                cr.golden.matched = true;
+              }
+            }
+          }
+        }
+      }
+
+      // Write golden artifacts when requested.
+      if (wantArtifacts) {
+        std::string gerr;
+        const isocity::PpmImage* diffPtr = (!diff.rgb.empty()) ? &diff : nullptr;
+        if (!WriteGoldenArtifacts(caseDir, golden, cr.golden, actual, diffPtr, gerr)) {
+          cr.warnings.push_back("golden artifact write failed: " + gerr);
+        }
+      }
+    }
+  }
+
+  cr.ok = runOk && (!golden.enabled || cr.golden.ok);
+
+  if (golden.enabled && runOk && !cr.golden.ok) {
+    if (!cr.error.empty()) cr.error += " | ";
+    cr.error += cr.golden.error;
+  }
+
+  const auto t1 = Clock::now();
+  cr.seconds = std::chrono::duration<double>(t1 - t0).count();
+
+  return cr;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -513,6 +683,9 @@ int main(int argc, char** argv)
   bool verbose = false;
   bool ignoreReplayAsserts = false;
   bool laxReplayPatches = false;
+
+  int jobs = 1;        // 0 = auto
+  bool timing = false;
 
   std::string outDir;
   std::string jsonReport;
@@ -563,6 +736,15 @@ int main(int argc, char** argv)
         std::cerr << "invalid --shard (expected 0-based i/n, e.g. 0/4): " << val << "\n";
         return 2;
       }
+    } else if (arg == "--jobs" || arg == "-j") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--jobs requires an integer (0 = auto)\n";
+        return 2;
+      }
+      if (!ParseI32(val, &jobs) || jobs < 0) {
+        std::cerr << "invalid --jobs (expected integer >= 0): " << val << "\n";
+        return 2;
+      }
     } else if (arg == "--define") {
       if (!requireValue(i, val)) {
         std::cerr << "--define requires k=v\n";
@@ -584,6 +766,8 @@ int main(int argc, char** argv)
       failFast = true;
     } else if (arg == "--verbose") {
       verbose = true;
+    } else if (arg == "--timing") {
+      timing = true;
     } else if (arg == "--ignore-replay-asserts" || arg == "--ignore-asserts") {
       ignoreReplayAsserts = true;
     } else if (arg == "--lax-replay-patches" || arg == "--lax-patches") {
@@ -810,179 +994,100 @@ int main(int argc, char** argv)
   runOpt.strictReplayPatches = !laxReplayPatches;
   runOpt.scriptVars = scriptVars;
 
+  using Clock = std::chrono::steady_clock;
+  const auto suiteT0 = Clock::now();
+
+  int threads = jobs;
+  if (threads <= 0) {
+    threads = static_cast<int>(std::thread::hardware_concurrency());
+    if (threads <= 0) threads = 1;
+  }
+
+  // Avoid launching lots of threads for tiny suites.
+  threads = std::min<int>(threads, static_cast<int>(cases.size()));
+
   std::vector<CaseResult> results;
   results.reserve(cases.size());
 
   int passed = 0;
   int failed = 0;
 
-  for (std::size_t i = 0; i < cases.size(); ++i) {
-    const ScenarioCase& sc = cases[i];
-    ScenarioRunOutputs out;
-    std::string runErr;
-
-    runOpt.runIndex = static_cast<int>(i);
-    const bool runOk = RunScenario(sc, runOpt, out, runErr);
-
-    CaseResult cr;
-    cr.sc = sc;
-    cr.hash = out.finalHash;
-
-    fs::path caseDir;
-    const bool wantArtifacts = !outDir.empty() && runOk;
-    if (wantArtifacts) {
-      const fs::path base = fs::path(outDir);
-      const fs::path name = SanitizeName(fs::path(sc.path).stem().string());
-      std::ostringstream sub;
-      sub << std::setw(4) << std::setfill('0') << i << "_" << name;
-      caseDir = base / sub.str();
-
-      std::string artErr;
-      if (!WriteCaseArtifacts(caseDir, out, sc, artErr)) {
-        std::cerr << "  [WARN] artifact write failed: " << artErr << "\n";
-      }
-    }
-
-    // Golden compare/update (optional).
-    if (runOk && golden.enabled) {
-      cr.golden.attempted = true;
-
-      isocity::PpmImage actual;
-      std::string rerr;
-      if (!RenderGoldenImage(out, golden, actual, rerr)) {
-        cr.golden.ok = false;
-        cr.golden.matched = false;
-        cr.golden.error = "golden render failed: " + rerr;
-      } else {
-        const fs::path goldenPath = ComputeGoldenPath(sc, golden);
-        cr.golden.goldenPath = goldenPath.string();
-
-        std::error_code fec;
-        const bool goldenExists = fs::exists(goldenPath, fec) && fs::is_regular_file(goldenPath, fec);
-
-        isocity::PpmImage expected;
-        isocity::PpmImage diff;
-
-        if (golden.update) {
-          // Update mode: write snapshot if missing or different.
-          bool needsWrite = !goldenExists;
-
-          if (goldenExists) {
-            std::string readErr;
-            if (isocity::ReadImageAuto(goldenPath.string(), expected, readErr)) {
-              isocity::PpmDiffStats st{};
-              if (isocity::ComparePpm(expected, actual, st, golden.threshold, nullptr)) {
-                cr.golden.stats = st;
-                cr.golden.hasStats = true;
-                needsWrite = (st.pixelsDifferent != 0);
-              } else {
-                needsWrite = true;
-              }
-            } else {
-              needsWrite = true;
-            }
-          }
-
-          if (needsWrite) {
-            std::error_code ec;
-            fs::create_directories(goldenPath.parent_path(), ec);
-            if (ec) {
-              cr.golden.ok = false;
-              cr.golden.matched = false;
-              cr.golden.error = "failed to create golden directory: " + goldenPath.parent_path().string() + " (" + ec.message() + ")";
-            } else {
-              std::string werr;
-              if (!isocity::WriteImageAuto(goldenPath.string(), actual, werr)) {
-                cr.golden.ok = false;
-                cr.golden.matched = false;
-                cr.golden.error = "failed to update golden: " + werr;
-              } else {
-                cr.golden.updated = true;
-                cr.golden.matched = true;
-                cr.golden.ok = true;
-              }
-            }
-          } else {
-            cr.golden.updated = false;
-            cr.golden.matched = true;
-            cr.golden.ok = true;
-          }
-
-        } else {
-          // Compare mode.
-          if (!goldenExists) {
-            cr.golden.ok = false;
-            cr.golden.matched = false;
-            cr.golden.error = "missing golden image: " + goldenPath.string() + " (run with --update-golden to create)";
-          } else {
-            std::string readErr;
-            if (!isocity::ReadImageAuto(goldenPath.string(), expected, readErr)) {
-              cr.golden.ok = false;
-              cr.golden.matched = false;
-              cr.golden.error = "failed to read golden image: " + readErr;
-            } else {
-              isocity::PpmDiffStats st{};
-              isocity::PpmImage* diffPtr = wantArtifacts ? &diff : nullptr;
-              if (!isocity::ComparePpm(expected, actual, st, golden.threshold, diffPtr)) {
-                cr.golden.ok = false;
-                cr.golden.matched = false;
-                cr.golden.error = "golden compare failed (dimension mismatch or invalid buffers)";
-              } else {
-                cr.golden.stats = st;
-                cr.golden.hasStats = true;
-
-                if (st.pixelsDifferent != 0) {
-                  cr.golden.ok = false;
-                  cr.golden.matched = false;
-                  cr.golden.error = "golden mismatch: " + FormatPpmDiffSummary(st);
-                } else {
-                  cr.golden.ok = true;
-                  cr.golden.matched = true;
-                }
-              }
-            }
-          }
-        }
-
-        // Write golden artifacts when requested.
-        if (wantArtifacts) {
-          std::string gerr;
-          const isocity::PpmImage* diffPtr = (!diff.rgb.empty()) ? &diff : nullptr;
-          if (!WriteGoldenArtifacts(caseDir, golden, cr.golden, actual, diffPtr, gerr)) {
-            std::cerr << "  [WARN] golden artifact write failed: " << gerr << "\n";
-          }
-        }
-      }
-    }
-
-    const bool ok = runOk && (!golden.enabled || cr.golden.ok);
-
-    cr.ok = ok;
-    cr.error = runErr;
-    if (golden.enabled && runOk && !cr.golden.ok) {
-      if (!cr.error.empty()) cr.error += " | ";
-      cr.error += cr.golden.error;
-    }
-
-    if (ok) {
-      ++passed;
-      std::cout << "[PASS] " << sc.path << "  " << HexU64(out.finalHash);
+  auto printCase = [&](const CaseResult& cr) {
+    if (cr.ok) {
+      std::cout << "[PASS] " << cr.sc.path << "  " << HexU64(cr.hash);
       if (golden.enabled && cr.golden.attempted && golden.update && cr.golden.updated) {
         std::cout << "  [golden updated]";
       }
+      if (timing) {
+        std::cout << "  (" << std::fixed << std::setprecision(3) << cr.seconds << "s)";
+      }
       std::cout << "\n";
     } else {
-      ++failed;
-      std::cout << "[FAIL] " << sc.path << "\n";
-      std::cout << "       " << cr.error << "\n";
-      if (failFast) {
-        results.push_back(std::move(cr));
-        break;
+      std::cout << "[FAIL] " << cr.sc.path;
+      if (timing) {
+        std::cout << "  (" << std::fixed << std::setprecision(3) << cr.seconds << "s)";
       }
+      std::cout << "\n";
+      std::cout << "       " << cr.error << "\n";
     }
 
-    results.push_back(std::move(cr));
+    for (const std::string& w : cr.warnings) {
+      std::cerr << "  [WARN] " << w << "\n";
+    }
+  };
+
+  if (threads <= 1) {
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+      CaseResult cr = ProcessCase(i, cases[i], runOpt, golden, outDir);
+
+      if (cr.ok) ++passed;
+      else ++failed;
+
+      printCase(cr);
+      results.push_back(std::move(cr));
+
+      if (failFast && !cr.ok) break;
+    }
+  } else {
+    std::vector<CaseResult> all;
+    all.resize(cases.size());
+    std::vector<unsigned char> done(cases.size(), 0);
+
+    std::atomic<std::size_t> next{0};
+    std::atomic<bool> stop{false};
+
+    std::vector<std::thread> pool;
+    pool.reserve(static_cast<std::size_t>(threads));
+
+    for (int t = 0; t < threads; ++t) {
+      pool.emplace_back([&]() {
+        for (;;) {
+          if (failFast && stop.load()) break;
+          const std::size_t i = next.fetch_add(1);
+          if (i >= cases.size()) break;
+          if (failFast && stop.load()) break;
+
+          all[i] = ProcessCase(i, cases[i], runOpt, golden, outDir);
+          done[i] = 1;
+
+          if (failFast && !all[i].ok) stop.store(true);
+        }
+      });
+    }
+    for (auto& th : pool) th.join();
+
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+      if (!done[i]) continue;
+      CaseResult& cr = all[i];
+      if (cr.ok) ++passed;
+      else ++failed;
+      printCase(cr);
+      results.push_back(std::move(cr));
+    }
   }
+
+  const auto suiteT1 = Clock::now();
+  const double suiteSeconds = std::chrono::duration<double>(suiteT1 - suiteT0).count();
 
   // Suite JSON report.
   if (!jsonReport.empty()) {
@@ -994,11 +1099,15 @@ int main(int argc, char** argv)
       f << "  \"total\": " << results.size() << ",\n";
       f << "  \"passed\": " << passed << ",\n";
       f << "  \"failed\": " << failed << ",\n";
+      f << "  \"seconds\": " << std::fixed << std::setprecision(6) << suiteSeconds << ",\n";
+      f << "  \"jobsRequested\": " << jobs << ",\n";
+      f << "  \"jobsUsed\": " << threads << ",\n";
       f << "  \"cases\": [\n";
       for (std::size_t i = 0; i < results.size(); ++i) {
         const CaseResult& r = results[i];
         f << "    {\"path\": \"" << EscapeJson(r.sc.path) << "\", \"kind\": \"" << KindName(r.sc.kind)
           << "\", \"ok\": " << (r.ok ? "true" : "false")
+          << ", \"seconds\": " << std::fixed << std::setprecision(6) << r.seconds
           << ", \"hash\": \"" << HexU64(r.hash) << "\", \"error\": \"" << EscapeJson(r.error) << "\"";
         if (golden.enabled) {
           f << ", \"golden\": {\"attempted\": " << (r.golden.attempted ? "true" : "false")
@@ -1024,9 +1133,11 @@ int main(int argc, char** argv)
       std::cerr << "failed to write junit report: " << junitPath << "\n";
     } else {
       f << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
-      f << "<testsuite name=\"ProcIsoCitySuite\" tests=\"" << results.size() << "\" failures=\"" << failed << "\">\n";
+      f << "<testsuite name=\"ProcIsoCitySuite\" tests=\"" << results.size() << "\" failures=\"" << failed
+        << "\" time=\"" << std::fixed << std::setprecision(6) << suiteSeconds << "\">\n";
       for (const CaseResult& r : results) {
-        f << "  <testcase classname=\"" << KindName(r.sc.kind) << "\" name=\"" << EscapeXml(r.sc.path) << "\">\n";
+        f << "  <testcase classname=\"" << KindName(r.sc.kind) << "\" name=\"" << EscapeXml(r.sc.path)
+          << "\" time=\"" << std::fixed << std::setprecision(6) << r.seconds << "\">\n";
         if (!r.ok) {
           f << "    <failure message=\"" << EscapeXml(r.error) << "\"/>\n";
         }
@@ -1037,6 +1148,10 @@ int main(int argc, char** argv)
   }
 
   std::cout << "\nSuite results: " << passed << " passed, " << failed << " failed (" << results.size() << " total)\n";
+  if (timing) {
+    std::cout << "Suite time: " << std::fixed << std::setprecision(3) << suiteSeconds << "s";
+    std::cout << " (jobsUsed=" << threads << ")\n";
+  }
 
   return (failed == 0) ? 0 : 1;
 }
