@@ -2098,16 +2098,16 @@ bool ScriptRunner::runTextInternal(const std::string& text, const std::string& v
         return fail(virtualPath, lineNo, "add expects integer delta (supports +,-,*,/,%, parentheses)");
       }
 
-      int cur = 0;
+      int curVal = 0;
       const auto it = m_ctx.vars.find(name);
       if (it != m_ctx.vars.end()) {
         const std::string expanded = expandPathTemplate(it->second);
-        if (!ParseI32(expanded, &cur)) {
+        if (!ParseI32(expanded, &curVal)) {
           return fail(virtualPath, lineNo, "add: current variable value is not an integer");
         }
       }
 
-      const long long sum = static_cast<long long>(cur) + static_cast<long long>(delta);
+      const long long sum = static_cast<long long>(curVal) + static_cast<long long>(delta);
       m_ctx.vars[name] = std::to_string(sum);
       emitInfo("add: " + name + "=" + std::to_string(sum));
       continue;

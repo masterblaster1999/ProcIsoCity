@@ -48,7 +48,7 @@ ctest --test-dir build-tests --output-on-failure
 
 - `PROCISOCITY_BUILD_APP` (default: ON) — build the interactive raylib app (`proc_isocity`).
 - `PROCISOCITY_BUILD_TESTS` (default: OFF) — build `proc_isocity_tests` and enable `ctest`.
-- `PROCISOCITY_BUILD_CLI` (default: ON) — build headless command-line tools (`proc_isocity_cli`, `proc_isocity_diff`, `proc_isocity_imagediff`, `proc_isocity_inspect`, `proc_isocity_config`, `proc_isocity_patch`, `proc_isocity_script`, `proc_isocity_replay`, `proc_isocity_blueprint`, `proc_isocity_suite`, `proc_isocity_transform`, `proc_isocity_roadgraph`, `proc_isocity_roadcentrality`, `proc_isocity_trafficgraph`, `proc_isocity_goodsgraph`, `proc_isocity_transitplan`, `proc_isocity_parkopt`, `proc_isocity_floodrisk`, `proc_isocity_evac`, `proc_isocity_roadupgrades`, `proc_isocity_policyopt`, `proc_isocity_blocks`, `proc_isocity_mesh`).
+- `PROCISOCITY_BUILD_CLI` (default: ON) — build headless command-line tools (`proc_isocity_cli`, `proc_isocity_diff`, `proc_isocity_imagediff`, `proc_isocity_inspect`, `proc_isocity_config`, `proc_isocity_patch`, `proc_isocity_script`, `proc_isocity_replay`, `proc_isocity_blueprint`, `proc_isocity_suite`, `proc_isocity_transform`, `proc_isocity_roadgraph`, `proc_isocity_roadcentrality`, `proc_isocity_blocks`, `proc_isocity_mesh`).
 - `PROCISOCITY_USE_SYSTEM_RAYLIB` (default: OFF) — when building the app, use a system raylib instead of FetchContent.
 
 ### Headless CLI tools (optional)
@@ -145,31 +145,6 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
   # Analyze an existing save, with imports disabled (stress local industry)
   ./build/proc_isocity_goodsgraph --load save.bin --allow-imports 0 \
     --json goods_local.json --heatmap goods_local.png
-  ```
-
-
-- `proc_isocity_transitplan`: propose a small set of **transit lines (bus routes)** directly from simulated
-  demand on the road network.
-
-  Under the hood, it:
-  - builds the compressed `RoadGraph`
-  - computes a demand signal on road tiles (commute traffic, goods shipments, or both)
-  - aggregates that demand to RoadGraph edges
-  - greedily selects high-demand, not-too-circuitous paths between high-demand, spatially spread endpoints
-
-  Exports a compact JSON/GeoJSON plan and can render quick overlay images (per-tile + isometric).
-
-  ```bash
-  # Combined demand (commuters + goods), travel-time weighted
-  ./build/proc_isocity_transitplan --seed 1 --size 128x128 --days 60 \
-    --demand combined --weight time --lines 8 --endpoints 24 \
-    --json transit_plan.json --geojson transit_plan.geojson \
-    --overlay transit_overlay.png --iso transit_iso.png --scale 4
-
-  # Commute-only demand, shortest-path in steps, fewer lines, stricter detour
-  ./build/proc_isocity_transitplan --load save.bin --demand commute --weight steps \
-    --lines 4 --max-detour 1.3 --min-line-demand 200 \
-    --json commute_lines.json --overlay commute_lines.png
   ```
 
 
@@ -300,11 +275,6 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
   This yields neighborhood-like, block-contiguous districts (as opposed to the road-network-centered
   auto-districting). Exports a report to JSON/CSV/DOT and can write a new save with the districts applied.
 
-  It also supports an optional **balanced** mode (`--balanced 1`) that grows districts to reduce
-  weight imbalance while keeping blocks contiguous. Weights can be based on:
-  - `--weight-mode area` (default): block tile area
-  - `--weight-mode capacity`: sum of per-tile zone capacity inside the block (housing + jobs)
-
   ```bash
   # Generate a world, assign 6 districts, export a DOT graph and a district overlay image
   ./build/proc_isocity_blockdistricts --seed 1 --size 128x128 \
@@ -312,11 +282,6 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
     --json blockdistricts.json --dot blockdistricts.dot \
     --blocks-csv blockdistricts_blocks.csv --edges-csv blockdistricts_edges.csv \
     --district-ppm districts.png --scale 4
-
-  # Balanced mode: keep district capacity more even (tune with --lambda)
-  ./build/proc_isocity_blockdistricts --load save.bin --districts 6 \
-    --balanced 1 --weight-mode capacity --lambda 5 \
-    --json blockdistricts_balanced.json --write-save save_with_balanced_districts.bin
 
   # Apply block districts to an existing save and write out a new save
   ./build/proc_isocity_blockdistricts --load save.bin --districts 8 --write-save save_with_districts.bin

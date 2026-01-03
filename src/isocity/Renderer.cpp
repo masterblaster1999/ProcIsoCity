@@ -752,6 +752,42 @@ static void DrawMergedZoneBuildingAndIndicators(const ZoneBuildingParcel& p, con
   }
 }
 
+
+// Draw per-tile zone indicators (level pips + occupancy bar) when zoomed in.
+// Used for single-tile buildings and as a defensive fallback when parcelization is disabled.
+static void DrawZoneTileIndicators(const Tile& t, float tileW, float tileH, float zoom, const Vector2& center)
+{
+  if (!IsZoneOverlay(t.overlay)) return;
+
+  const float tileScreenW = tileW * zoom;
+  if (tileScreenW < 28.0f) return;
+
+  const float invZoom = 1.0f / std::max(0.001f, zoom);
+
+  const int lvl = ClampZoneLevel(t.level);
+  const int cap = CapacityForOverlayLevel(t.overlay, lvl);
+  const int occ = std::clamp(static_cast<int>(t.occupants), 0, cap);
+  const float occRatio = (cap > 0) ? (static_cast<float>(occ) / static_cast<float>(cap)) : 0.0f;
+
+  const float yInd = center.y - tileH * 0.18f;
+
+  // Pips:
+  const float pipR = 2.0f * invZoom;
+  const float pipGap = 5.0f * invZoom;
+  for (int i = 0; i < lvl; ++i) {
+    const float px = center.x - (static_cast<float>(lvl - 1) * 0.5f - static_cast<float>(i)) * pipGap;
+    DrawCircleV(Vector2{px, yInd}, pipR, Color{0, 0, 0, 100});
+  }
+
+  // Fill bar:
+  const float barW = tileW * 0.42f * invZoom;
+  const float barH = 3.0f * invZoom;
+  const float barX = center.x - barW * 0.5f;
+  const float barY = yInd + 5.0f * invZoom;
+  DrawRectangleV(Vector2{barX, barY}, Vector2{barW, barH}, Color{0, 0, 0, 90});
+  DrawRectangleV(Vector2{barX, barY}, Vector2{barW * occRatio, barH}, Color{255, 255, 255, 170});
+}
+
 Renderer::Renderer(int tileW, int tileH, std::uint64_t seed)
     : m_tileW(tileW)
     , m_tileH(tileH)
@@ -1640,6 +1676,9 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
 
         const Tile& t = world.at(x, y);
 
+        const std::size_t tileIdx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
+                                    static_cast<std::size_t>(x);
+
         const float tileW = static_cast<float>(m_tileW);
         const float tileH = static_cast<float>(m_tileH);
 
@@ -1709,15 +1748,13 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
         const bool isZone = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
                              t.overlay == Overlay::Industrial);
 
-        if (useMergedZoneBuildings && isZone &&
-            idx < static_cast<int>(m_zoneParcelsScratch.tileToParcel.size())) {
-          const int parcelAll = m_zoneParcelsScratch.tileToParcel[idx];
-          const int parcelAnchor = m_zoneParcelsScratch.anchorToParcel[idx];
+        if (useMergedZoneBuildings && isZone && tileIdx < m_zoneParcelsScratch.tileToParcel.size()) {
+          const int parcelAll = m_zoneParcelsScratch.tileToParcel[tileIdx];
+          const int parcelAnchor = m_zoneParcelsScratch.anchorToParcel[tileIdx];
 
           if (parcelAll >= 0) {
             // Only draw once per parcel (on the anchor tile).
-            if (parcelAnchor >= 0 &&
-                parcelAnchor < static_cast<int>(m_zoneParcelsScratch.parcels.size())) {
+            if (parcelAnchor >= 0 && parcelAnchor < static_cast<int>(m_zoneParcelsScratch.parcels.size())) {
               const ZoneBuildingParcel& p =
                   m_zoneParcelsScratch.parcels[static_cast<std::size_t>(parcelAnchor)];
 
@@ -1725,89 +1762,18 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
                 DrawMergedZoneBuildingAndIndicators(p, world, m_elev, tileW, tileH, camera.zoom, timeSec);
               } else {
                 DrawZoneBuilding(t, tileW, tileH, camera.zoom, center, brightness);
-              if (tileScreenW >= 28.0f) {
-                const float invZoom = 1.0f / std::max(0.001f, camera.zoom);
-                const int lvl = std::clamp<int>(t.level, 1, 3);
-                const int cap = CapacityForOverlayLevel(t.overlay, lvl);
-                const int occ = std::clamp<int>(static_cast<int>(t.occupants), 0, cap);
-                const float occRatio = (cap > 0) ? (static_cast<float>(occ) / static_cast<float>(cap)) : 0.0f;
-                const float y0 = center.y - tileH * 0.18f;
-
-                // Pips:
-                const float pipR = 2.0f * invZoom;
-                const float pipGap = 5.0f * invZoom;
-                for (int i = 0; i < lvl; ++i) {
-                  const float px = center.x - (static_cast<float>(lvl - 1) * 0.5f - static_cast<float>(i)) * pipGap;
-                  DrawCircleV(Vector2{px, yInd}, pipR, Color{0, 0, 0, 100});
-                }
-
-                // Fill bar:
-                const float barW = tileW * 0.42f * invZoom;
-                const float barH = 3.0f * invZoom;
-                const float barX = center.x - barW * 0.5f;
-                const float barY = yInd + 5.0f * invZoom;
-                DrawRectangleV(Vector2{barX, barY}, Vector2{barW, barH}, Color{0, 0, 0, 90});
-                DrawRectangleV(Vector2{barX, barY}, Vector2{barW * occRatio, barH}, Color{255, 255, 255, 170});
-              }
+                DrawZoneTileIndicators(t, tileW, tileH, camera.zoom, center);
               }
             }
           } else {
-            // Defensive fallback: weird zone tile not parcelized (e.g., zone-on-water in tests).
+            // Defensive fallback: zone tile not parcelized (should be rare).
             DrawZoneBuilding(t, tileW, tileH, camera.zoom, center, brightness);
-              if (tileScreenW >= 28.0f) {
-                const float invZoom = 1.0f / std::max(0.001f, camera.zoom);
-                const int lvl = std::clamp<int>(t.level, 1, 3);
-                const int cap = CapacityForOverlayLevel(t.overlay, lvl);
-                const int occ = std::clamp<int>(static_cast<int>(t.occupants), 0, cap);
-                const float occRatio = (cap > 0) ? (static_cast<float>(occ) / static_cast<float>(cap)) : 0.0f;
-                const float y0 = center.y - tileH * 0.18f;
-
-                // Pips:
-                const float pipR = 2.0f * invZoom;
-                const float pipGap = 5.0f * invZoom;
-                for (int i = 0; i < lvl; ++i) {
-                  const float px = center.x - (static_cast<float>(lvl - 1) * 0.5f - static_cast<float>(i)) * pipGap;
-                  DrawCircleV(Vector2{px, yInd}, pipR, Color{0, 0, 0, 100});
-                }
-
-                // Fill bar:
-                const float barW = tileW * 0.42f * invZoom;
-                const float barH = 3.0f * invZoom;
-                const float barX = center.x - barW * 0.5f;
-                const float barY = yInd + 5.0f * invZoom;
-                DrawRectangleV(Vector2{barX, barY}, Vector2{barW, barH}, Color{0, 0, 0, 90});
-                DrawRectangleV(Vector2{barX, barY}, Vector2{barW * occRatio, barH}, Color{255, 255, 255, 170});
-              }
+            DrawZoneTileIndicators(t, tileW, tileH, camera.zoom, center);
           }
         } else {
           // Per-tile fallback.
           DrawZoneBuilding(t, tileW, tileH, camera.zoom, center, brightness);
-          if (isZone) {
-              if (tileScreenW >= 28.0f) {
-                const float invZoom = 1.0f / std::max(0.001f, camera.zoom);
-                const int lvl = std::clamp<int>(t.level, 1, 3);
-                const int cap = CapacityForOverlayLevel(t.overlay, lvl);
-                const int occ = std::clamp<int>(static_cast<int>(t.occupants), 0, cap);
-                const float occRatio = (cap > 0) ? (static_cast<float>(occ) / static_cast<float>(cap)) : 0.0f;
-                const float y0 = center.y - tileH * 0.18f;
-
-                // Pips:
-                const float pipR = 2.0f * invZoom;
-                const float pipGap = 5.0f * invZoom;
-                for (int i = 0; i < lvl; ++i) {
-                  const float px = center.x - (static_cast<float>(lvl - 1) * 0.5f - static_cast<float>(i)) * pipGap;
-                  DrawCircleV(Vector2{px, yInd}, pipR, Color{0, 0, 0, 100});
-                }
-
-                // Fill bar:
-                const float barW = tileW * 0.42f * invZoom;
-                const float barH = 3.0f * invZoom;
-                const float barX = center.x - barW * 0.5f;
-                const float barY = yInd + 5.0f * invZoom;
-                DrawRectangleV(Vector2{barX, barY}, Vector2{barW, barH}, Color{0, 0, 0, 90});
-                DrawRectangleV(Vector2{barX, barY}, Vector2{barW * occRatio, barH}, Color{255, 255, 255, 170});
-              }
-          }
+          DrawZoneTileIndicators(t, tileW, tileH, camera.zoom, center);
         }
 
 // Road indicators: show small pips for upgraded road class (2..3) when zoomed in.
@@ -1849,6 +1815,9 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
       if (y < vis.minY || y > vis.maxY) continue;
 
       const Tile& t = world.at(x, y);
+
+      const std::size_t tileIdx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
+                                  static_cast<std::size_t>(x);
 
       const float tileW = static_cast<float>(m_tileW);
       const float tileH = static_cast<float>(m_tileH);
@@ -2054,10 +2023,8 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
 
       // Heatmap overlay (drawn after tile overlays so it can tint zones/roads).
       if (showHeatmap) {
-        const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
-                                static_cast<std::size_t>(x);
-        if (idx < heatmap->size()) {
-          const float hv = (*heatmap)[idx];
+        if (tileIdx < heatmap->size()) {
+          const float hv = (*heatmap)[tileIdx];
           const Color c = HeatmapColor(hv, heatmapRamp);
           Vector2 corners[4];
           TileDiamondCorners(center, tileW, tileH, corners);
@@ -2104,15 +2071,13 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
       const bool isZone = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
                            t.overlay == Overlay::Industrial);
 
-      if (useMergedZoneBuildings && isZone &&
-          idx < static_cast<int>(m_zoneParcelsScratch.tileToParcel.size())) {
-        const int parcelAll = m_zoneParcelsScratch.tileToParcel[idx];
-        const int parcelAnchor = m_zoneParcelsScratch.anchorToParcel[idx];
+      if (useMergedZoneBuildings && isZone && tileIdx < m_zoneParcelsScratch.tileToParcel.size()) {
+        const int parcelAll = m_zoneParcelsScratch.tileToParcel[tileIdx];
+        const int parcelAnchor = m_zoneParcelsScratch.anchorToParcel[tileIdx];
 
         if (parcelAll >= 0) {
           // Only draw once per parcel (on the anchor tile).
-          if (parcelAnchor >= 0 &&
-              parcelAnchor < static_cast<int>(m_zoneParcelsScratch.parcels.size())) {
+          if (parcelAnchor >= 0 && parcelAnchor < static_cast<int>(m_zoneParcelsScratch.parcels.size())) {
             const ZoneBuildingParcel& p =
                 m_zoneParcelsScratch.parcels[static_cast<std::size_t>(parcelAnchor)];
 
@@ -2120,89 +2085,18 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
               DrawMergedZoneBuildingAndIndicators(p, world, m_elev, tileW, tileH, camera.zoom, timeSec);
             } else {
               DrawZoneBuilding(t, tileW, tileH, camera.zoom, center, brightness);
-            if (tileScreenW >= 28.0f) {
-              const float invZoom = 1.0f / std::max(0.001f, camera.zoom);
-              const int lvl = std::clamp<int>(t.level, 1, 3);
-              const int cap = CapacityForOverlayLevel(t.overlay, lvl);
-              const int occ = std::clamp<int>(static_cast<int>(t.occupants), 0, cap);
-              const float occRatio = (cap > 0) ? (static_cast<float>(occ) / static_cast<float>(cap)) : 0.0f;
-              const float y0 = center.y - tileH * 0.18f;
-
-              // Pips:
-              const float pipR = 2.0f * invZoom;
-              const float pipGap = 5.0f * invZoom;
-              for (int i = 0; i < lvl; ++i) {
-                const float px = center.x - (static_cast<float>(lvl - 1) * 0.5f - static_cast<float>(i)) * pipGap;
-                DrawCircleV(Vector2{px, yInd}, pipR, Color{0, 0, 0, 100});
-              }
-
-              // Fill bar:
-              const float barW = tileW * 0.42f * invZoom;
-              const float barH = 3.0f * invZoom;
-              const float barX = center.x - barW * 0.5f;
-              const float barY = yInd + 5.0f * invZoom;
-              DrawRectangleV(Vector2{barX, barY}, Vector2{barW, barH}, Color{0, 0, 0, 90});
-              DrawRectangleV(Vector2{barX, barY}, Vector2{barW * occRatio, barH}, Color{255, 255, 255, 170});
-            }
+              DrawZoneTileIndicators(t, tileW, tileH, camera.zoom, center);
             }
           }
         } else {
-          // Defensive fallback: weird zone tile not parcelized (e.g., zone-on-water in tests).
+          // Defensive fallback: zone tile not parcelized (should be rare).
           DrawZoneBuilding(t, tileW, tileH, camera.zoom, center, brightness);
-            if (tileScreenW >= 28.0f) {
-              const float invZoom = 1.0f / std::max(0.001f, camera.zoom);
-              const int lvl = std::clamp<int>(t.level, 1, 3);
-              const int cap = CapacityForOverlayLevel(t.overlay, lvl);
-              const int occ = std::clamp<int>(static_cast<int>(t.occupants), 0, cap);
-              const float occRatio = (cap > 0) ? (static_cast<float>(occ) / static_cast<float>(cap)) : 0.0f;
-              const float y0 = center.y - tileH * 0.18f;
-
-              // Pips:
-              const float pipR = 2.0f * invZoom;
-              const float pipGap = 5.0f * invZoom;
-              for (int i = 0; i < lvl; ++i) {
-                const float px = center.x - (static_cast<float>(lvl - 1) * 0.5f - static_cast<float>(i)) * pipGap;
-                DrawCircleV(Vector2{px, yInd}, pipR, Color{0, 0, 0, 100});
-              }
-
-              // Fill bar:
-              const float barW = tileW * 0.42f * invZoom;
-              const float barH = 3.0f * invZoom;
-              const float barX = center.x - barW * 0.5f;
-              const float barY = yInd + 5.0f * invZoom;
-              DrawRectangleV(Vector2{barX, barY}, Vector2{barW, barH}, Color{0, 0, 0, 90});
-              DrawRectangleV(Vector2{barX, barY}, Vector2{barW * occRatio, barH}, Color{255, 255, 255, 170});
-            }
+          DrawZoneTileIndicators(t, tileW, tileH, camera.zoom, center);
         }
       } else {
         // Per-tile fallback.
         DrawZoneBuilding(t, tileW, tileH, camera.zoom, center, brightness);
-        if (isZone) {
-            if (tileScreenW >= 28.0f) {
-              const float invZoom = 1.0f / std::max(0.001f, camera.zoom);
-              const int lvl = std::clamp<int>(t.level, 1, 3);
-              const int cap = CapacityForOverlayLevel(t.overlay, lvl);
-              const int occ = std::clamp<int>(static_cast<int>(t.occupants), 0, cap);
-              const float occRatio = (cap > 0) ? (static_cast<float>(occ) / static_cast<float>(cap)) : 0.0f;
-              const float y0 = center.y - tileH * 0.18f;
-
-              // Pips:
-              const float pipR = 2.0f * invZoom;
-              const float pipGap = 5.0f * invZoom;
-              for (int i = 0; i < lvl; ++i) {
-                const float px = center.x - (static_cast<float>(lvl - 1) * 0.5f - static_cast<float>(i)) * pipGap;
-                DrawCircleV(Vector2{px, yInd}, pipR, Color{0, 0, 0, 100});
-              }
-
-              // Fill bar:
-              const float barW = tileW * 0.42f * invZoom;
-              const float barH = 3.0f * invZoom;
-              const float barX = center.x - barW * 0.5f;
-              const float barY = yInd + 5.0f * invZoom;
-              DrawRectangleV(Vector2{barX, barY}, Vector2{barW, barH}, Color{0, 0, 0, 90});
-              DrawRectangleV(Vector2{barX, barY}, Vector2{barW * occRatio, barH}, Color{255, 255, 255, 170});
-            }
-        }
+        DrawZoneTileIndicators(t, tileW, tileH, camera.zoom, center);
       }
 
 // Road indicators: show small pips for upgraded road class (2..3) when zoomed in.

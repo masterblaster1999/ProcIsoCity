@@ -3,7 +3,6 @@
 #include "isocity/RoadGraph.hpp"
 #include "isocity/RoadGraphExport.hpp"
 #include "isocity/RoadGraphTraffic.hpp"
-#include "isocity/TransitPlanner.hpp"
 #include "isocity/RoadGraphResilience.hpp"
 #include "isocity/RoadGraphCentrality.hpp"
 #include "isocity/RoadUpgradePlanner.hpp"
@@ -1532,71 +1531,6 @@ void TestRoadGraphExportMetricsAndJson()
   EXPECT_TRUE(json.find("\"approxDiameter\": 4") != std::string::npos);
   EXPECT_TRUE(json.find("\"nodes\"") != std::string::npos);
   EXPECT_TRUE(json.find("\"edges\"") != std::string::npos);
-}
-
-void TestTransitPlannerChoosesHighDemandCorridor()
-{
-  using namespace isocity;
-
-  // Hand-constructed cross with very high demand on the horizontal corridor.
-  //
-  //   top
-  //    |
-  // left-ctr-right
-  //    |
-  //  bottom
-  RoadGraph g;
-  g.nodes.resize(5);
-  g.nodes[0].pos = Point{9, 10};  // left
-  g.nodes[1].pos = Point{10, 10}; // center
-  g.nodes[2].pos = Point{11, 10}; // right
-  g.nodes[3].pos = Point{10, 9};  // top
-  g.nodes[4].pos = Point{10, 11}; // bottom
-
-  g.edges.resize(4);
-  auto addEdge = [&](int ei, int a, int b, const std::vector<Point>& tiles) {
-    g.edges[static_cast<std::size_t>(ei)].a = a;
-    g.edges[static_cast<std::size_t>(ei)].b = b;
-    g.edges[static_cast<std::size_t>(ei)].tiles = tiles;
-    g.edges[static_cast<std::size_t>(ei)].length = static_cast<int>(tiles.size()) - 1;
-    g.nodes[static_cast<std::size_t>(a)].edges.push_back(ei);
-    g.nodes[static_cast<std::size_t>(b)].edges.push_back(ei);
-  };
-
-  addEdge(0, 0, 1, {g.nodes[0].pos, g.nodes[1].pos});
-  addEdge(1, 1, 2, {g.nodes[1].pos, g.nodes[2].pos});
-  addEdge(2, 1, 3, {g.nodes[1].pos, g.nodes[3].pos});
-  addEdge(3, 1, 4, {g.nodes[1].pos, g.nodes[4].pos});
-
-  std::vector<std::uint64_t> demand = {150, 150, 10, 10};
-
-  TransitPlannerConfig cfg;
-  cfg.maxLines = 1;
-  cfg.endpointCandidates = 5;
-  cfg.weightMode = TransitEdgeWeightMode::Steps;
-  cfg.demandBias = 2.0;
-  cfg.maxDetour = 2.0;
-  cfg.coverFraction = 0.7;
-  cfg.minEdgeDemand = 1;
-  cfg.minLineDemand = 200; // force the planner to pick the horizontal corridor
-
-  const TransitPlan plan = PlanTransitLines(g, demand, cfg, nullptr);
-  EXPECT_EQ(static_cast<int>(plan.lines.size()), 1);
-  if (plan.lines.size() != 1) return;
-  const TransitLine& line = plan.lines[0];
-
-  // The only valid (>=200 demand) line is left->center->right.
-  EXPECT_EQ(line.sumDemand, 300);
-  EXPECT_EQ(static_cast<int>(line.edges.size()), 2);
-  EXPECT_TRUE((line.edges[0] == 0 && line.edges[1] == 1) || (line.edges[0] == 1 && line.edges[1] == 0));
-
-  std::vector<Point> tiles;
-  EXPECT_TRUE(BuildTransitLineTilePolyline(g, line, tiles));
-  EXPECT_EQ(static_cast<int>(tiles.size()), 3);
-  EXPECT_EQ(tiles.front().x, 9);
-  EXPECT_EQ(tiles.front().y, 10);
-  EXPECT_EQ(tiles.back().x, 11);
-  EXPECT_EQ(tiles.back().y, 10);
 }
 
 
@@ -5338,70 +5272,6 @@ static void TestBlockDistrictingDisconnectedComponents()
   }
 }
 
-
-static void TestBlockDistrictingBalancedCapacityLine()
-{
-  using namespace isocity;
-
-  // Construct a 1D chain of 4 blocks separated by vertical road columns. The middle blocks
-  // have higher development capacity. The classic (hop-distance) algorithm will tend to
-  // absorb the small center block into the same district as the heavy seed due to tie breaks.
-  // The balanced mode should instead split the center blocks across districts.
-  //
-  // Layout (width=11, height=3):
-  //  [B0] R [  B1  ] R [B2] R [  B3  ]
-  //   x=0 1  2-4   5  6  7  8-10
-  World world(11, 3, 1);
-
-  for (int y = 0; y < 3; ++y) {
-    world.setRoad(1, y);
-    world.setRoad(5, y);
-    world.setRoad(7, y);
-  }
-
-  // Heavy blocks: residential level 3 everywhere.
-  for (int y = 0; y < 3; ++y) {
-    for (int x = 2; x <= 4; ++x) {
-      world.at(x, y).overlay = Overlay::Residential;
-      world.at(x, y).level = 3;
-    }
-    for (int x = 8; x <= 10; ++x) {
-      world.at(x, y).overlay = Overlay::Residential;
-      world.at(x, y).level = 3;
-    }
-  }
-
-  // Light blocks: a single residential tile (level 1) each.
-  world.at(0, 1).overlay = Overlay::Residential;
-  world.at(0, 1).level = 1;
-  world.at(6, 1).overlay = Overlay::Residential;
-  world.at(6, 1).level = 1;
-
-  BlockDistrictConfig cfg;
-  cfg.districts = 2;
-  cfg.fillRoadTiles = false;
-  cfg.includeWater = false;
-  cfg.balanced = true;
-  cfg.weightMode = BlockDistrictWeightMode::Capacity;
-  cfg.lambda = 5.0f;
-
-  const BlockDistrictResult r = AssignDistrictsByBlocks(world, cfg);
-  EXPECT_TRUE(r.districtsUsed == 2);
-  EXPECT_TRUE(r.usedBalanced);
-  EXPECT_TRUE(r.weightMode == BlockDistrictWeightMode::Capacity || r.weightMode == BlockDistrictWeightMode::Area);
-
-  // The small middle block (B2 at x=6) should be pulled into the right district to balance
-  // the two heavy residential blocks.
-  for (int y = 0; y < 3; ++y) {
-    EXPECT_TRUE(world.at(6, y).district == 1);
-  }
-
-  // The left small block (B0 at x=0) should stay with the left heavy block.
-  for (int y = 0; y < 3; ++y) {
-    EXPECT_TRUE(world.at(0, y).district == 0);
-  }
-}
-
 void TestRoadGraphTrafficAggregationSimpleLine()
 {
   using namespace isocity;
@@ -5833,7 +5703,6 @@ int main()
   TestRoadGraphPlusIntersection();
   TestRoadGraphCornerCreatesNode();
   TestRoadGraphExportMetricsAndJson();
-  TestTransitPlannerChoosesHighDemandCorridor();
   TestTrafficCommuteHeatmapSimple();
   TestTrafficPrefersHighSpeedRoadsWhenStepsTie();
   TestTrafficUnreachableAcrossDisconnectedEdgeComponents();
@@ -5892,7 +5761,6 @@ int main()
   TestVectorizeLabelGridWithHole();
   TestCityBlockGraphFrontageAndAdjacency();
   TestBlockDistrictingDisconnectedComponents();
-  TestBlockDistrictingBalancedCapacityLine();
   TestRoadGraphTrafficAggregationSimpleLine();
   TestRoadUpgradePlannerPrefersAvenueUpgradeWhenCostBenefitIsBetter();
   TestPolicyOptimizerExhaustivePrefersLowMaintenanceWhenNoRevenue();
