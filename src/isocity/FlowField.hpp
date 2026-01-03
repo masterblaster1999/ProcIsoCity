@@ -56,9 +56,12 @@ struct RoadFlowField {
 // - If `extraCostMilli` is provided (and has size w*h), its values are treated as an
 //   additional per-road-tile travel-time penalty (in milli-steps) applied when entering
 //   that road tile. This is useful for congestion-aware routing.
+// - If `roadBlockMask` is provided (and has size w*h), any road tile with mask!=0 is treated
+//   as non-traversable. This is useful for scenario analysis (closures, flooding, construction).
 RoadFlowField BuildRoadFlowField(const World& world, const std::vector<int>& sourceRoadIdx,
                                  const RoadFlowFieldConfig& cfg = {},
                                  const std::vector<std::uint8_t>* precomputedRoadToEdge = nullptr,
-                                 const std::vector<int>* extraCostMilli = nullptr);
+                                 const std::vector<int>* extraCostMilli = nullptr,
+                                 const std::vector<std::uint8_t>* roadBlockMask = nullptr);
 
 } // namespace isocity

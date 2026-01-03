@@ -44,7 +44,8 @@ struct HeapCmp {
 RoadFlowField BuildRoadFlowField(const World& world, const std::vector<int>& sourceRoadIdx,
                                  const RoadFlowFieldConfig& cfg,
                                  const std::vector<std::uint8_t>* precomputedRoadToEdge,
-                                 const std::vector<int>* extraCostMilli)
+                                 const std::vector<int>* extraCostMilli,
+                                 const std::vector<std::uint8_t>* roadBlockMask)
 {
   RoadFlowField out;
 
@@ -78,12 +79,18 @@ RoadFlowField BuildRoadFlowField(const World& world, const std::vector<int>& sou
     }
   }
 
+  const bool blockOk = MaskUsable(roadBlockMask, w, h);
+
   auto isTraversableRoad = [&](int ridx) -> bool {
     if (ridx < 0 || static_cast<std::size_t>(ridx) >= n) return false;
     const int x = ridx % w;
     const int y = ridx / w;
     if (!world.inBounds(x, y)) return false;
     if (world.at(x, y).overlay != Overlay::Road) return false;
+    if (blockOk) {
+      const std::size_t ui = static_cast<std::size_t>(ridx);
+      if (ui < roadBlockMask->size() && (*roadBlockMask)[ui] != 0) return false;
+    }
     if (cfg.requireOutsideConnection) {
       const std::size_t ui = static_cast<std::size_t>(ridx);
       if (!roadToEdge || ui >= roadToEdge->size() || (*roadToEdge)[ui] == 0) return false;
