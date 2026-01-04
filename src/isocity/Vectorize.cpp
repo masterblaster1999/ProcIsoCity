@@ -115,11 +115,11 @@ void SimplifyRing(std::vector<IPoint>& ring)
   bool changed = true;
   while (changed && out.size() >= 4) {
     changed = false;
-    const std::size_t n = out.size();
-    for (std::size_t i = 0; i < n; ++i) {
-      const std::size_t i0 = (i + n - 1) % n;
+    const std::size_t outN = out.size();
+    for (std::size_t i = 0; i < outN; ++i) {
+      const std::size_t i0 = (i + outN - 1) % outN;
       const std::size_t i1 = i;
-      const std::size_t i2 = (i + 1) % n;
+      const std::size_t i2 = (i + 1) % outN;
       if (CollinearSameDir(out[i0], out[i1], out[i2])) {
         out.erase(out.begin() + static_cast<std::ptrdiff_t>(i1));
         changed = true;

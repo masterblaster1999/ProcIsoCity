@@ -925,7 +925,6 @@ void Game::setupDevConsole()
           showToast(enabled ? "Day/night lighting: ON" : "Day/night lighting: OFF");
         } else if (name == "cache") {
           const bool enabled = want(m_renderer.baseCacheEnabled());
-          m_renderCacheEnabled = enabled;
           m_renderer.setBaseCacheEnabled(enabled);
           m_renderer.markBaseCacheDirtyAll();
           showToast(enabled ? "Render cache: ON" : "Render cache: OFF");
@@ -1053,7 +1052,7 @@ void Game::setupDevConsole()
       "weather",
       "weather [clear|rain|snow|toggle] | weather intensity <0..1> | weather wind <deg> [speed] | weather overcast <0..1> | "
       "weather fog <0..1> | weather ground <on|off> | weather particles <on|off> | weather reflect <on|off>",
-      [this](DevConsole& c, const DevConsole::Args& args) {
+      [this, toLower, parseF32](DevConsole& c, const DevConsole::Args& args) {
         auto s = m_renderer.weatherSettings();
         using M = Renderer::WeatherSettings::Mode;
 
@@ -3567,16 +3566,16 @@ void Game::drawBlueprintOverlay()
 {
   if (m_blueprintMode == BlueprintMode::Off) return;
 
-  const float hw = m_cfg.tileW * 0.5f;
-  const float hh = m_cfg.tileH * 0.5f;
+  const float tileW = static_cast<float>(m_cfg.tileWidth);
+  const float tileH = static_cast<float>(m_cfg.tileHeight);
   const float thickness = 2.0f / std::max(0.35f, m_camera.zoom);
 
   auto drawOutline = [&](int tx, int ty, Color c) {
     if (!m_world.inBounds(tx, ty)) return;
     const Vector2 center =
-        TileToWorldCenterElevated(m_world, tx, ty, m_cfg.tileW, m_cfg.tileH, m_elev);
+        TileToWorldCenterElevated(m_world, tx, ty, tileW, tileH, m_elev);
     Vector2 corners[4];
-    TileDiamondCorners(center, hw, hh, corners);
+    TileDiamondCorners(center, tileW, tileH, corners);
     for (int i = 0; i < 4; ++i) {
       const int j = (i + 1) % 4;
       DrawLineEx(corners[i], corners[j], thickness, c);

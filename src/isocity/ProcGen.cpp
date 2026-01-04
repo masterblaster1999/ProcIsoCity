@@ -93,21 +93,6 @@ static float noise2D(float x, float y, std::uint32_t seed)
   return lerp(x1, x2, v);
 }
 
-static float fbm(float x, float y, std::uint32_t seed, int octaves)
-{
-  float total = 0.0f;
-  float amp = 0.5f;
-  float freq = 1.0f;
-
-  for (int i = 0; i < octaves; ++i) {
-    total += noise2D(x * freq, y * freq, seed + static_cast<std::uint32_t>(i) * 1013u) * amp;
-    freq *= 2.0f;
-    amp *= 0.5f;
-  }
-
-  return total;
-}
-
 static float fbmNormalized(float x, float y, std::uint32_t seed, int octaves)
 {
   float total = 0.0f;
@@ -496,7 +481,7 @@ static float ScoreHubCandidate(const World& world, int x, int y, bool hasAnyWate
 
   // Weighted sum + tiny deterministic tie-breaker.
   float score = 0.46f * flatScore + 0.34f * landFrac + 0.15f * edgeNorm + 0.05f * waterScore;
-  score += 0.0001f * TileRand01(x, y, seed32 ^ 0xA11CE5EEDu);
+  score += 0.0001f * TileRand01(x, y, seed32 ^ 0x11CE5EEDu);
   return score;
 }
 
@@ -925,72 +910,6 @@ static void CarveBeltwayIfUseful(World& world, RNG& rng, const std::vector<P>& h
 // -----------------------------
 // Zone selection (deterministic, uses hashed floats rather than RNG state)
 // -----------------------------
-
-static Overlay PickZoneTypeDet(float d01, int roadLevel, float water01, float r01)
-{
-  // Base weights: nearer hubs favor residential/commerce; farther favors industry.
-  float resW = 0.65f * (1.0f - d01) + 0.10f;
-  float comW = 0.20f * (1.0f - d01) + 0.10f;
-  float indW = 0.10f + 0.60f * d01;
-
-  // Water-adjacent frontage tends to attract residential + commerce and push
-  // heavy industry away.
-  const float w = Clamp01(water01);
-  resW *= (1.0f + 0.25f * w);
-  comW *= (1.0f + 0.55f * w);
-  indW *= (1.0f - 0.60f * w);
-  indW = std::max(0.01f, indW);
-
-  // Higher-class roads skew toward commerce/industry.
-  if (roadLevel >= 2) {
-    resW *= 0.80f;
-    comW *= 1.20f;
-    indW *= 1.15f;
-  }
-  if (roadLevel >= 3) {
-    resW *= 0.60f;
-    comW *= 1.25f;
-    indW *= 1.35f;
-  }
-
-  const float sum = resW + comW + indW;
-  if (sum <= 0.0f) {
-    return Overlay::Residential;
-  }
-
-  const float r = Clamp01(r01) * sum;
-  if (r < resW) {
-    return Overlay::Residential;
-  }
-  if (r < resW + comW) {
-    return Overlay::Commercial;
-  }
-  return Overlay::Industrial;
-}
-
-static int PickZoneLevelDet(float d01, int roadLevel, float r0, float r1, float r2, float r3)
-{
-  // Default low density.
-  int lvl = 1;
-
-  // Near hubs we allow higher density more often.
-  if (d01 < 0.25f && r0 < 0.35f) {
-    lvl = 2;
-  }
-  if (d01 < 0.12f && r1 < 0.18f) {
-    lvl = 3;
-  }
-
-  // Higher class roads allow higher density, too.
-  if (roadLevel >= 2 && r2 < 0.25f) {
-    lvl = std::max(lvl, 2);
-  }
-  if (roadLevel >= 3 && r3 < 0.18f) {
-    lvl = 3;
-  }
-
-  return std::clamp(lvl, 1, 3);
-}
 
 static int MaxAdjacentRoadLevel(const World& world, int x, int y)
 {

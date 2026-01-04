@@ -286,6 +286,7 @@ static void DrawProceduralTileDetails(const World& world, int x, int y, const Ti
                                      float tileW, float tileH, float zoom, float brightness, std::uint32_t seed32,
                                      float timeSec)
 {
+  (void)world;
   // Purely aesthetic; keep utility overlays readable by suppressing detail on man-made tiles.
   if (t.overlay == Overlay::Road || t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
       t.overlay == Overlay::Industrial)
@@ -515,6 +516,13 @@ static void DrawWeatherGroundEffects(const World& world, int x, int y, const Til
 }
 
 // ---------------------------------------------------------------------------------------------
+struct TileRect {
+  int minX = 0;
+  int maxX = 0;
+  int minY = 0;
+  int maxY = 0;
+};
+
 // Day / night emissive decals (streetlights + windows)
 // ---------------------------------------------------------------------------------------------
 
@@ -843,13 +851,6 @@ Texture2D MakeDiamondTexture(int w, int h, Fn fn)
 }
 
 inline float Dot2(float ax, float ay, float bx, float by) { return ax * bx + ay * by; }
-struct TileRect {
-  int minX = 0;
-  int maxX = 0;
-  int minY = 0;
-  int maxY = 0;
-};
-
 // Compute a conservative tile-coordinate rectangle that covers the current camera viewport.
 // This is used to avoid drawing off-screen tiles (big win when panning/zooming on larger maps).
 TileRect ComputeVisibleTileRect(const Camera2D& camera, int screenW, int screenH, int mapW, int mapH, float tileW,
@@ -1899,7 +1900,7 @@ void Renderer::rebuildBaseCacheBand(const World& world, BandCache& band)
   const float tileWf = static_cast<float>(m_tileW);
   const float tileHf = static_cast<float>(m_tileH);
 
-  const Rectangle src = Rectangle{0, 0, tileW, tileH};
+  const Rectangle src = Rectangle{0, 0, tileWf, tileHf};
   const Vector2 shift = Vector2{-band.origin.x, -band.origin.y};
 
   BeginTextureMode(band.rt);
@@ -1913,13 +1914,13 @@ void Renderer::rebuildBaseCacheBand(const World& world, BandCache& band)
       const Tile& t = world.at(x, y);
 
       const float elevPx = TileElevationPx(t, m_elev);
-      const Vector2 baseCenterW = TileToWorldCenter(x, y, tileW, tileH);
+      const Vector2 baseCenterW = TileToWorldCenter(x, y, tileWf, tileHf);
       const Vector2 baseCenter{baseCenterW.x + shift.x, baseCenterW.y + shift.y};
       const Vector2 center{baseCenter.x, baseCenter.y - elevPx};
 
-      const Rectangle dst = Rectangle{center.x - tileW * 0.5f, center.y - tileH * 0.5f, tileW, tileH};
+      const Rectangle dst = Rectangle{center.x - tileWf * 0.5f, center.y - tileHf * 0.5f, tileWf, tileHf};
       // Per-tile lighting: base height/variation + slope/AO (no animated water shimmer in cache).
-      const TileLighting light = ComputeTileLighting(world, x, y, tileW, tileH, m_elev, 0.0f, false);
+      const TileLighting light = ComputeTileLighting(world, x, y, tileWf, tileHf, m_elev, 0.0f, false);
       const float brightness = light.base;
 
       // Draw terrain
@@ -1928,7 +1929,7 @@ void Renderer::rebuildBaseCacheBand(const World& world, BandCache& band)
       // Draw cliff walls for higher neighbors behind this tile (same logic as immediate path).
       {
         Vector2 baseCorners[4];
-        TileDiamondCorners(baseCenter, tileW, tileH, baseCorners);
+        TileDiamondCorners(baseCenter, tileWf, tileHf, baseCorners);
 
         const float eps = 0.5f;
 
@@ -2084,11 +2085,11 @@ bool Renderer::exportWorldOverview(const World& world, const char* fileName, int
   // - We add a small extra margin at the top to avoid clipping tall zone "buildings".
   const float tileWf = static_cast<float>(m_tileW);
   const float tileHf = static_cast<float>(m_tileH);
-  const float halfW = tileW * 0.5f;
-  const float halfH = tileH * 0.5f;
+  const float halfW = tileWf * 0.5f;
+  const float halfH = tileHf * 0.5f;
 
   const float maxElev = std::max(0.0f, m_elev.maxPixels);
-  const float extraTop = tileH * 5.0f; // safety margin for extruded zone buildings
+  const float extraTop = tileHf * 5.0f; // safety margin for extruded zone buildings
 
   const float left = -static_cast<float>(h) * halfW;
   const float right = static_cast<float>(w) * halfW;
