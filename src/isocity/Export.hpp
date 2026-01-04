@@ -137,6 +137,98 @@ struct IsoOverviewConfig {
   // If true, draw a thin outline around each tile top diamond.
   bool drawGrid = false;
 
+  // If true, render Terrain/Overlay isometric exports with per-pixel procedural detail:
+  //  - subtle terrain texture (grass/sand/water)
+  //  - shoreline foam/highlights
+  //  - proper road geometry with lane markings/crosswalks
+  //  - simple zone/park patterns
+  //
+  // This is purely a visualization feature; analysis layers (height/traffic/etc) can
+  // disable it for cleaner heatmaps.
+  bool fancy = true;
+
+  // Strength of micro texture noise in fancy mode (0 disables). Typical range: [0, 1].
+  float textureStrength = 1.0f;
+
+  // Fancy-mode toggles.
+  bool drawShore = true;
+  bool drawRoadMarkings = true;
+  bool drawZonePatterns = true;
+
+  // -------------------------------------------------------------------------------------------
+  // Optional cinematic / atmospheric styling (Terrain/Overlay iso exports only)
+  //
+  // These controls are intentionally *off* by default so existing tooling and regression
+  // artifacts remain stable. When enabled, they allow the headless iso exporter to match
+  // the in-app renderer more closely (day/night grading, city lights, weather styling).
+  // -------------------------------------------------------------------------------------------
+
+  struct DayNightConfig {
+    // Enable day/night grading + optional emissive lights pass.
+    bool enabled = false;
+
+    // Cycle phase in [0,1]:
+    //   0.00 = sunrise, 0.25 = noon, 0.50 = sunset, 0.75 = midnight.
+    // This matches the in-app sine sun curve.
+    float phase01 = 0.25f;
+
+    // How strongly to darken at night (0..1). Similar to Renderer::DayNightSettings::nightDarken.
+    float nightDarken = 0.80f;
+
+    // Warm tint strength around dawn/dusk (0..1). Similar to Renderer::DayNightSettings::duskTint.
+    float duskTint = 0.55f;
+
+    // Draw an emissive lights pass (streetlights + window glows) when night > ~5%.
+    bool drawLights = true;
+
+    // Extra intensity multiplier for the lights pass.
+    float lightStrength = 1.0f;
+  } dayNight;
+
+  struct WeatherConfig {
+    enum class Mode : std::uint8_t { Clear = 0, Rain = 1, Snow = 2 };
+
+    Mode mode = Mode::Clear;
+
+    // Overall intensity (0..1). Interpreted as wetness (rain) or snow cover (snow).
+    float intensity = 0.0f;
+
+    // Overcast grade strength (0..1). Used to desaturate/dim and soften contrast.
+    float overcast = 0.60f;
+
+    // Atmospheric haze (0..1) applied as a simple top-of-image fog gradient.
+    float fog = 0.0f;
+
+    // Draw precipitation particles (rain streaks / snow flakes).
+    bool drawPrecipitation = true;
+
+    // When raining and lights are enabled, draw simple reflections/smears.
+    bool reflectLights = true;
+
+    // Wind angle in degrees (used to orient rain streaks). 0 = +X, 90 = +Y.
+    float windAngleDeg = 35.0f;
+  } weather;
+
+  struct CloudConfig {
+    // Enable moving cloud shadows (dappled sunlight) based on deterministic procedural noise.
+    // Note: shadows are only visible when dayNight is enabled and the sun is above the horizon.
+    bool enabled = false;
+
+    // Fraction of the sky covered by shadow-casting clouds (0..1).
+    float coverage = 0.45f;
+
+    // Darkness of the cloud shadows (0..1).
+    float strength = 0.45f;
+
+    // Approximate cloud feature size in *tiles* (higher = larger, smoother patches).
+    float scaleTiles = 26.0f;
+
+    // Optional deterministic offset in tile units (lets you "slide" the cloud pattern).
+    float offsetX = 0.0f;
+    float offsetY = 0.0f;
+  } clouds;
+
+
   // Background color (RGB).
   std::uint8_t bgR = 110;
   std::uint8_t bgG = 160;

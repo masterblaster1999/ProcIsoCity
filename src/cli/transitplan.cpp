@@ -1,5 +1,6 @@
 #include "isocity/Export.hpp"
 #include "isocity/Goods.hpp"
+#include "isocity/Isochrone.hpp"
 #include "isocity/Pathfinding.hpp"
 #include "isocity/ProcGen.hpp"
 #include "isocity/RoadGraph.hpp"
@@ -12,11 +13,15 @@
 #include "isocity/ZoneAccess.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <filesystem>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -30,6 +35,19 @@ bool ParseI32(const std::string& s, int* out)
   if (!end || *end != '\0') return false;
   if (v < std::numeric_limits<int>::min() || v > std::numeric_limits<int>::max()) return false;
   *out = static_cast<int>(v);
+  return true;
+}
+
+bool EnsureParentDir(const std::string& path)
+{
+  if (path.empty()) return true;
+  try {
+    std::filesystem::path p(path);
+    const std::filesystem::path parent = p.parent_path();
+    if (!parent.empty()) std::filesystem::create_directories(parent);
+  } catch (...) {
+    return false;
+  }
   return true;
 }
 
@@ -125,6 +143,35 @@ bool ParseTransitWeightMode(const std::string& s, isocity::TransitEdgeWeightMode
   return false;
 }
 
+
+bool ParseStopMode(const std::string& s, isocity::TransitStopMode* out)
+{
+  if (!out) return false;
+  if (s == "nodes" || s == "node") {
+    *out = isocity::TransitStopMode::Nodes;
+    return true;
+  }
+  if (s == "tiles" || s == "tile") {
+    *out = isocity::TransitStopMode::Tiles;
+    return true;
+  }
+  return false;
+}
+
+bool ParseIsochroneWeightMode(const std::string& s, isocity::IsochroneWeightMode* out)
+{
+  if (!out) return false;
+  if (s == "steps" || s == "walk") {
+    *out = isocity::IsochroneWeightMode::Steps;
+    return true;
+  }
+  if (s == "time" || s == "travel" || s == "traveltime") {
+    *out = isocity::IsochroneWeightMode::TravelTime;
+    return true;
+  }
+  return false;
+}
+
 bool ParseExportLayerName(const std::string& s, isocity::ExportLayer* out)
 {
   return isocity::ParseExportLayer(s, *out);
@@ -167,6 +214,14 @@ void PrintHelp()
       << "  --geojson <path>         Write GeoJSON FeatureCollection (LineString + optional stops).\n"
       << "  --include-tiles <0|1>    Include per-line road-tile polylines. Default: 1\n"
       << "  --include-stops <0|1>    Include stop points. Default: 1\n"
+      << "  --stop-mode <nodes|tiles>  How stops are emitted/drawn. Default: nodes\n"
+      << "  --stop-spacing <N>         Stop spacing in road tiles when stop-mode=tiles. Default: 12\n"
+      << "\n"
+      << "Access analysis:\n"
+      << "  --access-json <path>       Write JSON summary of distance-to-stop for residents/jobs.\n"
+      << "  --access-heat <path>       Write per-tile heatmap overlay of distance-to-nearest stop.\n"
+      << "  --access-weight <steps|time>  Road routing weights for access. Default: steps\n"
+      << "  --access-walk-cost <N>     Extra milli-step cost when mapping road->tile. Default: 0\n"
       << "\n"
       << "Images:\n"
       << "  --overlay <path>         Per-tile overlay image (PPM/PNG by extension).\n"
@@ -211,11 +266,19 @@ int main(int argc, char** argv)
   TransitPlanExportConfig ecfg{};
   ecfg.includeTiles = true;
   ecfg.includeStops = true;
+  ecfg.stopMode = TransitStopMode::Nodes;
+  ecfg.stopSpacingTiles = 12;
 
   std::string jsonPath;
   std::string geojsonPath;
   std::string overlayPath;
   std::string isoPath;
+
+  // Optional access-to-transit analysis exports.
+  std::string accessJsonPath;
+  std::string accessHeatPath;
+  IsochroneWeightMode accessWeightMode = IsochroneWeightMode::Steps;
+  int accessWalkCostMilli = 0;
 
   ExportLayer baseLayer = ExportLayer::Overlay;
   int scale = 4;
@@ -332,6 +395,38 @@ int main(int argc, char** argv)
     } else if (arg == "--include-stops") {
       if (!requireValue(i, val, argc, argv) || !ParseBool01(val, &ecfg.includeStops)) {
         std::cerr << "--include-stops requires 0|1\n";
+        return 2;
+      }
+    } else if (arg == "--stop-mode") {
+      if (!requireValue(i, val, argc, argv) || !ParseStopMode(val, &ecfg.stopMode)) {
+        std::cerr << "--stop-mode requires nodes|tiles\n";
+        return 2;
+      }
+    } else if (arg == "--stop-spacing") {
+      if (!requireValue(i, val, argc, argv) || !ParseI32(val, &ecfg.stopSpacingTiles) || ecfg.stopSpacingTiles < 1) {
+        std::cerr << "--stop-spacing requires N >= 1\n";
+        return 2;
+      }
+    } else if (arg == "--access-json") {
+      if (!requireValue(i, val, argc, argv)) {
+        std::cerr << "--access-json requires a path\n";
+        return 2;
+      }
+      accessJsonPath = val;
+    } else if (arg == "--access-heat") {
+      if (!requireValue(i, val, argc, argv)) {
+        std::cerr << "--access-heat requires a path\n";
+        return 2;
+      }
+      accessHeatPath = val;
+    } else if (arg == "--access-weight") {
+      if (!requireValue(i, val, argc, argv) || !ParseIsochroneWeightMode(val, &accessWeightMode)) {
+        std::cerr << "--access-weight requires steps|time\n";
+        return 2;
+      }
+    } else if (arg == "--access-walk-cost") {
+      if (!requireValue(i, val, argc, argv) || !ParseI32(val, &accessWalkCostMilli) || accessWalkCostMilli < 0) {
+        std::cerr << "--access-walk-cost requires N >= 0\n";
         return 2;
       }
     } else if (arg == "--overlay") {
@@ -464,10 +559,289 @@ int main(int argc, char** argv)
   const int printLines = std::min<int>(static_cast<int>(plan.lines.size()), 10);
   for (int i = 0; i < printLines; ++i) {
     const TransitLine& l = plan.lines[static_cast<std::size_t>(i)];
-    std::cout << "    line " << l.id << ": stops=" << l.nodes.size()
+    std::size_t stopCount = ecfg.includeStops ? l.nodes.size() : 0;
+    if (ecfg.includeStops && ecfg.stopMode == TransitStopMode::Tiles) {
+      std::vector<Point> stops;
+      if (BuildTransitLineStopTiles(rg, l, ecfg.stopSpacingTiles, stops)) stopCount = stops.size();
+    }
+    std::cout << "    line " << l.id << ": stops=" << stopCount
               << " edges=" << l.edges.size()
               << " sumDemand=" << l.sumDemand
               << " baseCost=" << l.baseCost << "\n";
+  }
+
+  // Optional access-to-transit analysis (distance-to-nearest planned stop).
+  //
+  // This uses the same road-graph routing machinery as isochrones. By default the access metric is in
+  // road-steps (IsochroneWeightMode::Steps), which is a decent proxy for walking distance to a stop.
+  if (!accessJsonPath.empty() || !accessHeatPath.empty()) {
+    const int ww = world.width();
+    const int hh = world.height();
+    const std::size_t n = static_cast<std::size_t>(ww) * static_cast<std::size_t>(hh);
+
+    // Collect unique stop tiles across all planned lines.
+    std::vector<int> stopRoadIdx;
+    std::vector<Point> stopPoints;
+    std::vector<std::uint8_t> seen(n, 0);
+
+    auto addStop = [&](const Point& p) {
+      if (!world.inBounds(p.x, p.y)) return;
+      const std::size_t idx = static_cast<std::size_t>(p.y) * static_cast<std::size_t>(ww) +
+                              static_cast<std::size_t>(p.x);
+      if (idx >= seen.size() || seen[idx]) return;
+      seen[idx] = 1;
+
+      const Tile& t = world.at(p.x, p.y);
+      if (t.overlay != Overlay::Road) return;
+
+      stopRoadIdx.push_back(static_cast<int>(idx));
+      stopPoints.push_back(p);
+    };
+
+    if (ecfg.includeStops) {
+      for (const TransitLine& l : plan.lines) {
+        if (ecfg.stopMode == TransitStopMode::Nodes) {
+          for (int nid : l.nodes) {
+            if (nid < 0 || nid >= static_cast<int>(rg.nodes.size())) continue;
+            addStop(rg.nodes[static_cast<std::size_t>(nid)].pos);
+          }
+        } else {
+          std::vector<Point> stops;
+          if (BuildTransitLineStopTiles(rg, l, ecfg.stopSpacingTiles, stops)) {
+            for (const Point& p : stops) addStop(p);
+          }
+        }
+      }
+    }
+
+    RoadIsochroneConfig icfg;
+    icfg.requireOutsideConnection = requireOutside;
+    icfg.weightMode = accessWeightMode;
+    icfg.computeOwner = false;
+
+    const RoadIsochroneField roadField = BuildRoadIsochroneField(world, stopRoadIdx, icfg, roadToEdgePtr, nullptr);
+
+    TileAccessCostConfig tcfg;
+    tcfg.includeRoadTiles = true;
+    tcfg.includeZones = true;
+    tcfg.includeNonZonesAdjacentToRoad = true;
+    tcfg.includeWater = false;
+    tcfg.accessStepCostMilli = accessWalkCostMilli;
+    tcfg.useZoneAccessMap = true;
+
+    const std::vector<int> tileCost = BuildTileAccessCostField(world, roadField, tcfg, roadToEdgePtr);
+
+    struct WeightedCostSummary {
+      std::uint64_t totalWeight = 0;
+      std::uint64_t reachableWeight = 0;
+      double avgCostMilli = -1.0;
+      int p50CostMilli = -1;
+      int p95CostMilli = -1;
+      std::vector<std::uint64_t> withinWeight;
+    };
+
+    const std::vector<int> thresholdsSteps = {5, 10, 20};
+
+    auto weightedQuantile = [&](std::vector<std::pair<int, std::uint64_t>>& cw, std::uint64_t totalW, double q) -> int {
+      if (cw.empty() || totalW == 0) return -1;
+      std::sort(cw.begin(), cw.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+      const double target = q * static_cast<double>(totalW);
+      std::uint64_t acc = 0;
+      for (const auto& it : cw) {
+        acc += it.second;
+        if (static_cast<double>(acc) >= target) return it.first;
+      }
+      return cw.back().first;
+    };
+
+    auto computeSummary = [&](auto pred) -> WeightedCostSummary {
+      WeightedCostSummary s;
+      s.withinWeight.assign(thresholdsSteps.size(), 0);
+      std::vector<std::pair<int, std::uint64_t>> cw;
+      cw.reserve(1024);
+
+      std::uint64_t sumCost = 0;
+      for (int y = 0; y < hh; ++y) {
+        for (int x = 0; x < ww; ++x) {
+          const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(ww) +
+                                  static_cast<std::size_t>(x);
+          if (idx >= tileCost.size()) continue;
+
+          const Tile& t = world.at(x, y);
+          if (!pred(t)) continue;
+
+          const std::uint64_t wgt = static_cast<std::uint64_t>(t.occupants);
+          if (wgt == 0) continue;
+
+          s.totalWeight += wgt;
+
+          const int c = tileCost[idx];
+          if (c < 0) continue;
+
+          s.reachableWeight += wgt;
+          sumCost += static_cast<std::uint64_t>(c) * wgt;
+          cw.emplace_back(c, wgt);
+
+          for (std::size_t i = 0; i < thresholdsSteps.size(); ++i) {
+            const int thr = thresholdsSteps[i] * 1000;
+            if (c <= thr) s.withinWeight[i] += wgt;
+          }
+        }
+      }
+
+      if (s.reachableWeight > 0) {
+        s.avgCostMilli = static_cast<double>(sumCost) / static_cast<double>(s.reachableWeight);
+        s.p50CostMilli = weightedQuantile(cw, s.reachableWeight, 0.50);
+        s.p95CostMilli = weightedQuantile(cw, s.reachableWeight, 0.95);
+      }
+
+      return s;
+    };
+
+    const WeightedCostSummary resident = computeSummary([](const Tile& t) { return t.overlay == Overlay::Residential; });
+    const WeightedCostSummary jobs = computeSummary([](const Tile& t) {
+      return t.overlay == Overlay::Commercial || t.overlay == Overlay::Industrial;
+    });
+
+    // JSON summary export.
+    if (!accessJsonPath.empty()) {
+      if (!EnsureParentDir(accessJsonPath)) {
+        std::cerr << "Failed to create output directory for access-json: " << accessJsonPath << "\n";
+        return 2;
+      }
+      std::ofstream f(accessJsonPath, std::ios::binary);
+      if (!f) {
+        std::cerr << "Failed to write access-json: " << accessJsonPath << "\n";
+        return 2;
+      }
+
+      auto writeSummary = [&](const char* name, const WeightedCostSummary& s) {
+        f << "    \"" << name << "\":{";
+        f << "\"total\":" << s.totalWeight << ",";
+        f << "\"reachable\":" << s.reachableWeight << ",";
+        f << "\"shareReachable\":" << (s.totalWeight > 0 ? (static_cast<double>(s.reachableWeight) /
+                                                         static_cast<double>(s.totalWeight))
+                                                     : 0.0)
+          << ",";
+        f << "\"avgCostMilli\":" << s.avgCostMilli << ",";
+        f << "\"p50CostMilli\":" << s.p50CostMilli << ",";
+        f << "\"p95CostMilli\":" << s.p95CostMilli << ",";
+        f << "\"withinSteps\":[";
+        for (std::size_t i = 0; i < thresholdsSteps.size(); ++i) {
+          if (i) f << ",";
+          const double share = (s.totalWeight > 0) ? (static_cast<double>(s.withinWeight[i]) /
+                                                    static_cast<double>(s.totalWeight))
+                                                 : 0.0;
+          f << "{\"steps\":" << thresholdsSteps[i] << ",\"count\":" << s.withinWeight[i] << ",\"share\":" << share << "}";
+        }
+        f << "]}";
+      };
+
+      f << "{\n";
+      f << "  \"version\":1,\n";
+      f << "  \"stopMode\":\"" << TransitStopModeName(ecfg.stopMode) << "\",\n";
+      f << "  \"stopSpacingTiles\":" << ecfg.stopSpacingTiles << ",\n";
+      f << "  \"accessWeightMode\":\"" << (accessWeightMode == IsochroneWeightMode::Steps ? "steps" : "time") << "\",\n";
+      f << "  \"accessWalkCostMilli\":" << accessWalkCostMilli << ",\n";
+      f << "  \"stopCount\":" << stopRoadIdx.size() << ",\n";
+      f << "  \"thresholdsSteps\":[";
+      for (std::size_t i = 0; i < thresholdsSteps.size(); ++i) {
+        if (i) f << ",";
+        f << thresholdsSteps[i];
+      }
+      f << "],\n";
+      f << "  \"groups\":{\n";
+      writeSummary("residents", resident);
+      f << ",\n";
+      writeSummary("jobs", jobs);
+      f << "\n  }\n";
+      f << "}\n";
+    }
+
+    // Heatmap export.
+    if (!accessHeatPath.empty()) {
+      PpmImage img = RenderPpmLayer(world, baseLayer, nullptr, nullptr, nullptr);
+
+      // Pick a robust max for normalization (95th percentile of reachable costs).
+      std::vector<int> costs;
+      costs.reserve(tileCost.size());
+      for (int c : tileCost) {
+        if (c >= 0) costs.push_back(c);
+      }
+      int maxCost = 1;
+      if (!costs.empty()) {
+        std::sort(costs.begin(), costs.end());
+        const std::size_t idx = (costs.size() - 1) * 95 / 100;
+        maxCost = std::max(1, costs[idx]);
+      }
+
+      auto blend = [&](std::uint8_t& dst, std::uint8_t src) {
+        // 1/3 original + 2/3 overlay.
+        dst = static_cast<std::uint8_t>((static_cast<int>(dst) + static_cast<int>(src) * 2) / 3);
+      };
+
+      auto setPixel = [&](int x, int y, std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+        if (x < 0 || y < 0 || x >= img.width || y >= img.height) return;
+        const std::size_t o = (static_cast<std::size_t>(y) * static_cast<std::size_t>(img.width) +
+                               static_cast<std::size_t>(x)) *
+                              3u;
+        if (o + 2 >= img.rgb.size()) return;
+        img.rgb[o + 0] = r;
+        img.rgb[o + 1] = g;
+        img.rgb[o + 2] = b;
+      };
+
+      // Heat overlay.
+      for (int y = 0; y < hh; ++y) {
+        for (int x = 0; x < ww; ++x) {
+          const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(ww) +
+                                  static_cast<std::size_t>(x);
+          if (idx >= tileCost.size()) continue;
+
+          const int c = tileCost[idx];
+          if (c < 0) continue;
+
+          const double t = std::clamp(static_cast<double>(c) / static_cast<double>(maxCost), 0.0, 1.0);
+          const std::uint8_t rr = static_cast<std::uint8_t>(t * 255.0 + 0.5);
+          const std::uint8_t gg = static_cast<std::uint8_t>((1.0 - t) * 255.0 + 0.5);
+          const std::uint8_t bb = 0;
+
+          const std::size_t o = idx * 3u;
+          if (o + 2 >= img.rgb.size()) continue;
+          blend(img.rgb[o + 0], rr);
+          blend(img.rgb[o + 1], gg);
+          blend(img.rgb[o + 2], bb);
+        }
+      }
+
+      // Draw line polylines (crisp on top of heatmap).
+      auto lineColor = [](int lineId) -> std::array<std::uint8_t, 3> {
+        std::uint32_t x = static_cast<std::uint32_t>(lineId) * 2654435761u;
+        std::uint8_t r = static_cast<std::uint8_t>(64 + (x & 0x7F));
+        std::uint8_t g = static_cast<std::uint8_t>(64 + ((x >> 8) & 0x7F));
+        std::uint8_t b = static_cast<std::uint8_t>(64 + ((x >> 16) & 0x7F));
+        return {r, g, b};
+      };
+
+      for (const TransitLine& l : plan.lines) {
+        std::vector<Point> tiles;
+        if (!BuildTransitLineTilePolyline(rg, l, tiles)) continue;
+        const auto c = lineColor(l.id);
+        for (const Point& p : tiles) {
+          setPixel(p.x, p.y, c[0], c[1], c[2]);
+        }
+      }
+
+      // Stops in white.
+      for (const Point& p : stopPoints) setPixel(p.x, p.y, 255, 255, 255);
+
+      if (scale > 1) img = ScaleNearest(img, scale);
+      std::string err2;
+      if (!WriteImageAuto(accessHeatPath, img, err2)) {
+        std::cerr << "Failed to write access heatmap: " << accessHeatPath << "\n" << err2 << "\n";
+        return 2;
+      }
+    }
   }
 
   std::string err;
@@ -484,7 +858,7 @@ int main(int argc, char** argv)
     }
   }
   if (!overlayPath.empty()) {
-    PpmImage img = RenderTransitOverlayTile(world, baseLayer, rg, plan, /*drawStops=*/ecfg.includeStops);
+    PpmImage img = RenderTransitOverlayTile(world, baseLayer, rg, plan, ecfg);
     if (scale > 1) img = ScaleNearest(img, scale);
     if (!WriteImageAuto(overlayPath, img, err)) {
       std::cerr << "Failed to write overlay image: " << overlayPath << "\n" << err << "\n";
@@ -492,7 +866,7 @@ int main(int argc, char** argv)
     }
   }
   if (!isoPath.empty()) {
-    IsoOverviewResult iso = RenderTransitIsoOverlay(world, baseLayer, isoCfg, rg, plan, /*drawStops=*/ecfg.includeStops);
+    IsoOverviewResult iso = RenderTransitIsoOverlay(world, baseLayer, isoCfg, rg, plan, ecfg);
     PpmImage img = iso.image;
     if (scale > 1) img = ScaleNearest(img, scale);
     if (!WriteImageAuto(isoPath, img, err)) {

@@ -84,7 +84,12 @@ void PrintHelp()
       << "                 [--maint-road <N>] [--maint-park <N>]\n"
       << "                 [--export-ppm <layer> <out.ppm|out.png>]... [--export-scale <N>]\n"
       << "                 [--export-iso <layer> <out.ppm|out.png>]... [--iso-tile <WxH>] [--iso-height <N>]\n"
-      << "                 [--iso-margin <N>] [--iso-grid <0|1>] [--iso-cliffs <0|1>] [--export-tiles-csv <tiles.csv>]\n"
+      << "                 [--iso-margin <N>] [--iso-grid <0|1>] [--iso-cliffs <0|1>] [--iso-fancy <0|1>]\n"
+      << "                 [--iso-texture <0..100>] [--iso-shore <0|1>] [--iso-roadmarks <0|1>] [--iso-zonepatterns <0|1>]\n"
+      << "                 [--iso-daynight <0|1>] [--iso-time <0..100>] [--iso-lights <0|1>] [--iso-night <0..100>] [--iso-dusk <0..100>]\n"
+      << "                 [--iso-weather <clear|rain|snow>] [--iso-wx-intensity <0..100>] [--iso-wx-overcast <0..100>] [--iso-wx-fog <0..100>]\n"
+      << "                 [--iso-wx-precip <0|1>] [--iso-wx-reflect <0|1>] [--iso-clouds <0|1>] [--iso-cloud-cover <0..100>] [--iso-cloud-strength <0..100>] [--iso-cloud-scale <N>]\n"
+      << "                 [--export-tiles-csv <tiles.csv>]\n"
       << "                 [--batch <N>]\n\n"
       << "Export layers (for --export-ppm / --export-iso):\n"
       << "  terrain overlay height landvalue traffic goods_traffic goods_fill district\n\n"
@@ -380,6 +385,230 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.drawCliffs = (b != 0);
+    } else if (arg == "--iso-fancy") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-fancy requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--iso-fancy requires 0 or 1\n";
+        return 2;
+      }
+      isoCfg.fancy = (b != 0);
+    } else if (arg == "--iso-texture") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-texture requires an integer percent (0..100)\n";
+        return 2;
+      }
+      int p = 100;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--iso-texture requires an integer percent (0..100)\n";
+        return 2;
+      }
+      isoCfg.textureStrength = static_cast<float>(p) / 100.0f;
+    } else if (arg == "--iso-shore") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-shore requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--iso-shore requires 0 or 1\n";
+        return 2;
+      }
+      isoCfg.drawShore = (b != 0);
+    } else if (arg == "--iso-roadmarks") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-roadmarks requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--iso-roadmarks requires 0 or 1\n";
+        return 2;
+      }
+      isoCfg.drawRoadMarkings = (b != 0);
+    } else if (arg == "--iso-zonepatterns") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-zonepatterns requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--iso-zonepatterns requires 0 or 1\n";
+        return 2;
+      }
+      isoCfg.drawZonePatterns = (b != 0);
+    } else if (arg == "--iso-daynight") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-daynight requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--iso-daynight requires 0 or 1\n";
+        return 2;
+      }
+      isoCfg.dayNight.enabled = (b != 0);
+    } else if (arg == "--iso-time") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-time requires an integer percent (0..100)\n";
+        return 2;
+      }
+      int p = 25;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--iso-time requires an integer percent (0..100)\n";
+        return 2;
+      }
+      isoCfg.dayNight.phase01 = static_cast<float>(p) / 100.0f;
+    } else if (arg == "--iso-lights") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-lights requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--iso-lights requires 0 or 1\n";
+        return 2;
+      }
+      isoCfg.dayNight.drawLights = (b != 0);
+    } else if (arg == "--iso-night") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-night requires an integer percent (0..100)\n";
+        return 2;
+      }
+      int p = 80;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--iso-night requires an integer percent (0..100)\n";
+        return 2;
+      }
+      isoCfg.dayNight.nightDarken = static_cast<float>(p) / 100.0f;
+    } else if (arg == "--iso-dusk") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-dusk requires an integer percent (0..100)\n";
+        return 2;
+      }
+      int p = 55;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--iso-dusk requires an integer percent (0..100)\n";
+        return 2;
+      }
+      isoCfg.dayNight.duskTint = static_cast<float>(p) / 100.0f;
+    } else if (arg == "--iso-weather") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-weather requires one of: clear, rain, snow\n";
+        return 2;
+      }
+      if (val == "clear") {
+        isoCfg.weather.mode = isocity::IsoOverviewConfig::WeatherConfig::Mode::Clear;
+      } else if (val == "rain") {
+        isoCfg.weather.mode = isocity::IsoOverviewConfig::WeatherConfig::Mode::Rain;
+      } else if (val == "snow") {
+        isoCfg.weather.mode = isocity::IsoOverviewConfig::WeatherConfig::Mode::Snow;
+      } else {
+        std::cerr << "--iso-weather requires one of: clear, rain, snow\n";
+        return 2;
+      }
+    } else if (arg == "--iso-wx-intensity") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-wx-intensity requires an integer percent (0..100)\n";
+        return 2;
+      }
+      int p = 0;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--iso-wx-intensity requires an integer percent (0..100)\n";
+        return 2;
+      }
+      isoCfg.weather.intensity = static_cast<float>(p) / 100.0f;
+    } else if (arg == "--iso-wx-overcast") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-wx-overcast requires an integer percent (0..100)\n";
+        return 2;
+      }
+      int p = 65;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--iso-wx-overcast requires an integer percent (0..100)\n";
+        return 2;
+      }
+      isoCfg.weather.overcast = static_cast<float>(p) / 100.0f;
+    } else if (arg == "--iso-wx-fog") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-wx-fog requires an integer percent (0..100)\n";
+        return 2;
+      }
+      int p = 0;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--iso-wx-fog requires an integer percent (0..100)\n";
+        return 2;
+      }
+      isoCfg.weather.fog = static_cast<float>(p) / 100.0f;
+    } else if (arg == "--iso-wx-precip") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-wx-precip requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--iso-wx-precip requires 0 or 1\n";
+        return 2;
+      }
+      isoCfg.weather.drawPrecipitation = (b != 0);
+    } else if (arg == "--iso-wx-reflect") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-wx-reflect requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--iso-wx-reflect requires 0 or 1\n";
+        return 2;
+      }
+      isoCfg.weather.reflectLights = (b != 0);
+    } else if (arg == "--iso-clouds") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-clouds requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--iso-clouds requires 0 or 1\n";
+        return 2;
+      }
+      isoCfg.clouds.enabled = (b != 0);
+    } else if (arg == "--iso-cloud-cover") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-cloud-cover requires an integer percent (0..100)\n";
+        return 2;
+      }
+      int p = 45;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--iso-cloud-cover requires an integer percent (0..100)\n";
+        return 2;
+      }
+      isoCfg.clouds.coverage = static_cast<float>(p) / 100.0f;
+    } else if (arg == "--iso-cloud-strength") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-cloud-strength requires an integer percent (0..100)\n";
+        return 2;
+      }
+      int p = 45;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--iso-cloud-strength requires an integer percent (0..100)\n";
+        return 2;
+      }
+      isoCfg.clouds.strength = static_cast<float>(p) / 100.0f;
+    } else if (arg == "--iso-cloud-scale") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-cloud-scale requires an integer >= 1 (tiles)\n";
+        return 2;
+      }
+      int s = 24;
+      if (!ParseI32(val, &s) || s < 1) {
+        std::cerr << "--iso-cloud-scale requires an integer >= 1 (tiles)\n";
+        return 2;
+      }
+      isoCfg.clouds.scaleTiles = static_cast<float>(s);
     } else if (arg == "--export-scale") {
       if (!requireValue(i, val)) {
         std::cerr << "--export-scale requires an integer\n";

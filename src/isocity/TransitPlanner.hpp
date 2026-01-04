@@ -107,4 +107,15 @@ TransitPlan PlanTransitLines(const RoadGraph& g, const std::vector<std::uint64_t
 // Returns false on invalid indices.
 bool BuildTransitLineTilePolyline(const RoadGraph& g, const TransitLine& line, std::vector<Point>& outTiles);
 
+
+// Build a set of stop tiles for a transit line by sampling its tile polyline.
+//
+// stopSpacingTiles controls spacing along the road-tile polyline (in tile steps).
+// The first and last tiles are always included.
+// A spacing of 8 means roughly "one stop every 8 road tiles".
+//
+// Returns false on invalid indices / empty line.
+bool BuildTransitLineStopTiles(const RoadGraph& g, const TransitLine& line, int stopSpacingTiles,
+                               std::vector<Point>& outStops);
+
 } // namespace isocity

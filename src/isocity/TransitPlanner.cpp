@@ -437,4 +437,38 @@ bool BuildTransitLineTilePolyline(const RoadGraph& g, const TransitLine& line, s
   return !outTiles.empty();
 }
 
+
+bool BuildTransitLineStopTiles(const RoadGraph& g, const TransitLine& line, int stopSpacingTiles,
+                               std::vector<Point>& outStops)
+{
+  outStops.clear();
+  std::vector<Point> tiles;
+  if (!BuildTransitLineTilePolyline(g, line, tiles)) return false;
+  if (tiles.empty()) return false;
+
+  const int spacing = std::max(1, stopSpacingTiles);
+
+  outStops.push_back(tiles.front());
+
+  int lastIdx = 0;
+  // Always keep the final tile as a stop; only iterate interior tiles here.
+  for (int i = 1; i + 1 < static_cast<int>(tiles.size()); ++i) {
+    if (i - lastIdx >= spacing) {
+      const Point p = tiles[static_cast<std::size_t>(i)];
+      // Avoid duplicates in degenerate cases.
+      if (outStops.empty() || outStops.back().x != p.x || outStops.back().y != p.y) {
+        outStops.push_back(p);
+      }
+      lastIdx = i;
+    }
+  }
+
+  const Point last = tiles.back();
+  if (outStops.empty() || outStops.back().x != last.x || outStops.back().y != last.y) {
+    outStops.push_back(last);
+  }
+
+  return !outStops.empty();
+}
+
 } // namespace isocity

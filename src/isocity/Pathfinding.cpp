@@ -260,6 +260,31 @@ bool FindRoadBuildPath(const World& world, Point start, Point goal, std::vector<
 
   constexpr int kInf = std::numeric_limits<int>::max() / 4;
 
+  auto slopePenalty = [&](int x0, int y0, int x1, int y1) -> int {
+    if (cfg.slopeCost <= 0) return 0;
+    if (!world.inBounds(x0, y0) || !world.inBounds(x1, y1)) return 0;
+
+    const Tile& from = world.at(x0, y0);
+    const Tile& to = world.at(x1, y1);
+
+    // By default, don't penalize traversing *existing* roads so the planner
+    // continues to strongly prefer reuse.
+    if (!cfg.slopeCostAffectsExistingRoads && to.overlay == Overlay::Road) {
+      return 0;
+    }
+
+    float dh = to.height - from.height;
+    if (dh < 0.0f) dh = -dh;
+
+    // slopeCost is interpreted as "cost units per 1.0 height delta".
+    // Convert to an integer penalty with a stable round-to-nearest.
+    const float raw = dh * static_cast<float>(cfg.slopeCost);
+    int pen = static_cast<int>(raw + 0.5f);
+    if (pen < 0) pen = 0;
+    if (pen > (kInf / 8)) pen = (kInf / 8);
+    return pen;
+  };
+
   auto tileCost = [&](int x, int y) -> int {
     if (!world.inBounds(x, y)) return kInf;
     const Tile& t = world.at(x, y);
@@ -278,10 +303,20 @@ bool FindRoadBuildPath(const World& world, Point start, Point goal, std::vector<
 
   auto computePrimaryCost = [&](const std::vector<Point>& path) -> int {
     int cost = 0;
+    if (path.empty()) return 0;
+
+    // Tile costs: cost of building/upgrading each tile in the path.
     for (const Point& p : path) {
       const int c = tileCost(p.x, p.y);
       if (c >= kInf) continue;
       cost += c;
+    }
+
+    // Slope costs: per-move penalty (optional).
+    for (std::size_t i = 1; i < path.size(); ++i) {
+      const Point& a = path[i - 1];
+      const Point& b = path[i];
+      cost += slopePenalty(a.x, a.y, b.x, b.y);
     }
     return cost;
   };
@@ -393,7 +428,9 @@ bool FindRoadBuildPath(const World& world, Point start, Point goal, std::vector<
       const int stepCost = tileCost(nx, ny);
       if (stepCost >= kInf) continue;
 
-      const int nCost = cur.cost + stepCost;
+      const int slopeCost = slopePenalty(cx, cy, nx, ny);
+
+      const int nCost = cur.cost + stepCost + slopeCost;
       const int nSteps = cur.steps + 1;
       const int nTurns = cur.turns + ((curDir != kDirNone && d != curDir) ? 1 : 0);
 
@@ -463,6 +500,27 @@ bool FindRoadBuildPathBetweenSets(const World& world,
 
   constexpr int kInf = std::numeric_limits<int>::max() / 4;
 
+  auto slopePenalty = [&](int x0, int y0, int x1, int y1) -> int {
+    if (cfg.slopeCost <= 0) return 0;
+    if (!world.inBounds(x0, y0) || !world.inBounds(x1, y1)) return 0;
+
+    const Tile& from = world.at(x0, y0);
+    const Tile& to = world.at(x1, y1);
+
+    if (!cfg.slopeCostAffectsExistingRoads && to.overlay == Overlay::Road) {
+      return 0;
+    }
+
+    float dh = to.height - from.height;
+    if (dh < 0.0f) dh = -dh;
+
+    const float raw = dh * static_cast<float>(cfg.slopeCost);
+    int pen = static_cast<int>(raw + 0.5f);
+    if (pen < 0) pen = 0;
+    if (pen > (kInf / 8)) pen = (kInf / 8);
+    return pen;
+  };
+
   auto tileCost = [&](int x, int y) -> int {
     if (!world.inBounds(x, y)) return kInf;
     const Tile& t = world.at(x, y);
@@ -481,10 +539,18 @@ bool FindRoadBuildPathBetweenSets(const World& world,
 
   auto computePrimaryCost = [&](const std::vector<Point>& path) -> int {
     int cost = 0;
+    if (path.empty()) return 0;
+
     for (const Point& p : path) {
       const int c = tileCost(p.x, p.y);
       if (c >= kInf) continue;
       cost += c;
+    }
+
+    for (std::size_t i = 1; i < path.size(); ++i) {
+      const Point& a = path[i - 1];
+      const Point& b = path[i];
+      cost += slopePenalty(a.x, a.y, b.x, b.y);
     }
     return cost;
   };
@@ -639,7 +705,9 @@ bool FindRoadBuildPathBetweenSets(const World& world,
       const int stepCost = tileCost(nx, ny);
       if (stepCost >= kInf) continue;
 
-      const int nCost = cur.cost + stepCost;
+      const int slopeCost = slopePenalty(cx, cy, nx, ny);
+
+      const int nCost = cur.cost + stepCost + slopeCost;
       const int nSteps = cur.steps + 1;
       const int nTurns = cur.turns + ((curDir != kDirNone && d != curDir) ? 1 : 0);
 

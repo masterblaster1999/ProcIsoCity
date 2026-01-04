@@ -110,6 +110,55 @@ void WriteGeoJsonPointCoords(std::ostream& os, const Point& p)
   os << '[' << p.x << ',' << p.y << ']';
 }
 
+struct StopSet {
+  std::vector<Point> points;
+  std::vector<int> nodeIds; // -1 for tile-sampled stops
+};
+
+StopSet ComputeStops(const RoadGraph& g, const TransitLine& line, const TransitPlanExportConfig& cfg)
+{
+  StopSet out;
+
+  if (!cfg.includeStops) return out;
+
+  if (cfg.stopMode == TransitStopMode::Nodes) {
+    out.points.reserve(line.nodes.size());
+    out.nodeIds.reserve(line.nodes.size());
+    for (int nid : line.nodes) {
+      Point p{};
+      if (nid >= 0 && nid < static_cast<int>(g.nodes.size())) p = g.nodes[static_cast<std::size_t>(nid)].pos;
+      out.points.push_back(p);
+      out.nodeIds.push_back(nid);
+    }
+  } else {
+    std::vector<Point> stops;
+    if (!BuildTransitLineStopTiles(g, line, cfg.stopSpacingTiles, stops)) stops.clear();
+    out.points = std::move(stops);
+    out.nodeIds.assign(out.points.size(), -1);
+  }
+
+  // Defensive: collapse consecutive duplicates.
+  if (!out.points.empty()) {
+    std::vector<Point> uniqPts;
+    std::vector<int> uniqIds;
+    uniqPts.reserve(out.points.size());
+    uniqIds.reserve(out.nodeIds.size());
+
+    for (std::size_t i = 0; i < out.points.size(); ++i) {
+      const Point p = out.points[i];
+      const int nid = (i < out.nodeIds.size()) ? out.nodeIds[i] : -1;
+      if (!uniqPts.empty() && uniqPts.back().x == p.x && uniqPts.back().y == p.y) continue;
+      uniqPts.push_back(p);
+      uniqIds.push_back(nid);
+    }
+
+    out.points = std::move(uniqPts);
+    out.nodeIds = std::move(uniqIds);
+  }
+
+  return out;
+}
+
 } // namespace
 
 bool WriteTransitPlanJson(std::ostream& os, const RoadGraph& g, const TransitPlan& plan,
@@ -124,6 +173,8 @@ bool WriteTransitPlanJson(std::ostream& os, const RoadGraph& g, const TransitPla
   os << "{\n";
   os << "  \"version\":1,\n";
   os << "  \"weightMode\":\"" << TransitEdgeWeightModeName(plan.cfg.weightMode) << "\",\n";
+  os << "  \"stopMode\":\"" << TransitStopModeName(cfg.stopMode) << "\",\n";
+  os << "  \"stopSpacingTiles\":" << cfg.stopSpacingTiles << ",\n";
   os << "  \"totalDemand\":" << plan.totalDemand << ",\n";
   os << "  \"coveredDemand\":" << plan.coveredDemand << ",\n";
   os << "  \"lines\":[\n";
@@ -149,13 +200,11 @@ bool WriteTransitPlanJson(std::ostream& os, const RoadGraph& g, const TransitPla
 
     // Optional stops (redundant but handy for some pipelines).
     if (cfg.includeStops) {
+      const StopSet stops = ComputeStops(g, line, cfg);
       os << ",\n      \"stops\":[";
-      for (std::size_t i = 0; i < line.nodes.size(); ++i) {
-        const int nid = line.nodes[i];
+      for (std::size_t i = 0; i < stops.points.size(); ++i) {
         if (i) os << ',';
-        Point p{};
-        if (nid >= 0 && nid < static_cast<int>(g.nodes.size())) p = g.nodes[static_cast<std::size_t>(nid)].pos;
-        WriteJsonPointArray(os, p);
+        WriteJsonPointArray(os, stops.points[i]);
       }
       os << "]";
     }
@@ -252,11 +301,10 @@ bool WriteTransitPlanGeoJson(std::ostream& os, const RoadGraph& g, const Transit
     os << "    }";
 
     if (cfg.includeStops) {
-      // Stop Point features.
-      for (std::size_t si = 0; si < line.nodes.size(); ++si) {
-        const int nid = line.nodes[si];
-        Point p{};
-        if (nid >= 0 && nid < static_cast<int>(g.nodes.size())) p = g.nodes[static_cast<std::size_t>(nid)].pos;
+      const StopSet stops = ComputeStops(g, line, cfg);
+      for (std::size_t si = 0; si < stops.points.size(); ++si) {
+        const Point p = stops.points[si];
+        const int nid = (si < stops.nodeIds.size()) ? stops.nodeIds[si] : -1;
 
         emitComma();
         os << "    {\n";
@@ -295,7 +343,7 @@ bool ExportTransitPlanGeoJson(const std::string& path, const RoadGraph& g, const
 }
 
 PpmImage RenderTransitOverlayTile(const World& world, ExportLayer baseLayer, const RoadGraph& g, const TransitPlan& plan,
-                                  bool drawStops)
+                                  const TransitPlanExportConfig& cfg)
 {
   PpmImage img = RenderPpmLayer(world, baseLayer, nullptr, nullptr, nullptr);
   if (img.width <= 0 || img.height <= 0) return img;
@@ -308,10 +356,9 @@ PpmImage RenderTransitOverlayTile(const World& world, ExportLayer baseLayer, con
       SetPixel(img, p.x, p.y, c.r, c.g, c.b);
     }
 
-    if (drawStops) {
-      for (int nid : line.nodes) {
-        if (nid < 0 || nid >= static_cast<int>(g.nodes.size())) continue;
-        const Point sp = g.nodes[static_cast<std::size_t>(nid)].pos;
+    if (cfg.includeStops) {
+      const StopSet stops = ComputeStops(g, line, cfg);
+      for (const Point& sp : stops.points) {
         SetPixel(img, sp.x, sp.y, 255, 255, 255);
       }
     }
@@ -320,8 +367,17 @@ PpmImage RenderTransitOverlayTile(const World& world, ExportLayer baseLayer, con
   return img;
 }
 
+PpmImage RenderTransitOverlayTile(const World& world, ExportLayer baseLayer, const RoadGraph& g, const TransitPlan& plan,
+                                  bool drawStops)
+{
+  TransitPlanExportConfig cfg{};
+  cfg.includeTiles = true;
+  cfg.includeStops = drawStops;
+  return RenderTransitOverlayTile(world, baseLayer, g, plan, cfg);
+}
+
 IsoOverviewResult RenderTransitIsoOverlay(const World& world, ExportLayer baseLayer, const IsoOverviewConfig& isoCfg,
-                                         const RoadGraph& g, const TransitPlan& plan, bool drawStops)
+                                         const RoadGraph& g, const TransitPlan& plan, const TransitPlanExportConfig& cfg)
 {
   IsoOverviewResult iso = RenderIsoOverview(world, baseLayer, isoCfg, nullptr, nullptr, nullptr);
   if (iso.image.width <= 0 || iso.image.height <= 0) return iso;
@@ -346,11 +402,10 @@ IsoOverviewResult RenderTransitIsoOverlay(const World& world, ExportLayer baseLa
       drawDot(px, py, c, 1);
     }
 
-    if (drawStops) {
+    if (cfg.includeStops) {
       const RGB stop{255, 255, 255};
-      for (int nid : line.nodes) {
-        if (nid < 0 || nid >= static_cast<int>(g.nodes.size())) continue;
-        const Point sp = g.nodes[static_cast<std::size_t>(nid)].pos;
+      const StopSet stops = ComputeStops(g, line, cfg);
+      for (const Point& sp : stops.points) {
         int px = 0, py = 0;
         if (!IsoTileCenterToPixel(world, iso, sp.x, sp.y, px, py)) continue;
         drawDot(px, py, stop, 2);
@@ -359,6 +414,15 @@ IsoOverviewResult RenderTransitIsoOverlay(const World& world, ExportLayer baseLa
   }
 
   return iso;
+}
+
+IsoOverviewResult RenderTransitIsoOverlay(const World& world, ExportLayer baseLayer, const IsoOverviewConfig& isoCfg,
+                                         const RoadGraph& g, const TransitPlan& plan, bool drawStops)
+{
+  TransitPlanExportConfig cfg{};
+  cfg.includeTiles = true;
+  cfg.includeStops = drawStops;
+  return RenderTransitIsoOverlay(world, baseLayer, isoCfg, g, plan, cfg);
 }
 
 } // namespace isocity

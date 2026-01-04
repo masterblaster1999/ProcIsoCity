@@ -76,6 +76,26 @@ struct RoadBuildPathConfig {
 
   // Which cost model to optimize.
   CostModel costModel = CostModel::NewTiles;
+
+  // Optional terrain-aware penalty: discourage building roads over steep slopes.
+  //
+  // This is implemented as an *additional per-move cost* proportional to the
+  // absolute height delta between adjacent tiles:
+  //
+  //   extraCost = round(|height(to) - height(from)| * slopeCost)
+  //
+  // Where height is the procedural heightfield stored in Tile::height.
+  //
+  // Notes:
+  //  - slopeCost is interpreted as "cost units per 1.0 height delta".
+  //  - slopeCost == 0 disables the feature (default).
+  //  - By default, slope penalty is NOT applied when traversing existing roads,
+  //    so the planner still strongly prefers reusing already-built roads.
+  int slopeCost = 0;
+
+  // If true, apply slopeCost even when stepping onto existing road tiles.
+  // Default false so cost-surface routing prefers reusing roads.
+  bool slopeCostAffectsExistingRoads = false;
 };
 
 // Find a road-building path between two tiles.
@@ -87,9 +107,9 @@ struct RoadBuildPathConfig {
 // The path is optimized according to cfg.costModel, and ties are broken by
 // fewer steps, fewer turns, and stable per-tile variation bits.
 //
-// outPrimaryCost (if non-null) is:
-//  - cfg.costModel==NewTiles => number of tiles in the path that are not already roads
-//  - cfg.costModel==Money    => estimated money cost to build/upgrade the whole path
+// outPrimaryCost (if non-null) is the estimated primary cost optimized by the planner:
+//  - base tile cost according to cfg.costModel
+//  - plus (when cfg.slopeCost > 0) an extra per-move slope penalty
 bool FindRoadBuildPath(const World& world, Point start, Point goal, std::vector<Point>& outPath,
                        int* outPrimaryCost = nullptr, const RoadBuildPathConfig& cfg = {});
 

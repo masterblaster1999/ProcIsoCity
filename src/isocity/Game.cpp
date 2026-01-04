@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <ctime>
 #include <cmath>
 #include <cstdio>
@@ -181,8 +182,19 @@ bool Game::loadFromPath(const std::string& path, const char* toastLabel)
   m_trafficDirty = true;
   m_goodsDirty = true;
   m_landValueDirty = true;
+  m_seaFloodDirty = true;
   m_vehiclesDirty = true;
   m_vehicles.clear();
+
+  // Road-resilience caches/suggestions are tied to the road graph.
+  m_resilienceDirty = true;
+  m_resilienceBypassesDirty = true;
+  m_resilienceBypasses.clear();
+  m_roadGraphTileToNode.clear();
+  m_roadGraphTileToEdge.clear();
+
+  // Keep flood overlay defaults in sync with the loaded proc-gen thresholds.
+  m_seaLevel = std::clamp(m_procCfg.waterLevel, 0.0f, 1.0f);
 
   // Deterministic vehicle RNG seed per world seed.
   m_vehicleRngState = (m_world.seed() ^ 0x9E3779B97F4A7C15ULL);
@@ -277,6 +289,9 @@ Game::Game(Config cfg)
 {
   // Prevent accidental Alt+F4 style exits while testing.
   SetExitKey(KEY_NULL);
+
+  // Blueprint stamping: by default, disallow placing non-road overlays onto water.
+  m_blueprintApplyOpt.force = false;
 
   // Track the initial window geometry so fullscreen/borderless toggles can
   // restore back to the original windowed size/position.
@@ -395,6 +410,7 @@ void Game::setupDevConsole()
     case HeatmapOverlay::WaterAmenity: return "water";
     case HeatmapOverlay::Pollution: return "pollution";
     case HeatmapOverlay::TrafficSpill: return "traffic";
+    case HeatmapOverlay::FloodDepth: return "flood";
     default: return "?";
     }
   };
@@ -621,10 +637,10 @@ void Game::setupDevConsole()
       });
 
   m_console.registerCommand(
-      "heatmap", "heatmap <off|land|park|water|pollution|traffic> - set heatmap overlay",
+      "heatmap", "heatmap <off|land|park|water|pollution|traffic|flood> - set heatmap overlay",
       [this, toLower, heatmapName](DevConsole& c, const DevConsole::Args& args) {
         if (args.size() != 1) {
-          c.print("Usage: heatmap <off|land|park|water|pollution|traffic>");
+          c.print("Usage: heatmap <off|land|park|water|pollution|traffic|flood>");
           return;
         }
         const std::string h = toLower(args[0]);
@@ -634,18 +650,206 @@ void Game::setupDevConsole()
         else if (h == "water") m_heatmapOverlay = HeatmapOverlay::WaterAmenity;
         else if (h == "pollution") m_heatmapOverlay = HeatmapOverlay::Pollution;
         else if (h == "traffic") m_heatmapOverlay = HeatmapOverlay::TrafficSpill;
+        else if (h == "flood") m_heatmapOverlay = HeatmapOverlay::FloodDepth;
         else {
           c.print("Unknown heatmap: " + args[0]);
           return;
         }
+
+        // Mark derived fields dirty. Which ones get recomputed depends on which heatmap is active.
         m_landValueDirty = true;
+        m_seaFloodDirty = true;
+
         showToast(TextFormat("Heatmap: %s", heatmapName(m_heatmapOverlay)));
         c.print(TextFormat("heatmap = %s", heatmapName(m_heatmapOverlay)));
       });
 
   m_console.registerCommand(
+      "sea",
+      "sea [level] [edge|all] [4|8]  - configure sea-level flooding overlay (used by heatmap flood)",
+      [this, toLower, parseF32](DevConsole& c, const DevConsole::Args& args) {
+        if (args.size() > 3) {
+          c.print("Usage: sea [level] [edge|all] [4|8]");
+          return;
+        }
+
+        bool changed = false;
+
+        if (!args.empty()) {
+          float lv = 0.0f;
+          if (!parseF32(args[0], lv)) {
+            c.print("Invalid sea level: " + args[0]);
+            return;
+          }
+          m_seaLevel = std::clamp(lv, 0.0f, 1.0f);
+          changed = true;
+        }
+
+        if (args.size() >= 2) {
+          const std::string mode = toLower(args[1]);
+          if (mode == "edge" || mode == "coast" || mode == "coastal") {
+            m_seaFloodCfg.requireEdgeConnection = true;
+          } else if (mode == "all" || mode == "any") {
+            m_seaFloodCfg.requireEdgeConnection = false;
+          } else {
+            c.print("Unknown mode: " + args[1] + " (use edge|all)");
+            return;
+          }
+          changed = true;
+        }
+
+        if (args.size() >= 3) {
+          const std::string conn = toLower(args[2]);
+          if (conn == "8" || conn == "8c" || conn == "eight") {
+            m_seaFloodCfg.eightConnected = true;
+          } else if (conn == "4" || conn == "4c" || conn == "four") {
+            m_seaFloodCfg.eightConnected = false;
+          } else {
+            c.print("Unknown connectivity: " + args[2] + " (use 4|8)");
+            return;
+          }
+          changed = true;
+        }
+
+        if (changed) {
+          m_seaFloodDirty = true;
+          showToast(TextFormat("Sea level: %.2f (%s,%s)", static_cast<double>(m_seaLevel),
+                               m_seaFloodCfg.requireEdgeConnection ? "edge" : "all",
+                               m_seaFloodCfg.eightConnected ? "8c" : "4c"));
+        }
+
+        c.print(TextFormat("sea = %.3f  mode=%s  conn=%s", static_cast<double>(m_seaLevel),
+                           m_seaFloodCfg.requireEdgeConnection ? "edge" : "all",
+                           m_seaFloodCfg.eightConnected ? "8" : "4"));
+      });
+
+  m_console.registerCommand(
+      "floodapply",
+      "floodapply [level] [edge|all] [4|8]  - apply sea flooding to the world (undoable)",
+      [this, toLower, parseF32](DevConsole& c, const DevConsole::Args& args) {
+        if (args.size() > 3) {
+          c.print("Usage: floodapply [level] [edge|all] [4|8]");
+          return;
+        }
+
+        // Commit any in-progress user stroke so this is a clean, single undo step.
+        endPaintStroke();
+
+        float seaLevel = m_seaLevel;
+        SeaFloodConfig cfg = m_seaFloodCfg;
+
+        if (!args.empty()) {
+          float lv = 0.0f;
+          if (!parseF32(args[0], lv)) {
+            c.print("Invalid sea level: " + args[0]);
+            return;
+          }
+          seaLevel = std::clamp(lv, 0.0f, 1.0f);
+        }
+
+        if (args.size() >= 2) {
+          const std::string mode = toLower(args[1]);
+          if (mode == "edge" || mode == "coast" || mode == "coastal") {
+            cfg.requireEdgeConnection = true;
+          } else if (mode == "all" || mode == "any") {
+            cfg.requireEdgeConnection = false;
+          } else {
+            c.print("Unknown mode: " + args[1] + " (use edge|all)");
+            return;
+          }
+        }
+
+        if (args.size() >= 3) {
+          const std::string conn = toLower(args[2]);
+          if (conn == "8" || conn == "8c" || conn == "eight") {
+            cfg.eightConnected = true;
+          } else if (conn == "4" || conn == "4c" || conn == "four") {
+            cfg.eightConnected = false;
+          } else {
+            c.print("Unknown connectivity: " + args[2] + " (use 4|8)");
+            return;
+          }
+        }
+
+        // Make the overlay configuration reflect the parameters we just used.
+        m_seaLevel = seaLevel;
+        m_seaFloodCfg = cfg;
+        m_seaFloodDirty = true;
+
+        const int w = m_world.width();
+        const int h = m_world.height();
+        if (w <= 0 || h <= 0) {
+          c.print("World is empty");
+          return;
+        }
+
+        const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+        std::vector<float> heights(n, 0.0f);
+        for (int y = 0; y < h; ++y) {
+          for (int x = 0; x < w; ++x) {
+            heights[static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x)] =
+                m_world.at(x, y).height;
+          }
+        }
+
+        const SeaFloodResult r = ComputeSeaLevelFlood(heights, w, h, seaLevel, cfg);
+
+        const auto idxToXY = [&](int idx, int& x, int& y) {
+          x = idx % w;
+          y = idx / w;
+        };
+
+        int changedTiles = 0;
+
+        m_history.beginStroke(m_world);
+        for (int i = 0; i < static_cast<int>(n); ++i) {
+          if (r.flooded[static_cast<std::size_t>(i)] == 0) continue;
+
+          int x = 0, y = 0;
+          idxToXY(i, x, y);
+          if (!m_world.inBounds(x, y)) continue;
+
+          Tile& t = m_world.at(x, y);
+          const bool needTerrain = (t.terrain != Terrain::Water);
+          const bool needOverlayClear = (t.overlay != Overlay::None && t.overlay != Overlay::Road);
+          if (!needTerrain && !needOverlayClear) continue;
+
+          m_history.noteTilePreEdit(m_world, x, y);
+
+          // Flooded land becomes water. Roads survive as bridges; everything else is removed.
+          t.terrain = Terrain::Water;
+          if (needOverlayClear) {
+            m_world.setOverlay(Overlay::None, x, y);
+          }
+
+          ++changedTiles;
+        }
+        m_history.endStroke(m_world);
+
+        if (changedTiles <= 0) {
+          showToast(TextFormat("Flood apply: no changes (sea %.2f)", static_cast<double>(seaLevel)));
+          c.print("no changes");
+          return;
+        }
+
+        // A flood can invalidate many derived overlays/stats.
+        m_renderer.markMinimapDirty();
+        m_renderer.markBaseCacheDirtyAll();
+        m_sim.refreshDerivedStats(m_world);
+        m_trafficDirty = true;
+        m_goodsDirty = true;
+        m_landValueDirty = true;
+        m_vehiclesDirty = true;
+        m_roadGraphDirty = true;
+        m_seaFloodDirty = true;
+
+        showToast(TextFormat("Flood applied: %d tiles (sea %.2f)", changedTiles, static_cast<double>(seaLevel)), 3.0f);
+        c.print(TextFormat("flooded %d tiles (sea %.3f)", changedTiles, static_cast<double>(seaLevel)));
+      });
+
+  m_console.registerCommand(
       "overlay",
-      "overlay <minimap|vehicles|traffic|goods|outside|help|policy|report|cache|traffic_model> [on|off|toggle]",
+      "overlay <minimap|vehicles|traffic|goods|outside|help|policy|report|cache|traffic_model|roadgraph|resilience|daynight|weather> [on|off|toggle]",
       [this, toLower](DevConsole& c, const DevConsole::Args& args) {
         if (args.empty()) {
           c.print("Usage: overlay <name> [on|off|toggle]");
@@ -676,6 +880,17 @@ void Game::setupDevConsole()
         } else if (name == "outside") {
           m_showOutsideOverlay = want(m_showOutsideOverlay);
           showToast(m_showOutsideOverlay ? "Outside overlay: ON" : "Outside overlay: OFF");
+        } else if (name == "roadgraph") {
+          m_showRoadGraphOverlay = want(m_showRoadGraphOverlay);
+          showToast(m_showRoadGraphOverlay ? "Road graph overlay: ON" : "Road graph overlay: OFF");
+        } else if (name == "resilience" || name == "res") {
+          m_showResilienceOverlay = want(m_showResilienceOverlay);
+          if (m_showResilienceOverlay) {
+            ensureRoadResilienceUpToDate();
+            m_resilienceBypassesDirty = true;
+            rebuildRoadResilienceBypasses();
+          }
+          showToast(m_showResilienceOverlay ? "Resilience overlay: ON" : "Resilience overlay: OFF");
         } else if (name == "help") {
           m_showHelp = want(m_showHelp);
           showToast(m_showHelp ? "Help: ON" : "Help: OFF");
@@ -688,8 +903,29 @@ void Game::setupDevConsole()
         } else if (name == "traffic_model") {
           m_showTrafficModel = want(m_showTrafficModel);
           showToast(m_showTrafficModel ? "Traffic model: ON" : "Traffic model: OFF");
+        } else if (name == "weather" || name == "wx") {
+          auto s = m_renderer.weatherSettings();
+          using M = Renderer::WeatherSettings::Mode;
+
+          if (mode == "on" || mode == "1" || mode == "true") {
+            if (s.mode == M::Clear) s.mode = M::Rain;
+          } else if (mode == "off" || mode == "0" || mode == "false") {
+            s.mode = M::Clear;
+          } else { // toggle/cycle
+            if (s.mode == M::Clear) s.mode = M::Rain;
+            else if (s.mode == M::Rain) s.mode = M::Snow;
+            else s.mode = M::Clear;
+          }
+
+          m_renderer.setWeatherSettings(s);
+          showToast(std::string("Weather: ") + ((s.mode == M::Rain) ? "Rain" : (s.mode == M::Snow) ? "Snow" : "Clear"));
+        } else if (name == "daynight" || name == "dn" || name == "lighting") {
+          const bool enabled = want(m_renderer.dayNightEnabled());
+          m_renderer.setDayNightEnabled(enabled);
+          showToast(enabled ? "Day/night lighting: ON" : "Day/night lighting: OFF");
         } else if (name == "cache") {
           const bool enabled = want(m_renderer.baseCacheEnabled());
+          m_renderCacheEnabled = enabled;
           m_renderer.setBaseCacheEnabled(enabled);
           m_renderer.markBaseCacheDirtyAll();
           showToast(enabled ? "Render cache: ON" : "Render cache: OFF");
@@ -699,6 +935,253 @@ void Game::setupDevConsole()
         }
         c.print("ok");
       });
+
+  m_console.registerCommand(
+      "daynight",
+      "daynight [on|off|toggle] | daynight len <sec> | daynight strength <0..1> | daynight dusk <0..1> | "
+      "daynight offset <sec> | daynight lights <on|off>",
+      [this, toLower, parseF32](DevConsole& c, const DevConsole::Args& args) {
+        auto s = m_renderer.dayNightSettings();
+
+        auto printStatus = [&]() {
+          c.print(TextFormat("Day/night: %s  len=%0.1fs  offset=%0.1fs  strength=%0.2f  dusk=%0.2f  lights=%s",
+                             s.enabled ? "ON" : "OFF", s.dayLengthSec, s.timeOffsetSec, s.nightDarken, s.duskTint,
+                             s.drawLights ? "ON" : "OFF"));
+        };
+
+        if (args.empty()) {
+          printStatus();
+          return;
+        }
+
+        const std::string cmd = toLower(args[0]);
+
+        if (cmd == "on" || cmd == "off" || cmd == "toggle") {
+          if (cmd == "toggle") {
+            s.enabled = !s.enabled;
+          } else {
+            s.enabled = (cmd == "on");
+          }
+          m_renderer.setDayNightSettings(s);
+          showToast(s.enabled ? "Day/night lighting: ON" : "Day/night lighting: OFF");
+          printStatus();
+          c.print("ok");
+          return;
+        }
+
+        if ((cmd == "len" || cmd == "length") && args.size() >= 2) {
+          float v = 0.0f;
+          if (!parseF32(args[1], v)) {
+            c.print("Bad number: " + args[1]);
+            return;
+          }
+          s.dayLengthSec = std::max(1.0f, v);
+          m_renderer.setDayNightSettings(s);
+          printStatus();
+          c.print("ok");
+          return;
+        }
+
+        if ((cmd == "strength" || cmd == "night") && args.size() >= 2) {
+          float v = 0.0f;
+          if (!parseF32(args[1], v)) {
+            c.print("Bad number: " + args[1]);
+            return;
+          }
+          s.nightDarken = std::clamp(v, 0.0f, 1.0f);
+          m_renderer.setDayNightSettings(s);
+          printStatus();
+          c.print("ok");
+          return;
+        }
+
+        if ((cmd == "dusk" || cmd == "twilight") && args.size() >= 2) {
+          float v = 0.0f;
+          if (!parseF32(args[1], v)) {
+            c.print("Bad number: " + args[1]);
+            return;
+          }
+          s.duskTint = std::clamp(v, 0.0f, 1.0f);
+          m_renderer.setDayNightSettings(s);
+          printStatus();
+          c.print("ok");
+          return;
+        }
+
+        if (cmd == "offset" && args.size() >= 2) {
+          float v = 0.0f;
+          if (!parseF32(args[1], v)) {
+            c.print("Bad number: " + args[1]);
+            return;
+          }
+          s.timeOffsetSec = v;
+          m_renderer.setDayNightSettings(s);
+          printStatus();
+          c.print("ok");
+          return;
+        }
+
+        if (cmd == "lights" && args.size() >= 2) {
+          const std::string v = toLower(args[1]);
+          if (v == "on" || v == "1" || v == "true") {
+            s.drawLights = true;
+          } else if (v == "off" || v == "0" || v == "false") {
+            s.drawLights = false;
+          } else {
+            c.print("Expected on/off, got: " + args[1]);
+            return;
+          }
+          m_renderer.setDayNightSettings(s);
+          printStatus();
+          c.print("ok");
+          return;
+        }
+
+        c.print("Usage:");
+        c.print("  daynight");
+        c.print("  daynight on|off|toggle");
+        c.print("  daynight len <sec>");
+        c.print("  daynight strength <0..1>");
+        c.print("  daynight dusk <0..1>");
+        c.print("  daynight offset <sec>");
+        c.print("  daynight lights <on|off>");
+      });
+
+
+  // --- weather ---
+  m_console.registerCommand(
+      "weather",
+      "weather [clear|rain|snow|toggle] | weather intensity <0..1> | weather wind <deg> [speed] | weather overcast <0..1> | "
+      "weather fog <0..1> | weather ground <on|off> | weather particles <on|off> | weather reflect <on|off>",
+      [this](DevConsole& c, const DevConsole::Args& args) {
+        auto s = m_renderer.weatherSettings();
+        using M = Renderer::WeatherSettings::Mode;
+
+        auto modeName = [&](M m) -> const char* {
+          switch (m) {
+          case M::Rain: return "Rain";
+          case M::Snow: return "Snow";
+          default: return "Clear";
+          }
+        };
+
+        auto clamp01 = [&](float v) { return std::max(0.0f, std::min(1.0f, v)); };
+
+        auto parseOnOff = [&](const std::string& v, bool cur) -> bool {
+          const std::string t = toLower(v);
+          if (t == "on" || t == "1" || t == "true" || t == "yes") return true;
+          if (t == "off" || t == "0" || t == "false" || t == "no") return false;
+          return cur;
+        };
+
+        auto printStatus = [&]() {
+          c.print(TextFormat("Weather: %s  intensity=%.2f  wind=%.1fdeg x%.2f  overcast=%.2f  fog=%.2f  ground=%s  particles=%s  reflect=%s",
+                             modeName(s.mode), s.intensity, s.windAngleDeg, s.windSpeed, s.overcast, s.fog,
+                             s.affectGround ? "ON" : "OFF", s.drawParticles ? "ON" : "OFF",
+                             s.reflectLights ? "ON" : "OFF"));
+        };
+
+        if (args.empty()) {
+          printStatus();
+          return;
+        }
+
+        const std::string a0 = toLower(args[0]);
+
+        if (a0 == "clear" || a0 == "rain" || a0 == "snow" || a0 == "toggle") {
+          if (a0 == "clear") s.mode = M::Clear;
+          else if (a0 == "rain") s.mode = M::Rain;
+          else if (a0 == "snow") s.mode = M::Snow;
+          else {
+            if (s.mode == M::Clear) s.mode = M::Rain;
+            else if (s.mode == M::Rain) s.mode = M::Snow;
+            else s.mode = M::Clear;
+          }
+
+          if (s.mode != M::Clear && s.intensity < 0.05f) s.intensity = 0.80f;
+
+          m_renderer.setWeatherSettings(s);
+          printStatus();
+          return;
+        }
+
+        if (a0 == "intensity" && args.size() >= 2) {
+          float v = 0.0f;
+          if (!parseF32(args[1], v)) { c.print("Bad intensity value."); return; }
+          s.intensity = clamp01(v);
+          m_renderer.setWeatherSettings(s);
+          printStatus();
+          return;
+        }
+
+        if (a0 == "wind" && args.size() >= 2) {
+          float deg = 0.0f;
+          if (!parseF32(args[1], deg)) { c.print("Bad wind angle."); return; }
+          s.windAngleDeg = deg;
+
+          if (args.size() >= 3) {
+            float spd = 1.0f;
+            if (!parseF32(args[2], spd)) { c.print("Bad wind speed."); return; }
+            s.windSpeed = std::max(0.05f, spd);
+          }
+
+          m_renderer.setWeatherSettings(s);
+          printStatus();
+          return;
+        }
+
+        if (a0 == "overcast" && args.size() >= 2) {
+          float v = 0.0f;
+          if (!parseF32(args[1], v)) { c.print("Bad overcast value."); return; }
+          s.overcast = clamp01(v);
+          m_renderer.setWeatherSettings(s);
+          printStatus();
+          return;
+        }
+
+        if (a0 == "fog" && args.size() >= 2) {
+          float v = 0.0f;
+          if (!parseF32(args[1], v)) { c.print("Bad fog value."); return; }
+          s.fog = clamp01(v);
+          m_renderer.setWeatherSettings(s);
+          printStatus();
+          return;
+        }
+
+        if ((a0 == "ground" || a0 == "affect") && args.size() >= 2) {
+          s.affectGround = parseOnOff(args[1], s.affectGround);
+          m_renderer.setWeatherSettings(s);
+          printStatus();
+          return;
+        }
+
+        if (a0 == "particles" && args.size() >= 2) {
+          s.drawParticles = parseOnOff(args[1], s.drawParticles);
+          m_renderer.setWeatherSettings(s);
+          printStatus();
+          return;
+        }
+
+        if (a0 == "reflect" && args.size() >= 2) {
+          s.reflectLights = parseOnOff(args[1], s.reflectLights);
+          m_renderer.setWeatherSettings(s);
+          printStatus();
+          return;
+        }
+
+        c.print("Usage:");
+        c.print("  weather                           (show status)");
+        c.print("  weather <clear|rain|snow|toggle>");
+        c.print("  weather intensity <0..1>");
+        c.print("  weather wind <deg> [speed]");
+        c.print("  weather overcast <0..1>");
+        c.print("  weather fog <0..1>");
+        c.print("  weather ground <on|off>");
+        c.print("  weather particles <on|off>");
+        c.print("  weather reflect <on|off>");
+      });
+
+
 
   // --- file export ---
   m_console.registerCommand(
@@ -1081,6 +1564,320 @@ void Game::setupDevConsole()
         m_cfg.worldRenderTargetFps = m_worldRenderTargetFps;
         showToast(TextFormat("Render target: %dfps", m_worldRenderTargetFps), 1.5f);
         c.print(TextFormat("render_targetfps -> %d", m_worldRenderTargetFps));
+      });
+
+
+  // Road resilience overlay + bypass planner.
+  // Toggle overlay: Shift+T (in-game) or `res on/off`.
+  m_console.registerCommand(
+      "res",
+      "res ... - road resilience overlay + bypass planner.\n"
+      "Usage:\n"
+      "  res status\n"
+      "  res on|off|toggle\n"
+      "  res suggest [topN] [money|tiles] [targetLevel] [allowBridges 0|1] [maxCost]\n"
+      "  res list\n"
+      "  res clear\n"
+      "  res apply <i>",
+      [this, parseI64](DevConsole& c, const DevConsole::Args& args) {
+        auto lower = [](std::string s) {
+          for (char& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+          return s;
+        };
+
+        auto printStatus = [&]() {
+          ensureRoadResilienceUpToDate();
+          c.print(TextFormat("res: overlay=%s  bridges=%d  articulations=%d  bypasses=%d  top=%d  obj=%s  lvl=%d  allowBridges=%d",
+                             m_showResilienceOverlay ? "on" : "off",
+                             static_cast<int>(m_roadResilience.bridgeEdges.size()),
+                             static_cast<int>(m_roadResilience.articulationNodes.size()),
+                             static_cast<int>(m_resilienceBypasses.size()),
+                             m_resilienceBypassTop,
+                             m_resilienceBypassMoney ? "money" : "tiles",
+                             m_resilienceBypassTargetLevel,
+                             m_resilienceBypassAllowBridges ? 1 : 0));
+        };
+
+        if (args.empty() || args[0] == "status" || args[0] == "help") {
+          printStatus();
+          if (args.empty() || args[0] == "help") {
+            c.print("Try: res on | res suggest 5 money 2 0 2500 | res list | res apply 0");
+          }
+          return;
+        }
+
+        const std::string sub = lower(args[0]);
+
+        if (sub == "on" || sub == "off" || sub == "toggle") {
+          const bool want = (sub == "toggle") ? !m_showResilienceOverlay : (sub == "on");
+          m_showResilienceOverlay = want;
+          if (m_showResilienceOverlay) {
+            ensureRoadResilienceUpToDate();
+            m_resilienceBypassesDirty = true;
+            rebuildRoadResilienceBypasses();
+          }
+          showToast(m_showResilienceOverlay ? "Resilience overlay: ON" : "Resilience overlay: OFF", 1.5f);
+          printStatus();
+          return;
+        }
+
+        if (sub == "suggest") {
+          // Defaults: keep current settings.
+          if (args.size() >= 2) {
+            long long topN = m_resilienceBypassTop;
+            if (parseI64(args[1], topN)) m_resilienceBypassTop = std::clamp(static_cast<int>(topN), 0, 64);
+          }
+          if (args.size() >= 3) {
+            const std::string obj = lower(args[2]);
+            if (obj == "money") m_resilienceBypassMoney = true;
+            if (obj == "tiles" || obj == "newtiles") m_resilienceBypassMoney = false;
+          }
+          if (args.size() >= 4) {
+            long long lvl = m_resilienceBypassTargetLevel;
+            if (parseI64(args[3], lvl)) m_resilienceBypassTargetLevel = ClampRoadLevel(static_cast<int>(lvl));
+          }
+          if (args.size() >= 5) {
+            long long ab = 0;
+            if (parseI64(args[4], ab)) m_resilienceBypassAllowBridges = (ab != 0);
+          }
+          if (args.size() >= 6) {
+            long long mc = 0;
+            if (parseI64(args[5], mc)) m_resilienceBypassMaxCost = std::max(0, static_cast<int>(mc));
+          }
+
+          m_resilienceBypassesDirty = true;
+          rebuildRoadResilienceBypasses();
+          showToast(TextFormat("Res bypasses: %d", static_cast<int>(m_resilienceBypasses.size())), 1.5f);
+          printStatus();
+          return;
+        }
+
+        if (sub == "list") {
+          if (m_resilienceBypassesDirty) {
+            rebuildRoadResilienceBypasses();
+          }
+          if (m_resilienceBypasses.empty()) {
+            c.print("No bypass suggestions. Try: res suggest 5 money 2 0");
+            return;
+          }
+          for (std::size_t i = 0; i < m_resilienceBypasses.size(); ++i) {
+            const ResilienceBypassSuggestion& s = m_resilienceBypasses[i];
+            c.print(TextFormat("[%d] bridgeEdge=%d cut=%d cost=%d (%s) money=%d new=%d steps=%d lvl=%d bridges=%d",
+                               static_cast<int>(i), s.bridgeEdge, s.cutSize, s.primaryCost,
+                               s.moneyObjective ? "money" : "tiles", s.moneyCost, s.newTiles, s.steps,
+                               s.targetLevel, s.allowBridges ? 1 : 0));
+          }
+          return;
+        }
+
+        if (sub == "clear") {
+          m_resilienceBypasses.clear();
+          m_resilienceBypassesDirty = false;
+          c.print("Cleared bypass suggestions");
+          return;
+        }
+
+        if (sub == "apply") {
+          if (args.size() < 2) {
+            c.print("Usage: res apply <index>");
+            return;
+          }
+          long long idx = 0;
+          if (!parseI64(args[1], idx)) {
+            c.print("Invalid index: " + args[1]);
+            return;
+          }
+          applyRoadResilienceBypass(static_cast<std::size_t>(std::max(0LL, idx)));
+          return;
+        }
+
+        c.print("Unknown subcommand. Try: res help");
+      });
+
+
+  // Blueprint copy/paste stamping (interactive: toggle with J, console: bp ...)
+  m_console.registerCommand(
+      "bp",
+      "bp <on|off|status|clear|capture|stamp|save|load|transform> ... - blueprint tooling",
+      [this, joinArgs, parseI64](DevConsole& c, const DevConsole::Args& args) {
+        auto printStatus = [&]() {
+          const char* mode = "off";
+          if (m_blueprintMode == BlueprintMode::Capture) mode = "capture";
+          if (m_blueprintMode == BlueprintMode::Stamp) mode = "stamp";
+          c.print(TextFormat("bp status: mode=%s hasBlueprint=%s size=%dx%d tiles=%d rot=%d mx=%d my=%d",
+                             mode, m_hasBlueprint ? "yes" : "no", m_blueprintTransformed.width,
+                             m_blueprintTransformed.height,
+                             static_cast<int>(m_blueprintTransformed.tiles.size()),
+                             m_blueprintTransform.rotateDeg, m_blueprintTransform.mirrorX ? 1 : 0,
+                             m_blueprintTransform.mirrorY ? 1 : 0));
+        };
+
+        if (args.empty() || args[0] == "help") {
+          c.print("bp on/off/status/clear");
+          c.print("bp capture <x0> <y0> <w> <h>");
+          c.print("bp stamp <x> <y>   (x/y are anchor tile; stamp is center-anchored)");
+          c.print("bp transform <rotDeg> <mirrorX 0|1> <mirrorY 0|1>");
+          c.print("bp save <path> | bp load <path>");
+          printStatus();
+          return;
+        }
+
+        const std::string sub = args[0];
+
+        if (sub == "status") {
+          updateBlueprintTransformed();
+          printStatus();
+          return;
+        }
+
+        if (sub == "on") {
+          endPaintStroke();
+          m_blueprintMode = BlueprintMode::Capture;
+          c.print("bp -> on (capture)");
+          showToast("Blueprint: CAPTURE (drag LMB to select)");
+          return;
+        }
+        if (sub == "off") {
+          m_blueprintMode = BlueprintMode::Off;
+          m_blueprintSelecting = false;
+          m_blueprintSelStart.reset();
+          c.print("bp -> off");
+          showToast("Blueprint: OFF");
+          return;
+        }
+        if (sub == "clear") {
+          clearBlueprint();
+          m_blueprintMode = BlueprintMode::Capture;
+          c.print("bp -> cleared (capture)");
+          showToast("Blueprint cleared");
+          return;
+        }
+
+        if (sub == "capture") {
+          if (args.size() != 5) {
+            c.print("Usage: bp capture <x0> <y0> <w> <h>");
+            return;
+          }
+          long long x0 = 0, y0 = 0, w = 0, h = 0;
+          if (!parseI64(args[1], x0) || !parseI64(args[2], y0) || !parseI64(args[3], w) ||
+              !parseI64(args[4], h)) {
+            c.print("Invalid ints");
+            return;
+          }
+          Blueprint bp;
+          std::string err;
+          if (!CaptureBlueprintRect(m_world, static_cast<int>(x0), static_cast<int>(y0), static_cast<int>(w),
+                                   static_cast<int>(h), bp, err, m_blueprintCaptureOpt)) {
+            c.print("Capture failed: " + err);
+            showToast(std::string("Blueprint capture failed: ") + err, 3.0f);
+            return;
+          }
+
+          m_hasBlueprint = true;
+          m_blueprint = std::move(bp);
+          m_blueprintTransform = BlueprintTransform{};
+          m_blueprintTransformedDirty = true;
+          updateBlueprintTransformed();
+          m_blueprintMode = BlueprintMode::Stamp;
+          c.print(TextFormat("Captured blueprint %dx%d (%d tiles)", m_blueprintTransformed.width,
+                             m_blueprintTransformed.height,
+                             static_cast<int>(m_blueprintTransformed.tiles.size())));
+          showToast(TextFormat("Blueprint captured (%dx%d) - STAMP mode", m_blueprintTransformed.width,
+                               m_blueprintTransformed.height));
+          return;
+        }
+
+        if (sub == "transform") {
+          if (args.size() != 4) {
+            c.print("Usage: bp transform <rotDeg> <mirrorX 0|1> <mirrorY 0|1>");
+            return;
+          }
+          long long rot = 0, mx = 0, my = 0;
+          if (!parseI64(args[1], rot) || !parseI64(args[2], mx) || !parseI64(args[3], my)) {
+            c.print("Invalid ints");
+            return;
+          }
+          m_blueprintTransform.rotateDeg = static_cast<int>((rot % 360 + 360) % 360);
+          // Snap to multiples of 90 to match apply-time semantics.
+          m_blueprintTransform.rotateDeg = (m_blueprintTransform.rotateDeg / 90) * 90;
+          m_blueprintTransform.mirrorX = (mx != 0);
+          m_blueprintTransform.mirrorY = (my != 0);
+          m_blueprintTransformedDirty = true;
+          updateBlueprintTransformed();
+          printStatus();
+          return;
+        }
+
+        if (sub == "save") {
+          if (args.size() < 2) {
+            c.print("Usage: bp save <path>");
+            return;
+          }
+          if (!m_hasBlueprint) {
+            c.print("No blueprint to save");
+            return;
+          }
+          const std::string path = joinArgs(args, 1);
+          std::string err;
+          if (!SaveBlueprintBinary(m_blueprint, path, err)) {
+            c.print("Save failed: " + err);
+            showToast(std::string("Blueprint save failed: ") + err, 3.0f);
+            return;
+          }
+          c.print("Saved blueprint: " + path);
+          showToast("Blueprint saved", 1.5f);
+          return;
+        }
+
+        if (sub == "load") {
+          if (args.size() < 2) {
+            c.print("Usage: bp load <path>");
+            return;
+          }
+          const std::string path = joinArgs(args, 1);
+          Blueprint bp;
+          std::string err;
+          if (!LoadBlueprintBinary(bp, path, err)) {
+            c.print("Load failed: " + err);
+            showToast(std::string("Blueprint load failed: ") + err, 3.0f);
+            return;
+          }
+          m_hasBlueprint = true;
+          m_blueprint = std::move(bp);
+          m_blueprintTransform = BlueprintTransform{};
+          m_blueprintTransformedDirty = true;
+          updateBlueprintTransformed();
+          m_blueprintMode = BlueprintMode::Stamp;
+          c.print(TextFormat("Loaded blueprint %dx%d (%d tiles)", m_blueprintTransformed.width,
+                             m_blueprintTransformed.height,
+                             static_cast<int>(m_blueprintTransformed.tiles.size())));
+          showToast("Blueprint loaded (STAMP mode)");
+          return;
+        }
+
+        if (sub == "stamp") {
+          if (args.size() != 3) {
+            c.print("Usage: bp stamp <x> <y>");
+            return;
+          }
+          long long x = 0, y = 0;
+          if (!parseI64(args[1], x) || !parseI64(args[2], y)) {
+            c.print("Invalid ints");
+            return;
+          }
+          if (!m_hasBlueprint) {
+            c.print("No blueprint captured/loaded");
+            return;
+          }
+          if (!stampBlueprintAt(Point{static_cast<int>(x), static_cast<int>(y)})) {
+            c.print("Stamp failed (see toast for details)");
+            return;
+          }
+          c.print("Stamped blueprint");
+          return;
+        }
+
+        c.print("Unknown bp subcommand: " + sub);
       });
 
   m_console.registerCommand(
@@ -2533,6 +3330,11 @@ void Game::applyToolBrush(int centerX, int centerY)
 
         applied = overlayChanged || terrainChanged || heightChanged;
 
+        if (heightChanged) {
+          // Flood overlay is derived purely from the heightfield.
+          m_seaFloodDirty = true;
+        }
+
         if (applied) {
           m_landValueDirty = true;
         }
@@ -2663,6 +3465,677 @@ void Game::endPaintStroke()
   }
 }
 
+
+// -----------------------------------------------------------------------------
+// Blueprint tool helpers
+// -----------------------------------------------------------------------------
+void Game::clearBlueprint()
+{
+  m_hasBlueprint = false;
+  m_blueprint = Blueprint{};
+  m_blueprintTransformed = Blueprint{};
+  m_blueprintTransform = BlueprintTransform{};
+  m_blueprintTransformedDirty = false;
+  m_blueprintSelecting = false;
+  m_blueprintSelStart.reset();
+  m_blueprintSelEnd = Point{0, 0};
+}
+
+void Game::updateBlueprintTransformed()
+{
+  if (!m_hasBlueprint) {
+    m_blueprintTransformed = Blueprint{};
+    m_blueprintTransformedDirty = false;
+    return;
+  }
+
+  if (!m_blueprintTransformedDirty) return;
+
+  Blueprint out;
+  std::string err;
+  if (!TransformBlueprint(m_blueprint, m_blueprintTransform, out, err)) {
+    // Fail safe: revert to identity transform.
+    m_blueprintTransform = BlueprintTransform{};
+    m_blueprintTransformed = m_blueprint;
+    m_blueprintTransformedDirty = false;
+    showToast(std::string("Blueprint transform failed: ") + err, 3.0f);
+    return;
+  }
+
+  m_blueprintTransformed = std::move(out);
+  m_blueprintTransformedDirty = false;
+}
+
+bool Game::stampBlueprintAt(const Point& anchorTile)
+{
+  if (!m_hasBlueprint) {
+    showToast("No blueprint captured", 2.0f);
+    return false;
+  }
+
+  updateBlueprintTransformed();
+  const Blueprint& bp = m_blueprintTransformed;
+  if (bp.width <= 0 || bp.height <= 0) {
+    showToast("Blueprint is empty", 2.0f);
+    return false;
+  }
+
+  // Center-anchor the blueprint on the hovered tile.
+  const int dstX = anchorTile.x - (bp.width / 2);
+  const int dstY = anchorTile.y - (bp.height / 2);
+
+  // Commit any in-progress stroke, then make stamping undoable as a single stroke.
+  endPaintStroke();
+  beginPaintStroke();
+
+  // Pre-mark tiles for undo/redo tracking and base-cache invalidation.
+  for (const auto& d : bp.tiles) {
+    const int lx = d.index % bp.width;
+    const int ly = d.index / bp.width;
+    const int tx = dstX + lx;
+    const int ty = dstY + ly;
+    if (!m_world.inBounds(tx, ty)) continue;
+    m_history.noteTilePreEdit(m_world, tx, ty);
+    m_tilesEditedThisStroke.push_back(Point{tx, ty});
+  }
+
+  std::string err;
+  BlueprintApplyOptions opt = m_blueprintApplyOpt;
+  opt.transform = BlueprintTransform{}; // already baked into bp
+  const bool ok = ApplyBlueprint(m_world, bp, dstX, dstY, opt, err);
+  if (!ok) {
+    showToast(std::string("Blueprint stamp failed: ") + err, 3.0f);
+    endPaintStroke();
+    return false;
+  }
+
+  // Stamps can affect everything.
+  m_roadGraphDirty = true;
+  m_trafficDirty = true;
+  m_goodsDirty = true;
+  m_landValueDirty = true;
+  m_seaFloodDirty = true;
+  m_vehiclesDirty = true;
+
+  endPaintStroke();
+  showToast(TextFormat("Stamped blueprint (%dx%d, %d tiles)", bp.width, bp.height,
+                       static_cast<int>(bp.tiles.size())));
+  return true;
+}
+
+void Game::drawBlueprintOverlay()
+{
+  if (m_blueprintMode == BlueprintMode::Off) return;
+
+  const float hw = m_cfg.tileW * 0.5f;
+  const float hh = m_cfg.tileH * 0.5f;
+  const float thickness = 2.0f / std::max(0.35f, m_camera.zoom);
+
+  auto drawOutline = [&](int tx, int ty, Color c) {
+    if (!m_world.inBounds(tx, ty)) return;
+    const Vector2 center =
+        TileToWorldCenterElevated(m_world, tx, ty, m_cfg.tileW, m_cfg.tileH, m_elev);
+    Vector2 corners[4];
+    TileDiamondCorners(center, hw, hh, corners);
+    for (int i = 0; i < 4; ++i) {
+      const int j = (i + 1) % 4;
+      DrawLineEx(corners[i], corners[j], thickness, c);
+    }
+  };
+
+  BeginMode2D(m_camera);
+
+  if (m_blueprintMode == BlueprintMode::Capture && m_blueprintSelecting && m_blueprintSelStart) {
+    const Point a = *m_blueprintSelStart;
+    const Point b = m_blueprintSelEnd;
+    const int x0 = std::min(a.x, b.x);
+    const int y0 = std::min(a.y, b.y);
+    const int x1 = std::max(a.x, b.x);
+    const int y1 = std::max(a.y, b.y);
+    const Color col = Color{60, 255, 120, 200};
+    for (int x = x0; x <= x1; ++x) {
+      drawOutline(x, y0, col);
+      drawOutline(x, y1, col);
+    }
+    for (int y = y0; y <= y1; ++y) {
+      drawOutline(x0, y, col);
+      drawOutline(x1, y, col);
+    }
+  }
+
+  if (m_blueprintMode == BlueprintMode::Stamp && m_hasBlueprint && m_hovered) {
+    updateBlueprintTransformed();
+    const Blueprint& bp = m_blueprintTransformed;
+    if (bp.width > 0 && bp.height > 0) {
+      const int dstX = m_hovered->x - (bp.width / 2);
+      const int dstY = m_hovered->y - (bp.height / 2);
+
+      bool oob = false;
+      for (const auto& d : bp.tiles) {
+        const int lx = d.index % bp.width;
+        const int ly = d.index / bp.width;
+        const int tx = dstX + lx;
+        const int ty = dstY + ly;
+        if (!m_world.inBounds(tx, ty)) {
+          oob = true;
+          break;
+        }
+      }
+
+      const Color border = oob ? Color{255, 80, 80, 220} : Color{80, 170, 255, 220};
+      const Color tileCol = oob ? Color{255, 150, 80, 200} : Color{255, 240, 120, 220};
+
+      // Draw transformed blueprint bounds.
+      const int x0 = dstX;
+      const int y0 = dstY;
+      const int x1 = dstX + bp.width - 1;
+      const int y1 = dstY + bp.height - 1;
+      for (int x = x0; x <= x1; ++x) {
+        drawOutline(x, y0, border);
+        drawOutline(x, y1, border);
+      }
+      for (int y = y0; y <= y1; ++y) {
+        drawOutline(x0, y, border);
+        drawOutline(x1, y, border);
+      }
+
+      // Draw actual affected tiles.
+      for (const auto& d : bp.tiles) {
+        const int lx = d.index % bp.width;
+        const int ly = d.index / bp.width;
+        const int tx = dstX + lx;
+        const int ty = dstY + ly;
+        drawOutline(tx, ty, tileCol);
+      }
+    }
+  }
+
+  EndMode2D();
+}
+
+void Game::drawBlueprintPanel(int uiW, int uiH)
+{
+  if (m_blueprintMode == BlueprintMode::Off) return;
+
+  const int x = 12;
+  const int y = 96;
+  const int w = 420;
+  const int h = 150;
+
+  DrawRectangle(x, y, w, h, Color{0, 0, 0, 170});
+  DrawRectangleLines(x, y, w, h, Color{255, 255, 255, 80});
+
+  const char* mode = (m_blueprintMode == BlueprintMode::Capture) ? "CAPTURE" : "STAMP";
+  DrawText(TextFormat("Blueprint Tool [%s]", mode), x + 10, y + 8, 20, RAYWHITE);
+
+  int ty = y + 34;
+  if (m_blueprintMode == BlueprintMode::Capture) {
+    DrawText("LMB drag: select region to capture", x + 10, ty, 18, RAYWHITE);
+    ty += 22;
+    DrawText("Enter: switch to STAMP (if captured) | Backspace: clear | J/Esc: exit", x + 10,
+             ty, 14, Color{220, 220, 220, 255});
+    ty += 20;
+    if (m_blueprintSelecting && m_blueprintSelStart) {
+      const Point a = *m_blueprintSelStart;
+      const Point b = m_blueprintSelEnd;
+      const int sx = std::min(a.x, b.x);
+      const int sy = std::min(a.y, b.y);
+      const int ex = std::max(a.x, b.x);
+      const int ey = std::max(a.y, b.y);
+      DrawText(TextFormat("Selecting: (%d,%d) -> (%d,%d)  size=%dx%d", sx, sy, ex, ey,
+                           (ex - sx + 1), (ey - sy + 1)),
+               x + 10, ty, 16, Color{150, 255, 170, 255});
+    } else if (m_hasBlueprint) {
+      updateBlueprintTransformed();
+      DrawText(TextFormat("Current stamp: %dx%d (%d tiles)", m_blueprintTransformed.width,
+                           m_blueprintTransformed.height,
+                           static_cast<int>(m_blueprintTransformed.tiles.size())),
+               x + 10, ty, 16, Color{200, 220, 255, 255});
+    }
+  } else {
+    DrawText("LMB: stamp at hovered tile (center anchored)", x + 10, ty, 18, RAYWHITE);
+    ty += 22;
+    DrawText("Z: rotate 90° | X/Y: mirror | Enter: CAPTURE | Backspace: clear | J/Esc: exit",
+             x + 10, ty, 14, Color{220, 220, 220, 255});
+    ty += 20;
+    if (m_hasBlueprint) {
+      updateBlueprintTransformed();
+      DrawText(TextFormat("Stamp: %dx%d (%d tiles) rot=%d mx=%d my=%d",
+                           m_blueprintTransformed.width, m_blueprintTransformed.height,
+                           static_cast<int>(m_blueprintTransformed.tiles.size()),
+                           m_blueprintTransform.rotateDeg, m_blueprintTransform.mirrorX ? 1 : 0,
+                           m_blueprintTransform.mirrorY ? 1 : 0),
+               x + 10, ty, 16, Color{255, 240, 190, 255});
+    } else {
+      DrawText("No stamp captured yet - press Enter or switch to CAPTURE", x + 10, ty, 16,
+               Color{255, 200, 200, 255});
+    }
+  }
+
+  (void)uiW;
+  (void)uiH;
+}
+
+// -----------------------------------------------------------------------------
+// Road resilience overlay + bypass planner
+// -----------------------------------------------------------------------------
+
+void Game::ensureRoadGraphUpToDate()
+{
+  if (!m_roadGraphDirty) return;
+
+  m_roadGraph = BuildRoadGraph(m_world);
+  m_roadGraphDirty = false;
+
+  const int w = m_world.width();
+  const int h = m_world.height();
+  const std::size_t n = static_cast<std::size_t>(std::max(0, w) * std::max(0, h));
+
+  m_roadGraphTileToNode.assign(n, -1);
+  m_roadGraphTileToEdge.assign(n, -1);
+
+  if (w > 0 && h > 0) {
+    // Nodes: direct tile->node lookup.
+    for (int ni = 0; ni < static_cast<int>(m_roadGraph.nodes.size()); ++ni) {
+      const Point p = m_roadGraph.nodes[static_cast<std::size_t>(ni)].pos;
+      if (p.x < 0 || p.y < 0 || p.x >= w || p.y >= h) continue;
+      const std::size_t idx = static_cast<std::size_t>(p.y) * static_cast<std::size_t>(w) +
+                              static_cast<std::size_t>(p.x);
+      if (idx < n) m_roadGraphTileToNode[idx] = ni;
+    }
+
+    // Edges: fill interior tiles (skip endpoints so intersections map to nodes).
+    for (int ei = 0; ei < static_cast<int>(m_roadGraph.edges.size()); ++ei) {
+      const RoadGraphEdge& e = m_roadGraph.edges[static_cast<std::size_t>(ei)];
+      if (e.tiles.size() <= 2) continue;
+      for (std::size_t i = 1; i + 1 < e.tiles.size(); ++i) {
+        const Point p = e.tiles[i];
+        if (p.x < 0 || p.y < 0 || p.x >= w || p.y >= h) continue;
+        const std::size_t idx = static_cast<std::size_t>(p.y) * static_cast<std::size_t>(w) +
+                                static_cast<std::size_t>(p.x);
+        if (idx < n && m_roadGraphTileToEdge[idx] < 0) {
+          m_roadGraphTileToEdge[idx] = ei;
+        }
+      }
+    }
+  }
+
+  // Any road-graph change invalidates downstream road-resilience caches.
+  m_resilienceDirty = true;
+  m_resilienceBypassesDirty = true;
+}
+
+void Game::ensureRoadResilienceUpToDate()
+{
+  ensureRoadGraphUpToDate();
+  if (!m_resilienceDirty) return;
+  m_roadResilience = ComputeRoadGraphResilience(m_roadGraph);
+  m_resilienceDirty = false;
+}
+
+static int CountNewRoadTilesInPath(const isocity::World& world, const std::vector<isocity::Point>& path)
+{
+  int out = 0;
+  for (const isocity::Point& p : path) {
+    if (!world.inBounds(p.x, p.y)) continue;
+    if (world.at(p.x, p.y).overlay != isocity::Overlay::Road) ++out;
+  }
+  return out;
+}
+
+static int EstimateMoneyCostForRoadPath(const isocity::World& world, const std::vector<isocity::Point>& path,
+                                       int targetLevel)
+{
+  using namespace isocity;
+
+  int outCost = 0;
+  for (const Point& p : path) {
+    if (!world.inBounds(p.x, p.y)) continue;
+    const Tile& t = world.at(p.x, p.y);
+    const bool isBridge = (t.terrain == Terrain::Water);
+    if (t.overlay == Overlay::Road) {
+      const int cur = ClampRoadLevel(static_cast<int>(t.level));
+      outCost += RoadPlacementCost(cur, targetLevel, /*alreadyRoad=*/true, isBridge);
+    } else {
+      outCost += RoadPlacementCost(1, targetLevel, /*alreadyRoad=*/false, isBridge);
+    }
+  }
+  return outCost;
+}
+
+void Game::rebuildRoadResilienceBypasses()
+{
+  ensureRoadResilienceUpToDate();
+
+  m_resilienceBypasses.clear();
+  m_resilienceBypassesDirty = false;
+
+  if (m_resilienceBypassTop <= 0) return;
+  if (m_roadResilience.bridgeEdges.empty()) return;
+
+  const int mapW = m_world.width();
+  const int mapH = m_world.height();
+  if (mapW <= 0 || mapH <= 0) return;
+
+  const bool haveTraffic = (!m_trafficDirty && !m_traffic.roadTraffic.empty() &&
+                            static_cast<int>(m_traffic.roadTraffic.size()) == mapW * mapH);
+
+  struct RankedBridge {
+    int ei = -1;
+    double score = 0.0;
+    int cutSize = 0;
+  };
+
+  std::vector<RankedBridge> ranked;
+  ranked.reserve(m_roadResilience.bridgeEdges.size());
+
+  for (int ei : m_roadResilience.bridgeEdges) {
+    if (ei < 0 || ei >= static_cast<int>(m_roadGraph.edges.size())) continue;
+    const int sub = (ei < static_cast<int>(m_roadResilience.bridgeSubtreeNodes.size()))
+                        ? m_roadResilience.bridgeSubtreeNodes[static_cast<std::size_t>(ei)]
+                        : 0;
+    const int oth = (ei < static_cast<int>(m_roadResilience.bridgeOtherNodes.size()))
+                        ? m_roadResilience.bridgeOtherNodes[static_cast<std::size_t>(ei)]
+                        : 0;
+    const int cut = std::min(sub, oth);
+
+    double score = static_cast<double>(cut);
+    if (haveTraffic) {
+      const RoadGraphEdge& e = m_roadGraph.edges[static_cast<std::size_t>(ei)];
+      int maxTraffic = 0;
+      for (const Point& p : e.tiles) {
+        const int idx = p.y * mapW + p.x;
+        if (idx < 0 || idx >= static_cast<int>(m_traffic.roadTraffic.size())) continue;
+        maxTraffic = std::max(maxTraffic, static_cast<int>(m_traffic.roadTraffic[static_cast<std::size_t>(idx)]));
+      }
+      // Prioritize heavily used bridges, breaking ties by cut size.
+      score = static_cast<double>(maxTraffic) + static_cast<double>(cut) * 0.001;
+    }
+
+    ranked.push_back(RankedBridge{ei, score, cut});
+  }
+
+  std::sort(ranked.begin(), ranked.end(), [](const RankedBridge& a, const RankedBridge& b) {
+    if (a.score != b.score) return a.score > b.score;
+    if (a.cutSize != b.cutSize) return a.cutSize > b.cutSize;
+    return a.ei < b.ei;
+  });
+
+  const int want = std::min(m_resilienceBypassTop, static_cast<int>(ranked.size()));
+  m_resilienceBypasses.reserve(static_cast<std::size_t>(want));
+
+  auto sampleNodePositions = [&](const std::vector<int>& nodes, int mustInclude, std::uint64_t seed,
+                                 std::vector<Point>& out) {
+    out.clear();
+    if (nodes.empty()) return;
+
+    // Always include the bridge-side endpoint if provided.
+    if (mustInclude >= 0 && mustInclude < static_cast<int>(m_roadGraph.nodes.size())) {
+      out.push_back(m_roadGraph.nodes[static_cast<std::size_t>(mustInclude)].pos);
+    }
+
+    const int maxN = std::max(1, m_resilienceBypassMaxNodesPerSide);
+    if (static_cast<int>(nodes.size()) <= maxN) {
+      for (int ni : nodes) {
+        if (ni == mustInclude) continue;
+        out.push_back(m_roadGraph.nodes[static_cast<std::size_t>(ni)].pos);
+      }
+      return;
+    }
+
+    // Deterministic hashed sampling so we don't explode the multi-source frontier.
+    std::vector<std::pair<std::uint64_t, int>> scored;
+    scored.reserve(nodes.size());
+    std::uint64_t st = seed;
+    for (int ni : nodes) {
+      if (ni == mustInclude) continue;
+      st ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(ni)) + 0x9E3779B97F4A7C15ULL;
+      const std::uint64_t key = SplitMix64Next(st);
+      scored.emplace_back(key, ni);
+    }
+    const int take = maxN - static_cast<int>(out.size());
+    if (take <= 0) return;
+    std::nth_element(scored.begin(), scored.begin() + take, scored.end(),
+                     [](const auto& a, const auto& b) { return a.first < b.first; });
+    scored.resize(static_cast<std::size_t>(take));
+    for (const auto& kv : scored) {
+      out.push_back(m_roadGraph.nodes[static_cast<std::size_t>(kv.second)].pos);
+    }
+  };
+
+  for (int i = 0; i < want; ++i) {
+    const int bridgeEi = ranked[static_cast<std::size_t>(i)].ei;
+
+    RoadGraphBridgeCut cut;
+    if (!ComputeRoadGraphBridgeCut(m_roadGraph, bridgeEi, cut)) continue;
+
+    // Start from the smaller side so the multi-source frontier stays manageable.
+    const std::vector<int>* sideS = &cut.sideA;
+    const std::vector<int>* sideG = &cut.sideB;
+    int mustS = m_roadGraph.edges[static_cast<std::size_t>(bridgeEi)].a;
+    int mustG = m_roadGraph.edges[static_cast<std::size_t>(bridgeEi)].b;
+    if (cut.sideB.size() < cut.sideA.size()) {
+      sideS = &cut.sideB;
+      sideG = &cut.sideA;
+      mustS = m_roadGraph.edges[static_cast<std::size_t>(bridgeEi)].b;
+      mustG = m_roadGraph.edges[static_cast<std::size_t>(bridgeEi)].a;
+    }
+
+    std::vector<Point> starts;
+    std::vector<Point> goals;
+
+    const std::uint64_t seed = (m_world.seed() ^ (static_cast<std::uint64_t>(bridgeEi) * 0xD6E8FEB86659FD93ULL));
+    sampleNodePositions(*sideS, mustS, seed ^ 0xA5A5A5A5A5A5A5A5ULL, starts);
+    sampleNodePositions(*sideG, mustG, seed ^ 0x5A5A5A5A5A5A5A5AULL, goals);
+    if (starts.empty() || goals.empty()) continue;
+
+    const std::vector<std::uint64_t> blocked = BuildBlockedMovesForRoadGraphEdge(m_roadGraph, bridgeEi, mapW);
+
+    RoadBuildPathConfig cfg;
+    cfg.targetLevel = ClampRoadLevel(m_resilienceBypassTargetLevel);
+    cfg.allowBridges = m_resilienceBypassAllowBridges;
+    cfg.costModel = m_resilienceBypassMoney ? RoadBuildPathConfig::CostModel::Money
+                                            : RoadBuildPathConfig::CostModel::NewTiles;
+
+    std::vector<Point> path;
+    int primaryCost = 0;
+
+    const int maxCost = (m_resilienceBypassMaxCost > 0) ? m_resilienceBypassMaxCost : -1;
+    const bool ok = FindRoadBuildPathBetweenSets(m_world, starts, goals, path, &primaryCost, cfg, &blocked, maxCost);
+    if (!ok || path.size() < 2) continue;
+
+    ResilienceBypassSuggestion s;
+    s.bridgeEdge = bridgeEi;
+    s.cutSize = ranked[static_cast<std::size_t>(i)].cutSize;
+    s.primaryCost = primaryCost;
+    s.newTiles = CountNewRoadTilesInPath(m_world, path);
+    s.moneyCost = EstimateMoneyCostForRoadPath(m_world, path, cfg.targetLevel);
+    s.steps = static_cast<int>(path.size()) - 1;
+    s.targetLevel = cfg.targetLevel;
+    s.allowBridges = cfg.allowBridges;
+    s.moneyObjective = m_resilienceBypassMoney;
+    s.path = std::move(path);
+
+    m_resilienceBypasses.push_back(std::move(s));
+  }
+}
+
+bool Game::applyRoadResilienceBypass(std::size_t idx)
+{
+  if (idx >= m_resilienceBypasses.size()) {
+    showToast("No such bypass suggestion");
+    return false;
+  }
+
+  const ResilienceBypassSuggestion& s = m_resilienceBypasses[idx];
+  if (s.path.size() < 2) {
+    showToast("Bypass path is empty");
+    return false;
+  }
+
+  // Validate buildability and compute the current money cost (world may have changed since planning).
+  int moneyCost = 0;
+  bool anyChange = false;
+  for (const Point& p : s.path) {
+    if (!m_world.inBounds(p.x, p.y)) {
+      showToast("Bypass path is out of bounds (re-suggest)");
+      return false;
+    }
+    const Tile& t = m_world.at(p.x, p.y);
+    if (t.overlay != Overlay::None && t.overlay != Overlay::Road) {
+      showToast("Bypass path is blocked (re-suggest)");
+      return false;
+    }
+    if (t.terrain == Terrain::Water && !s.allowBridges) {
+      showToast("Bypass would require bridges (enable allowBridges)");
+      return false;
+    }
+
+    const bool isBridge = (t.terrain == Terrain::Water);
+    if (t.overlay == Overlay::Road) {
+      const int cur = ClampRoadLevel(static_cast<int>(t.level));
+      const int c = RoadPlacementCost(cur, s.targetLevel, /*alreadyRoad=*/true, isBridge);
+      moneyCost += c;
+      if (c > 0) anyChange = true;
+    } else {
+      const int c = RoadPlacementCost(1, s.targetLevel, /*alreadyRoad=*/false, isBridge);
+      moneyCost += c;
+      if (c > 0) anyChange = true;
+    }
+  }
+
+  if (!anyChange) {
+    showToast("Bypass already built (no changes)");
+    return false;
+  }
+
+  if (moneyCost > m_world.stats().money) {
+    showToast(TextFormat("Insufficient funds (%d needed)", moneyCost));
+    return false;
+  }
+
+  endPaintStroke();
+
+  const int moneyBefore = m_world.stats().money;
+  m_history.beginStroke(m_world);
+
+  std::vector<Point> changed;
+  changed.reserve(s.path.size());
+
+  for (const Point& p : s.path) {
+    // Always note the pre-edit state so undo/redo can restore tiles.
+    m_history.noteTilePreEdit(m_world, p.x, p.y);
+    const ToolApplyResult r = m_world.applyRoad(p.x, p.y, s.targetLevel);
+    if (r == ToolApplyResult::Applied) {
+      changed.push_back(p);
+    }
+  }
+
+  m_history.endStroke(m_world);
+
+  // Invalidate render caches and derived stats.
+  m_sim.refreshDerivedStats(m_world);
+  m_renderer.markMinimapDirty();
+  m_renderer.markBaseCacheDirtyForTiles(changed, m_world.width(), m_world.height());
+
+  m_roadGraphDirty = true;
+  m_trafficDirty = true;
+  m_goodsDirty = true;
+  m_landValueDirty = true;
+  m_vehiclesDirty = true;
+
+  // Suggestions are now stale.
+  m_resilienceDirty = true;
+  m_resilienceBypassesDirty = true;
+  m_resilienceBypasses.clear();
+
+  const int spent = moneyBefore - m_world.stats().money;
+  showToast(TextFormat("Bypass applied: %d tiles, spent %d", static_cast<int>(changed.size()), spent));
+  return true;
+}
+
+void Game::drawRoadResilienceOverlay()
+{
+  if (!m_showResilienceOverlay) return;
+
+  ensureRoadResilienceUpToDate();
+  if (m_resilienceBypassesDirty) {
+    rebuildRoadResilienceBypasses();
+  }
+
+  if (m_roadGraph.nodes.empty()) return;
+
+  BeginMode2D(m_camera);
+
+  const float zoom = std::max(0.25f, m_camera.zoom);
+  const float thicknessBridge = 3.5f / zoom;
+  const float thicknessBypass = 2.5f / zoom;
+  const float radius = 4.0f / zoom;
+
+  // Hover highlight (optional).
+  int hoveredEdge = -1;
+  int hoveredNode = -1;
+  if (m_hovered) {
+    const int w = m_world.width();
+    const int h = m_world.height();
+    if (w > 0 && h > 0) {
+      const int idx = m_hovered->y * w + m_hovered->x;
+      if (idx >= 0 && idx < static_cast<int>(m_roadGraphTileToNode.size())) {
+        hoveredNode = m_roadGraphTileToNode[static_cast<std::size_t>(idx)];
+      }
+      if (idx >= 0 && idx < static_cast<int>(m_roadGraphTileToEdge.size())) {
+        hoveredEdge = m_roadGraphTileToEdge[static_cast<std::size_t>(idx)];
+      }
+    }
+  }
+
+  // Draw bridge edges.
+  for (int ei : m_roadResilience.bridgeEdges) {
+    if (ei < 0 || ei >= static_cast<int>(m_roadGraph.edges.size())) continue;
+    const RoadGraphEdge& e = m_roadGraph.edges[static_cast<std::size_t>(ei)];
+    const bool hi = (ei == hoveredEdge);
+    const Color c = hi ? Color{255, 80, 80, 230} : Color{255, 80, 80, 170};
+
+    for (std::size_t i = 1; i < e.tiles.size(); ++i) {
+      const Point& a = e.tiles[i - 1];
+      const Point& b = e.tiles[i];
+      const Vector2 wa = TileToWorldCenterElevated(m_world, a.x, a.y, static_cast<float>(m_cfg.tileWidth),
+                                                   static_cast<float>(m_cfg.tileHeight), m_elev);
+      const Vector2 wb = TileToWorldCenterElevated(m_world, b.x, b.y, static_cast<float>(m_cfg.tileWidth),
+                                                   static_cast<float>(m_cfg.tileHeight), m_elev);
+      DrawLineEx(wa, wb, thicknessBridge, c);
+    }
+  }
+
+  // Draw articulation nodes.
+  for (int ni : m_roadResilience.articulationNodes) {
+    if (ni < 0 || ni >= static_cast<int>(m_roadGraph.nodes.size())) continue;
+    const RoadGraphNode& n = m_roadGraph.nodes[static_cast<std::size_t>(ni)];
+    const bool hi = (ni == hoveredNode);
+    const Color c = hi ? Color{255, 235, 60, 255} : Color{255, 235, 60, 200};
+    const Vector2 wpos = TileToWorldCenterElevated(m_world, n.pos.x, n.pos.y, static_cast<float>(m_cfg.tileWidth),
+                                                   static_cast<float>(m_cfg.tileHeight), m_elev);
+    DrawCircleV(wpos, radius, c);
+  }
+
+  // Draw bypass suggestions as translucent polylines.
+  for (const ResilienceBypassSuggestion& s : m_resilienceBypasses) {
+    if (s.path.size() < 2) continue;
+    const Color c = Color{80, 255, 140, 140};
+    for (std::size_t i = 1; i < s.path.size(); ++i) {
+      const Point& a = s.path[i - 1];
+      const Point& b = s.path[i];
+      const Vector2 wa = TileToWorldCenterElevated(m_world, a.x, a.y, static_cast<float>(m_cfg.tileWidth),
+                                                   static_cast<float>(m_cfg.tileHeight), m_elev);
+      const Vector2 wb = TileToWorldCenterElevated(m_world, b.x, b.y, static_cast<float>(m_cfg.tileWidth),
+                                                   static_cast<float>(m_cfg.tileHeight), m_elev);
+      DrawLineEx(wa, wb, thicknessBypass, c);
+    }
+  }
+
+  EndMode2D();
+}
+
 void Game::doUndo()
 {
   // Commit any in-progress stroke before undoing.
@@ -2676,6 +4149,7 @@ void Game::doUndo()
     m_trafficDirty = true;
     m_goodsDirty = true;
     m_landValueDirty = true;
+    m_seaFloodDirty = true;
     m_vehiclesDirty = true;
     showToast(TextFormat("Undo (%d left)", static_cast<int>(m_history.undoSize())));
   } else {
@@ -2695,6 +4169,7 @@ void Game::doRedo()
     m_trafficDirty = true;
     m_goodsDirty = true;
     m_landValueDirty = true;
+    m_seaFloodDirty = true;
     m_vehiclesDirty = true;
     showToast(TextFormat("Redo (%d left)", static_cast<int>(m_history.redoSize())));
   } else {
@@ -2713,8 +4188,12 @@ void Game::resetWorld(std::uint64_t newSeed)
   m_trafficDirty = true;
   m_goodsDirty = true;
   m_landValueDirty = true;
+  m_seaFloodDirty = true;
   m_vehiclesDirty = true;
   m_vehicles.clear();
+
+  // Default flood overlay sea level tracks the current proc-gen water threshold.
+  m_seaLevel = std::clamp(m_procCfg.waterLevel, 0.0f, 1.0f);
 
   // Deterministic vehicle RNG seed per world seed.
   m_vehicleRngState = (newSeed ^ 0x9E3779B97F4A7C15ULL);
@@ -3186,22 +4665,42 @@ void Game::handleInput(float dt)
   }
 
   if (IsKeyPressed(KEY_F2)) {
-    const bool enabled = !m_renderer.baseCacheEnabled();
-    m_renderer.setBaseCacheEnabled(enabled);
-    m_renderer.markBaseCacheDirtyAll();
-    showToast(enabled ? "Render cache: ON" : "Render cache: OFF");
+    if (shift) {
+      const bool enabled = !m_renderer.dayNightEnabled();
+      m_renderer.setDayNightEnabled(enabled);
+      showToast(enabled ? "Day/night lighting: ON" : "Day/night lighting: OFF");
+    } else {
+      const bool enabled = !m_renderer.baseCacheEnabled();
+      m_renderer.setBaseCacheEnabled(enabled);
+      m_renderer.markBaseCacheDirtyAll();
+      showToast(enabled ? "Render cache: ON" : "Render cache: OFF");
+    }
   }
 
-    if (IsKeyPressed(KEY_I)) {
-      m_mergedZoneBuildings = !m_mergedZoneBuildings;
-      m_cfg.mergedZoneBuildings = m_mergedZoneBuildings;
-      showToast(std::string("Merged zone buildings: ") +
-                (m_mergedZoneBuildings ? "ON" : "OFF"));
-    }
+  if (IsKeyPressed(KEY_I)) {
+    m_mergedZoneBuildings = !m_mergedZoneBuildings;
+    m_cfg.mergedZoneBuildings = m_mergedZoneBuildings;
+    showToast(std::string("Merged zone buildings: ") + (m_mergedZoneBuildings ? "ON" : "OFF"));
+  }
 
   if (IsKeyPressed(KEY_F3)) {
-    m_showTrafficModel = !m_showTrafficModel;
-    showToast(m_showTrafficModel ? "Traffic model: ON" : "Traffic model: OFF");
+    if (shift) {
+      auto s = m_renderer.weatherSettings();
+      using M = Renderer::WeatherSettings::Mode;
+
+      if (s.mode == M::Clear) s.mode = M::Rain;
+      else if (s.mode == M::Rain) s.mode = M::Snow;
+      else s.mode = M::Clear;
+
+      // Ensure intensity isn't accidentally near-zero when enabling.
+      if (s.mode != M::Clear && s.intensity < 0.05f) s.intensity = 0.80f;
+
+      m_renderer.setWeatherSettings(s);
+      showToast(std::string("Weather: ") + ((s.mode == M::Rain) ? "Rain" : (s.mode == M::Snow) ? "Snow" : "Clear"));
+    } else {
+      m_showTrafficModel = !m_showTrafficModel;
+      showToast(m_showTrafficModel ? "Traffic model: ON" : "Traffic model: OFF");
+    }
     endPaintStroke();
   }
 
@@ -3276,16 +4775,29 @@ void Game::handleInput(float dt)
   }
 
   if (IsKeyPressed(KEY_T)) {
-    m_showRoadGraphOverlay = !m_showRoadGraphOverlay;
-    m_roadGraphDirty = true;
-
-    if (m_showRoadGraphOverlay) {
-      m_roadGraph = BuildRoadGraph(m_world);
-      m_roadGraphDirty = false;
-      showToast(TextFormat("Road graph: ON (%d nodes, %d edges)", static_cast<int>(m_roadGraph.nodes.size()),
-                           static_cast<int>(m_roadGraph.edges.size())));
+    // Shift+T toggles road resilience; plain T toggles road graph.
+    if (shift) {
+      m_showResilienceOverlay = !m_showResilienceOverlay;
+      if (m_showResilienceOverlay) {
+        ensureRoadResilienceUpToDate();
+        m_resilienceBypassesDirty = true;
+        rebuildRoadResilienceBypasses();
+        showToast(TextFormat("Resilience: ON (%d bridges, %d articulations)",
+                             static_cast<int>(m_roadResilience.bridgeEdges.size()),
+                             static_cast<int>(m_roadResilience.articulationNodes.size())));
+      } else {
+        showToast("Resilience: OFF");
+      }
     } else {
-      showToast("Road graph: OFF");
+      m_showRoadGraphOverlay = !m_showRoadGraphOverlay;
+      if (m_showRoadGraphOverlay) {
+        ensureRoadGraphUpToDate();
+        showToast(TextFormat("Road graph: ON (%d nodes, %d edges)",
+                             static_cast<int>(m_roadGraph.nodes.size()),
+                             static_cast<int>(m_roadGraph.edges.size())));
+      } else {
+        showToast("Road graph: OFF");
+      }
     }
   }
 
@@ -3373,6 +4885,7 @@ void Game::handleInput(float dt)
       case HeatmapOverlay::WaterAmenity: return "Water amenity";
       case HeatmapOverlay::Pollution: return "Pollution";
       case HeatmapOverlay::TrafficSpill: return "Traffic spill";
+      case HeatmapOverlay::FloodDepth: return "Flood depth";
       default: return "Heatmap";
       }
     };
@@ -3385,6 +4898,7 @@ void Game::handleInput(float dt)
       case HeatmapOverlay::WaterAmenity: return 3;
       case HeatmapOverlay::Pollution: return 4;
       case HeatmapOverlay::TrafficSpill: return 5;
+      case HeatmapOverlay::FloodDepth: return 6;
       default: return 0;
       }
     };
@@ -3397,17 +4911,19 @@ void Game::handleInput(float dt)
       case 3: return HeatmapOverlay::WaterAmenity;
       case 4: return HeatmapOverlay::Pollution;
       case 5: return HeatmapOverlay::TrafficSpill;
+      case 6: return HeatmapOverlay::FloodDepth;
       default: return HeatmapOverlay::Off;
       }
     };
 
-    const int count = 6;
+    const int count = 7;
     const int delta = shift ? -1 : 1;
     int idx = toIndex(m_heatmapOverlay);
     idx = (idx + delta + count) % count;
     m_heatmapOverlay = fromIndex(idx);
 
     m_landValueDirty = true;
+    m_seaFloodDirty = true;
     showToast(TextFormat("Heatmap: %s", nameOf(m_heatmapOverlay)));
   }
 
@@ -3699,6 +5215,71 @@ void Game::handleInput(float dt)
   if (IsKeyPressed(KEY_EIGHT)) setTool(Tool::SmoothTerrain);
   if (IsKeyPressed(KEY_NINE)) setTool(Tool::District);
 
+  // ---------------------------------------------------------------------
+  // Blueprint tool: capture a rectangular stamp and paste it elsewhere.
+  // Toggle with J. In Capture mode: LMB drag selects a rect. In Stamp mode:
+  // LMB stamps at the hovered tile (center-anchored).
+  // ---------------------------------------------------------------------
+  if (IsKeyPressed(KEY_J)) {
+    endPaintStroke();
+    if (m_blueprintMode == BlueprintMode::Off) {
+      m_blueprintMode = BlueprintMode::Capture;
+      showToast("Blueprint: CAPTURE (drag LMB to select)");
+    } else {
+      m_blueprintMode = BlueprintMode::Off;
+      m_blueprintSelecting = false;
+      m_blueprintSelStart.reset();
+      showToast("Blueprint: OFF");
+    }
+  }
+
+  if (m_blueprintMode != BlueprintMode::Off) {
+    if (IsKeyPressed(KEY_ESCAPE)) {
+      m_blueprintMode = BlueprintMode::Off;
+      m_blueprintSelecting = false;
+      m_blueprintSelStart.reset();
+      showToast("Blueprint: OFF");
+    }
+
+    // Enter toggles between Capture and Stamp (if a blueprint is available).
+    if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+      if (m_hasBlueprint) {
+        m_blueprintMode = (m_blueprintMode == BlueprintMode::Capture) ? BlueprintMode::Stamp
+                                                                      : BlueprintMode::Capture;
+        showToast(m_blueprintMode == BlueprintMode::Capture ? "Blueprint: CAPTURE"
+                                                           : "Blueprint: STAMP");
+      } else {
+        m_blueprintMode = BlueprintMode::Capture;
+        showToast("Blueprint: CAPTURE (no stamp yet)");
+      }
+    }
+
+    if (IsKeyPressed(KEY_BACKSPACE)) {
+      clearBlueprint();
+      m_blueprintMode = BlueprintMode::Capture;
+      showToast("Blueprint cleared");
+    }
+
+    // Transform keys (Stamp mode)
+    if (m_blueprintMode == BlueprintMode::Stamp && m_hasBlueprint) {
+      if (IsKeyPressed(KEY_Z)) {
+        m_blueprintTransform.rotateDeg = (m_blueprintTransform.rotateDeg + 90) % 360;
+        m_blueprintTransformedDirty = true;
+        showToast(TextFormat("Blueprint rot: %d", m_blueprintTransform.rotateDeg));
+      }
+      if (IsKeyPressed(KEY_X)) {
+        m_blueprintTransform.mirrorX = !m_blueprintTransform.mirrorX;
+        m_blueprintTransformedDirty = true;
+        showToast(m_blueprintTransform.mirrorX ? "Blueprint mirrorX: ON" : "Blueprint mirrorX: OFF");
+      }
+      if (IsKeyPressed(KEY_Y)) {
+        m_blueprintTransform.mirrorY = !m_blueprintTransform.mirrorY;
+        m_blueprintTransformedDirty = true;
+        showToast(m_blueprintTransform.mirrorY ? "Blueprint mirrorY: ON" : "Blueprint mirrorY: OFF");
+      }
+    }
+  }
+
   // Auto-generate administrative districts based on the current road network.
   // K = use all roads. Shift+K = use only roads connected to the map edge.
   if (IsKeyPressed(KEY_K)) {
@@ -3766,10 +5347,12 @@ void Game::handleInput(float dt)
 
   // --- Minimap interaction (UI consumes left mouse so we don't accidentally paint the world). ---
   bool consumeLeft = false;
+  bool overMinimap = false;
   if (m_showMinimap && m_world.width() > 0 && m_world.height() > 0) {
     const Renderer::MinimapLayout mini = m_renderer.minimapLayout(m_world, uiW, uiH);
     const Vector2 mp = mouseUi;
     const bool over = CheckCollisionPointRec(mp, mini.rect);
+    overMinimap = over;
 
     if (leftPressed && over) {
       // Cancel any in-progress stroke before moving the camera.
@@ -3798,6 +5381,67 @@ void Game::handleInput(float dt)
     if (over && leftPressed) consumeLeft = true;
   } else {
     m_minimapDragActive = false;
+  }
+
+
+  // Blueprint interaction: capture/stamp consumes LMB while active.
+  if (m_blueprintMode != BlueprintMode::Off) {
+    // Prevent other tools from reacting to left mouse while blueprint mode is active.
+    consumeLeft = true;
+
+    // Minimap gets priority if the cursor is over it.
+    if (!overMinimap) {
+      if (m_blueprintMode == BlueprintMode::Capture) {
+        if (leftPressed && m_hovered && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+          endPaintStroke();
+          m_blueprintSelecting = true;
+          m_blueprintSelStart = *m_hovered;
+          m_blueprintSelEnd = *m_hovered;
+        }
+
+        if (leftDown && m_blueprintSelecting && m_hovered) {
+          m_blueprintSelEnd = *m_hovered;
+        }
+
+        if (leftReleased && m_blueprintSelecting) {
+          m_blueprintSelecting = false;
+          if (m_blueprintSelStart) {
+            const Point a = *m_blueprintSelStart;
+            const Point b = m_blueprintSelEnd;
+            const int x0 = std::min(a.x, b.x);
+            const int y0 = std::min(a.y, b.y);
+            const int x1 = std::max(a.x, b.x);
+            const int y1 = std::max(a.y, b.y);
+            const int w = x1 - x0 + 1;
+            const int h = y1 - y0 + 1;
+
+            Blueprint bp;
+            std::string err;
+            if (CaptureBlueprintRect(m_world, x0, y0, w, h, bp, err, m_blueprintCaptureOpt)) {
+              m_hasBlueprint = true;
+              m_blueprint = std::move(bp);
+              m_blueprintTransform = BlueprintTransform{};
+              m_blueprintTransformedDirty = true;
+              updateBlueprintTransformed();
+              m_blueprintMode = BlueprintMode::Stamp;
+              showToast(TextFormat("Blueprint captured (%dx%d, %d tiles) - click to stamp",
+                                   m_blueprintTransformed.width, m_blueprintTransformed.height,
+                                   static_cast<int>(m_blueprintTransformed.tiles.size())));
+            } else {
+              showToast(std::string("Blueprint capture failed: ") + err, 3.0f);
+            }
+          }
+        }
+      } else if (m_blueprintMode == BlueprintMode::Stamp) {
+        if (leftPressed && m_hovered && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+          if (!m_hasBlueprint) {
+            showToast("No blueprint captured (switch to CAPTURE)", 2.0f);
+          } else {
+            stampBlueprintAt(*m_hovered);
+          }
+        }
+      }
+    }
   }
 
   // Road tool: Shift+drag plans a cheapest (money cost) road path (includes upgrades/bridges)
@@ -4494,13 +6138,14 @@ void Game::draw()
   }
 
   const bool heatmapActive = (m_heatmapOverlay != HeatmapOverlay::Off);
+  const bool heatmapUsesLandValue = heatmapActive && (m_heatmapOverlay != HeatmapOverlay::FloodDepth);
   const bool districtStatsActive = m_showDistrictPanel || (m_showReport && m_reportPage == 4);
 
   // Many derived systems need the "road component touches map edge" mask.
   // This should be computed regardless of whether the connectivity overlay is *drawn*.
   const bool requireOutside = m_sim.config().requireOutsideConnection;
   const bool needRoadToEdgeMask = requireOutside &&
-                                (m_showOutsideOverlay || m_showTrafficOverlay || m_showGoodsOverlay || heatmapActive || districtStatsActive);
+                                (m_showOutsideOverlay || m_showTrafficOverlay || m_showGoodsOverlay || heatmapUsesLandValue || districtStatsActive);
 
   const std::vector<std::uint8_t>* roadToEdgeMask = nullptr;
   if (needRoadToEdgeMask) {
@@ -4512,7 +6157,7 @@ void Game::draw()
   const std::vector<std::uint8_t>* outsideMask = m_showOutsideOverlay ? roadToEdgeMask : nullptr;
 
   // Traffic is used by both the explicit traffic overlay and the land value heatmap.
-  const bool needTrafficResult = (m_showTrafficOverlay || heatmapActive || districtStatsActive);
+  const bool needTrafficResult = (m_showTrafficOverlay || heatmapUsesLandValue || districtStatsActive);
   if (needTrafficResult && m_trafficDirty) {
     const float share = (m_world.stats().population > 0)
                             ? (static_cast<float>(m_world.stats().employed) /
@@ -4562,7 +6207,7 @@ void Game::draw()
   }
 
   // --- Land value (heatmap + district stats) ---
-  const bool needLandValueResult = heatmapActive || districtStatsActive;
+  const bool needLandValueResult = heatmapUsesLandValue || districtStatsActive;
   if (needLandValueResult) {
     if (m_landValueDirty ||
         m_landValue.value.size() != static_cast<std::size_t>(std::max(0, m_world.width()) * std::max(0, m_world.height()))) {
@@ -4571,6 +6216,39 @@ void Game::draw()
       const TrafficResult* tptr = needTrafficResult ? &m_traffic : nullptr;
       m_landValue = ComputeLandValue(m_world, lc, tptr, roadToEdgeMask);
       m_landValueDirty = false;
+    }
+  }
+
+  // --- Sea-level flood heatmap (derived from the heightfield) ---
+  const bool needSeaFloodHeatmap = heatmapActive && (m_heatmapOverlay == HeatmapOverlay::FloodDepth);
+  if (needSeaFloodHeatmap) {
+    const int w = m_world.width();
+    const int h = m_world.height();
+    const std::size_t n = static_cast<std::size_t>(std::max(0, w) * std::max(0, h));
+
+    if (m_seaFloodDirty || m_seaFloodHeatmap.size() != n) {
+      std::vector<float> heights(n, 0.0f);
+      if (w > 0 && h > 0) {
+        for (int y = 0; y < h; ++y) {
+          for (int x = 0; x < w; ++x) {
+            heights[static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x)] =
+                m_world.at(x, y).height;
+          }
+        }
+      }
+
+      m_seaFlood = ComputeSeaLevelFlood(heights, w, h, m_seaLevel, m_seaFloodCfg);
+
+      m_seaFloodHeatmap.assign(n, 0.0f);
+      const float denom = (m_seaFlood.maxDepth > 1e-6f) ? m_seaFlood.maxDepth : 0.0f;
+      if (denom > 0.0f) {
+        for (std::size_t i = 0; i < n; ++i) {
+          const float d = (i < m_seaFlood.depth.size()) ? m_seaFlood.depth[i] : 0.0f;
+          m_seaFloodHeatmap[i] = std::clamp(d / denom, 0.0f, 1.0f);
+        }
+      }
+
+      m_seaFloodDirty = false;
     }
   }
 
@@ -4604,6 +6282,11 @@ void Game::draw()
     case HeatmapOverlay::TrafficSpill:
       heatmapName = "Traffic spill";
       heatmap = &m_landValue.traffic;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
+    case HeatmapOverlay::FloodDepth:
+      heatmapName = "Flood depth";
+      heatmap = &m_seaFloodHeatmap;
       heatmapRamp = Renderer::HeatmapRamp::Bad;
       break;
     default: break;
@@ -4659,14 +6342,20 @@ void Game::draw()
   }
 
   // Vehicle micro-sim overlay (commuters + goods trucks).
+  // Screen-space weather (fog/precip). Suppressed in utility overlays for readability.
+  const bool allowWeatherFx =
+    (outsideMask == nullptr) && (trafficMask == nullptr) && (goodsTrafficMask == nullptr) && (commercialGoodsFill == nullptr) &&
+    (heatmap == nullptr);
+  m_renderer.drawWeatherScreenFX(screenW, screenH, m_timeSec, allowWeatherFx);
+
+
+  drawBlueprintOverlay();
+
   drawVehicles();
 
   // Road graph overlay (debug): nodes/edges extracted from the current road tiles.
   if (m_showRoadGraphOverlay) {
-    if (m_roadGraphDirty) {
-      m_roadGraph = BuildRoadGraph(m_world);
-      m_roadGraphDirty = false;
-    }
+    ensureRoadGraphUpToDate();
 
     if (!m_roadGraph.nodes.empty()) {
       BeginMode2D(m_camera);
@@ -4724,6 +6413,9 @@ void Game::draw()
     }
   }
 
+  // Road resilience overlay (debug): bridge edges, articulation nodes, and optional bypass suggestions.
+  drawRoadResilienceOverlay();
+
   const float simSpeed = kSimSpeeds[static_cast<std::size_t>(std::clamp(m_simSpeedIndex, 0, kSimSpeedCount - 1))];
   const char* inspectInfo = (m_tool == Tool::Inspect && !m_inspectInfo.empty()) ? m_inspectInfo.c_str() : nullptr;
 
@@ -4734,10 +6426,22 @@ void Game::draw()
                             static_cast<std::size_t>(m_hovered->x);
     const float hv = (*heatmap)[idx];
     char buf[128];
-    std::snprintf(buf, sizeof(buf), "Heatmap: %s  %.2f", heatmapName, static_cast<double>(hv));
+    if (m_heatmapOverlay == HeatmapOverlay::FloodDepth) {
+      const float depth = (m_seaFlood.maxDepth > 1e-6f) ? (hv * m_seaFlood.maxDepth) : 0.0f;
+      std::snprintf(buf, sizeof(buf), "Heatmap: %s (sea %.2f)  depth %.2f", heatmapName,
+                    static_cast<double>(m_seaLevel), static_cast<double>(depth));
+    } else {
+      std::snprintf(buf, sizeof(buf), "Heatmap: %s  %.2f", heatmapName, static_cast<double>(hv));
+    }
     heatmapInfo = buf;
   } else if (heatmapActive && heatmapName) {
-    heatmapInfo = std::string("Heatmap: ") + heatmapName;
+    if (m_heatmapOverlay == HeatmapOverlay::FloodDepth) {
+      char buf[128];
+      std::snprintf(buf, sizeof(buf), "Heatmap: %s (sea %.2f)", heatmapName, static_cast<double>(m_seaLevel));
+      heatmapInfo = buf;
+    } else {
+      heatmapInfo = std::string("Heatmap: ") + heatmapName;
+    }
   }
 
   const char* heatmapInfoC = (!heatmapInfo.empty()) ? heatmapInfo.c_str() : nullptr;
@@ -4755,6 +6459,8 @@ void Game::draw()
   m_renderer.drawHUD(m_world, m_camera, m_tool, m_roadBuildLevel, m_hovered, uiW, uiH, m_showHelp,
                      m_brushRadius, static_cast<int>(m_history.undoSize()), static_cast<int>(m_history.redoSize()),
                      m_simPaused, simSpeed, m_saveSlot, m_showMinimap, inspectInfo, heatmapInfoC);
+
+  drawBlueprintPanel(uiW, uiH);
 
   // Policy / budget panel (simple keyboard-driven UI).
   if (m_showPolicy) {

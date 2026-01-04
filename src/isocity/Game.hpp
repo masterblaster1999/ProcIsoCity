@@ -3,11 +3,14 @@
 #include "isocity/Config.hpp"
 #include "isocity/Console.hpp"
 #include "isocity/EditHistory.hpp"
+#include "isocity/FloodRisk.hpp"
 #include "isocity/FlowField.hpp"
+#include "isocity/Blueprint.hpp"
 #include "isocity/Iso.hpp"
 #include "isocity/ProcGen.hpp"
 #include "isocity/Renderer.hpp"
 #include "isocity/RoadGraph.hpp"
+#include "isocity/RoadGraphResilience.hpp"
 #include "isocity/SaveLoad.hpp"
 #include "isocity/Traffic.hpp"
 #include "isocity/Goods.hpp"
@@ -114,6 +117,21 @@ private:
   void update(float dt);
   void draw();
 
+  // Blueprint (copy/paste stamp) tool (toggle with J).
+  void clearBlueprint();
+  void updateBlueprintTransformed();
+  bool stampBlueprintAt(const Point& anchorTile);
+  void drawBlueprintOverlay();
+  void drawBlueprintPanel(int uiW, int uiH);
+
+  // Road resilience overlay + bypass planner (Shift+T).
+  void ensureRoadGraphUpToDate();
+  void ensureRoadResilienceUpToDate();
+  void rebuildRoadResilienceBypasses();
+  void drawRoadResilienceOverlay();
+  bool applyRoadResilienceBypass(std::size_t idx);
+
+
   // Display helpers
   float computeAutoUiScale(int screenW, int screenH) const;
   Vector2 mouseUiPosition(float uiScale) const;
@@ -212,6 +230,22 @@ private:
   bool m_showMinimap = false;
   bool m_minimapDragActive = false;
 
+  // Blueprint copy/paste stamp tool (toggle with J).
+  enum class BlueprintMode : std::uint8_t { Off = 0, Capture = 1, Stamp = 2 };
+  BlueprintMode m_blueprintMode = BlueprintMode::Off;
+  bool m_blueprintSelecting = false;
+  std::optional<Point> m_blueprintSelStart;
+  Point m_blueprintSelEnd{0, 0};
+
+  bool m_hasBlueprint = false;
+  Blueprint m_blueprint;
+  BlueprintTransform m_blueprintTransform{};
+  bool m_blueprintTransformedDirty = false;
+  Blueprint m_blueprintTransformed;
+  BlueprintCaptureOptions m_blueprintCaptureOpt{};
+  BlueprintApplyOptions m_blueprintApplyOpt{};
+
+
   // Quick save slot (1..kMaxSaveSlot). Slot 1 == legacy isocity_save.bin.
   int m_saveSlot = 1;
 
@@ -259,6 +293,42 @@ private:
   bool m_roadGraphDirty = true;
   RoadGraph m_roadGraph;
 
+  // Cached lookups for road-graph overlays (rebuilt with the road graph).
+  // Indexing uses idx = y*w + x.
+  std::vector<int> m_roadGraphTileToNode;
+  std::vector<int> m_roadGraphTileToEdge;
+
+  // Debug overlay: road network resilience (bridge edges + articulation nodes) and optional bypass suggestions.
+  bool m_showResilienceOverlay = false;
+  bool m_resilienceDirty = true;
+  RoadGraphResilienceResult m_roadResilience;
+
+  struct ResilienceBypassSuggestion {
+    int bridgeEdge = -1;
+    int cutSize = 0;     // min(sideA, sideB) in node count
+    int primaryCost = 0; // either money or newTiles depending on plan settings
+    int moneyCost = 0;   // always computed for application
+    int newTiles = 0;
+    int steps = 0;
+
+    int targetLevel = 1;
+    bool allowBridges = false;
+    bool moneyObjective = true;
+
+    std::vector<Point> path;
+  };
+
+  bool m_resilienceBypassesDirty = true;
+  std::vector<ResilienceBypassSuggestion> m_resilienceBypasses;
+
+  // Default bypass planner settings (tweak via dev console `res ...`).
+  int m_resilienceBypassTop = 5;
+  bool m_resilienceBypassMoney = true;
+  int m_resilienceBypassTargetLevel = 1;
+  bool m_resilienceBypassAllowBridges = false;
+  int m_resilienceBypassMaxCost = 0; // 0 => no limit
+  int m_resilienceBypassMaxNodesPerSide = 256;
+
   // Debug overlay: traffic heatmap (derived commute model).
   bool m_showTrafficOverlay = false;
   bool m_trafficDirty = true;
@@ -277,11 +347,21 @@ private:
     WaterAmenity,
     Pollution,
     TrafficSpill,
+
+    // Sea-level coastal flooding depth (derived from the heightfield).
+    FloodDepth,
   };
 
   HeatmapOverlay m_heatmapOverlay = HeatmapOverlay::Off;
   bool m_landValueDirty = true;
   LandValueResult m_landValue;
+
+  // Sea-level flooding (heatmap): computed on-demand when the flood heatmap is active.
+  bool m_seaFloodDirty = true;
+  float m_seaLevel = 0.35f; // 0..1 height threshold
+  SeaFloodConfig m_seaFloodCfg{};
+  SeaFloodResult m_seaFlood;
+  std::vector<float> m_seaFloodHeatmap; // normalized depth: 0 (dry) .. 1 (deepest)
 
   // Vehicles overlay: small moving agents representing commuting + goods shipments.
   bool m_showVehicles = false;

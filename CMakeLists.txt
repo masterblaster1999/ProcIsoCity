@@ -76,6 +76,8 @@ add_library(isocity_core
   src/isocity/Hydrology.cpp
   src/isocity/Contours.cpp
   src/isocity/Isochrone.cpp
+  src/isocity/TransitPlanner.cpp
+  src/isocity/TransitPlannerExport.cpp
   src/isocity/Sim.cpp
   src/isocity/FlowField.cpp
   src/isocity/Traffic.cpp
@@ -407,6 +409,17 @@ if (PROCISOCITY_BUILD_CLI)
   target_link_libraries(proc_isocity_goodsgraph PRIVATE isocity_core)
 
   procisocity_set_strict_warnings(proc_isocity_goodsgraph)
+
+  # Transit line planning tool (headless): plan bus-line style corridors from simulated demand.
+  add_executable(proc_isocity_transitplan
+    src/cli/transitplan.cpp
+  )
+
+  target_include_directories(proc_isocity_transitplan PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_transitplan PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_transitplan)
+
 
   # Park placement tool (headless): suggest new parks based on underserved demand.
   add_executable(proc_isocity_parkopt

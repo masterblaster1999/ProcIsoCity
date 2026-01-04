@@ -1,6 +1,7 @@
 #include "isocity/EditHistory.hpp"
 #include "isocity/Pathfinding.hpp"
 #include "isocity/RoadGraph.hpp"
+#include "isocity/TransitPlanner.hpp"
 #include "isocity/RoadGraphExport.hpp"
 #include "isocity/RoadGraphTraffic.hpp"
 #include "isocity/RoadGraphResilience.hpp"
@@ -1255,6 +1256,43 @@ void TestRoadPathfindingToEdge()
   EXPECT_EQ(path.back().y, 3);
 }
 
+void TestRoadBuildPathSlopePenaltyAvoidsSteepRidge()
+{
+  using namespace isocity;
+
+  // Simple synthetic setup: start/goal can connect either by crossing a steep
+  // "ridge" tile or by taking a slightly longer detour on flat ground.
+  World w(7, 3, 42u);
+
+  // All tiles flat...
+  for (int y = 0; y < w.height(); ++y) {
+    for (int x = 0; x < w.width(); ++x) {
+      w.at(x, y).terrain = Terrain::Grass;
+      w.at(x, y).overlay = Overlay::None;
+      w.at(x, y).height = 0.0f;
+    }
+  }
+
+  // ...except one tall ridge point in the direct corridor.
+  w.at(3, 1).height = 1.0f;
+
+  RoadBuildPathConfig cfg;
+  cfg.costModel = RoadBuildPathConfig::CostModel::NewTiles;
+  cfg.allowBridges = false;
+  cfg.slopeCost = 64; // strong enough to prefer the detour
+  cfg.slopeCostAffectsExistingRoads = true;
+
+  std::vector<Point> path;
+  int cost = 0;
+  EXPECT_TRUE(FindRoadBuildPath(w, Point{0, 1}, Point{6, 1}, path, &cost, cfg));
+  EXPECT_TRUE(!path.empty());
+
+  // The ridge tile should never be used when slope penalties are high.
+  for (const Point& p : path) {
+    EXPECT_TRUE(!(p.x == 3 && p.y == 1));
+  }
+}
+
 
 void TestRoadToEdgeMask()
 {
@@ -2317,6 +2355,7 @@ void TestProcGenBlockZoningCreatesInteriorAccessibleZones()
   // Avoid water so the test is stable and focuses on zoning connectivity.
   cfg.waterLevel = -1.0f;
   cfg.sandLevel = -0.5f;
+  cfg.erosion.riversEnabled = false; // keep the map waterless for this test
   cfg.hubs = 3;
   cfg.extraConnections = 1;
 
@@ -2340,6 +2379,53 @@ void TestProcGenBlockZoningCreatesInteriorAccessibleZones()
 
   EXPECT_TRUE(found);
 }
+
+void TestProcGenRiversAsWaterAddsWaterTiles()
+{
+  using namespace isocity;
+
+  ProcGenConfig pcDry{};
+  pcDry.zoneChance = 0.0f;
+  pcDry.parkChance = 0.0f;
+  pcDry.hubs = 2;
+  pcDry.extraConnections = 0;
+
+  // Force the classic height-threshold classifier to produce *no* water.
+  pcDry.waterLevel = -999.0f;
+  pcDry.sandLevel = -999.0f;
+
+  // Disable river carving/conversion.
+  pcDry.erosion.riversEnabled = false;
+
+  ProcGenConfig pcRivers = pcDry;
+  pcRivers.erosion.riversEnabled = true;
+
+  // Make the river mask easier to trigger so the test is robust.
+  pcRivers.erosion.riverMinAccum = 16;
+
+  const std::uint64_t seed = 12345;
+
+  const World dry = GenerateWorld(64, 64, seed, pcDry);
+  const World wet = GenerateWorld(64, 64, seed, pcRivers);
+
+  auto countWater = [](const World& w) -> int {
+    int c = 0;
+    for (int y = 0; y < w.height(); ++y) {
+      for (int x = 0; x < w.width(); ++x) {
+        if (w.at(x, y).terrain == Terrain::Water) ++c;
+      }
+    }
+    return c;
+  };
+
+  const int dryWater = countWater(dry);
+  const int wetWater = countWater(wet);
+
+  EXPECT_EQ(dryWater, 0);
+  EXPECT_TRUE(wetWater > 0);
+}
+
+
 
 
 void TestProcGenErosionToggleAffectsHash()
@@ -2671,6 +2757,102 @@ void TestExportIsoOverview()
   EXPECT_TRUE(isoTerrain.image.rgb[idxT + 0] != isoOverlay.image.rgb[idxO + 0] ||
               isoTerrain.image.rgb[idxT + 1] != isoOverlay.image.rgb[idxO + 1] ||
               isoTerrain.image.rgb[idxT + 2] != isoOverlay.image.rgb[idxO + 2]);
+}
+
+void TestExportIsoOverviewAtmosphere()
+{
+  World w(24, 16, 0xC0FFEEu);
+
+  // Water + beach.
+  for (int y = 0; y < 5; ++y) {
+    for (int x = 0; x < 8; ++x) {
+      w.at(x, y).terrain = Terrain::Water;
+      w.at(x, y).height = 0.0f;
+    }
+    for (int x = 8; x < 11; ++x) {
+      w.at(x, y).terrain = Terrain::Sand;
+      w.at(x, y).height = 0.10f;
+    }
+  }
+
+  // Simple elevated interior.
+  for (int y = 5; y < w.height(); ++y) {
+    for (int x = 0; x < w.width(); ++x) {
+      w.at(x, y).terrain = Terrain::Grass;
+      w.at(x, y).height = 0.25f + 0.015f * static_cast<float>(x + y);
+    }
+  }
+
+  // A cross road to seed night-lights.
+  for (int x = 2; x < w.width() - 2; ++x) {
+    w.at(x, 9).overlay = Overlay::Road;
+    w.at(x, 9).level = 2;
+  }
+  for (int y = 3; y < w.height() - 2; ++y) {
+    w.at(12, y).overlay = Overlay::Road;
+    w.at(12, y).level = 2;
+  }
+
+  // A few zoned tiles near the road, with occupants so windows can light up.
+  for (int y = 7; y <= 11; ++y) {
+    for (int x = 14; x <= 18; ++x) {
+      w.at(x, y).overlay = Overlay::Residential;
+      w.at(x, y).level = 3;
+      w.at(x, y).occupants = 24;
+    }
+  }
+  for (int y = 6; y <= 8; ++y) {
+    for (int x = 6; x <= 8; ++x) {
+      w.at(x, y).overlay = Overlay::Commercial;
+      w.at(x, y).level = 3;
+      w.at(x, y).occupants = 16;
+    }
+  }
+
+  IsoOverviewConfig cfg{};
+  cfg.tileW = 18;
+  cfg.tileH = 9;
+  cfg.heightScalePx = 14;
+  cfg.marginPx = 6;
+  cfg.drawGrid = false;
+  cfg.drawCliffs = true;
+  cfg.fancy = true;
+  cfg.textureStrength = 0.9f;
+
+  // Enable atmosphere: nighttime + rainy + cloud shadows.
+  cfg.dayNight.enabled = true;
+  cfg.dayNight.phase01 = 0.75f; // midnight
+  cfg.dayNight.drawLights = true;
+  cfg.dayNight.nightDarken = 0.85f;
+  cfg.dayNight.duskTint = 0.40f;
+
+  cfg.weather.mode = IsoOverviewConfig::WeatherConfig::Mode::Rain;
+  cfg.weather.intensity = 0.85f;
+  cfg.weather.overcast = 0.70f;
+  cfg.weather.fog = 0.35f;
+  cfg.weather.drawPrecipitation = true;
+  cfg.weather.reflectLights = true;
+
+  cfg.clouds.enabled = true;
+  cfg.clouds.coverage = 0.55f;
+  cfg.clouds.strength = 0.55f;
+  cfg.clouds.scaleTiles = 22.0f;
+
+  const IsoOverviewResult a = RenderIsoOverview(w, ExportLayer::Overlay, cfg);
+  const IsoOverviewResult b = RenderIsoOverview(w, ExportLayer::Overlay, cfg);
+  EXPECT_EQ(a.image.width, b.image.width);
+  EXPECT_EQ(a.image.height, b.image.height);
+  EXPECT_TRUE(a.image.rgb == b.image.rgb);
+
+  // Baseline (no atmosphere) should differ.
+  IsoOverviewConfig cfgBase = cfg;
+  cfgBase.dayNight.enabled = false;
+  cfgBase.weather.mode = IsoOverviewConfig::WeatherConfig::Mode::Clear;
+  cfgBase.weather.intensity = 0.0f;
+  cfgBase.weather.fog = 0.0f;
+  cfgBase.clouds.enabled = false;
+  const IsoOverviewResult base = RenderIsoOverview(w, ExportLayer::Overlay, cfgBase);
+  EXPECT_TRUE(a.image.rgb != base.image.rgb);
 }
 
 void TestPpmReadWriteAndCompare()
@@ -5418,6 +5600,90 @@ void TestRoadGraphResilienceFindsBridgesAndArticulations()
   EXPECT_TRUE(res.isBridgeEdge[2] == 1);
 }
 
+void TestRoadResilienceBypassPlannerFindsShortBypass()
+{
+  using namespace isocity;
+
+  // Build a tiny "tree" road network with a clear bridge edge:
+  //
+  // (0,0) .  (1,0) R
+  //
+  // (0,1) R  (1,1) R  (2,1) R  (3,1) R
+  //
+  // The edge between (0,1) and (1,1) is a bridge. A 1-tile bypass exists
+  // via (0,0): (0,1)->(0,0)->(1,0).
+  World world(4, 3, 1);
+  world.setRoad(0, 1);
+  world.setRoad(1, 1);
+  world.setRoad(2, 1);
+  world.setRoad(3, 1);
+  world.setRoad(1, 0);
+  world.recomputeRoadMasks();
+
+  const RoadGraph rg = BuildRoadGraph(world);
+  const RoadGraphResilienceResult res = ComputeRoadGraphResilience(rg);
+
+  int nodeLeft = -1;
+  int nodeCenter = -1;
+  for (std::size_t i = 0; i < rg.nodes.size(); ++i) {
+    if (rg.nodes[i].pos.x == 0 && rg.nodes[i].pos.y == 1) nodeLeft = static_cast<int>(i);
+    if (rg.nodes[i].pos.x == 1 && rg.nodes[i].pos.y == 1) nodeCenter = static_cast<int>(i);
+  }
+  EXPECT_TRUE(nodeLeft >= 0);
+  EXPECT_TRUE(nodeCenter >= 0);
+
+  int bridgeEdge = -1;
+  for (std::size_t ei = 0; ei < rg.edges.size(); ++ei) {
+    const RoadGraphEdge& e = rg.edges[ei];
+    const bool match = (e.a == nodeLeft && e.b == nodeCenter) || (e.a == nodeCenter && e.b == nodeLeft);
+    if (match) {
+      bridgeEdge = static_cast<int>(ei);
+      break;
+    }
+  }
+  EXPECT_TRUE(bridgeEdge >= 0);
+  EXPECT_TRUE(res.isBridgeEdge[static_cast<std::size_t>(bridgeEdge)] == 1);
+
+  RoadGraphBridgeCut cut;
+  EXPECT_TRUE(ComputeRoadGraphBridgeCut(rg, bridgeEdge, cut));
+  EXPECT_TRUE(!cut.sideA.empty());
+  EXPECT_TRUE(!cut.sideB.empty());
+
+  // Choose smaller side as starts.
+  const std::vector<int>* startSide = &cut.sideA;
+  const std::vector<int>* goalSide = &cut.sideB;
+  if (startSide->size() > goalSide->size()) std::swap(startSide, goalSide);
+
+  std::vector<Point> starts;
+  std::vector<Point> goals;
+  for (int ni : *startSide) starts.push_back(rg.nodes[static_cast<std::size_t>(ni)].pos);
+  for (int ni : *goalSide) goals.push_back(rg.nodes[static_cast<std::size_t>(ni)].pos);
+
+  const std::vector<std::uint64_t> blockedMoves = BuildBlockedMovesForRoadGraphEdge(rg, bridgeEdge, world.width());
+
+  RoadBuildPathConfig cfg;
+  cfg.allowBridges = false;
+  cfg.costModel = RoadBuildPathConfig::CostModel::NewTiles;
+  cfg.targetLevel = 1;
+
+  std::vector<Point> path;
+  int primaryCost = 0;
+  const bool ok = FindRoadBuildPathBetweenSets(world, starts, goals, path, &primaryCost, cfg, &blockedMoves, -1);
+  EXPECT_TRUE(ok);
+
+  // Cheapest bypass should require building exactly one new tile.
+  EXPECT_TRUE(primaryCost == 1);
+
+  // Ensure the computed path does not traverse the blocked bridge move.
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    const Point& a = path[i - 1];
+    const Point& b = path[i];
+    const bool usesBridge =
+        (a.x == 0 && a.y == 1 && b.x == 1 && b.y == 1) || (a.x == 1 && a.y == 1 && b.x == 0 && b.y == 1);
+    EXPECT_TRUE(!usesBridge);
+  }
+}
+
 void TestRoadGraphCentralityStarGraph()
 {
   using namespace isocity;
@@ -5675,6 +5941,94 @@ void TestPolicyOptimizerExhaustivePrefersLowMaintenanceWhenNoRevenue()
   EXPECT_EQ(r.best.policy.taxIndustrial, 0);
 }
 
+
+void TestTransitPlannerStopTileSampling()
+{
+  using namespace isocity;
+
+  RoadGraph g;
+  g.nodes.resize(2);
+  g.nodes[0].pos = Point{0, 0};
+  g.nodes[1].pos = Point{10, 0};
+
+  RoadGraphEdge e;
+  e.a = 0;
+  e.b = 1;
+  e.length = 10;
+  e.tiles.clear();
+  for (int x = 0; x <= 10; ++x) {
+    e.tiles.push_back(Point{x, 0});
+  }
+  g.edges.push_back(e);
+
+  g.nodes[0].edges.push_back(0);
+  g.nodes[1].edges.push_back(0);
+
+  TransitLine line;
+  line.id = 0;
+  line.nodes = {0, 1};
+  line.edges = {0};
+
+  std::vector<Point> stops;
+  EXPECT_TRUE(BuildTransitLineStopTiles(g, line, /*stopSpacingTiles=*/4, stops));
+  EXPECT_EQ(stops.size(), 4u);
+  EXPECT_EQ(stops[0].x, 0);
+  EXPECT_EQ(stops[1].x, 4);
+  EXPECT_EQ(stops[2].x, 8);
+  EXPECT_EQ(stops[3].x, 10);
+
+  std::vector<Point> stops2;
+  EXPECT_TRUE(BuildTransitLineStopTiles(g, line, /*stopSpacingTiles=*/20, stops2));
+  EXPECT_EQ(stops2.size(), 2u);
+  EXPECT_EQ(stops2.front().x, 0);
+  EXPECT_EQ(stops2.back().x, 10);
+}
+
+void TestTransitPlannerPicksHighDemandCorridor()
+{
+  using namespace isocity;
+
+  // Simple 0-1-2-3 chain with one very high-demand edge (1-2).
+  RoadGraph g;
+  g.nodes.resize(4);
+  for (int i = 0; i < 4; ++i) {    g.nodes[static_cast<std::size_t>(i)].pos = Point{i, 0};
+  }
+
+  g.edges.resize(3);
+  for (int i = 0; i < 3; ++i) {
+    RoadGraphEdge& e = g.edges[static_cast<std::size_t>(i)];
+    e.a = i;
+    e.b = i + 1;
+    e.length = 1;
+    e.tiles = {Point{i, 0}, Point{i + 1, 0}};
+    g.nodes[static_cast<std::size_t>(i)].edges.push_back(i);
+    g.nodes[static_cast<std::size_t>(i + 1)].edges.push_back(i);
+  }
+
+  const std::vector<std::uint64_t> demand = {1, 100, 1};
+
+  TransitPlannerConfig cfg;
+  cfg.maxLines = 1;
+  cfg.endpointCandidates = 4;
+  cfg.weightMode = TransitEdgeWeightMode::Steps;
+  cfg.demandBias = 0.0;
+  cfg.maxDetour = 10.0;
+  cfg.coverFraction = 1.0;
+  cfg.minEdgeDemand = 1;
+  cfg.minLineDemand = 1;
+  cfg.seedSalt = 0;
+
+  const TransitPlan plan = PlanTransitLines(g, demand, cfg, nullptr);
+  EXPECT_EQ(plan.lines.size(), 1u);
+
+  const TransitLine& l = plan.lines[0];
+  EXPECT_EQ(l.nodes.size(), 2u);
+  EXPECT_EQ(l.nodes[0], 1);
+  EXPECT_EQ(l.nodes[1], 2);
+  EXPECT_EQ(l.edges.size(), 1u);
+  EXPECT_EQ(l.edges[0], 1);
+}
+
 int main()
 {
   TestRoadAutoTilingMasks();
@@ -5697,6 +6051,7 @@ int main()
   TestSimulatorStepInvariants();
   TestEmploymentCountsOnlyAccessibleJobs();
   TestRoadPathfindingToEdge();
+  TestRoadBuildPathSlopePenaltyAvoidsSteepRidge();
   TestRoadToEdgeMask();
   TestFlowFieldRespectsBlockedRoadMask();
   TestEvacuationReachabilityUnderHazard();
@@ -5723,6 +6078,7 @@ int main()
 
   TestWorldHashDeterministicForSameSeed();
   TestProcGenBlockZoningCreatesInteriorAccessibleZones();
+  TestProcGenRiversAsWaterAddsWaterTiles();
   TestProcGenErosionToggleAffectsHash();
   TestSimulationDeterministicHashAfterTicks();
   TestWorldDiffCounts();
@@ -5739,6 +6095,7 @@ int main()
   TestAutoDistrictsFillAllTilesIsDeterministic();
   TestExportPpmLayers();
   TestExportIsoOverview();
+  TestExportIsoOverviewAtmosphere();
   TestPpmReadWriteAndCompare();
   TestHeightmapApplyReclassifyAndBulldoze();
   TestHeightmapApplyResampleNearest();
@@ -5762,9 +6119,12 @@ int main()
   TestCityBlockGraphFrontageAndAdjacency();
   TestBlockDistrictingDisconnectedComponents();
   TestRoadGraphTrafficAggregationSimpleLine();
+  TestTransitPlannerStopTileSampling();
+  TestTransitPlannerPicksHighDemandCorridor();
   TestRoadUpgradePlannerPrefersAvenueUpgradeWhenCostBenefitIsBetter();
   TestPolicyOptimizerExhaustivePrefersLowMaintenanceWhenNoRevenue();
   TestRoadGraphResilienceFindsBridgesAndArticulations();
+  TestRoadResilienceBypassPlannerFindsShortBypass();
   TestRoadGraphCentralityStarGraph();
   TestRoadBuildPathBetweenSetsRespectsBlockedMoves();
   TestParkOptimizerSuggestsParksInUnderservedAreas();

@@ -109,6 +109,25 @@ void SimplifyRing(std::vector<IPoint>& ring)
     }
   }
 
+  // The linear pass above can't remove collinear vertices that straddle the seam
+  // between the end and the beginning of the ring (e.g. an extra point on the
+  // last edge returning to the start). Clean those up in a small circular pass.
+  bool changed = true;
+  while (changed && out.size() >= 4) {
+    changed = false;
+    const std::size_t n = out.size();
+    for (std::size_t i = 0; i < n; ++i) {
+      const std::size_t i0 = (i + n - 1) % n;
+      const std::size_t i1 = i;
+      const std::size_t i2 = (i + 1) % n;
+      if (CollinearSameDir(out[i0], out[i1], out[i2])) {
+        out.erase(out.begin() + static_cast<std::ptrdiff_t>(i1));
+        changed = true;
+        break;
+      }
+    }
+  }
+
   // Ensure we didn't degenerate.
   if (out.size() < 4) return;
 
