@@ -381,6 +381,9 @@ private:
     // Small lateral offset (world pixels) so vehicles don't all draw on top of each other.
     float laneOffset = 0.0f;
 
+    // Stable per-vehicle style id (used to pick deterministic sprite variants).
+    int style = 0;
+
     // For commuters: number of direction flips remaining (1 => go there and back).
     int turnsRemaining = 0;
   };

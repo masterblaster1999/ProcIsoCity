@@ -62,6 +62,28 @@ struct TrafficConfig {
   // With the default (3.0) and BPR defaults, the per-tile travel time multiplier is
   // ~13x at the clamp.
   float congestionRatioClamp = 3.0f;
+
+
+  // --- Capacity-aware job assignment (optional) ---
+  //
+  // Classic commute assignment routes every commuter to the nearest job access point in
+  // travel-time, which implicitly assumes each job cluster has infinite capacity.
+  //
+  // When enabled, we derive a *soft* capacity for each job access point from nearby
+  // commercial/industrial job capacity, then run a small deterministic iterative
+  // reweighting pass that adds per-source penalties when a source is overloaded.
+  //
+  // This produces a more realistic pattern in cities with a small number of job centers:
+  // close jobs "fill up" first, and additional commuters are pushed to alternative centers.
+  bool capacityAwareJobs = false;
+
+  // Number of iterations of the source-penalty fitting pass (>=1). More => closer to a
+  // balanced assignment but more CPU cost.
+  int jobAssignmentIterations = 6;
+
+  // Baseline penalty scale (in milli-travel-time units, where 1000 ~= one street tile).
+  // Larger values push commuters away from overloaded job clusters more aggressively.
+  int jobPenaltyBaseMilli = 8000;
 };
 
 struct TrafficResult {
@@ -94,6 +116,11 @@ struct TrafficResult {
   // Debug/telemetry: which routing model was used.
   bool usedCongestionAwareRouting = false;
   int routingPasses = 1;
+
+  // Debug/telemetry: capacity-aware job assignment.
+  bool usedCapacityAwareJobs = false;
+  int jobAssignmentIterations = 0;
+  float maxJobSourceOverload = 0.0f;
 };
 
 // Compute a traffic heatmap by assigning commuters to their nearest reachable job access point.

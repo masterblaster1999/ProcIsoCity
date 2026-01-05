@@ -343,6 +343,9 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
   tc.congestionBeta = m_trafficModel.congestionBeta;
   tc.congestionCapacityScale = m_trafficModel.congestionCapacityScale;
   tc.congestionRatioClamp = m_trafficModel.congestionRatioClamp;
+  tc.capacityAwareJobs = m_trafficModel.capacityAwareJobs;
+  tc.jobAssignmentIterations = m_trafficModel.jobAssignmentIterations;
+  tc.jobPenaltyBaseMilli = m_trafficModel.jobPenaltyBaseMilli;
   const TrafficResult traffic = ComputeCommuteTraffic(world, tc, employedShare, roadToEdge, zoneAccess);
 
   s.commuters = traffic.totalCommuters;

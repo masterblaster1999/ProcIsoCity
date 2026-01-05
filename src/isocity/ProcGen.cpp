@@ -640,6 +640,121 @@ static void CarveRoad(World& world, RNG& rng, P a, P b, int level, bool allowBri
   CarveRoadWiggle(world, rng, a, b, level, /*allowBridges=*/allowBridges || !hasLand);
 }
 
+
+
+// -----------------------------
+// Curvy arterial connectors
+// -----------------------------
+//
+// Many city generators carve hub-to-hub arterials as the single cheapest path.
+// That often produces overly-straight, "utility-corridor" highways.
+//
+// To make networks read as more *planned* (and more varied across seeds), we
+// optionally route long, high-class connections through a deterministic waypoint
+// offset perpendicular to the chord. The underlying A*/Dijkstra cost model still
+// handles slopes/water, but the waypoint injects a gentle macro-curve.
+
+static bool FindNearestWaypointTile(const World& world, int cx, int cy, int maxR, bool allowWater,
+                                   std::uint32_t seed32, P& out)
+{
+  int bestD = std::numeric_limits<int>::max();
+  std::uint32_t bestTie = std::numeric_limits<std::uint32_t>::max();
+  bool found = false;
+
+  for (int dy = -maxR; dy <= maxR; ++dy) {
+    for (int dx = -maxR; dx <= maxR; ++dx) {
+      const int x = cx + dx;
+      const int y = cy + dy;
+      if (!world.inBounds(x, y)) continue;
+
+      const int d = std::abs(dx) + std::abs(dy);
+      if (d > maxR) continue;
+
+      const Tile& t = world.at(x, y);
+      if (t.terrain == Terrain::Water && !allowWater) continue;
+
+      // Don't route through zones/parks; we only want empty land or existing roads.
+      if (t.overlay != Overlay::None && t.overlay != Overlay::Road) continue;
+
+      const std::uint32_t tie = HashCoords32(x, y, seed32);
+      if (d < bestD || (d == bestD && tie < bestTie)) {
+        bestD = d;
+        bestTie = tie;
+        out = {x, y};
+        found = true;
+      }
+    }
+  }
+
+  return found;
+}
+
+static void CarveRoadCurvy(World& world, RNG& rng, P a, P b, int level, bool allowBridges, std::uint32_t seed32)
+{
+  const int dist = std::abs(a.x - b.x) + std::abs(a.y - b.y);
+
+  // Short/low-class connections look better as direct cost-optimal paths.
+  if (dist < 22 || level <= 1) {
+    CarveRoad(world, rng, a, b, level, allowBridges);
+    return;
+  }
+
+  // Compute a perpendicular waypoint near the midpoint.
+  const int mx = (a.x + b.x) / 2;
+  const int my = (a.y + b.y) / 2;
+  const int dx = b.x - a.x;
+  const int dy = b.y - a.y;
+
+  // Deterministic side choice.
+  const std::uint32_t h = HashCoords32(mx, my, seed32 ^ 0xA11CEB0Bu);
+  const int sign = (h & 1u) ? 1 : -1;
+
+  int px = 0;
+  int py = 0;
+  if (std::abs(dx) >= std::abs(dy)) {
+    // Mostly horizontal chord -> offset vertically.
+    py = sign;
+  } else {
+    // Mostly vertical chord -> offset horizontally.
+    px = sign;
+  }
+
+  const float r = TileRand01(mx, my, seed32 ^ 0xC0FFEEu);
+  int offset = static_cast<int>(std::round(static_cast<float>(dist) * (0.12f + 0.22f * r)));
+  offset = std::clamp(offset, 6, std::max(6, dist / 2));
+
+  int wx = mx + px * offset;
+  int wy = my + py * offset;
+  wx = std::clamp(wx, 1, std::max(1, world.width() - 2));
+  wy = std::clamp(wy, 1, std::max(1, world.height() - 2));
+
+  P wp{wx, wy};
+  if (!FindNearestWaypointTile(world, wx, wy, /*maxR=*/10, /*allowWater=*/allowBridges,
+                              seed32 ^ 0xBADC0DEu, wp)) {
+    CarveRoad(world, rng, a, b, level, allowBridges);
+    return;
+  }
+
+  // Avoid degenerate waypoints too close to endpoints.
+  const int dA = std::abs(a.x - wp.x) + std::abs(a.y - wp.y);
+  const int dB = std::abs(b.x - wp.x) + std::abs(b.y - wp.y);
+  if (dA < 10 || dB < 10) {
+    CarveRoad(world, rng, a, b, level, allowBridges);
+    return;
+  }
+
+  // Carve via waypoint. If the first segment can't reach the waypoint (rare but possible
+  // on extreme terrain/water layouts), fall back to a direct carve so connectivity isn't lost.
+  const Overlay before = world.inBounds(wp.x, wp.y) ? world.at(wp.x, wp.y).overlay : Overlay::None;
+  CarveRoad(world, rng, a, wp, level, allowBridges);
+  const bool seg1Ok = world.inBounds(wp.x, wp.y) && (world.at(wp.x, wp.y).overlay == Overlay::Road || before == Overlay::Road);
+  CarveRoad(world, rng, wp, b, level, allowBridges);
+
+  if (!seg1Ok) {
+    CarveRoad(world, rng, a, b, level, allowBridges);
+  }
+}
+
 static void CarveHubGrid(World& world, RNG& rng, P hub)
 {
   // Create a small local grid around a hub.
@@ -876,7 +991,7 @@ static void CarveBeltwayIfUseful(World& world, RNG& rng, const std::vector<P>& h
     // Skip super short edges (degenerate waypoint placement).
     if (ManhattanDist(a, b) < 6) continue;
 
-    CarveRoad(world, rng, a, b, beltwayLevel, /*allowBridges=*/true);
+    CarveRoadCurvy(world, rng, a, b, beltwayLevel, /*allowBridges=*/true, seed32 ^ HashCoords32(a.x, a.y, 0xB17BEEFu) ^ HashCoords32(b.x, b.y, 0xB17BEEFu));
   }
 
   // Add a small number of spokes from hubs to the beltway (recognizable interchanges).
@@ -902,7 +1017,7 @@ static void CarveBeltwayIfUseful(World& world, RNG& rng, const std::vector<P>& h
     if (bestD < minDim / 7) continue;
 
     const P target = ring[static_cast<std::size_t>(bestIdx)];
-    CarveRoad(world, rng, hub, target, /*level=*/2, /*allowBridges=*/true);
+    CarveRoadCurvy(world, rng, hub, target, /*level=*/2, /*allowBridges=*/true, seed32 ^ HashCoords32(hub.x, hub.y, 0x05B0A1E5u) ^ HashCoords32(target.x, target.y, 0x05B0A1E5u));
     ++spokes;
   }
 }
@@ -1664,6 +1779,698 @@ static void CarveInternalStreets(World& world, const std::vector<P>& hubs, std::
   }
 }
 
+
+
+// -----------------------------
+// Road-network "stitching": opportunistic short bridges
+// -----------------------------
+//
+// The terrain generator can produce rivers that cleanly bisect districts.
+// Arterials generally bridge them, but local street grids may remain split
+// into multiple components, hurting accessibility and later traffic routing.
+//
+// This pass looks for *single-tile* water gaps between two existing road
+// components and selectively places bridges to reconnect the network.
+
+static void ComputeRoadComponents(const World& world, std::vector<int>& outComp, std::vector<int>& outSize)
+{
+  const int w = world.width();
+  const int h = world.height();
+  const int n = w * h;
+  outComp.assign(static_cast<std::size_t>(std::max(0, n)), -1);
+  outSize.clear();
+
+  if (w <= 0 || h <= 0) return;
+
+  std::vector<int> q;
+  q.reserve(4096);
+
+  int compId = 0;
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const int idx = y * w + x;
+      if (outComp[static_cast<std::size_t>(idx)] != -1) continue;
+      if (world.at(x, y).overlay != Overlay::Road) continue;
+
+      // BFS.
+      q.clear();
+      std::size_t head = 0;
+      q.push_back(idx);
+      outComp[static_cast<std::size_t>(idx)] = compId;
+      int count = 0;
+
+      while (head < q.size()) {
+        const int cur = q[head++];
+        ++count;
+
+        const int cx = cur % w;
+        const int cy = cur / w;
+
+        constexpr int dx[4] = {1, -1, 0, 0};
+        constexpr int dy[4] = {0, 0, 1, -1};
+
+        for (int k = 0; k < 4; ++k) {
+          const int nx = cx + dx[k];
+          const int ny = cy + dy[k];
+          if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+          const int nidx = ny * w + nx;
+          if (outComp[static_cast<std::size_t>(nidx)] != -1) continue;
+          if (world.at(nx, ny).overlay != Overlay::Road) continue;
+          outComp[static_cast<std::size_t>(nidx)] = compId;
+          q.push_back(nidx);
+        }
+      }
+
+      outSize.push_back(count);
+      ++compId;
+    }
+  }
+}
+
+struct BridgeCandidate {
+  int x = 0;
+  int y = 0;
+  int ca = -1;
+  int cb = -1;
+  int level = 1;
+  float score = 0.0f;
+  std::uint32_t tie = 0;
+};
+
+static void StitchNarrowWaterBridges(World& world, const std::vector<P>& hubs, std::uint32_t seed32)
+{
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return;
+
+  std::vector<int> comp;
+  std::vector<int> compSize;
+  ComputeRoadComponents(world, comp, compSize);
+  if (compSize.size() <= 1) return;
+
+  auto compAt = [&](int x, int y) -> int {
+    if (x < 0 || y < 0 || x >= w || y >= h) return -1;
+    if (world.at(x, y).overlay != Overlay::Road) return -1;
+    return comp[static_cast<std::size_t>(y * w + x)];
+  };
+
+  std::vector<BridgeCandidate> cands;
+  cands.reserve(256);
+
+  const int minDim = std::min(w, h);
+  const float diag = static_cast<float>(w + h);
+
+  for (int y = 1; y < h - 1; ++y) {
+    for (int x = 1; x < w - 1; ++x) {
+      const Tile& t = world.at(x, y);
+      if (t.terrain != Terrain::Water) continue;
+      if (t.overlay != Overlay::None) continue; // don't overwrite existing bridges etc.
+
+      // East-west gap.
+      {
+        const int c0 = compAt(x - 1, y);
+        const int c1 = compAt(x + 1, y);
+        if (c0 >= 0 && c1 >= 0 && c0 != c1) {
+          BridgeCandidate bc;
+          bc.x = x;
+          bc.y = y;
+          bc.ca = c0;
+          bc.cb = c1;
+          bc.level = std::max(ClampRoadLevel(static_cast<int>(world.at(x - 1, y).level)),
+                              ClampRoadLevel(static_cast<int>(world.at(x + 1, y).level)));
+
+          const int hubDist = NearestHubDist(hubs, x, y);
+          const float d01 = std::clamp(static_cast<float>(hubDist) / std::max(1.0f, diag), 0.0f, 1.0f);
+
+          // Prefer bridges that connect big components and are somewhat near the core.
+          const float sizeScore = static_cast<float>(compSize[static_cast<std::size_t>(c0)] +
+                                                     compSize[static_cast<std::size_t>(c1)]);
+          bc.score = sizeScore * 0.60f + (1.0f - d01) * 45.0f + (static_cast<float>(bc.level) * 18.0f);
+
+          // Slight bias away from the extreme map edge (avoid random sea causeways).
+          const int edgeDist = std::min(std::min(x, w - 1 - x), std::min(y, h - 1 - y));
+          const float edge01 = 1.0f - std::clamp(static_cast<float>(edgeDist) / std::max(1.0f, static_cast<float>(minDim) * 0.5f),
+                                                 0.0f, 1.0f);
+          bc.score -= edge01 * 20.0f;
+
+          bc.tie = HashCoords32(x, y, seed32 ^ 0xBEEFB00Bu);
+          cands.push_back(bc);
+        }
+      }
+
+      // North-south gap.
+      {
+        const int c0 = compAt(x, y - 1);
+        const int c1 = compAt(x, y + 1);
+        if (c0 >= 0 && c1 >= 0 && c0 != c1) {
+          BridgeCandidate bc;
+          bc.x = x;
+          bc.y = y;
+          bc.ca = c0;
+          bc.cb = c1;
+          bc.level = std::max(ClampRoadLevel(static_cast<int>(world.at(x, y - 1).level)),
+                              ClampRoadLevel(static_cast<int>(world.at(x, y + 1).level)));
+
+          const int hubDist = NearestHubDist(hubs, x, y);
+          const float d01 = std::clamp(static_cast<float>(hubDist) / std::max(1.0f, diag), 0.0f, 1.0f);
+
+          const float sizeScore = static_cast<float>(compSize[static_cast<std::size_t>(c0)] +
+                                                     compSize[static_cast<std::size_t>(c1)]);
+          bc.score = sizeScore * 0.60f + (1.0f - d01) * 45.0f + (static_cast<float>(bc.level) * 18.0f);
+
+          const int edgeDist = std::min(std::min(x, w - 1 - x), std::min(y, h - 1 - y));
+          const float edge01 = 1.0f - std::clamp(static_cast<float>(edgeDist) / std::max(1.0f, static_cast<float>(minDim) * 0.5f),
+                                                 0.0f, 1.0f);
+          bc.score -= edge01 * 20.0f;
+
+          bc.tie = HashCoords32(x, y, seed32 ^ 0xBEEFB00Bu);
+          cands.push_back(bc);
+        }
+      }
+    }
+  }
+
+  if (cands.empty()) return;
+
+  std::sort(cands.begin(), cands.end(), [](const BridgeCandidate& a, const BridgeCandidate& b) {
+    if (a.score != b.score) return a.score > b.score;
+    return a.tie < b.tie;
+  });
+
+  // Budget: bigger maps can afford more stitch bridges.
+  int maxBridges = std::clamp(minDim / 28, 2, 8);
+  // If there are lots of components, allow a couple more.
+  if (compSize.size() >= 4) maxBridges = std::min(10, maxBridges + 2);
+
+  std::vector<P> chosen;
+  chosen.reserve(static_cast<std::size_t>(maxBridges));
+
+  for (const BridgeCandidate& bc : cands) {
+    if (static_cast<int>(chosen.size()) >= maxBridges) break;
+
+    // Keep bridges somewhat separated so we don't turn rivers into solid highways.
+    bool tooClose = false;
+    for (const P& p : chosen) {
+      const int d = std::abs(p.x - bc.x) + std::abs(p.y - bc.y);
+      if (d < 10) {
+        tooClose = true;
+        break;
+      }
+    }
+    if (tooClose) continue;
+
+    // Final safety check.
+    if (!world.inBounds(bc.x, bc.y)) continue;
+    Tile& t = world.at(bc.x, bc.y);
+    if (t.terrain != Terrain::Water) continue;
+    if (t.overlay != Overlay::None) continue;
+
+    SetRoadWithLevel(world, bc.x, bc.y, bc.level, /*allowBridges=*/true);
+    chosen.push_back(P{bc.x, bc.y});
+  }
+}
+
+// -----------------------------
+// Signature parks / greenways
+// -----------------------------
+
+static int PickCBDHubIndex(const std::vector<P>& hubs, int w, int h, std::uint32_t seed32)
+{
+  if (hubs.empty()) return -1;
+  const int cx = w / 2;
+  const int cy = h / 2;
+
+  int best = 0;
+  int bestD = std::numeric_limits<int>::max();
+  std::uint32_t bestTie = std::numeric_limits<std::uint32_t>::max();
+
+  for (int i = 0; i < static_cast<int>(hubs.size()); ++i) {
+    const P& p = hubs[static_cast<std::size_t>(i)];
+    const int d = std::abs(p.x - cx) + std::abs(p.y - cy);
+    const std::uint32_t tie = HashCoords32(p.x, p.y, seed32 ^ 0xC8D0BEEF);
+    if (d < bestD || (d == bestD && tie < bestTie)) {
+      bestD = d;
+      bestTie = tie;
+      best = i;
+    }
+  }
+
+  return best;
+}
+
+static bool FindParkStartInBlock(const World& world, const CityBlocksResult& cb, const CityBlock& b, int inset,
+                                int cx, int cy, std::uint32_t seed32, Point& out)
+{
+  const int w = cb.w;
+  const int h = cb.h;
+  if (w <= 0 || h <= 0) return false;
+
+  const int bid = b.id;
+  if (bid < 0) return false;
+
+  const int maxR = std::max(8, std::min(b.maxX - b.minX, b.maxY - b.minY) / 2);
+
+  int bestD = std::numeric_limits<int>::max();
+  std::uint32_t bestTie = std::numeric_limits<std::uint32_t>::max();
+  bool found = false;
+
+  for (int dy = -maxR; dy <= maxR; ++dy) {
+    for (int dx = -maxR; dx <= maxR; ++dx) {
+      const int x = cx + dx;
+      const int y = cy + dy;
+      if (x < 0 || y < 0 || x >= w || y >= h) continue;
+
+      const int d = std::abs(dx) + std::abs(dy);
+      if (d > maxR) continue;
+
+      const int idx = y * w + x;
+      if (cb.tileToBlock[static_cast<std::size_t>(idx)] != bid) continue;
+
+      if (inset > 0) {
+        if (x - b.minX < inset) continue;
+        if (b.maxX - x < inset) continue;
+        if (y - b.minY < inset) continue;
+        if (b.maxY - y < inset) continue;
+      }
+
+      const Tile& t = world.at(x, y);
+      if (t.terrain == Terrain::Water) continue;
+      if (t.overlay != Overlay::None) continue;
+
+      const std::uint32_t tie = HashCoords32(x, y, seed32);
+      if (d < bestD || (d == bestD && tie < bestTie)) {
+        bestD = d;
+        bestTie = tie;
+        out = Point{x, y};
+        found = true;
+      }
+    }
+  }
+
+  return found;
+}
+
+static int PlaceParkBlobInBlock(World& world, const CityBlocksResult& cb, const CityBlock& b, int targetArea,
+                               int inset, std::uint32_t seed32)
+{
+  if (targetArea <= 0) return 0;
+  const int w = cb.w;
+  const int h = cb.h;
+  const int n = w * h;
+  if (w <= 0 || h <= 0 || n <= 0) return 0;
+
+  const int bid = b.id;
+  if (bid < 0) return 0;
+
+  const int cx = (b.minX + b.maxX) / 2;
+  const int cy = (b.minY + b.maxY) / 2;
+
+  Point start;
+  if (!FindParkStartInBlock(world, cb, b, inset, cx, cy, seed32 ^ 0xFACEB00Cu, start)) {
+    return 0;
+  }
+
+  std::vector<std::uint8_t> seen;
+  seen.assign(static_cast<std::size_t>(n), 0);
+
+  std::vector<int> q;
+  q.reserve(static_cast<std::size_t>(targetArea) * 4u);
+  std::size_t head = 0;
+
+  auto push = [&](int x, int y) {
+    if (x < 0 || y < 0 || x >= w || y >= h) return;
+    const int idx = y * w + x;
+    const std::size_t uidx = static_cast<std::size_t>(idx);
+    if (seen[uidx]) return;
+    if (cb.tileToBlock[uidx] != bid) return;
+
+    if (inset > 0) {
+      if (x - b.minX < inset) return;
+      if (b.maxX - x < inset) return;
+      if (y - b.minY < inset) return;
+      if (b.maxY - y < inset) return;
+    }
+
+    const Tile& t = world.at(x, y);
+    if (t.terrain == Terrain::Water) return;
+    if (t.overlay != Overlay::None) return;
+
+    seen[uidx] = 1;
+    q.push_back(idx);
+  };
+
+  push(start.x, start.y);
+
+  // Local RNG so the park shape doesn't depend on global RNG call order.
+  RNG prng((static_cast<std::uint64_t>(seed32) << 32) ^ static_cast<std::uint64_t>(bid) ^ 0x9E3779B97F4A7C15ULL);
+
+  std::vector<int> chosen;
+  chosen.reserve(static_cast<std::size_t>(targetArea));
+
+  while (head < q.size() && static_cast<int>(chosen.size()) < targetArea) {
+    const int cur = q[head++];
+    chosen.push_back(cur);
+
+    const int x = cur % w;
+    const int y = cur / w;
+
+    int order[4] = {0, 1, 2, 3};
+    for (int i = 0; i < 4; ++i) {
+      const int j = prng.rangeInt(i, 3);
+      std::swap(order[i], order[j]);
+    }
+
+    constexpr int dx[4] = {1, -1, 0, 0};
+    constexpr int dy[4] = {0, 0, 1, -1};
+
+    for (int oi = 0; oi < 4; ++oi) {
+      const int k = order[oi];
+      const int nx = x + dx[k];
+      const int ny = y + dy[k];
+
+      // Slightly bias growth to be less diamond-shaped by randomly skipping a few frontier pushes.
+      const float skip = TileRand01(nx, ny, seed32 ^ 0x13579BDFu);
+      if (skip < 0.06f) continue;
+
+      push(nx, ny);
+    }
+  }
+
+  int placed = 0;
+  for (int idx : chosen) {
+    const int x = idx % w;
+    const int y = idx / w;
+    Tile& t = world.at(x, y);
+    if (t.overlay != Overlay::None) continue;
+    t.overlay = Overlay::Park;
+    t.level = 1;
+    t.occupants = 0;
+    ++placed;
+  }
+
+  return placed;
+}
+
+static void PlaceMajorParksFromBlocks(World& world,
+                                     const CityBlocksResult& cb,
+                                     const std::vector<std::vector<Point>>& blockRoadAdj,
+                                     const std::vector<P>& hubs,
+                                     std::uint32_t seed32,
+                                     const ProcGenConfig& cfg)
+{
+  (void)blockRoadAdj; // kept for future "entrance" heuristics
+
+  if (cfg.zoneChance <= 0.0f) return;
+  if (cfg.parkChance <= 0.0f) return;
+
+  const int w = cb.w;
+  const int h = cb.h;
+  if (w <= 0 || h <= 0) return;
+
+  const int minDim = std::min(w, h);
+  if (minDim < 48) return; // tiny maps don't have room for signature parks
+
+  const int cbdIdx = PickCBDHubIndex(hubs, w, h, seed32 ^ 0xC0DECAFEu);
+  const P cbd = (cbdIdx >= 0) ? hubs[static_cast<std::size_t>(cbdIdx)] : P{w / 2, h / 2};
+
+  // Number of major parks depends on map size.
+  int want = (minDim >= 96) ? 2 : 1;
+
+  struct BlockPick {
+    int bid = -1;
+    int cx = 0;
+    int cy = 0;
+    float score = -1e9f;
+    std::uint32_t tie = 0;
+  };
+
+  std::vector<BlockPick> picks;
+  picks.reserve(static_cast<std::size_t>(want));
+
+  auto scoreBlock = [&](const CityBlock& b, int variant) -> float {
+    if (b.id < 0) return -1e9f;
+
+    const int bw = (b.maxX - b.minX + 1);
+    const int bh = (b.maxY - b.minY + 1);
+    if (bw < 12 || bh < 12) return -1e9f;
+    if (b.area < 220) return -1e9f;
+
+    // We want parks surrounded by streets so they create a "front".
+    if (b.roadEdges < 18) return -1e9f;
+
+    const int cx = (b.minX + b.maxX) / 2;
+    const int cy = (b.minY + b.maxY) / 2;
+
+    const int dCBD = std::abs(cx - cbd.x) + std::abs(cy - cbd.y);
+    const float d01 = std::clamp(static_cast<float>(dCBD) / static_cast<float>(w + h), 0.0f, 1.0f);
+
+    const float area01 = std::clamp(static_cast<float>(b.area) / 700.0f, 0.0f, 1.0f);
+
+    const float bound = static_cast<float>(std::max(1, b.boundaryEdges()));
+    const float water01 = std::clamp(static_cast<float>(b.waterEdges) / bound, 0.0f, 1.0f);
+
+    // Variant 0: central park near CBD.
+    // Variant 1: waterfront park / green anchor.
+    float s = 0.0f;
+    if (variant == 0) {
+      s += (1.0f - d01) * 0.62f;
+      s += area01 * 0.28f;
+      s += water01 * 0.10f;
+    } else {
+      s += water01 * 0.55f;
+      s += (1.0f - d01) * 0.25f;
+      s += area01 * 0.20f;
+    }
+
+    // Prefer blocks with some hub proximity (avoid putting signature parks in total wilderness).
+    const int hubDist = NearestHubDist(hubs, cx, cy);
+    const float h01 = std::clamp(static_cast<float>(hubDist) / static_cast<float>(w + h), 0.0f, 1.0f);
+    s += (1.0f - h01) * 0.08f;
+
+    // Tie-break jitter.
+    s += TileRand01(cx, cy, seed32 ^ 0x1CEB00DAu) * 0.02f;
+
+    return s;
+  };
+
+  for (int variant = 0; variant < want; ++variant) {
+    BlockPick best;
+
+    for (const CityBlock& b : cb.blocks) {
+      const float s = scoreBlock(b, variant);
+      if (s < -1e8f) continue;
+      const int cx = (b.minX + b.maxX) / 2;
+      const int cy = (b.minY + b.maxY) / 2;
+
+      // Keep major parks spread out.
+      bool tooClose = false;
+      for (const BlockPick& p : picks) {
+        const int d = std::abs(p.cx - cx) + std::abs(p.cy - cy);
+        if (d < minDim / 3) {
+          tooClose = true;
+          break;
+        }
+      }
+      if (tooClose) continue;
+
+      const std::uint32_t tie = HashCoords32(b.id, variant, seed32 ^ 0xABCDEF01u);
+      if (s > best.score || (s == best.score && tie < best.tie)) {
+        best.bid = b.id;
+        best.cx = cx;
+        best.cy = cy;
+        best.score = s;
+        best.tie = tie;
+      }
+    }
+
+    if (best.bid >= 0) {
+      picks.push_back(best);
+    }
+  }
+
+  for (std::size_t i = 0; i < picks.size(); ++i) {
+    const int bid = picks[i].bid;
+    if (bid < 0 || bid >= static_cast<int>(cb.blocks.size())) continue;
+
+    const CityBlock& b = cb.blocks[static_cast<std::size_t>(bid)];
+    const int target = std::clamp(b.area / 6, 34, 180);
+    const int inset = (target > 120) ? 2 : 1;
+
+    (void)PlaceParkBlobInBlock(world, cb, b, target, inset, seed32 ^ (0x9E3779B9u * static_cast<std::uint32_t>(i + 1)));
+  }
+}
+
+static void PlaceWaterfrontGreenways(World& world, const std::vector<P>& hubs, std::uint32_t seed32, const ProcGenConfig& cfg)
+{
+  if (cfg.zoneChance <= 0.0f) return;
+  if (cfg.parkChance <= 0.0f) return;
+
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return;
+
+  const int n = w * h;
+  const int minDim = std::min(w, h);
+
+  // Budget scales with map size and global park chance.
+  const float parkScale = std::clamp(cfg.parkChance / 0.06f, 0.35f, 2.0f);
+  int budget = static_cast<int>(std::round(static_cast<float>(minDim) * 3.0f * parkScale));
+  budget = std::clamp(budget, 40, 320);
+
+  auto isShore = [&](int x, int y) -> bool {
+    if (!world.inBounds(x, y)) return false;
+    const Tile& t = world.at(x, y);
+    if (t.terrain == Terrain::Water) return false;
+    if (t.overlay != Overlay::None) return false;
+    return HasAdjacentWater4(world, x, y);
+  };
+
+  // Pick a few good shoreline seeds.
+  struct Seed {
+    int x = 0;
+    int y = 0;
+    float score = -1e9f;
+    std::uint32_t tie = 0;
+  };
+
+  std::vector<Seed> candidates;
+  candidates.reserve(2048);
+
+  const float diag = static_cast<float>(w + h);
+
+  for (int y = 1; y < h - 1; ++y) {
+    for (int x = 1; x < w - 1; ++x) {
+      if (!isShore(x, y)) continue;
+
+      const int hubDist = NearestHubDist(hubs, x, y);
+      const float d01 = std::clamp(static_cast<float>(hubDist) / std::max(1.0f, diag), 0.0f, 1.0f);
+
+      float s = (1.0f - d01) * 0.55f;
+      if (world.hasAdjacentRoad(x, y)) s += 0.35f;
+
+      // Coastlines near the edge are allowed (they often are the edge), but slightly prefer
+      // non-corner areas to avoid silly "park pinstripes".
+      const int edgeDist = std::min(std::min(x, w - 1 - x), std::min(y, h - 1 - y));
+      const float edge01 = 1.0f - std::clamp(static_cast<float>(edgeDist) / std::max(1.0f, static_cast<float>(minDim) * 0.5f),
+                                             0.0f, 1.0f);
+      s -= edge01 * 0.08f;
+
+      const std::uint32_t tie = HashCoords32(x, y, seed32 ^ 0x5151C0DEu);
+      s += Hash01From32(tie) * 0.02f;
+
+      candidates.push_back(Seed{x, y, s, tie});
+    }
+  }
+
+  if (candidates.empty()) return;
+
+  std::sort(candidates.begin(), candidates.end(), [](const Seed& a, const Seed& b) {
+    if (a.score != b.score) return a.score > b.score;
+    return a.tie < b.tie;
+  });
+
+  int seeds = std::clamp(minDim / 64 + 2, 2, 4);
+  if (budget < 70) seeds = std::min(seeds, 2);
+
+  std::vector<Seed> chosen;
+  chosen.reserve(static_cast<std::size_t>(seeds));
+
+  for (const Seed& s : candidates) {
+    if (static_cast<int>(chosen.size()) >= seeds) break;
+
+    bool tooClose = false;
+    for (const Seed& c : chosen) {
+      const int d = std::abs(c.x - s.x) + std::abs(c.y - s.y);
+      if (d < minDim / 4) {
+        tooClose = true;
+        break;
+      }
+    }
+    if (tooClose) continue;
+    chosen.push_back(s);
+  }
+
+  if (chosen.empty()) return;
+
+  const int perSeed = std::max(10, budget / static_cast<int>(chosen.size()));
+
+  std::vector<std::uint8_t> seen;
+  seen.assign(static_cast<std::size_t>(n), 0);
+
+  std::vector<int> q;
+  q.reserve(4096);
+
+  for (std::size_t si = 0; si < chosen.size(); ++si) {
+    q.clear();
+    std::size_t head = 0;
+
+    const int sx = chosen[si].x;
+    const int sy = chosen[si].y;
+    const int sIdx = sy * w + sx;
+    if (sIdx < 0 || sIdx >= n) continue;
+
+    q.push_back(sIdx);
+    seen[static_cast<std::size_t>(sIdx)] = 1;
+
+    int placed = 0;
+
+    while (head < q.size() && placed < perSeed) {
+      const int cur = q[head++];
+      const int x = cur % w;
+      const int y = cur / w;
+
+      if (isShore(x, y)) {
+        Tile& t = world.at(x, y);
+        if (t.overlay == Overlay::None) {
+          t.overlay = Overlay::Park;
+          t.level = 1;
+          t.occupants = 0;
+          ++placed;
+
+          // Occasionally widen the greenway one tile inland for a more "promenade" feel.
+          const float widen = TileRand01(x, y, seed32 ^ 0xA5A5BEEF);
+          if (widen < 0.22f) {
+            constexpr int dx[4] = {1, -1, 0, 0};
+            constexpr int dy[4] = {0, 0, 1, -1};
+            for (int k = 0; k < 4; ++k) {
+              const int nx = x + dx[k];
+              const int ny = y + dy[k];
+              if (!world.inBounds(nx, ny)) continue;
+              Tile& nt = world.at(nx, ny);
+              if (nt.terrain == Terrain::Water) continue;
+              if (nt.overlay != Overlay::None) continue;
+              if (HasAdjacentWater4(world, nx, ny)) continue; // keep widening inland
+              // A quick road-adjacency check avoids turning major boulevards into parks.
+              if (world.hasAdjacentRoad(nx, ny) && TileRand01(nx, ny, seed32 ^ 0x1234ABCDu) < 0.45f) continue;
+              nt.overlay = Overlay::Park;
+              nt.level = 1;
+              nt.occupants = 0;
+              break;
+            }
+          }
+        }
+      }
+
+      // Shoreline BFS neighbors.
+      constexpr int dx[4] = {1, -1, 0, 0};
+      constexpr int dy[4] = {0, 0, 1, -1};
+      for (int k = 0; k < 4; ++k) {
+        const int nx = x + dx[k];
+        const int ny = y + dy[k];
+        if (nx <= 0 || ny <= 0 || nx >= w - 1 || ny >= h - 1) continue;
+        const int nIdx = ny * w + nx;
+        const std::size_t u = static_cast<std::size_t>(nIdx);
+        if (seen[u]) continue;
+
+        // Only flood along coastline candidates.
+        if (!isShore(nx, ny)) continue;
+
+        seen[u] = 1;
+        q.push_back(nIdx);
+      }
+    }
+  }
+}
 // -----------------------------
 // Zoning pass: seed from road-adjacent tiles and grow inward within blocks
 // -----------------------------
@@ -1680,6 +2487,14 @@ static void PlaceZonesAndParksFromBlocks(World& world, const std::vector<P>& hub
 
   std::vector<std::vector<Point>> blockRoadAdj;
   BuildBlockRoadAdj(world, cb, blockRoadAdj);
+
+  // -------------------------------------------------------------------------
+  // Phase 0: signature parks and waterfront greenways.
+  // These are placed *before* the standard road-edge seeding so they influence
+  // the land value field and produce more recognizable city landmarks.
+  // -------------------------------------------------------------------------
+  PlaceMajorParksFromBlocks(world, cb, blockRoadAdj, hubs, seed32 ^ 0xC3A7E5E1u, cfg);
+  PlaceWaterfrontGreenways(world, hubs, seed32 ^ 0x6A9E4A71u, cfg);
 
   // -------------------------------------------------------------------------
   // Phase A: seed parks along road edges (still gated by zoneChance so "no development"
@@ -2422,7 +3237,7 @@ World GenerateWorld(int width, int height, std::uint64_t seed, const ProcGenConf
     const P a = hubPts[static_cast<std::size_t>(e.a)];
     const P b = hubPts[static_cast<std::size_t>(e.b)];
     const int lvl = ChooseHubConnectionLevel(world, a, b);
-    CarveRoad(world, rng, a, b, lvl, /*allowBridges=*/(lvl >= 2));
+    CarveRoadCurvy(world, rng, a, b, lvl, /*allowBridges=*/(lvl >= 2), seed32 ^ HashCoords32(e.a, e.b, 0xC0FFEEu));
   }
 
   auto edgeUsed = [&](std::uint32_t key) {
@@ -2491,7 +3306,7 @@ World GenerateWorld(int width, int height, std::uint64_t seed, const ProcGenConf
 
       // Loops should be at least avenue-class so they meaningfully take load off the backbone.
       const int lvl = std::max(2, ChooseHubConnectionLevel(world, a, b));
-      CarveRoad(world, rng, a, b, lvl, /*allowBridges=*/true);
+      CarveRoadCurvy(world, rng, a, b, lvl, /*allowBridges=*/true, seed32 ^ HashCoords32(e.a, e.b, 0xBADC0DEu));
 
       usedEdgeKeys.push_back(key);
       ++added;
@@ -2517,7 +3332,7 @@ World GenerateWorld(int width, int height, std::uint64_t seed, const ProcGenConf
     }
 
     const int lvl = std::max(2, ChooseHubConnectionLevel(world, hubPts[static_cast<std::size_t>(bestHub)], bestEdge));
-    CarveRoad(world, rng, hubPts[static_cast<std::size_t>(bestHub)], bestEdge, lvl, /*allowBridges=*/true);
+    CarveRoadCurvy(world, rng, hubPts[static_cast<std::size_t>(bestHub)], bestEdge, lvl, /*allowBridges=*/true, seed32 ^ HashCoords32(bestHub, lvl, 0xED9EED6Eu));
   }
 
   // Optional: carve a highway-ish beltway around the hub cluster.
@@ -2525,6 +3340,8 @@ World GenerateWorld(int width, int height, std::uint64_t seed, const ProcGenConf
 
   // Subdivide large blocks with a small hierarchical street network before zoning.
   CarveInternalStreets(world, hubPts, seed32 ^ 0x1337C0DEu);
+  // Opportunistically stitch disconnected local networks across narrow water gaps.
+  StitchNarrowWaterBridges(world, hubPts, seed32 ^ 0xB16B00B5u);
   // Place zones and parks using block-aware inward growth.
   PlaceZonesAndParksFromBlocks(world, hubPts, seed32 ^ 0xD15EA5E5u, cfg);
 

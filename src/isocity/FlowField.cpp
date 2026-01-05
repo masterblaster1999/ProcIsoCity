@@ -41,11 +41,12 @@ struct HeapCmp {
 
 } // namespace
 
-RoadFlowField BuildRoadFlowField(const World& world, const std::vector<int>& sourceRoadIdx,
-                                 const RoadFlowFieldConfig& cfg,
-                                 const std::vector<std::uint8_t>* precomputedRoadToEdge,
-                                 const std::vector<int>* extraCostMilli,
-                                 const std::vector<std::uint8_t>* roadBlockMask)
+RoadFlowField BuildRoadFlowField(const World& world, const std::vector<int>& sourceRoadIdx
+                                 , const RoadFlowFieldConfig& cfg
+                                 , const std::vector<std::uint8_t>* precomputedRoadToEdge
+                                 , const std::vector<int>* extraCostMilli
+                                 , const std::vector<std::uint8_t>* roadBlockMask
+                                 , const std::vector<int>* sourceInitialCostMilli)
 {
   RoadFlowField out;
 
@@ -105,6 +106,11 @@ RoadFlowField BuildRoadFlowField(const World& world, const std::vector<int>& sou
     extraCost = extraCostMilli;
   }
 
+  const std::vector<int>* sourceInit = nullptr;
+  if (sourceInitialCostMilli && sourceInitialCostMilli->size() == sourceRoadIdx.size()) {
+    sourceInit = sourceInitialCostMilli;
+  }
+
   // Deterministic neighbor order.
   constexpr int dirs[4][2] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}};
 
@@ -119,8 +125,10 @@ RoadFlowField BuildRoadFlowField(const World& world, const std::vector<int>& sou
       const std::size_t ui = static_cast<std::size_t>(sidx);
       if (out.dist[ui] == 0) continue; // already seeded
 
+      const int initCost = sourceInit ? std::max(0, (*sourceInit)[static_cast<std::size_t>(si)]) : 0;
+
       out.dist[ui] = 0;
-      out.cost[ui] = 0;
+      out.cost[ui] = initCost;
       out.parent[ui] = -1;
       if (cfg.computeOwner) out.owner[ui] = si;
       queue.push_back(sidx);
@@ -171,14 +179,29 @@ RoadFlowField BuildRoadFlowField(const World& world, const std::vector<int>& sou
     const int sidx = sourceRoadIdx[static_cast<std::size_t>(si)];
     if (!isTraversableRoad(sidx)) continue;
     const std::size_t ui = static_cast<std::size_t>(sidx);
-    if (bestCost[ui] == 0) continue;
 
-    bestCost[ui] = 0;
+    const int initCost = sourceInit ? std::max(0, (*sourceInit)[static_cast<std::size_t>(si)]) : 0;
+
+    bool improve = false;
+    if (initCost < bestCost[ui]) {
+      improve = true;
+    } else if (initCost == bestCost[ui]) {
+      if (cfg.computeOwner) {
+        const int oldOwner = out.owner[ui];
+        if (oldOwner < 0 || si < oldOwner) {
+          improve = true;
+        }
+      }
+    }
+
+    if (!improve) continue;
+
+    bestCost[ui] = initCost;
     bestSteps[ui] = 0;
     out.parent[ui] = -1;
     if (cfg.computeOwner) out.owner[ui] = si;
 
-    heap.push(HeapNode{0, 0, cfg.computeOwner ? si : 0, sidx});
+    heap.push(HeapNode{initCost, 0, cfg.computeOwner ? si : 0, sidx});
   }
 
   while (!heap.empty()) {

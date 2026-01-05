@@ -88,7 +88,19 @@ add_library(isocity_core
   src/isocity/ZoneAccess.cpp
   src/isocity/SaveLoad.cpp
   src/isocity/Export.cpp
+  src/isocity/Export3D.cpp
   src/isocity/ImageIO.cpp
+  src/isocity/Soft3D.cpp
+  src/isocity/GfxQuantize.cpp
+  src/isocity/GfxAtlasFx.cpp
+  src/isocity/GfxMipmaps.cpp
+  src/isocity/GfxOutlines.cpp
+  src/isocity/GfxPacker.cpp
+  src/isocity/GfxTilesetAtlas.cpp
+  src/isocity/GfxPalette.cpp
+  src/isocity/GfxBuildings.cpp
+  src/isocity/GfxProps.cpp
+  src/isocity/GfxTileset.cpp
   src/isocity/Heightmap.cpp
   src/isocity/Hash.cpp
   src/isocity/EditHistory.cpp
@@ -303,6 +315,16 @@ if (PROCISOCITY_BUILD_CLI)
   target_link_libraries(proc_isocity_suite PRIVATE isocity_core)
 
   procisocity_set_strict_warnings(proc_isocity_suite)
+
+  # Timelapse tool (headless): run the simulator forward and export an isometric frame sequence.
+  add_executable(proc_isocity_timelapse
+    src/cli/timelapse.cpp
+  )
+
+  target_include_directories(proc_isocity_timelapse PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_timelapse PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_timelapse)
 
 
   # World transform tool (headless): rotate/mirror/crop entire saves.
@@ -535,6 +557,26 @@ if (PROCISOCITY_BUILD_CLI)
   target_link_libraries(proc_isocity_districtreport PRIVATE isocity_core)
 
   procisocity_set_strict_warnings(proc_isocity_districtreport)
+
+  # Map export tool (headless): export a world as a single GeoJSON FeatureCollection.
+  add_executable(proc_isocity_mapexport
+    src/cli/mapexport.cpp
+  )
+
+  target_include_directories(proc_isocity_mapexport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_mapexport PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_mapexport)
+
+  # Tileset generator tool (headless): export procedural tile textures as a sprite atlas PNG (+ optional JSON metadata).
+  add_executable(proc_isocity_tileset
+    src/cli/tileset.cpp
+  )
+
+  target_include_directories(proc_isocity_tileset PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_tileset PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_tileset)
 
 endif()
 

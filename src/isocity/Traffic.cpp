@@ -4,6 +4,7 @@
 #include "isocity/Pathfinding.hpp"
 #include "isocity/Road.hpp"
 #include "isocity/ZoneAccess.hpp"
+#include "isocity/ZoneMetrics.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -151,9 +152,43 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
   }
 
   // --- Collect job access points (sources) ---
-  std::vector<std::uint8_t> isSource(n, 0);
+  //
+  // We create sources on road tiles adjacent to job zones.
+  // For capacity-aware assignment, we also accumulate an approximate job capacity per source.
   std::vector<int> sources;
+  std::vector<int> sourceCaps;
+  std::vector<int> roadToSource(n, -1);
   sources.reserve(n / 16);
+  sourceCaps.reserve(n / 16);
+
+  auto addSourceCap = [&](int ridx, int capAdd) {
+    if (ridx < 0 || static_cast<std::size_t>(ridx) >= n) return;
+    const int rx = ridx % w;
+    const int ry = ridx / w;
+    if (!world.inBounds(rx, ry)) return;
+    if (world.at(rx, ry).overlay != Overlay::Road) return;
+
+    const std::size_t ui = static_cast<std::size_t>(ridx);
+    if (cfg.requireOutsideConnection) {
+      if (!roadToEdge || ui >= roadToEdge->size() || (*roadToEdge)[ui] == 0) return;
+    }
+
+    int si = roadToSource[ui];
+    if (si < 0) {
+      si = static_cast<int>(sources.size());
+      sources.push_back(ridx);
+      sourceCaps.push_back(0);
+      roadToSource[ui] = si;
+    }
+
+    if (capAdd > 0) {
+      const std::size_t usi = static_cast<std::size_t>(si);
+      const long long sum = static_cast<long long>(sourceCaps[usi]) + static_cast<long long>(capAdd);
+      sourceCaps[usi] = static_cast<int>(std::min<long long>(sum, static_cast<long long>(std::numeric_limits<int>::max())));
+    }
+  };
+
+  constexpr int dirs[4][2] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}};
 
   for (int y = 0; y < h; ++y) {
     for (int x = 0; x < w; ++x) {
@@ -166,42 +201,40 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
       if (isCommercial && !cfg.includeCommercialJobs) continue;
       if (isIndustrial && !cfg.includeIndustrialJobs) continue;
 
+      // Ignore zones that have no road access (even via boundary propagation).
       const std::size_t zidx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
       if (zidx >= zoneAccess->roadIdx.size()) continue;
       const int accessRoad = zoneAccess->roadIdx[zidx];
       if (accessRoad < 0) continue;
 
-      // Preserve the older behavior for boundary tiles: if this job tile touches road tiles,
-      // treat each adjacent road as a job source. For interior tiles, fall back to the
-      // propagated access road.
-      bool addedAdjacent = false;
-      constexpr int dirs[4][2] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}};
+      const int jobs = CapacityForTile(t);
+      if (jobs <= 0) continue;
+
+      // Preserve older behavior for boundary tiles:
+      // - If this job tile touches road tiles, treat each adjacent road as a source.
+      // - Otherwise, fall back to the propagated access road.
+      int adj[4];
+      int adjCount = 0;
       for (const auto& d : dirs) {
         const int rx = x + d[0];
         const int ry = y + d[1];
         if (!world.inBounds(rx, ry)) continue;
         if (world.at(rx, ry).overlay != Overlay::Road) continue;
-
-        const int ridx = ry * w + rx;
-        const std::size_t ur = static_cast<std::size_t>(ridx);
-        if (ur >= isSource.size()) continue;
-        if (cfg.requireOutsideConnection) {
-          if (!roadToEdge || ur >= roadToEdge->size() || (*roadToEdge)[ur] == 0) continue;
-        }
-
-        if (!isSource[ur]) {
-          isSource[ur] = 1;
-          sources.push_back(ridx);
-        }
-        addedAdjacent = true;
+        adj[adjCount++] = ry * w + rx;
       }
 
-      if (!addedAdjacent) {
-        const std::size_t ur = static_cast<std::size_t>(accessRoad);
-        if (ur < isSource.size() && !isSource[ur]) {
-          isSource[ur] = 1;
-          sources.push_back(accessRoad);
+      if (adjCount > 0) {
+        std::sort(adj, adj + adjCount);
+        // Distribute jobs across adjacent road sources deterministically.
+        const int k = adjCount;
+        const int base = jobs / k;
+        int rem = jobs - base * k;
+        for (int i = 0; i < k; ++i) {
+          const int capAdd = base + ((i < rem) ? 1 : 0);
+          addSourceCap(adj[i], capAdd);
         }
+      } else {
+        addSourceCap(accessRoad, jobs);
       }
     }
   }
@@ -266,6 +299,72 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
     return r;
   }
 
+  // --- Optional: capacity-aware job assignment (soft constraints) ---
+  //
+  // We fit a per-source penalty (added to the initial cost of that source in the flow field)
+  // so overloaded sources become less attractive, approximating a capacitated assignment.
+  std::vector<int> sourcePenalty;
+  if (cfg.capacityAwareJobs && cfg.jobPenaltyBaseMilli > 0 && cfg.jobAssignmentIterations > 0 && sources.size() >= 2) {
+    r.usedCapacityAwareJobs = true;
+    const int iters = std::clamp(cfg.jobAssignmentIterations, 1, 32);
+
+    sourcePenalty.assign(sources.size(), 0);
+    std::vector<int> nextPenalty(sources.size(), 0);
+
+    RoadFlowFieldConfig jcfg;
+    jcfg.requireOutsideConnection = cfg.requireOutsideConnection;
+    jcfg.computeOwner = true;
+    jcfg.useTravelTime = true;
+
+    auto computePenalty = [&](std::uint64_t load, int cap) -> int {
+      const int base = std::max(0, cfg.jobPenaltyBaseMilli);
+      if (base <= 0) return 0;
+      const int capSafe = std::max(1, cap);
+      double ratio = static_cast<double>(load) / static_cast<double>(capSafe);
+      if (ratio <= 1.0) return 0;
+      ratio = std::min(ratio, 3.0);
+      const double r2 = ratio * ratio;
+      const double r4 = r2 * r2;
+      // BPR-style curve: penalty = base * alpha * (ratio^beta - 1)
+      const double mult = 0.15 * (r4 - 1.0);
+      const double penD = static_cast<double>(base) * mult;
+      int pen = static_cast<int>(std::lround(penD));
+      if (pen < 0) pen = 0;
+      pen = std::min(pen, 2000000);
+      return pen;
+    };
+
+    int usedIters = 0;
+    for (int iter = 0; iter < iters; ++iter) {
+      usedIters = iter + 1;
+      const RoadFlowField field = BuildRoadFlowField(world, sources, jcfg, roadToEdge, nullptr, nullptr, &sourcePenalty);
+      if (field.owner.size() != n) break;
+
+      std::vector<std::uint64_t> load(sources.size(), 0);
+      for (const Origin& o : origins) {
+        if (o.commuters <= 0) continue;
+        if (o.roadIdx < 0 || static_cast<std::size_t>(o.roadIdx) >= n) continue;
+        const int owner = field.owner[static_cast<std::size_t>(o.roadIdx)];
+        if (owner < 0 || static_cast<std::size_t>(owner) >= load.size()) continue;
+        load[static_cast<std::size_t>(owner)] += static_cast<std::uint64_t>(o.commuters);
+      }
+
+      double maxRatio = 0.0;
+      for (std::size_t si = 0; si < sources.size(); ++si) {
+        const int cap = (si < sourceCaps.size()) ? sourceCaps[si] : 1;
+        const double ratio = static_cast<double>(load[si]) / static_cast<double>(std::max(1, cap));
+        if (ratio > maxRatio) maxRatio = ratio;
+        nextPenalty[si] = computePenalty(load[si], cap);
+      }
+      r.maxJobSourceOverload = static_cast<float>(maxRatio);
+
+      if (nextPenalty == sourcePenalty) break;
+      sourcePenalty.swap(nextPenalty);
+    }
+
+    r.jobAssignmentIterations = usedIters;
+  }
+
   // --- Multi-pass routing / assignment ---
   //
   // Classic behavior: 1 pass, assign everyone on the single shortest path.
@@ -273,11 +372,11 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
   // from the traffic predicted so far.
   RoadFlowFieldConfig fcfg;
   fcfg.requireOutsideConnection = cfg.requireOutsideConnection;
-  fcfg.computeOwner = false;
+  fcfg.computeOwner = !sourcePenalty.empty();
   fcfg.useTravelTime = true;
 
-  const bool useCongestion = cfg.congestionAwareRouting && cfg.congestionIterations > 1 &&
-                             cfg.congestionAlpha > 0.0f && cfg.congestionBeta > 0.0f;
+  const bool useCongestion = cfg.congestionAwareRouting && cfg.congestionIterations > 1 && cfg.congestionAlpha > 0.0f &&
+                             cfg.congestionBeta > 0.0f;
   const int passes = useCongestion ? std::clamp(cfg.congestionIterations, 2, 16) : 1;
   r.usedCongestionAwareRouting = useCongestion;
   r.routingPasses = passes;
@@ -303,8 +402,8 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
       extraCost.clear();
     }
 
-    const RoadFlowField field = BuildRoadFlowField(world, sources, fcfg, roadToEdge,
-                                                   useCongestion ? &extraCost : nullptr);
+    const RoadFlowField field = BuildRoadFlowField(world, sources, fcfg, roadToEdge, useCongestion ? &extraCost : nullptr,
+                                                   nullptr, sourcePenalty.empty() ? nullptr : &sourcePenalty);
 
     for (const Origin& o : origins) {
       if (o.commuters <= 0) continue;
@@ -316,8 +415,7 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
       const int chunk = b - a;
       if (chunk <= 0) continue;
 
-      if (static_cast<std::size_t>(o.roadIdx) >= field.dist.size() ||
-          static_cast<std::size_t>(o.roadIdx) >= field.cost.size()) {
+      if (static_cast<std::size_t>(o.roadIdx) >= field.dist.size() || static_cast<std::size_t>(o.roadIdx) >= field.cost.size()) {
         r.unreachableCommuters += chunk;
         continue;
       }
@@ -331,11 +429,21 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
         continue;
       }
 
+      int cAdj = c;
+      if (!sourcePenalty.empty()) {
+        if (uo < field.owner.size()) {
+          const int owner = field.owner[uo];
+          if (owner >= 0 && static_cast<std::size_t>(owner) < sourcePenalty.size()) {
+            cAdj = cAdj - sourcePenalty[static_cast<std::size_t>(owner)];
+          }
+        }
+      }
+
       reachable += chunk;
       sumDist += static_cast<double>(d) * static_cast<double>(chunk);
-      sumCost += static_cast<double>(c) * static_cast<double>(chunk);
+      sumCost += static_cast<double>(cAdj) * static_cast<double>(chunk);
       commuteSamples.emplace_back(d, chunk);
-      timeSamples.emplace_back(c, chunk);
+      timeSamples.emplace_back(cAdj, chunk);
 
       // Trace the parent pointers back to a job access point and increment traffic.
       int cur = o.roadIdx;
@@ -361,8 +469,7 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
     r.avgCommuteTime = static_cast<float>((sumCost / static_cast<double>(reachable)) / kMilli);
 
     // Weighted 95th percentile (steps).
-    std::sort(commuteSamples.begin(), commuteSamples.end(),
-              [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::sort(commuteSamples.begin(), commuteSamples.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     const int target = static_cast<int>(std::ceil(static_cast<double>(reachable) * 0.95));
     int accum = 0;
     int p95 = 0;
@@ -374,8 +481,7 @@ TrafficResult ComputeCommuteTraffic(const World& world, const TrafficConfig& cfg
     r.p95Commute = static_cast<float>(p95);
 
     // Weighted 95th percentile (travel time).
-    std::sort(timeSamples.begin(), timeSamples.end(),
-              [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::sort(timeSamples.begin(), timeSamples.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     accum = 0;
     int p95Cost = 0;
     for (const auto& s : timeSamples) {

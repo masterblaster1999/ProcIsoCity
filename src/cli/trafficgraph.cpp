@@ -125,6 +125,11 @@ void PrintHelp()
       << "  --cap-scale <f>           Capacity scale for congestion cost. Default: 1.0\n"
       << "  --ratio-clamp <f>         Clamp v/c in congestion curve. Default: 3.0\n"
       << "\n"
+      << "Capacity-aware job assignment (optional):\n"
+      << "  --capacity-aware-jobs <0|1>  Enable capacity-aware job assignment. Default: 0\n"
+      << "  --job-iters <N>              Penalty fitting iterations. Default: 6\n"
+      << "  --job-penalty <N>            Penalty base (milli). Default: 8000\n"
+      << "\n"
       << "Outputs:\n"
       << "  --dot <path>          GraphViz DOT (edges colored by utilization).\n"
       << "  --json <path>         JSON export (nodes/edges + traffic stats).\n"
@@ -183,6 +188,11 @@ int main(int argc, char** argv)
   float beta = tcfg.congestionBeta;
   float capScale = tcfg.congestionCapacityScale;
   float ratioClamp = tcfg.congestionRatioClamp;
+
+  // Capacity-aware job assignment
+  bool capacityAwareJobs = false;
+  int jobIters = tcfg.jobAssignmentIterations;
+  int jobPenalty = tcfg.jobPenaltyBaseMilli;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -338,6 +348,23 @@ int main(int argc, char** argv)
         std::cerr << "--ratio-clamp requires a float > 0\n";
         return 2;
       }
+    } else if (arg == "--capacity-aware-jobs") {
+      bool b = false;
+      if (!requireValue(i, val, argc, argv) || !ParseBool01(val, &b)) {
+        std::cerr << "--capacity-aware-jobs requires 0 or 1\n";
+        return 2;
+      }
+      capacityAwareJobs = b;
+    } else if (arg == "--job-iters") {
+      if (!requireValue(i, val, argc, argv) || !ParseI32(val, &jobIters) || jobIters < 1) {
+        std::cerr << "--job-iters requires an integer >= 1\n";
+        return 2;
+      }
+    } else if (arg == "--job-penalty") {
+      if (!requireValue(i, val, argc, argv) || !ParseI32(val, &jobPenalty) || jobPenalty < 0) {
+        std::cerr << "--job-penalty requires an integer >= 0\n";
+        return 2;
+      }
     } else {
       std::cerr << "Unknown arg: " << arg << "\n";
       std::cerr << "Run with --help for usage.\n";
@@ -387,6 +414,10 @@ int main(int argc, char** argv)
   tcfg.congestionCapacityScale = capScale;
   tcfg.congestionRatioClamp = ratioClamp;
 
+  tcfg.capacityAwareJobs = capacityAwareJobs;
+  tcfg.jobAssignmentIterations = jobIters;
+  tcfg.jobPenaltyBaseMilli = jobPenalty;
+
   float employedShare = 1.0f;
   if (employedShareSet) {
     employedShare = employedShareOverride;
@@ -411,8 +442,14 @@ int main(int argc, char** argv)
   std::cout << "  world: " << world.width() << "x" << world.height() << "  day=" << world.stats().day << "\n";
   std::cout << "  pop=" << world.stats().population << " employed=" << world.stats().employed << " employedShare=" << employedShare << "\n";
   std::cout << "  roadGraph: nodes=" << rg.nodes.size() << " edges=" << rg.edges.size() << "\n";
-  std::cout << "  traffic: maxTileTraffic=" << tr.maxTraffic << "  routing=" << (tr.usedCongestionAwareRouting ? "congestionAware" : "classic")
-            << " passes=" << tr.routingPasses << "\n";
+  std::cout << "  traffic: maxTileTraffic=" << tr.maxTraffic
+            << " routing=" << (tr.usedCongestionAwareRouting ? "congestionAware" : "classic")
+            << " passes=" << tr.routingPasses
+            << " jobCap=" << (tr.usedCapacityAwareJobs ? "on" : "off");
+  if (tr.usedCapacityAwareJobs) {
+    std::cout << " jobIters=" << tr.jobAssignmentIterations << " maxJobOver=" << tr.maxJobSourceOverload;
+  }
+  std::cout << "\n";
 
   // Rank edges by congestion.
   std::vector<int> edgeOrder;

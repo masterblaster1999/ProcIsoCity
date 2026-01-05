@@ -8,10 +8,14 @@
 #include "isocity/Road.hpp"
 #include "isocity/Traffic.hpp"
 
+#include "isocity/GfxProps.hpp"
+
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace isocity {
@@ -23,6 +27,61 @@ static Color TerrainCliffBaseColor(Terrain t);
 namespace {
 
 inline unsigned char ClampU8(int v) { return static_cast<unsigned char>(std::clamp(v, 0, 255)); }
+
+// Convert an isocity::RgbaImage (byte RGBA) into a raylib Image.
+inline Image ImageFromRgbaImage(const RgbaImage& src)
+{
+  Image img{};
+  img.width = src.width;
+  img.height = src.height;
+  img.mipmaps = 1;
+  img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+
+  const int w = std::max(0, src.width);
+  const int h = std::max(0, src.height);
+  const int bytes = w * h * 4;
+  img.data = (bytes > 0) ? MemAlloc(bytes) : nullptr;
+  if (img.data && static_cast<int>(src.rgba.size()) >= bytes) {
+    std::memcpy(img.data, src.rgba.data(), static_cast<std::size_t>(bytes));
+  }
+  return img;
+}
+
+// Compute the sign of cov(x,y) for the alpha mask, which is a cheap way to
+// classify whether a sprite's major axis aligns to the screen-space +45° or
+// -45° diagonal.
+inline double AlphaCovXY(const RgbaImage& img)
+{
+  const int w = img.width;
+  const int h = img.height;
+  if (w <= 0 || h <= 0) return 0.0;
+  if (static_cast<int>(img.rgba.size()) < w * h * 4) return 0.0;
+
+  double sumW = 0.0;
+  double sumX = 0.0;
+  double sumY = 0.0;
+  double sumXY = 0.0;
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const std::size_t i = (static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x)) * 4u;
+      const unsigned char a = img.rgba[i + 3u];
+      if (a == 0) continue;
+      const double ww = static_cast<double>(a) / 255.0;
+      sumW += ww;
+      sumX += ww * static_cast<double>(x);
+      sumY += ww * static_cast<double>(y);
+      sumXY += ww * static_cast<double>(x) * static_cast<double>(y);
+    }
+  }
+
+  if (sumW <= 1e-9) return 0.0;
+  const double mx = sumX / sumW;
+  const double my = sumY / sumW;
+  const double exy = sumXY / sumW;
+  return exy - mx * my;
+}
+
 
 inline Color Mul(Color c, float b)
 {
@@ -1751,9 +1810,123 @@ void Renderer::unloadTextures()
     }
   }
 
+  unloadVehicleSprites();
+
   unloadBaseCache();
 
   unloadMinimap();
+}
+
+
+void Renderer::unloadVehicleSprites()
+{
+  auto unloadVec = [](std::vector<VehicleSprite>& v) {
+    for (auto& s : v) {
+      if (s.color.id != 0) UnloadTexture(s.color);
+      if (s.emissive.id != 0) UnloadTexture(s.emissive);
+      s = VehicleSprite{};
+    }
+    v.clear();
+  };
+
+  unloadVec(m_vehicleCarPosSlope);
+  unloadVec(m_vehicleCarNegSlope);
+  unloadVec(m_vehicleTruckPosSlope);
+  unloadVec(m_vehicleTruckNegSlope);
+}
+
+
+const Renderer::VehicleSprite* Renderer::carSprite(bool slopePositive, int style) const
+{
+  const auto& primary = slopePositive ? m_vehicleCarPosSlope : m_vehicleCarNegSlope;
+  const auto& fallback = slopePositive ? m_vehicleCarNegSlope : m_vehicleCarPosSlope;
+  const auto& v = !primary.empty() ? primary : fallback;
+  if (v.empty()) return nullptr;
+  const std::uint32_t u = static_cast<std::uint32_t>(style);
+  const std::size_t idx = static_cast<std::size_t>(u % static_cast<std::uint32_t>(v.size()));
+  return &v[idx];
+}
+
+const Renderer::VehicleSprite* Renderer::truckSprite(bool slopePositive, int style) const
+{
+  const auto& primary = slopePositive ? m_vehicleTruckPosSlope : m_vehicleTruckNegSlope;
+  const auto& fallback = slopePositive ? m_vehicleTruckNegSlope : m_vehicleTruckPosSlope;
+  const auto& v = !primary.empty() ? primary : fallback;
+  if (v.empty()) return nullptr;
+  const std::uint32_t u = static_cast<std::uint32_t>(style);
+  const std::size_t idx = static_cast<std::size_t>(u % static_cast<std::uint32_t>(v.size()));
+  return &v[idx];
+}
+
+float Renderer::nightFactor(float timeSec) const
+{
+  const DayNightState st = ComputeDayNightState(timeSec, m_dayNight);
+  return st.night;
+}
+
+void Renderer::rebuildVehicleSprites()
+{
+  unloadVehicleSprites();
+
+  // Small sprites for the traffic micro-sim overlay (decoupled from tile resolution).
+  const int sprW = std::max(24, m_tileW / 3);
+  const int sprH = std::max(12, m_tileH / 3);
+
+  GfxPropsConfig cfg{};
+  cfg.tileW = sprW;
+  cfg.tileH = sprH;
+  cfg.includeEmissive = true;
+
+  // Use the palette system for vehicle paint materials (keeps the project asset-free while
+  // still looking coherent across seeds).
+  const GfxPalette pal = GenerateGfxPalette(m_gfxSeed32 ^ 0xB16B00B5u, GfxTheme::Classic);
+
+  auto loadTex = [](const RgbaImage& src) -> Texture2D {
+    Texture2D t{};
+    if (src.width <= 0 || src.height <= 0) return t;
+    if (src.rgba.empty()) return t;
+    Image img = ImageFromRgbaImage(src);
+    t = LoadTextureFromImage(img);
+    UnloadImage(img);
+    if (t.id != 0) SetTextureFilter(t, TEXTURE_FILTER_POINT);
+    return t;
+  };
+
+  auto buildKind = [&](GfxPropKind kind, std::vector<VehicleSprite>& pos, std::vector<VehicleSprite>& neg) {
+    constexpr int kWantPerSlope = 8;
+    constexpr int kMaxTrials = 64;
+
+    std::string err;
+    for (int variant = 0; variant < kMaxTrials; ++variant) {
+      if (static_cast<int>(pos.size()) >= kWantPerSlope && static_cast<int>(neg.size()) >= kWantPerSlope) break;
+
+      GfxPropSprite spr{};
+      if (!GenerateGfxPropSprite(kind, variant, m_gfxSeed32, cfg, pal, spr, err)) continue;
+
+      VehicleSprite vs{};
+      vs.pivotX = spr.pivotX;
+      vs.pivotY = spr.pivotY;
+      vs.color = loadTex(spr.color);
+      if (!spr.emissive.rgba.empty()) vs.emissive = loadTex(spr.emissive);
+
+      if (vs.color.id == 0) {
+        if (vs.emissive.id != 0) UnloadTexture(vs.emissive);
+        continue;
+      }
+
+      const bool slopePositive = (AlphaCovXY(spr.color) >= 0.0);
+      auto& dst = slopePositive ? pos : neg;
+      if (static_cast<int>(dst.size()) >= kWantPerSlope) {
+        UnloadTexture(vs.color);
+        if (vs.emissive.id != 0) UnloadTexture(vs.emissive);
+        continue;
+      }
+      dst.push_back(vs);
+    }
+  };
+
+  buildKind(GfxPropKind::VehicleCar, m_vehicleCarPosSlope, m_vehicleCarNegSlope);
+  buildKind(GfxPropKind::VehicleTruck, m_vehicleTruckPosSlope, m_vehicleTruckNegSlope);
 }
 
 void Renderer::unloadMinimap()
@@ -2681,6 +2854,9 @@ void Renderer::rebuildTextures(std::uint64_t seed)
     c.a = static_cast<unsigned char>(static_cast<float>(c.a) * a);
     return c;
   });
+
+  // Procedural vehicle sprites (used by the micro-sim overlay).
+  rebuildVehicleSprites();
 }
 
 namespace {

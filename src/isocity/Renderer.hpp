@@ -80,7 +80,6 @@ public:
   //  - optional screen-space particles (rain streaks / snowflakes) and fog gradient.
   struct WeatherSettings {
     enum class Mode : std::uint8_t { Clear = 0, Rain = 1, Snow = 2 };
-
     Mode mode = Mode::Clear;
 
     // 0..1 precipitation intensity (rain streak density / snowflake density).
@@ -107,6 +106,27 @@ public:
     // When raining at night, draw a cheap "reflection" under lights on roads.
     bool reflectLights = true;
   };
+  // Lightweight procedural vehicle sprites (used by the vehicle micro-sim overlay).
+  //
+  // These are generated at runtime (like terrain/road textures) so the project stays asset-free.
+  // Sprites are grouped into two screen-space diagonal orientations to match the isometric grid.
+  struct VehicleSprite {
+    Texture2D color{};
+    Texture2D emissive{}; // optional (headlights)
+    int pivotX = 0;
+    int pivotY = 0;
+  };
+
+  // Fetch a deterministic variant for the requested diagonal orientation.
+  // - slopePositive: true for directions with positive screen-space slope (dir.x * dir.y >= 0).
+  // - style: stable per-vehicle style id (usually random at spawn time).
+  const VehicleSprite* carSprite(bool slopePositive, int style) const;
+  const VehicleSprite* truckSprite(bool slopePositive, int style) const;
+
+  // 0..1 night amount for the configured day/night settings at timeSec.
+  float nightFactor(float timeSec) const;
+
+
 
   Renderer(int tileW, int tileH, std::uint64_t seed);
   ~Renderer();
@@ -224,6 +244,16 @@ private:
 
   // Bridges share the same mask/variant layout as roads but are drawn on water.
   std::array<std::array<std::array<Texture2D, kRoadVariants>, 16>, kRoadLevels> m_bridgeTex{};
+
+  // Vehicle overlay sprite variants (two diagonal orientations).
+  std::vector<VehicleSprite> m_vehicleCarPosSlope;
+  std::vector<VehicleSprite> m_vehicleCarNegSlope;
+  std::vector<VehicleSprite> m_vehicleTruckPosSlope;
+  std::vector<VehicleSprite> m_vehicleTruckNegSlope;
+
+  void unloadVehicleSprites();
+  void rebuildVehicleSprites();
+
 
   // 32-bit seed used for procedural render details (ties visual variety to world seed).
   std::uint32_t m_gfxSeed32 = 0;

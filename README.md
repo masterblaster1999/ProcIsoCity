@@ -48,7 +48,7 @@ ctest --test-dir build-tests --output-on-failure
 
 - `PROCISOCITY_BUILD_APP` (default: ON) — build the interactive raylib app (`proc_isocity`).
 - `PROCISOCITY_BUILD_TESTS` (default: OFF) — build `proc_isocity_tests` and enable `ctest`.
-- `PROCISOCITY_BUILD_CLI` (default: ON) — build headless command-line tools (`proc_isocity_cli`, `proc_isocity_diff`, `proc_isocity_imagediff`, `proc_isocity_inspect`, `proc_isocity_config`, `proc_isocity_patch`, `proc_isocity_script`, `proc_isocity_replay`, `proc_isocity_blueprint`, `proc_isocity_suite`, `proc_isocity_transform`, `proc_isocity_roadgraph`, `proc_isocity_roadcentrality`, `proc_isocity_blocks`, `proc_isocity_mesh`).
+- `PROCISOCITY_BUILD_CLI` (default: ON) — build headless command-line tools (`proc_isocity_cli`, `proc_isocity_diff`, `proc_isocity_imagediff`, `proc_isocity_inspect`, `proc_isocity_config`, `proc_isocity_patch`, `proc_isocity_script`, `proc_isocity_replay`, `proc_isocity_blueprint`, `proc_isocity_suite`, `proc_isocity_transform`, `proc_isocity_roadgraph`, `proc_isocity_roadcentrality`, `proc_isocity_blocks`, `proc_isocity_mesh`, `proc_isocity_timelapse`, `proc_isocity_mapexport`, `proc_isocity_tileset`).
 - `PROCISOCITY_USE_SYSTEM_RAYLIB` (default: OFF) — when building the app, use a system raylib instead of FetchContent.
 
 ### Headless CLI tools (optional)
@@ -64,6 +64,12 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
     - `--iso-tile <WxH>` (default 16x8)
     - `--iso-height <N>` (max elevation in pixels; 0 disables vertical relief)
     - `--iso-margin <N>`, `--iso-grid <0|1>`, `--iso-cliffs <0|1>`
+  - software-rendered **3D view** exports (`--export-3d <layer> <out.ppm|out.png>`, repeatable):
+    - orthographic **isometric** (default) or perspective (`--3d-proj iso|persp`)
+    - simple directional lighting (`--3d-light x,y,z`, `--3d-ambient`, `--3d-diffuse`)
+    - anti-aliasing via SSAA (`--3d-ssaa 2` is a good starting point)
+    - optional fog (`--3d-fog 1`, `--3d-fog-strength`, `--3d-fog-start`, `--3d-fog-end`)
+    - geometry knobs: `--3d-heightscale`, `--3d-quant`, `--3d-buildings`, `--3d-cliffs`
   - batch runs across multiple seeds (`--batch N`)
 
   Example:
@@ -72,7 +78,27 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
   ./build/proc_isocity_cli --seed 1 --size 128x128 --days 200 \
     --out out_{seed}.json --csv ticks_{seed}.csv \
     --export-ppm overlay overlay_{seed}.ppm --export-scale 4 \
-    --export-iso overlay iso_{seed}.ppm --iso-tile 16x8 --iso-height 14 --batch 3
+    --export-iso overlay iso_{seed}.ppm --iso-tile 16x8 --iso-height 14 \
+    --export-3d overlay view3d_{seed}.png --3d-size 1280x720 --3d-proj iso --3d-ssaa 2 --batch 3
+  ```
+
+- `proc_isocity_timelapse`: generate a deterministic **isometric frame sequence** by stepping the simulator forward.
+  Useful for regression visuals / CI artifacts.
+
+  ```bash
+  ./build/proc_isocity_timelapse --seed 1 --size 128x128 --out frames \
+    --days 120 --every 2 --layers overlay,landvalue --format png
+  ```
+
+- `proc_isocity_mapexport`: export a world to a single **GeoJSON FeatureCollection** (roads + landuse polygons + optional
+  districts) for GIS tooling (QGIS/GeoPandas/Leaflet, etc.).
+
+  ```bash
+  # Generate + export
+  ./build/proc_isocity_mapexport --seed 1 --size 128x128 --geojson map.geojson
+
+  # Export a loaded save and include district polygons + stats
+  ./build/proc_isocity_mapexport --load save.bin --geojson map_with_districts.geojson --districts 1
   ```
 
 - `proc_isocity_diff`: compare two save files (deep tile diff + hash) and optionally write a color-coded diff map:
@@ -98,6 +124,70 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
 
   # Generate a new world and emit a diameter highlight image
   ./build/proc_isocity_roadgraph --seed 1 --size 128x128 --diameter-ppm diameter.ppm --ppm-scale 4
+  ```
+
+- `proc_isocity_tileset`: generate a dependency-free, deterministic **sprite atlas** of the project's procedural
+  textures (terrain, terrain transitions, roads, bridges, overlays) with optional **taller building sprites**, plus optional **emissive**,
+  **height**, **normal**, **shadow**, and **SDF** atlases (all sharing the exact same layout/metadata). This makes it easy to
+  plug the generator into external renderers or mod pipelines without needing any extra art.
+
+  Output formats:
+  - default: **RGBA PNG** (color type 6)
+  - optional: **indexed-color PNG** (color type 3) with a generated palette (`--indexed 1`).
+    This can drastically reduce file size because the built-in encoder intentionally writes stored (uncompressed) DEFLATE blocks.
+    You can also re-save the atlas in an external tool to get standard PNG compression; the loader now supports that.
+
+  - Consumers: `LoadGfxTilesetAtlas()` (used by `--iso-tileset` for headless isometric exports) can read:
+    - RGBA8 PNG (color type 6), RGB8 PNG (color type 2), and indexed-color PNG (color type 3 + PLTE/tRNS)
+    - scanline filters 0..4 (None/Sub/Up/Average/Paeth)
+    - zlib streams containing stored, fixed-Huffman, or dynamic-Huffman DEFLATE blocks
+    - (still no interlace / 16-bit / grayscale)
+
+  Quality / engine-integration options:
+  - `--extrude <px>` duplicates sprite border pixels outward into transparent padding.
+    This helps reduce texture bleeding when using **linear filtering + mipmaps** in downstream engines.
+  - `--mip-dir <dir>` writes a full mip chain (mip0..mipN) to a directory as `<base>_mipN.png`.
+    - `--mip-levels <n>` limits the number of mip levels written (0 = until 1x1 or `--mip-min-size`).
+    - `--mip-min-size <px>` stops once both dimensions are <= this value.
+    - `--mip-premultiply <0|1>` controls whether downsampling uses premultiplied-alpha filtering.
+    - `--mip-alpha-coverage <0|1>` preserves alpha coverage per-sprite across mips (useful for cutout sprites like trees).
+      - `--mip-alpha-threshold <f>` sets the alpha test threshold in [0,1] used for coverage matching (default: 0.5).
+      - `--mip-alpha-iters <n>` sets the binary search iterations for matching (default: 12).
+
+  Vector outline export (picking/physics/debug tooling):
+  - `--outlines <json>` writes per-sprite vector geometry extracted from the alpha mask:
+    - `polygons`: one or more outer rings + holes (pixel-edge polygons in sprite-local coordinates)
+    - `hull`: optional convex hull ring for cheap coarse hit-testing
+  - `--outline-svg <svg>` writes an SVG overlay preview on top of the atlas image.
+  - `--outline-threshold <f>` alpha threshold in [0,1] used to classify pixels as inside/outside.
+  - `--outline-hull <0|1>` enable/disable convex hull generation.
+  - `--outline-holes <0|1>` include/strip holes.
+  - `--outline-svg-scale <n>` scales the SVG output dimensions (viewBox remains in atlas pixels).
+
+  Atlas packing / size optimization options:
+  - `--pack <mode>` chooses the atlas layout: `grid` (legacy) or `maxrects` (denser for mixed sprite sizes).
+  - `--pack-width <px>` sets a target atlas width for `maxrects` (0 = auto).
+  - `--pow2 <0|1>` rounds the final atlas dimensions up to the next power-of-two (useful for some engines).
+  - `--trim <0|1>` trims fully transparent borders per sprite before packing. Metadata includes `srcW/srcH/trimX/trimY` so consumers can reconstruct original canvases if needed.
+  - `--trim-border <px>` keeps an extra transparent border when trimming (recommended when exporting SDF + mipmaps).
+
+  Notes:
+  - `--extrude` is now enforced to be `<= --pad` to prevent overlapping writes between neighboring sprites in tight pack modes.
+
+  ```bash
+  ./build/proc_isocity_tileset --out tileset.png --meta tileset.json --html tileset_preview.html \
+    --seed 1 --theme classic --tile 64x32 --cols 24 --pad 2 \
+    --extrude 2 --mip-dir mips --mip-levels 0 --mip-min-size 1 --mip-premultiply 1 \
+    --mip-alpha-coverage 1 --mip-alpha-threshold 0.5 --mip-alpha-iters 12 \
+    --transitions 1 --transition-variants 4 \
+    --buildings 1 --building-variants 12 \
+    --indexed 1 --indexed-colors 256 --indexed-dither 0 \
+    --emit tileset_emissive.png \
+    --height tileset_height.png --normal tileset_normal.png --shadow tileset_shadow.png --sdf tileset_sdf.png \
+    --outlines tileset_outlines.json --outline-svg tileset_outlines.svg \
+    --height-from alpha_luma --normal-strength 2.0 \
+    --shadow-dir 1,1 --shadow-length 18 --shadow-blur 2 --shadow-opacity 0.70 \
+    --sdf-spread 8 --sdf-threshold 0.5
   ```
 
 
@@ -508,6 +598,17 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
 
   #  - Verify against committed goldens in CI (fails on mismatch)
   ./build/proc_isocity_suite --discover scenarios --golden --golden-format iso --golden-threshold 0 --junit artifacts/suite.xml
+
+  # Golden hash regression (world state snapshot testing):
+  #  - Create/update hash goldens (writes *.golden.hash next to scenarios by default)
+  ./build/proc_isocity_suite --discover scenarios --hash-golden --update-hash-golden
+
+  # HTML dashboard (summary + links to artifacts + embedded golden previews when available):
+  #  - Tip: use --golden-ext png for browser-friendly images.
+  ./build/proc_isocity_suite --discover scenarios --out-dir artifacts/suite_out \
+    --golden --golden-ext png --hash-golden \
+    --json-report artifacts/suite.json --junit artifacts/suite.xml \
+    --html-report artifacts/suite_out/index.html --html-title "ProcIsoCity CI Suite"
   ```
 
 - `proc_isocity_autobuild`: run the deterministic **city bot** headlessly (generate or load a world, then grow it for N days).

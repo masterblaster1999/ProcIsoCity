@@ -86,6 +86,18 @@ struct TrafficModelSettings {
 
   float congestionCapacityScale = 1.0f;
   float congestionRatioClamp = 3.0f;
+
+  // Enable capacity-aware job assignment (soft constraints via per-source penalties).
+  // When enabled, commute destinations become less attractive once their nearby job capacity
+  // is 'full', which tends to produce more realistic commute lengths in cities with a few
+  // strong job centers.
+  bool capacityAwareJobs = false;
+
+  // Iterations used to fit the per-source penalties (>=1).
+  int jobAssignmentIterations = 6;
+
+  // Baseline penalty scale (milli-travel-time units). Roughly, 1000 ~= one street tile.
+  int jobPenaltyBaseMilli = 8000;
 };
 
 class Simulator {

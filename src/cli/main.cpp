@@ -3,8 +3,11 @@
 #include "isocity/SaveLoad.hpp"
 #include "isocity/Sim.hpp"
 #include "isocity/Export.hpp"
+#include "isocity/GfxTilesetAtlas.hpp"
 #include "isocity/Pathfinding.hpp"
 
+#include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -66,6 +69,54 @@ bool ParseWxH(const std::string& s, int* outW, int* outH)
   return true;
 }
 
+bool ParseF32(const std::string& s, float* out)
+{
+  if (!out) return false;
+  if (s.empty()) return false;
+  char* end = nullptr;
+  errno = 0;
+  const double v = std::strtod(s.c_str(), &end);
+  if (errno != 0) return false;
+  if (!end || *end != '\0') return false;
+  if (!std::isfinite(v)) return false;
+  *out = static_cast<float>(v);
+  return true;
+}
+
+bool ParseF32Triple(const std::string& s, float* outA, float* outB, float* outC)
+{
+  if (!outA || !outB || !outC) return false;
+  const std::size_t p0 = s.find_first_of(",xX");
+  if (p0 == std::string::npos) return false;
+  const std::size_t p1 = s.find_first_of(",xX", p0 + 1);
+  if (p1 == std::string::npos) return false;
+  float a = 0.0f;
+  float b = 0.0f;
+  float c = 0.0f;
+  if (!ParseF32(s.substr(0, p0), &a)) return false;
+  if (!ParseF32(s.substr(p0 + 1, p1 - (p0 + 1)), &b)) return false;
+  if (!ParseF32(s.substr(p1 + 1), &c)) return false;
+  *outA = a;
+  *outB = b;
+  *outC = c;
+  return true;
+}
+
+bool ParseU8Triple(const std::string& s, std::uint8_t* outA, std::uint8_t* outB, std::uint8_t* outC)
+{
+  if (!outA || !outB || !outC) return false;
+  float fa = 0.0f, fb = 0.0f, fc = 0.0f;
+  if (!ParseF32Triple(s, &fa, &fb, &fc)) return false;
+  auto clampU8 = [](float v) -> std::uint8_t {
+    const int i = static_cast<int>(std::lround(v));
+    return static_cast<std::uint8_t>(std::clamp(i, 0, 255));
+  };
+  *outA = clampU8(fa);
+  *outB = clampU8(fb);
+  *outC = clampU8(fc);
+  return true;
+}
+
 std::string HexU64(std::uint64_t v)
 {
   std::ostringstream oss;
@@ -84,14 +135,26 @@ void PrintHelp()
       << "                 [--maint-road <N>] [--maint-park <N>]\n"
       << "                 [--export-ppm <layer> <out.ppm|out.png>]... [--export-scale <N>]\n"
       << "                 [--export-iso <layer> <out.ppm|out.png>]... [--iso-tile <WxH>] [--iso-height <N>]\n"
+      << "                 [--export-3d <layer> <out.ppm|out.png>]... [--3d-size <WxH>] [--3d-proj <iso|persp>]\n"
+      << "                 [--3d-yaw <deg>] [--3d-pitch <deg>] [--3d-roll <deg>] [--3d-fit <0|1>] [--3d-ssaa <N>]\n"
+      << "                 [--3d-target <x,y,z>] [--3d-dist <N>] [--3d-fov <deg>] [--3d-ortho <N>]\n"
+      << "                 [--3d-outline <0|1>] [--3d-top <0|1>]\n"
+      << "                 [--3d-light <x,y,z>] [--3d-ambient <0..100>] [--3d-diffuse <0..100>] [--3d-bg <r,g,b>]\n"
+      << "                 [--3d-fog <0|1>] [--3d-fog-strength <0..100>] [--3d-fog-start <0..100>] [--3d-fog-end <0..100>]\n"
+      << "                 [--3d-heightscale <N>] [--3d-quant <N>] [--3d-buildings <0|1>] [--3d-cliffs <0|1>]\n"
       << "                 [--iso-margin <N>] [--iso-grid <0|1>] [--iso-cliffs <0|1>] [--iso-fancy <0|1>]\n"
       << "                 [--iso-texture <0..100>] [--iso-shore <0|1>] [--iso-roadmarks <0|1>] [--iso-zonepatterns <0|1>]\n"
       << "                 [--iso-daynight <0|1>] [--iso-time <0..100>] [--iso-lights <0|1>] [--iso-night <0..100>] [--iso-dusk <0..100>]\n"
       << "                 [--iso-weather <clear|rain|snow>] [--iso-wx-intensity <0..100>] [--iso-wx-overcast <0..100>] [--iso-wx-fog <0..100>]\n"
       << "                 [--iso-wx-precip <0|1>] [--iso-wx-reflect <0|1>] [--iso-clouds <0|1>] [--iso-cloud-cover <0..100>] [--iso-cloud-strength <0..100>] [--iso-cloud-scale <N>]\n"
+      << "                 [--iso-tileset <atlas.png> <meta.json>] [--iso-tileset-emit <emissive.png>]\n"
+      << "                 [--iso-tileset-normal <normal.png>] [--iso-tileset-shadow <shadow.png>]\n"
+      << "                 [--iso-tileset-light <x,y,z>] [--iso-tileset-normal-strength <0..100>] [--iso-tileset-shadow-strength <0..100>]\n"
+      << "                 [--iso-tileset-props <0|1>] [--iso-tileset-tree-density <0..100>] [--iso-tileset-conifer <0..100>]\n"
+      << "                 [--iso-tileset-streetlights <0|1>] [--iso-tileset-streetlight-chance <0..100>]\n"
       << "                 [--export-tiles-csv <tiles.csv>]\n"
       << "                 [--batch <N>]\n\n"
-      << "Export layers (for --export-ppm / --export-iso):\n"
+      << "Export layers (for --export-ppm / --export-iso / --export-3d):\n"
       << "  terrain overlay height landvalue traffic goods_traffic goods_fill district\n\n"
       << "Batch mode:\n"
       << "  - --batch N>1 runs N simulations with seeds (seed, seed+1, ...).\n"
@@ -196,6 +259,21 @@ int main(int argc, char** argv)
   };
   std::vector<IsoExport> isoExports;
   IsoOverviewConfig isoCfg{};
+
+  // Software-rendered 3D exports (orthographic/isometric or perspective)
+  struct Render3DExport {
+    ExportLayer layer = ExportLayer::Overlay;
+    std::string path;
+  };
+  std::vector<Render3DExport> render3dExports;
+  Render3DConfig render3dCfg{};
+
+  // Optional atlas-driven rendering for isometric exports.
+  std::string isoTilesetAtlasPath;
+  std::string isoTilesetMetaPath;
+  std::string isoTilesetEmissivePath;
+  std::string isoTilesetNormalPath;
+  std::string isoTilesetShadowPath;
 
   // Batch mode (optional): run multiple seeds in one invocation.
   int batchRuns = 1;
@@ -328,6 +406,257 @@ int main(int argc, char** argv)
         return 2;
       }
       isoExports.push_back(IsoExport{layer, outPath});
+    } else if (arg == "--export-3d") {
+      std::string layerName;
+      std::string outPath;
+      if (!requireValue(i, layerName) || !requireValue(i, outPath)) {
+        std::cerr << "--export-3d requires: <layer> <out.ppm>\n";
+        return 2;
+      }
+      ExportLayer layer = ExportLayer::Overlay;
+      if (!ParseExportLayer(layerName, layer)) {
+        std::cerr << "Unknown export layer: " << layerName << "\n";
+        std::cerr << "Valid layers: terrain overlay height landvalue traffic goods_traffic goods_fill district\n";
+        return 2;
+      }
+      render3dExports.push_back(Render3DExport{layer, outPath});
+    } else if (arg == "--3d-size") {
+      int ow = 0;
+      int oh = 0;
+      if (!requireValue(i, val) || !ParseWxH(val, &ow, &oh)) {
+        std::cerr << "--3d-size requires format WxH (e.g. 1600x900)\n";
+        return 2;
+      }
+      render3dCfg.width = ow;
+      render3dCfg.height = oh;
+    } else if (arg == "--3d-proj") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-proj requires: iso|persp\n";
+        return 2;
+      }
+      if (val == "iso" || val == "isometric" || val == "ortho" || val == "orthographic") {
+        render3dCfg.projection = Render3DConfig::Projection::Isometric;
+      } else if (val == "persp" || val == "perspective") {
+        render3dCfg.projection = Render3DConfig::Projection::Perspective;
+      } else {
+        std::cerr << "--3d-proj requires: iso|persp\n";
+        return 2;
+      }
+    } else if (arg == "--3d-yaw") {
+      float deg = 0.0f;
+      if (!requireValue(i, val) || !ParseF32(val, &deg)) {
+        std::cerr << "--3d-yaw requires a float (degrees)\n";
+        return 2;
+      }
+      render3dCfg.yawDeg = deg;
+    } else if (arg == "--3d-pitch") {
+      float deg = 0.0f;
+      if (!requireValue(i, val) || !ParseF32(val, &deg)) {
+        std::cerr << "--3d-pitch requires a float (degrees)\n";
+        return 2;
+      }
+      render3dCfg.pitchDeg = deg;
+    } else if (arg == "--3d-roll") {
+      float deg = 0.0f;
+      if (!requireValue(i, val) || !ParseF32(val, &deg)) {
+        std::cerr << "--3d-roll requires a float (degrees)\n";
+        return 2;
+      }
+      render3dCfg.rollDeg = deg;
+    } else if (arg == "--3d-target") {
+      float tx = 0.0f, ty = 0.0f, tz = 0.0f;
+      if (!requireValue(i, val) || !ParseF32Triple(val, &tx, &ty, &tz)) {
+        std::cerr << "--3d-target requires: x,y,z\n";
+        return 2;
+      }
+      render3dCfg.targetX = tx;
+      render3dCfg.targetY = ty;
+      render3dCfg.targetZ = tz;
+    } else if (arg == "--3d-dist") {
+      float d = 0.0f;
+      if (!requireValue(i, val) || !ParseF32(val, &d) || !(d > 0.0f)) {
+        std::cerr << "--3d-dist requires a float > 0\n";
+        return 2;
+      }
+      render3dCfg.distance = d;
+    } else if (arg == "--3d-fov") {
+      float deg = 0.0f;
+      if (!requireValue(i, val) || !ParseF32(val, &deg)) {
+        std::cerr << "--3d-fov requires a float (degrees)\n";
+        return 2;
+      }
+      render3dCfg.fovYDeg = deg;
+    } else if (arg == "--3d-ortho") {
+      float hh = 0.0f;
+      if (!requireValue(i, val) || !ParseF32(val, &hh) || !(hh > 0.0f)) {
+        std::cerr << "--3d-ortho requires a float > 0 (half-height in world units)\n";
+        return 2;
+      }
+      render3dCfg.orthoHalfHeight = hh;
+    } else if (arg == "--3d-fit") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-fit requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--3d-fit requires 0 or 1\n";
+        return 2;
+      }
+      render3dCfg.autoFit = (b != 0);
+    } else if (arg == "--3d-ssaa") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-ssaa requires an integer >= 1\n";
+        return 2;
+      }
+      int ss = 1;
+      if (!ParseI32(val, &ss) || ss < 1 || ss > 4) {
+        std::cerr << "--3d-ssaa requires an integer in [1..4]\n";
+        return 2;
+      }
+      render3dCfg.supersample = ss;
+    } else if (arg == "--3d-outline") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-outline requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--3d-outline requires 0 or 1\n";
+        return 2;
+      }
+      render3dCfg.drawOutlines = (b != 0);
+    } else if (arg == "--3d-light") {
+      float lx = 0.0f, ly = 0.0f, lz = 0.0f;
+      if (!requireValue(i, val) || !ParseF32Triple(val, &lx, &ly, &lz)) {
+        std::cerr << "--3d-light requires: x,y,z\n";
+        return 2;
+      }
+      render3dCfg.lightDirX = lx;
+      render3dCfg.lightDirY = ly;
+      render3dCfg.lightDirZ = lz;
+    } else if (arg == "--3d-ambient") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-ambient requires 0..100\n";
+        return 2;
+      }
+      int p = 0;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--3d-ambient requires 0..100\n";
+        return 2;
+      }
+      render3dCfg.ambient = static_cast<float>(p) / 100.0f;
+    } else if (arg == "--3d-diffuse") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-diffuse requires 0..100\n";
+        return 2;
+      }
+      int p = 0;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--3d-diffuse requires 0..100\n";
+        return 2;
+      }
+      render3dCfg.diffuse = static_cast<float>(p) / 100.0f;
+    } else if (arg == "--3d-bg") {
+      std::uint8_t r = 0, g = 0, b = 0;
+      if (!requireValue(i, val) || !ParseU8Triple(val, &r, &g, &b)) {
+        std::cerr << "--3d-bg requires: r,g,b (0..255)\n";
+        return 2;
+      }
+      render3dCfg.bgR = r;
+      render3dCfg.bgG = g;
+      render3dCfg.bgB = b;
+    } else if (arg == "--3d-fog") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-fog requires 0 or 1\n";
+        return 2;
+      }
+      int f = 0;
+      if (!ParseI32(val, &f) || (f != 0 && f != 1)) {
+        std::cerr << "--3d-fog requires 0 or 1\n";
+        return 2;
+      }
+      render3dCfg.fog = (f != 0);
+    } else if (arg == "--3d-fog-strength") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-fog-strength requires 0..100\n";
+        return 2;
+      }
+      int p = 0;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--3d-fog-strength requires 0..100\n";
+        return 2;
+      }
+      render3dCfg.fogStrength = static_cast<float>(p) / 100.0f;
+    } else if (arg == "--3d-fog-start") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-fog-start requires 0..100\n";
+        return 2;
+      }
+      int p = 0;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--3d-fog-start requires 0..100\n";
+        return 2;
+      }
+      render3dCfg.fogStart = static_cast<float>(p) / 100.0f;
+    } else if (arg == "--3d-fog-end") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-fog-end requires 0..100\n";
+        return 2;
+      }
+      int p = 0;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--3d-fog-end requires 0..100\n";
+        return 2;
+      }
+      render3dCfg.fogEnd = static_cast<float>(p) / 100.0f;
+    } else if (arg == "--3d-heightscale") {
+      float s = 0.0f;
+      if (!requireValue(i, val) || !ParseF32(val, &s) || !(s > 0.0f)) {
+        std::cerr << "--3d-heightscale requires a float > 0\n";
+        return 2;
+      }
+      render3dCfg.meshCfg.heightScale = s;
+    } else if (arg == "--3d-quant") {
+      float q = 0.0f;
+      if (!requireValue(i, val) || !ParseF32(val, &q) || !(q >= 0.0f)) {
+        std::cerr << "--3d-quant requires a float >= 0\n";
+        return 2;
+      }
+      render3dCfg.meshCfg.heightQuantization = q;
+    } else if (arg == "--3d-buildings") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-buildings requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--3d-buildings requires 0 or 1\n";
+        return 2;
+      }
+      render3dCfg.meshCfg.includeBuildings = (b != 0);
+    } else if (arg == "--3d-cliffs") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-cliffs requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--3d-cliffs requires 0 or 1\n";
+        return 2;
+      }
+      render3dCfg.meshCfg.includeCliffs = (b != 0);
+    } else if (arg == "--3d-top") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-top requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--3d-top requires 0 or 1\n";
+        return 2;
+      }
+      render3dCfg.meshCfg.includeTopSurfaces = (b != 0);
     } else if (arg == "--iso-tile") {
       int tw = 0;
       int th = 0;
@@ -609,6 +938,124 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.clouds.scaleTiles = static_cast<float>(s);
+    } else if (arg == "--iso-tileset") {
+      // Use a generated sprite atlas for ISO overviews.
+      if (i + 2 >= argc) {
+        std::cerr << "--iso-tileset requires: <atlas.png> <meta.json>\n";
+        return 2;
+      }
+      isoTilesetAtlasPath = argv[++i];
+      isoTilesetMetaPath = argv[++i];
+    } else if (arg == "--iso-tileset-emit") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-tileset-emit requires: <emissive.png>\n";
+        return 2;
+      }
+      isoTilesetEmissivePath = val;
+    } else if (arg == "--iso-tileset-normal") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-tileset-normal requires: <normal.png>\n";
+        return 2;
+      }
+      isoTilesetNormalPath = val;
+      isoCfg.tilesetLighting.enableNormals = true;
+    } else if (arg == "--iso-tileset-shadow") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-tileset-shadow requires: <shadow.png>\n";
+        return 2;
+      }
+      isoTilesetShadowPath = val;
+      isoCfg.tilesetLighting.enableShadows = true;
+    } else if (arg == "--iso-tileset-light") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-tileset-light requires: <x,y,z>\n";
+        return 2;
+      }
+      float lx = 0.0f, ly = 0.0f, lz = 0.0f;
+      if (!ParseF32Triple(val, &lx, &ly, &lz)) {
+        std::cerr << "--iso-tileset-light must be three floats: x,y,z\n";
+        return 2;
+      }
+      isoCfg.tilesetLighting.lightDirX = lx;
+      isoCfg.tilesetLighting.lightDirY = ly;
+      isoCfg.tilesetLighting.lightDirZ = lz;
+    } else if (arg == "--iso-tileset-normal-strength") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-tileset-normal-strength requires an integer percent (0..100)\n";
+        return 2;
+      }
+      int p = 100;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--iso-tileset-normal-strength requires an integer percent (0..100)\n";
+        return 2;
+      }
+      isoCfg.tilesetLighting.normalStrength = static_cast<float>(p) / 100.0f;
+    } else if (arg == "--iso-tileset-shadow-strength") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-tileset-shadow-strength requires an integer percent (0..100)\n";
+        return 2;
+      }
+      int p = 65;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--iso-tileset-shadow-strength requires an integer percent (0..100)\n";
+        return 2;
+      }
+      isoCfg.tilesetLighting.shadowStrength = static_cast<float>(p) / 100.0f;
+    } else if (arg == "--iso-tileset-props") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-tileset-props requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--iso-tileset-props requires 0 or 1\n";
+        return 2;
+      }
+      isoCfg.tilesetProps.enabled = (b != 0);
+    } else if (arg == "--iso-tileset-tree-density") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-tileset-tree-density requires an integer percent (0..100)\n";
+        return 2;
+      }
+      int p = 35;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--iso-tileset-tree-density requires an integer percent (0..100)\n";
+        return 2;
+      }
+      isoCfg.tilesetProps.treeDensity = static_cast<float>(p) / 100.0f;
+    } else if (arg == "--iso-tileset-conifer") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-tileset-conifer requires an integer percent (0..100)\n";
+        return 2;
+      }
+      int p = 35;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--iso-tileset-conifer requires an integer percent (0..100)\n";
+        return 2;
+      }
+      isoCfg.tilesetProps.coniferChance = static_cast<float>(p) / 100.0f;
+    } else if (arg == "--iso-tileset-streetlights") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-tileset-streetlights requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--iso-tileset-streetlights requires 0 or 1\n";
+        return 2;
+      }
+      isoCfg.tilesetProps.drawStreetlights = (b != 0);
+    } else if (arg == "--iso-tileset-streetlight-chance") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-tileset-streetlight-chance requires an integer percent (0..100)\n";
+        return 2;
+      }
+      int p = 30;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--iso-tileset-streetlight-chance requires an integer percent (0..100)\n";
+        return 2;
+      }
+      isoCfg.tilesetProps.streetlightChance = static_cast<float>(p) / 100.0f;
     } else if (arg == "--export-scale") {
       if (!requireValue(i, val)) {
         std::cerr << "--export-scale requires an integer\n";
@@ -676,6 +1123,9 @@ int main(int argc, char** argv)
     for (const auto& e : isoExports) {
       if (!checkTemplate(e.path, "--export-iso")) return 2;
     }
+    for (const auto& e : render3dExports) {
+      if (!checkTemplate(e.path, "--export-3d")) return 2;
+    }
   }
 
   auto replaceAll = [](std::string s, const std::string& from, const std::string& to) -> std::string {
@@ -708,6 +1158,40 @@ int main(int argc, char** argv)
       std::filesystem::create_directories(parent, ec);
     }
   };
+
+  // Optional tileset atlas for ISO exports (loaded once, reused across batch runs).
+  GfxTilesetAtlas isoTileset;
+  const GfxTilesetAtlas* isoTilesetPtr = nullptr;
+  if (!isoTilesetAtlasPath.empty() || !isoTilesetMetaPath.empty()) {
+    if (isoTilesetAtlasPath.empty() || isoTilesetMetaPath.empty()) {
+      std::cerr << "--iso-tileset requires both an atlas png and a meta json\n";
+      return 2;
+    }
+    std::string err;
+    if (!LoadGfxTilesetAtlas(isoTilesetAtlasPath, isoTilesetMetaPath, isoTileset, err)) {
+      std::cerr << "Failed to load ISO tileset atlas: " << err << "\n";
+      return 1;
+    }
+    if (!isoTilesetEmissivePath.empty()) {
+      if (!LoadGfxTilesetAtlasEmissive(isoTilesetEmissivePath, isoTileset, err)) {
+        std::cerr << "Failed to load ISO tileset emissive atlas: " << err << "\n";
+        return 1;
+      }
+    }
+    if (!isoTilesetNormalPath.empty()) {
+      if (!LoadGfxTilesetAtlasNormals(isoTilesetNormalPath, isoTileset, err)) {
+        std::cerr << "Failed to load ISO tileset normal atlas: " << err << "\n";
+        return 1;
+      }
+    }
+    if (!isoTilesetShadowPath.empty()) {
+      if (!LoadGfxTilesetAtlasShadows(isoTilesetShadowPath, isoTileset, err)) {
+        std::cerr << "Failed to load ISO tileset shadow atlas: " << err << "\n";
+        return 1;
+      }
+    }
+    isoTilesetPtr = &isoTileset;
+  }
 
   auto runOne = [&](int runIdx, std::uint64_t requestedSeed) -> int {
     World world;
@@ -771,8 +1255,8 @@ int main(int argc, char** argv)
       }
     }
 
-    // Optional derived-map exports (PPM images)
-    if (!ppmExports.empty() || !isoExports.empty()) {
+    // Optional derived-map exports (images)
+    if (!ppmExports.empty() || !isoExports.empty() || !render3dExports.empty()) {
       bool needTraffic = false;
       bool needGoods = false;
       bool needLandValue = false;
@@ -783,6 +1267,11 @@ int main(int argc, char** argv)
         if (e.layer == ExportLayer::LandValue) needLandValue = true;
       }
       for (const auto& e : isoExports) {
+        if (e.layer == ExportLayer::Traffic) needTraffic = true;
+        if (e.layer == ExportLayer::GoodsTraffic || e.layer == ExportLayer::GoodsFill) needGoods = true;
+        if (e.layer == ExportLayer::LandValue) needLandValue = true;
+      }
+      for (const auto& e : render3dExports) {
         if (e.layer == ExportLayer::Traffic) needTraffic = true;
         if (e.layer == ExportLayer::GoodsTraffic || e.layer == ExportLayer::GoodsFill) needGoods = true;
         if (e.layer == ExportLayer::LandValue) needLandValue = true;
@@ -850,7 +1339,8 @@ int main(int argc, char** argv)
         const IsoOverviewResult iso = RenderIsoOverview(world, e.layer, isoCfg,
                                                         landValueRes ? &(*landValueRes) : nullptr,
                                                         trafficRes ? &(*trafficRes) : nullptr,
-                                                        goodsRes ? &(*goodsRes) : nullptr);
+                                                        goodsRes ? &(*goodsRes) : nullptr,
+                                                        isoTilesetPtr);
         if (iso.image.width <= 0 || iso.image.height <= 0) {
           std::cerr << "Failed to render ISO overview (" << ExportLayerName(e.layer) << "): " << outP << "\n";
           return 1;
@@ -859,6 +1349,26 @@ int main(int argc, char** argv)
         std::string err;
         if (!WriteImageAuto(outP, iso.image, err)) {
           std::cerr << "Failed to write ISO image (" << ExportLayerName(e.layer) << "): " << outP << " (" << err << ")\n";
+          return 1;
+        }
+      }
+
+      for (const auto& e : render3dExports) {
+        const std::string outP = expandPath(e.path, runIdx, actualSeed);
+        ensureParentDir(outP);
+
+        PpmImage img3d = RenderWorld3D(world, e.layer, render3dCfg,
+                                       landValueRes ? &(*landValueRes) : nullptr,
+                                       trafficRes ? &(*trafficRes) : nullptr,
+                                       goodsRes ? &(*goodsRes) : nullptr);
+        if (img3d.width <= 0 || img3d.height <= 0) {
+          std::cerr << "Failed to render 3D view (" << ExportLayerName(e.layer) << "): " << outP << "\n";
+          return 1;
+        }
+
+        std::string err;
+        if (!WriteImageAuto(outP, img3d, err)) {
+          std::cerr << "Failed to write 3D image (" << ExportLayerName(e.layer) << "): " << outP << " (" << err << ")\n";
           return 1;
         }
       }

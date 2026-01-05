@@ -58,6 +58,25 @@ bool ParseI32(const std::string& s, int* out)
   return true;
 }
 
+bool ParseU64(const std::string& s, std::uint64_t* out)
+{
+  if (!out) return false;
+  if (s.empty()) return false;
+
+  int base = 10;
+  std::size_t offset = 0;
+  if (s.rfind("0x", 0) == 0 || s.rfind("0X", 0) == 0) {
+    base = 16;
+    offset = 2;
+  }
+
+  char* end = nullptr;
+  const unsigned long long v = std::strtoull(s.c_str() + offset, &end, base);
+  if (!end || *end != '\0') return false;
+  *out = static_cast<std::uint64_t>(v);
+  return true;
+}
+
 [[maybe_unused]] bool ParseU8(const std::string& s, std::uint8_t* out)
 {
   if (!out) return false;
@@ -187,6 +206,8 @@ void PrintHelp()
       << "  --out-dir <dir>              Write per-case artifacts (summary.json, final.bin, ticks.csv).\n"
       << "  --json-report <file>         Write a suite summary JSON.\n"
       << "  --junit <file>               Write a JUnit XML report (useful for CI).\n"
+      << "  --html-report <file>         Write an HTML dashboard (links to artifacts + golden previews).\n"
+      << "  --html-title <title>         Title string for the HTML report (optional).\n"
       << "  --fail-fast                  Stop on first failure.\n"
       << "  --verbose                    Print script output (default is quiet).\n"
       << "  --timing                     Print per-case and total timing information.\n"
@@ -205,6 +226,12 @@ void PrintHelp()
       << "  --golden-iso-margin <N>       Iso margin (px). Default: 8\n"
       << "  --golden-iso-grid <0|1>       Iso draw grid lines. Default: 0\n"
       << "  --golden-iso-cliffs <0|1>     Iso draw cliffs. Default: 1\n"
+      << "\n"
+      << "Golden hash regression (world state snapshot testing):\n"
+      << "  --hash-golden                Compare final world hash against a per-scenario golden hash sidecar.\n"
+      << "  --update-hash-golden         Create/overwrite golden hash files instead of failing.\n"
+      << "  --hash-golden-dir <dir>      Base directory for hash goldens (default: next to scenario file).\n"
+      << "  --hash-golden-ext <ext>      Golden hash extension (default: hash).\n"
       << "\n"
       << "  --help                       Show this help.\n";
 }
@@ -238,11 +265,39 @@ struct GoldenResult {
   bool hasStats = false;
 };
 
+struct HashGoldenConfig {
+  bool enabled = false;
+  bool update = false;
+
+  // If empty, snapshots are written next to the scenario file.
+  std::string dir;
+
+  // Extension for the golden hash sidecar. Default: "hash" (written as <stem>.golden.hash).
+  std::string ext = "hash";
+};
+
+struct HashGoldenResult {
+  bool attempted = false;
+  bool ok = true;
+  bool updated = false;
+  bool matched = true;
+
+  std::string path;
+  std::string error;
+
+  std::uint64_t expected = 0;
+  bool hasExpected = false;
+};
+
 struct CaseResult {
   isocity::ScenarioCase sc;
   bool ok = false;
   std::string error;
   std::uint64_t hash = 0;
+
+  // When --out-dir is provided and the case ran successfully, we write per-case artifacts
+  // and store the directory here so reports can link to them.
+  std::string artifactsDir;
 
   // Wall-clock time spent running this case (including golden compare/update and artifact writes).
   double seconds = 0.0;
@@ -251,6 +306,8 @@ struct CaseResult {
   std::vector<std::string> warnings;
 
   GoldenResult golden;
+
+  HashGoldenResult hashGolden;
 };
 
 std::string FormatPpmDiffSummary(const isocity::PpmDiffStats& st)
@@ -300,6 +357,31 @@ fs::path ComputeGoldenPath(const isocity::ScenarioCase& sc, const GoldenConfig& 
   return out;
 }
 
+fs::path ComputeHashGoldenPath(const isocity::ScenarioCase& sc, const HashGoldenConfig& g)
+{
+  fs::path base;
+
+  if (!g.dir.empty()) {
+    fs::path rel = fs::path(sc.path);
+    if (rel.is_absolute()) rel = rel.filename();
+    rel.replace_extension();
+    base = fs::path(g.dir) / rel;
+  } else {
+    // Sidecar next to scenario file.
+    fs::path p(sc.path);
+    base = p.parent_path() / p.stem();
+  }
+
+  std::string ext = g.ext;
+  if (!ext.empty() && ext[0] == '.') ext = ext.substr(1);
+  ext = ToLower(ext);
+  if (ext.empty()) ext = "hash";
+
+  fs::path out = base;
+  out += ".golden." + ext;
+  return out;
+}
+
 bool RenderGoldenImage(const isocity::ScenarioRunOutputs& out, const GoldenConfig& g, isocity::PpmImage& outImg,
                        std::string& outErr)
 {
@@ -327,7 +409,8 @@ bool RenderGoldenImage(const isocity::ScenarioRunOutputs& out, const GoldenConfi
 }
 
 bool WriteGoldenArtifacts(const fs::path& caseDir, const GoldenConfig& cfg, const GoldenResult& res,
-                          const isocity::PpmImage& actual, const isocity::PpmImage* diffImg, std::string& outErr)
+                          const isocity::PpmImage& actual, const isocity::PpmImage* expectedImg,
+                          const isocity::PpmImage* diffImg, std::string& outErr)
 {
   outErr.clear();
 
@@ -336,8 +419,34 @@ bool WriteGoldenArtifacts(const fs::path& caseDir, const GoldenConfig& cfg, cons
   ext = ToLower(ext);
   if (ext.empty()) ext = "ppm";
 
+  const fs::path expectedPath = caseDir / (std::string("golden_expected.") + ext);
   const fs::path actualPath = caseDir / (std::string("golden_actual.") + ext);
   const fs::path diffPath = caseDir / (std::string("golden_diff.") + ext);
+
+  // Always write PNG previews so the HTML report can embed images even when the
+  // main artifacts are written as PPM.
+  const fs::path expectedPreviewPath = caseDir / "golden_expected_preview.png";
+  const fs::path actualPreviewPath = caseDir / "golden_actual_preview.png";
+  const fs::path diffPreviewPath = caseDir / "golden_diff_preview.png";
+
+  auto writePreview = [&](const fs::path& p, const isocity::PpmImage& img) -> bool {
+    std::string err;
+    if (!isocity::WriteImageAuto(p.string(), img, err)) {
+      outErr = "failed to write preview: " + p.string() + " (" + err + ")";
+      return false;
+    }
+    return true;
+  };
+
+  // golden_expected
+  if (expectedImg && !expectedImg->rgb.empty() && expectedImg->width > 0 && expectedImg->height > 0) {
+    std::string err;
+    if (!isocity::WriteImageAuto(expectedPath.string(), *expectedImg, err)) {
+      outErr = "failed to write golden_expected: " + err;
+      return false;
+    }
+    if (!writePreview(expectedPreviewPath, *expectedImg)) return false;
+  }
 
   // golden_actual
   {
@@ -348,6 +457,8 @@ bool WriteGoldenArtifacts(const fs::path& caseDir, const GoldenConfig& cfg, cons
     }
   }
 
+  if (!writePreview(actualPreviewPath, actual)) return false;
+
   // golden_diff
   if (diffImg && !diffImg->rgb.empty() && diffImg->width > 0 && diffImg->height > 0) {
     std::string err;
@@ -355,6 +466,7 @@ bool WriteGoldenArtifacts(const fs::path& caseDir, const GoldenConfig& cfg, cons
       outErr = "failed to write golden_diff: " + err;
       return false;
     }
+    if (!writePreview(diffPreviewPath, *diffImg)) return false;
   }
 
   // golden.json
@@ -510,7 +622,7 @@ bool WriteCaseArtifacts(const fs::path& caseDir, const isocity::ScenarioRunOutpu
 }
 
 CaseResult ProcessCase(std::size_t index, const isocity::ScenarioCase& sc, const isocity::ScenarioRunOptions& baseOpt,
-                       const GoldenConfig& golden, const std::string& outDir)
+                       const GoldenConfig& golden, const HashGoldenConfig& hashGolden, const std::string& outDir)
 {
   using Clock = std::chrono::steady_clock;
   const auto t0 = Clock::now();
@@ -535,10 +647,113 @@ CaseResult ProcessCase(std::size_t index, const isocity::ScenarioCase& sc, const
     std::ostringstream sub;
     sub << std::setw(4) << std::setfill('0') << index << "_" << name;
     caseDir = base / sub.str();
+    cr.artifactsDir = caseDir.string();
 
     std::string artErr;
     if (!WriteCaseArtifacts(caseDir, out, sc, artErr)) {
       cr.warnings.push_back("artifact write failed: " + artErr);
+    }
+  }
+
+  // Golden hash compare/update (optional): store/verify the final world hash per scenario.
+  if (runOk && hashGolden.enabled) {
+    cr.hashGolden.attempted = true;
+
+    const fs::path goldenPath = ComputeHashGoldenPath(sc, hashGolden);
+    cr.hashGolden.path = goldenPath.string();
+
+    std::error_code fec;
+    const bool exists = fs::exists(goldenPath, fec) && fs::is_regular_file(goldenPath, fec);
+
+    auto readExpected = [&](std::uint64_t& outVal, std::string& outErr) -> bool {
+      outErr.clear();
+      std::ifstream f(goldenPath, std::ios::binary);
+      if (!f) {
+        outErr = "failed to open golden hash file";
+        return false;
+      }
+      std::ostringstream ss;
+      ss << f.rdbuf();
+      std::string s = Trim(ss.str());
+      if (s.empty()) {
+        outErr = "golden hash file is empty";
+        return false;
+      }
+      std::uint64_t v = 0;
+      if (!ParseU64(s, &v)) {
+        outErr = "invalid hash format (expected decimal or 0x...)";
+        return false;
+      }
+      outVal = v;
+      return true;
+    };
+
+    if (hashGolden.update) {
+      bool needsWrite = !exists;
+
+      if (exists) {
+        std::uint64_t expected = 0;
+        std::string rerr;
+        if (readExpected(expected, rerr)) {
+          cr.hashGolden.expected = expected;
+          cr.hashGolden.hasExpected = true;
+          needsWrite = (expected != cr.hash);
+        } else {
+          needsWrite = true;
+        }
+      }
+
+      if (needsWrite) {
+        std::error_code ec;
+        fs::create_directories(goldenPath.parent_path(), ec);
+        if (ec) {
+          cr.hashGolden.ok = false;
+          cr.hashGolden.matched = false;
+          cr.hashGolden.error = "failed to create hash golden directory: " + goldenPath.parent_path().string() + " (" + ec.message() + ")";
+        } else {
+          std::ofstream f(goldenPath, std::ios::binary);
+          if (!f) {
+            cr.hashGolden.ok = false;
+            cr.hashGolden.matched = false;
+            cr.hashGolden.error = "failed to write golden hash: " + goldenPath.string();
+          } else {
+            f << HexU64(cr.hash) << "\n";
+            cr.hashGolden.updated = true;
+            cr.hashGolden.matched = true;
+            cr.hashGolden.ok = true;
+          }
+        }
+      } else {
+        cr.hashGolden.updated = false;
+        cr.hashGolden.matched = true;
+        cr.hashGolden.ok = true;
+      }
+
+    } else {
+      if (!exists) {
+        cr.hashGolden.ok = false;
+        cr.hashGolden.matched = false;
+        cr.hashGolden.error = "missing golden hash: " + goldenPath.string() + " (run with --update-hash-golden to create)";
+      } else {
+        std::uint64_t expected = 0;
+        std::string rerr;
+        if (!readExpected(expected, rerr)) {
+          cr.hashGolden.ok = false;
+          cr.hashGolden.matched = false;
+          cr.hashGolden.error = "failed to read golden hash: " + rerr;
+        } else {
+          cr.hashGolden.expected = expected;
+          cr.hashGolden.hasExpected = true;
+          if (expected != cr.hash) {
+            cr.hashGolden.ok = false;
+            cr.hashGolden.matched = false;
+            cr.hashGolden.error = "hash mismatch: expected " + HexU64(expected) + ", got " + HexU64(cr.hash);
+          } else {
+            cr.hashGolden.ok = true;
+            cr.hashGolden.matched = true;
+          }
+        }
+      }
     }
   }
 
@@ -646,25 +861,243 @@ CaseResult ProcessCase(std::size_t index, const isocity::ScenarioCase& sc, const
       // Write golden artifacts when requested.
       if (wantArtifacts) {
         std::string gerr;
+        const isocity::PpmImage* expectedPtr = (!expected.rgb.empty()) ? &expected : nullptr;
         const isocity::PpmImage* diffPtr = (!diff.rgb.empty()) ? &diff : nullptr;
-        if (!WriteGoldenArtifacts(caseDir, golden, cr.golden, actual, diffPtr, gerr)) {
+        if (!WriteGoldenArtifacts(caseDir, golden, cr.golden, actual, expectedPtr, diffPtr, gerr)) {
           cr.warnings.push_back("golden artifact write failed: " + gerr);
         }
       }
     }
   }
 
-  cr.ok = runOk && (!golden.enabled || cr.golden.ok);
+  cr.ok = runOk && (!golden.enabled || cr.golden.ok) && (!hashGolden.enabled || cr.hashGolden.ok);
 
   if (golden.enabled && runOk && !cr.golden.ok) {
     if (!cr.error.empty()) cr.error += " | ";
     cr.error += cr.golden.error;
   }
 
+  if (hashGolden.enabled && runOk && !cr.hashGolden.ok) {
+    if (!cr.error.empty()) cr.error += " | ";
+    cr.error += cr.hashGolden.error;
+  }
+
   const auto t1 = Clock::now();
   cr.seconds = std::chrono::duration<double>(t1 - t0).count();
 
   return cr;
+}
+
+std::string RelLinkForHtml(const fs::path& target, const fs::path& htmlDir)
+{
+  std::error_code ec;
+  fs::path rel = fs::relative(target, htmlDir, ec);
+  fs::path use = ec ? target : rel;
+  std::string s = use.generic_string();
+  if (s.empty()) s = target.generic_string();
+  return s;
+}
+
+bool WriteHtmlReport(const std::string& htmlPath, const std::string& htmlTitle, const std::vector<CaseResult>& results,
+                     int passed, int failed, double seconds, int jobsRequested, int jobsUsed, bool goldenEnabled,
+                     bool hashGoldenEnabled, std::string& outErr)
+{
+  outErr.clear();
+
+  if (htmlPath.empty()) {
+    outErr = "empty html report path";
+    return false;
+  }
+
+  const fs::path outPath = fs::path(htmlPath);
+  const fs::path htmlDir = outPath.parent_path().empty() ? fs::path(".") : outPath.parent_path();
+
+  {
+    std::error_code ec;
+    if (!outPath.parent_path().empty()) {
+      fs::create_directories(outPath.parent_path(), ec);
+      if (ec) {
+        outErr = "failed to create html report directory: " + outPath.parent_path().string() + " (" + ec.message() + ")";
+        return false;
+      }
+    }
+  }
+
+  std::ofstream f(outPath, std::ios::binary);
+  if (!f) {
+    outErr = "failed to write html report: " + outPath.string();
+    return false;
+  }
+
+  const std::string title = htmlTitle.empty() ? std::string("ProcIsoCity Suite Report") : htmlTitle;
+
+  f << "<!doctype html>\n";
+  f << "<html lang=\"en\">\n";
+  f << "<head>\n";
+  f << "  <meta charset=\"utf-8\">\n";
+  f << "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n";
+  f << "  <title>" << EscapeXml(title) << "</title>\n";
+  f << "  <style>\n";
+  f << "    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:20px;line-height:1.35;}\n";
+  f << "    h1{margin:0 0 12px 0;}\n";
+  f << "    .meta{margin:8px 0 16px 0;color:#333;}\n";
+  f << "    .chips{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 16px 0;}\n";
+  f << "    .chip{padding:4px 10px;border-radius:999px;border:1px solid #ccc;font-size:12px;}\n";
+  f << "    .pass{background:#eaffea;border-color:#b7e1b7;}\n";
+  f << "    .fail{background:#ffecec;border-color:#e1b7b7;}\n";
+  f << "    details.case{border:1px solid #ddd;border-radius:8px;padding:8px 10px;margin:10px 0;}\n";
+  f << "    details.case[data-ok=\"0\"]{border-color:#e1b7b7;background:#fff7f7;}\n";
+  f << "    details.case[data-ok=\"1\"]{border-color:#b7e1b7;background:#f7fff7;}\n";
+  f << "    details.case > summary{cursor:pointer;user-select:none;}\n";
+  f << "    code{background:#f2f2f2;padding:1px 4px;border-radius:4px;}\n";
+  f << "    pre{white-space:pre-wrap;word-break:break-word;background:#111;color:#f5f5f5;padding:10px;border-radius:8px;overflow:auto;}\n";
+  f << "    .links a{margin-right:12px;}\n";
+  f << "    .images{display:flex;gap:12px;flex-wrap:wrap;margin-top:10px;}\n";
+  f << "    .imgbox{min-width:220px;}\n";
+  f << "    .imgbox img{max-width:340px;width:100%;height:auto;border:1px solid #ccc;border-radius:6px;}\n";
+  f << "    .small{font-size:12px;color:#444;}\n";
+  f << "  </style>\n";
+  f << "  <script>\n";
+  f << "    function updateFilter(){\n";
+  f << "      var showPass=document.getElementById('showPass').checked;\n";
+  f << "      var showFail=document.getElementById('showFail').checked;\n";
+  f << "      var nodes=document.querySelectorAll('details.case');\n";
+  f << "      for(var i=0;i<nodes.length;i++){\n";
+  f << "        var ok=nodes[i].getAttribute('data-ok')==='1';\n";
+  f << "        nodes[i].style.display = (ok?showPass:showFail) ? '' : 'none';\n";
+  f << "      }\n";
+  f << "    }\n";
+  f << "    window.addEventListener('load', updateFilter);\n";
+  f << "  </script>\n";
+  f << "</head>\n";
+  f << "<body>\n";
+
+  f << "  <h1>" << EscapeXml(title) << "</h1>\n";
+  f << "  <div class=\"meta\">\n";
+  f << "    <div><strong>Total:</strong> " << results.size() << " &nbsp; <strong>Passed:</strong> " << passed
+    << " &nbsp; <strong>Failed:</strong> " << failed << "</div>\n";
+  f << "    <div><strong>Time:</strong> " << std::fixed << std::setprecision(3) << seconds << "s &nbsp; <strong>Jobs:</strong> "
+    << jobsUsed << " (requested " << jobsRequested << ")</div>\n";
+  f << "    <div class=\"small\">Generated by proc_isocity_suite. Open this file in a browser (local file).";
+  if (!goldenEnabled) {
+    f << " Image previews require <code>--golden</code> (and <code>--out-dir</code> for artifacts).";
+  }
+  if (!hashGoldenEnabled) {
+    f << " Hash regression requires <code>--hash-golden</code>.";
+  }
+  f << "</div>\n";
+  f << "  </div>\n";
+
+  f << "  <div class=\"chips\">\n";
+  f << "    <label class=\"chip pass\"><input type=\"checkbox\" id=\"showPass\" checked onchange=\"updateFilter()\"> show passed</label>\n";
+  f << "    <label class=\"chip fail\"><input type=\"checkbox\" id=\"showFail\" checked onchange=\"updateFilter()\"> show failed</label>\n";
+  f << "  </div>\n";
+
+  for (std::size_t i = 0; i < results.size(); ++i) {
+    const CaseResult& r = results[i];
+    const bool ok = r.ok;
+    f << "  <details class=\"case\" data-ok=\"" << (ok ? '1' : '0') << "\"";
+    if (!ok) f << " open";
+    f << ">\n";
+
+    f << "    <summary>";
+    f << (ok ? "✅" : "❌") << " [" << std::setw(4) << std::setfill('0') << i << "] " << EscapeXml(r.sc.path)
+      << " <span class=\"small\">(" << KindName(r.sc.kind) << ", " << std::fixed << std::setprecision(3) << r.seconds
+      << "s)</span>";
+    f << "</summary>\n";
+
+    f << "    <div class=\"small\"><strong>Hash:</strong> <code>" << HexU64(r.hash) << "</code></div>\n";
+
+    if (!r.warnings.empty()) {
+      f << "    <div class=\"small\"><strong>Warnings:</strong><ul>\n";
+      for (const std::string& w : r.warnings) {
+        f << "      <li>" << EscapeXml(w) << "</li>\n";
+      }
+      f << "    </ul></div>\n";
+    }
+
+    if (!r.error.empty()) {
+      f << "    <pre>" << EscapeXml(r.error) << "</pre>\n";
+    }
+
+    // Links to artifacts if present.
+    if (!r.artifactsDir.empty()) {
+      const fs::path caseDir = fs::path(r.artifactsDir);
+      f << "    <div class=\"links small\"><strong>Artifacts:</strong> ";
+
+      const fs::path summary = caseDir / "summary.json";
+      const fs::path finalBin = caseDir / "final.bin";
+      const fs::path ticks = caseDir / "ticks.csv";
+      const fs::path goldenJson = caseDir / "golden.json";
+
+      auto linkIfExists = [&](const fs::path& p, const char* label) {
+        std::error_code ec;
+        if (fs::exists(p, ec)) {
+          f << "<a href=\"" << EscapeXml(RelLinkForHtml(p, htmlDir)) << "\">" << EscapeXml(label) << "</a>";
+        }
+      };
+
+      linkIfExists(summary, "summary.json");
+      linkIfExists(ticks, "ticks.csv");
+      linkIfExists(finalBin, "final.bin");
+      if (goldenEnabled) linkIfExists(goldenJson, "golden.json");
+      f << "</div>\n";
+
+      // Golden previews.
+      if (goldenEnabled && r.golden.attempted) {
+        f << "    <div class=\"small\"><strong>Golden image:</strong> ";
+        if (!r.golden.goldenPath.empty()) {
+          f << "<code>" << EscapeXml(r.golden.goldenPath) << "</code>";
+        }
+        if (r.golden.hasStats) {
+          f << " &nbsp; <span class=\"small\">" << EscapeXml(FormatPpmDiffSummary(r.golden.stats)) << "</span>";
+        }
+        f << "</div>\n";
+
+        const fs::path expPrev = caseDir / "golden_expected_preview.png";
+        const fs::path actPrev = caseDir / "golden_actual_preview.png";
+        const fs::path diffPrev = caseDir / "golden_diff_preview.png";
+
+        std::error_code ec;
+        const bool haveAct = fs::exists(actPrev, ec);
+        const bool haveExp = fs::exists(expPrev, ec);
+        const bool haveDiff = fs::exists(diffPrev, ec);
+
+        if (haveExp || haveAct || haveDiff) {
+          f << "    <div class=\"images\">\n";
+          if (haveExp) {
+            f << "      <div class=\"imgbox\"><div class=\"small\">expected</div><img src=\"" << EscapeXml(RelLinkForHtml(expPrev, htmlDir)) << "\" alt=\"expected\"></div>\n";
+          }
+          if (haveAct) {
+            f << "      <div class=\"imgbox\"><div class=\"small\">actual</div><img src=\"" << EscapeXml(RelLinkForHtml(actPrev, htmlDir)) << "\" alt=\"actual\"></div>\n";
+          }
+          if (haveDiff) {
+            f << "      <div class=\"imgbox\"><div class=\"small\">diff</div><img src=\"" << EscapeXml(RelLinkForHtml(diffPrev, htmlDir)) << "\" alt=\"diff\"></div>\n";
+          }
+          f << "    </div>\n";
+        }
+      }
+    }
+
+    // Hash golden section.
+    if (hashGoldenEnabled && r.hashGolden.attempted) {
+      f << "    <div class=\"small\"><strong>Golden hash:</strong> ";
+      if (!r.hashGolden.path.empty()) {
+        f << "<code>" << EscapeXml(r.hashGolden.path) << "</code>";
+      }
+      if (r.hashGolden.hasExpected) {
+        f << " &nbsp; expected <code>" << HexU64(r.hashGolden.expected) << "</code>";
+      }
+      f << "</div>\n";
+    }
+
+    f << "  </details>\n";
+  }
+
+  f << "</body>\n";
+  f << "</html>\n";
+
+  return static_cast<bool>(f);
 }
 
 } // namespace
@@ -690,11 +1123,14 @@ int main(int argc, char** argv)
   std::string outDir;
   std::string jsonReport;
   std::string junitPath;
+  std::string htmlReport;
+  std::string htmlTitle;
 
   int shardIndex = 0;
   int shardCount = 1;
 
   GoldenConfig golden;
+  HashGoldenConfig hashGolden;
 
   auto requireValue = [&](int& i, std::string& out) -> bool {
     if (i + 1 >= argc) return false;
@@ -790,6 +1226,19 @@ int main(int argc, char** argv)
         return 2;
       }
       junitPath = val;
+
+    } else if (arg == "--html-report") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--html-report requires a path\n";
+        return 2;
+      }
+      htmlReport = val;
+    } else if (arg == "--html-title") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--html-title requires a string\n";
+        return 2;
+      }
+      htmlTitle = val;
 
     } else if (arg == "--golden") {
       golden.enabled = true;
@@ -927,6 +1376,32 @@ int main(int argc, char** argv)
       }
       golden.isoCfg.drawCliffs = b;
 
+    } else if (arg == "--hash-golden") {
+      hashGolden.enabled = true;
+    } else if (arg == "--update-hash-golden") {
+      hashGolden.enabled = true;
+      hashGolden.update = true;
+    } else if (arg == "--hash-golden-dir") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--hash-golden-dir requires a directory\n";
+        return 2;
+      }
+      hashGolden.enabled = true;
+      hashGolden.dir = val;
+    } else if (arg == "--hash-golden-ext") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--hash-golden-ext requires a value (e.g. hash)\n";
+        return 2;
+      }
+      hashGolden.enabled = true;
+      std::string v = ToLower(Trim(val));
+      if (!v.empty() && v[0] == '.') v = v.substr(1);
+      if (v.empty()) {
+        std::cerr << "invalid --hash-golden-ext (empty)\n";
+        return 2;
+      }
+      hashGolden.ext = v;
+
     } else if (!arg.empty() && arg[0] == '-') {
       std::cerr << "unknown option: " << arg << "\n";
       return 2;
@@ -1018,6 +1493,9 @@ int main(int argc, char** argv)
       if (golden.enabled && cr.golden.attempted && golden.update && cr.golden.updated) {
         std::cout << "  [golden updated]";
       }
+      if (hashGolden.enabled && cr.hashGolden.attempted && hashGolden.update && cr.hashGolden.updated) {
+        std::cout << "  [hash updated]";
+      }
       if (timing) {
         std::cout << "  (" << std::fixed << std::setprecision(3) << cr.seconds << "s)";
       }
@@ -1038,7 +1516,7 @@ int main(int argc, char** argv)
 
   if (threads <= 1) {
     for (std::size_t i = 0; i < cases.size(); ++i) {
-      CaseResult cr = ProcessCase(i, cases[i], runOpt, golden, outDir);
+      CaseResult cr = ProcessCase(i, cases[i], runOpt, golden, hashGolden, outDir);
 
       if (cr.ok) ++passed;
       else ++failed;
@@ -1067,7 +1545,7 @@ int main(int argc, char** argv)
           if (i >= cases.size()) break;
           if (failFast && stop.load()) break;
 
-          all[i] = ProcessCase(i, cases[i], runOpt, golden, outDir);
+          all[i] = ProcessCase(i, cases[i], runOpt, golden, hashGolden, outDir);
           done[i] = 1;
 
           if (failFast && !all[i].ok) stop.store(true);
@@ -1109,6 +1587,18 @@ int main(int argc, char** argv)
           << "\", \"ok\": " << (r.ok ? "true" : "false")
           << ", \"seconds\": " << std::fixed << std::setprecision(6) << r.seconds
           << ", \"hash\": \"" << HexU64(r.hash) << "\", \"error\": \"" << EscapeJson(r.error) << "\"";
+
+        if (!r.artifactsDir.empty()) {
+          f << ", \"artifactsDir\": \"" << EscapeJson(r.artifactsDir) << "\"";
+        }
+        if (!r.warnings.empty()) {
+          f << ", \"warnings\": [";
+          for (std::size_t wi = 0; wi < r.warnings.size(); ++wi) {
+            f << "\"" << EscapeJson(r.warnings[wi]) << "\"";
+            if (wi + 1 < r.warnings.size()) f << ',';
+          }
+          f << "]";
+        }
         if (golden.enabled) {
           f << ", \"golden\": {\"attempted\": " << (r.golden.attempted ? "true" : "false")
             << ", \"ok\": " << (r.golden.ok ? "true" : "false")
@@ -1116,6 +1606,15 @@ int main(int argc, char** argv)
             << ", \"matched\": " << (r.golden.matched ? "true" : "false")
             << ", \"goldenPath\": \"" << EscapeJson(r.golden.goldenPath) << "\""
             << ", \"error\": \"" << EscapeJson(r.golden.error) << "\"}";
+        }
+        if (hashGolden.enabled) {
+          f << ", \"hashGolden\": {\"attempted\": " << (r.hashGolden.attempted ? "true" : "false")
+            << ", \"ok\": " << (r.hashGolden.ok ? "true" : "false")
+            << ", \"updated\": " << (r.hashGolden.updated ? "true" : "false")
+            << ", \"matched\": " << (r.hashGolden.matched ? "true" : "false")
+            << ", \"goldenPath\": \"" << EscapeJson(r.hashGolden.path) << "\""
+            << ", \"expected\": \"" << (r.hashGolden.hasExpected ? HexU64(r.hashGolden.expected) : std::string()) << "\""
+            << ", \"error\": \"" << EscapeJson(r.hashGolden.error) << "\"}";
         }
         f << "}";
         if (i + 1 < results.size()) f << ',';
@@ -1144,6 +1643,15 @@ int main(int argc, char** argv)
         f << "  </testcase>\n";
       }
       f << "</testsuite>\n";
+    }
+  }
+
+  // HTML report/dashboard.
+  if (!htmlReport.empty()) {
+    std::string herr;
+    if (!WriteHtmlReport(htmlReport, htmlTitle, results, passed, failed, suiteSeconds, jobs, threads, golden.enabled,
+                         hashGolden.enabled, herr)) {
+      std::cerr << "failed to write html report: " << herr << "\n";
     }
   }
 

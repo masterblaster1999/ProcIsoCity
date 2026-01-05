@@ -2,6 +2,7 @@
 
 #include "isocity/Goods.hpp"
 #include "isocity/LandValue.hpp"
+#include "isocity/MeshExport.hpp"
 #include "isocity/Traffic.hpp"
 #include "isocity/World.hpp"
 
@@ -37,6 +38,60 @@ struct PpmImage {
   // RGB bytes, row-major (y major), size = width * height * 3
   std::vector<std::uint8_t> rgb;
 };
+
+
+struct RgbaImage {
+  int width = 0;
+  int height = 0;
+  // RGBA bytes, row-major (y major), size = width * height * 4
+  std::vector<std::uint8_t> rgba;
+};
+
+// -----------------------------------------------------------------------------------------------
+// PNG IO (RGBA, minimal, dependency-free)
+// -----------------------------------------------------------------------------------------------
+//
+// This mirrors the existing RGB-only PNG support, but produces an RGBA buffer.
+//
+// The encoder remains intentionally tiny and always writes:
+//  - bit depth 8, no interlace
+//  - filter 0 (None)
+//  - zlib stream with stored (uncompressed) DEFLATE blocks
+//
+// The decoder is also intentionally tiny. It can read the subset produced by our tools:
+//  - color type 6 (RGBA), 2 (RGB), or 3 (indexed with PLTE + optional tRNS)
+//  - bit depth 8, no interlace, filter 0 (None)
+//  - zlib stream with stored (uncompressed) DEFLATE blocks
+//
+// Useful for generated sprite atlases / tilesets where preserving alpha is important.
+bool WritePngRGBA(const std::string& path, const RgbaImage& img, std::string& outError);
+bool ReadPngRGBA(const std::string& path, RgbaImage& outImg, std::string& outError);
+
+// -----------------------------------------------------------------------------------------------
+// PNG IO (indexed color, palette + optional per-entry alpha)
+// -----------------------------------------------------------------------------------------------
+//
+// This is useful for procedural sprite atlases intended for distribution/modding.
+// Because our PNG encoder intentionally uses stored (uncompressed) DEFLATE blocks,
+// indexed-color output can dramatically reduce file size vs RGBA.
+//
+// The palette is provided as RGBA bytes: paletteRgba.size() must be 4 * paletteSize,
+// where paletteSize is in [1, 256]. Pixels are 8-bit palette indices.
+//
+// Notes:
+//  - The encoder writes:
+//      * color type 3 (indexed)
+//      * PLTE chunk for RGB
+//      * tRNS chunk for alpha (one byte per palette entry)
+//      * filter 0 (None)
+//      * stored DEFLATE in the zlib stream
+bool WritePngIndexed(const std::string& path, int width, int height,
+                     const std::vector<std::uint8_t>& indices,
+                     const std::vector<std::uint8_t>& paletteRgba,
+                     std::string& outError);
+
+// Composite an RGBA image over a solid RGB background.
+PpmImage CompositeOverSolid(const RgbaImage& img, std::uint8_t bgR, std::uint8_t bgG, std::uint8_t bgB);
 
 
 struct PpmDiffStats {
@@ -120,7 +175,10 @@ bool WriteImageAuto(const std::string& path, const PpmImage& img, std::string& o
 // -----------------------------------------------------------------------------------------------
 
 struct IsoOverviewConfig {
-  // Tile pixel size for the top diamond. Must be even numbers (so halfW/halfH are integers).
+  // Tile pixel size for the top diamond.
+  //
+  // The headless isometric exporter supports both even and odd sizes; smaller tiles render
+  // faster but reduce detail in fancy mode.
   int tileW = 16;
   int tileH = 8;
 
@@ -229,6 +287,62 @@ struct IsoOverviewConfig {
   } clouds;
 
 
+  // -------------------------------------------------------------------------------------------
+  // Tileset-atlas rendering extras (only used when RenderIsoOverview is given a GfxTilesetAtlas)
+  // -------------------------------------------------------------------------------------------
+
+  // Optional per-pixel normal-mapped lighting for atlas-sprite rendering.
+  //
+  // The normal map is expected to be a tangent-space RGB normal map where:
+  //   - R encodes X, G encodes Y, B encodes Z
+  //   - (128,128,255) is the flat/default normal
+  //   - Positive Y (green) points "up" in texture space (OpenGL-style) rather than "down".
+  struct TilesetLightingConfig {
+    // Enable normal-mapped lighting when a matching normal atlas is provided.
+    bool enableNormals = false;
+
+    // Key light direction in normal-map space:
+    //   +X = right, +Y = up, +Z = out of the surface.
+    // This will be normalized at use time.
+    float lightDirX = -0.62f;
+    float lightDirY = 0.55f;
+    float lightDirZ = 0.56f;
+
+    // Lighting weights (ambient + diffuse ~= 1 recommended).
+    float ambient = 0.35f;
+    float diffuse = 0.65f;
+
+    // Overall blend strength in [0,1].
+    //  0 => no effect (flat sprite shading)
+    //  1 => full normal-mapped lighting
+    float normalStrength = 1.0f;
+
+    // Enable multiplicative drop shadows when a matching shadow atlas is provided.
+    bool enableShadows = false;
+
+    // Shadow darkening in [0,1].
+    float shadowStrength = 0.65f;
+  } tilesetLighting;
+
+  // Optional deterministic decorative props for atlas-sprite rendering.
+  // This is *only* used when a tileset atlas includes props and the layer is Overlay.
+  struct TilesetPropsConfig {
+    bool enabled = false;
+
+    // Park tree density in [0,1]. Higher values place more trees per park tile.
+    float treeDensity = 0.35f;
+
+    // Chance in [0,1] that a placed tree is a conifer (otherwise deciduous).
+    float coniferChance = 0.35f;
+
+    // If true, place streetlight props on some road tiles.
+    bool drawStreetlights = true;
+
+    // Streetlight placement chance in [0,1] (only evaluated on road tiles).
+    float streetlightChance = 0.30f;
+  } tilesetProps;
+
+
   // Background color (RGB).
   std::uint8_t bgR = 110;
   std::uint8_t bgG = 160;
@@ -248,6 +362,11 @@ struct IsoOverviewResult {
   int offsetY = 0;
 };
 
+// Optional binding: a generated tileset atlas (from proc_isocity_tileset).
+// When provided, RenderIsoOverview may use sprite blitting instead of per-pixel procedural drawing
+// for Terrain/Overlay layers.
+struct GfxTilesetAtlas;
+
 // Render an isometric overview image using the same layer coloring as RenderPpmLayer,
 // but projected into an isometric diamond grid.
 //
@@ -256,11 +375,92 @@ struct IsoOverviewResult {
 IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const IsoOverviewConfig& cfg,
                                    const LandValueResult* landValue = nullptr,
                                    const TrafficResult* traffic = nullptr,
-                                   const GoodsResult* goods = nullptr);
+                                   const GoodsResult* goods = nullptr,
+                                   const GfxTilesetAtlas* tileset = nullptr);
 
 // Compute the pixel coordinate of a tile center in a rendered isometric overview image.
 // Returns false if the tile is out of bounds or the transform is invalid.
 bool IsoTileCenterToPixel(const World& world, const IsoOverviewResult& iso, int tx, int ty, int& outPx, int& outPy);
+
+
+// -----------------------------------------------------------------------------------------------
+// 3D software render export (headless)
+//
+// This produces a shaded 3D render (orthographic/isometric or perspective) using a
+// tiny CPU rasterizer. It's meant for CLI tooling, regression snapshots, and
+// batch pipelines. (It is *not* intended as a high-performance runtime renderer.)
+// -----------------------------------------------------------------------------------------------
+
+struct Render3DConfig {
+  enum class Projection : std::uint8_t { IsometricOrtho = 0, Perspective = 1 };
+
+  // Output image size.
+  int width = 1600;
+  int height = 900;
+
+  // Camera.
+  Projection projection = Projection::IsometricOrtho;
+  bool autoFit = true;
+  float fitMargin = 0.08f;
+
+  // Angles in degrees. Classic isometric: yaw=45, pitch=35.264.
+  float yawDeg = 45.0f;
+  float pitchDeg = 35.264f;
+  float rollDeg = 0.0f;
+
+  // Used only when autoFit=false.
+  float targetX = 0.0f;
+  float targetY = 0.0f;
+  float targetZ = 0.0f;
+  float distance = 120.0f;
+
+  // Projection parameters.
+  float fovYDeg = 45.0f;        // perspective
+  float orthoHalfHeight = 20.0f; // isometric orthographic
+
+  // Quality/styling.
+  int supersample = 1; // SSAA (1=off)
+  bool drawOutlines = true;
+  std::uint8_t outlineR = 0;
+  std::uint8_t outlineG = 0;
+  std::uint8_t outlineB = 0;
+  float outlineDepthEps = 0.002f;
+
+  // Lighting (Lambert).
+  float lightDirX = -0.55f;
+  float lightDirY = 0.80f;
+  float lightDirZ = -0.25f;
+  float ambient = 0.35f;
+  float diffuse = 0.65f;
+
+  // Background clear.
+  std::uint8_t bgR = 30;
+  std::uint8_t bgG = 32;
+  std::uint8_t bgB = 42;
+
+  // Simple depth fog.
+  bool fog = false;
+  float fogStrength = 0.35f;
+  float fogStart = 0.35f; // [0..1] depth
+  float fogEnd = 1.0f;
+
+  // Mesh extraction parameters (world units).
+  //
+  // Note: RenderWorld3D always produces per-tile *top* surfaces colored using
+  // RenderPpmLayer(...) to support heatmaps. The MeshExportConfig is used for
+  // height scaling + quantization, cropping, and for generating cliffs/buildings.
+  MeshExportConfig meshCfg{};
+};
+
+// Render a shaded 3D view of the current world using ExportLayer coloring for
+// tile top surfaces.
+//
+// If layer requires derived fields, the corresponding pointers should be non-null;
+// otherwise RenderPpmLayer fallbacks will be used (same behavior as 2D exports).
+PpmImage RenderWorld3D(const World& world, ExportLayer layer, const Render3DConfig& cfg,
+                       const LandValueResult* landValue = nullptr,
+                       const TrafficResult* traffic = nullptr,
+                       const GoodsResult* goods = nullptr);
 
 // Parse a user-facing layer name (case-insensitive).
 // Examples:

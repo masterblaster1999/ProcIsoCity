@@ -58,10 +58,15 @@ struct RoadFlowField {
 //   that road tile. This is useful for congestion-aware routing.
 // - If `roadBlockMask` is provided (and has size w*h), any road tile with mask!=0 is treated
 //   as non-traversable. This is useful for scenario analysis (closures, flooding, construction).
+// - If `sourceInitialCostMilli` is provided (and has size sourceRoadIdx.size()), its values are
+//   treated as an initial per-source travel-time offset (in milli-steps) added to the total
+//   cost of any route terminating at that source. This is useful for *soft* capacity constraints
+//   (e.g., pushing flow away from overloaded destinations) while keeping routing deterministic.
 RoadFlowField BuildRoadFlowField(const World& world, const std::vector<int>& sourceRoadIdx,
                                  const RoadFlowFieldConfig& cfg = {},
                                  const std::vector<std::uint8_t>* precomputedRoadToEdge = nullptr,
                                  const std::vector<int>* extraCostMilli = nullptr,
-                                 const std::vector<std::uint8_t>* roadBlockMask = nullptr);
+                                 const std::vector<std::uint8_t>* roadBlockMask = nullptr,
+                                 const std::vector<int>* sourceInitialCostMilli = nullptr);
 
 } // namespace isocity

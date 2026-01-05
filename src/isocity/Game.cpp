@@ -2993,6 +2993,7 @@ void Game::updateVehicles(float dt)
     v.dir = 1.0f;
     v.speed = std::max(0.5f, baseSpeed + RandRange(m_vehicleRngState, -0.75f, 0.75f));
     v.laneOffset = RandRange(m_vehicleRngState, -5.0f, 5.0f);
+    v.style = static_cast<int>(SplitMix64Next(m_vehicleRngState) & 0x7FFFFFFFu);
     v.turnsRemaining = turns;
     m_vehicles.push_back(std::move(v));
   };
@@ -3147,12 +3148,22 @@ void Game::drawVehicles()
   BeginMode2D(m_camera);
 
   const float zoom = std::max(0.25f, m_camera.zoom);
+  const float invZoom = 1.0f / zoom;
+
+  // Primitive LOD (kept as fallback / for extreme zoom-out).
   const float carR = 2.4f / zoom;
   const float truckW = 7.0f / zoom;
   const float truckH = 4.2f / zoom;
 
-  for (const Vehicle& v : m_vehicles) {
-    if (v.path.size() < 2) continue;
+  const float tileScreenW = static_cast<float>(m_cfg.tileWidth) * zoom;
+
+  // Night emissive pass (headlights) based on the renderer's day/night cycle.
+  const float night = m_renderer.nightFactor(m_timeSec);
+  const bool doEmissive = (night > 0.02f);
+
+  auto drawOne = [&](const Vehicle& v, bool emissivePass) {
+    if (v.path.size() < 2) return;
+
     const float maxS = static_cast<float>(static_cast<int>(v.path.size()) - 1);
     const float s = std::clamp(v.s, 0.0f, maxS);
     int seg = static_cast<int>(std::floor(s));
@@ -3172,13 +3183,59 @@ void Game::drawVehicles()
 
     Vector2 pos{wa.x + (wb.x - wa.x) * t, wa.y + (wb.y - wa.y) * t};
     Vector2 dir{wb.x - wa.x, wb.y - wa.y};
+
     const float len = std::sqrt(dir.x * dir.x + dir.y * dir.y);
     if (len > 1e-3f) {
       const Vector2 nrm{-dir.y / len, dir.x / len};
-      const float off = (v.laneOffset / zoom);
+      const float off = (v.laneOffset * invZoom); // keep lane separation roughly constant in screen pixels
       pos.x += nrm.x * off;
       pos.y += nrm.y * off;
     }
+
+    const bool isTruck = (v.kind != VehicleKind::Commute);
+
+    // Sprite scale: keep vehicles readable, but clamp growth at high zoom.
+    // (k is a *screen-space* factor, so scale = k/zoom maps it into world space for BeginMode2D.)
+    const float k = std::clamp(tileScreenW / 120.0f, 0.16f, 0.55f);
+    const float scale = k * invZoom;
+
+    const bool slopePositive = (dir.x * dir.y >= 0.0f); // +45° diag vs -45° diag on screen
+    const bool flipX = (dir.x < 0.0f);
+
+    const Renderer::VehicleSprite* spr =
+        isTruck ? m_renderer.truckSprite(slopePositive, v.style) : m_renderer.carSprite(slopePositive, v.style);
+
+    if (spr && spr->color.id != 0) {
+      const Texture2D& tex = emissivePass ? spr->emissive : spr->color;
+      if (emissivePass && tex.id == 0) return;
+
+      Rectangle src{0.0f, 0.0f, static_cast<float>(tex.width), static_cast<float>(tex.height)};
+      if (flipX) {
+        src.x = static_cast<float>(tex.width);
+        src.width = -src.width;
+      }
+
+      const int pivotX = flipX ? (tex.width - spr->pivotX) : spr->pivotX;
+      const float px = static_cast<float>(pivotX) * scale;
+      const float py = static_cast<float>(spr->pivotY) * scale;
+
+      Rectangle dst{pos.x - px, pos.y - py, static_cast<float>(tex.width) * scale,
+                    static_cast<float>(tex.height) * scale};
+
+      Color tint = WHITE;
+      if (!emissivePass) {
+        tint.a = 230;
+      } else {
+        const int a8 = static_cast<int>(std::round(255.0f * std::clamp(night, 0.0f, 1.0f)));
+        tint.a = static_cast<unsigned char>(std::clamp(a8, 0, 255));
+      }
+
+      DrawTexturePro(tex, src, dst, Vector2{0.0f, 0.0f}, 0.0f, tint);
+      return;
+    }
+
+    // Fallback primitives (should be rare unless texture generation failed).
+    if (emissivePass) return;
 
     Color col = Color{255, 255, 255, 200};
     switch (v.kind) {
@@ -3193,6 +3250,20 @@ void Game::drawVehicles()
     } else {
       DrawRectangleV(Vector2{pos.x - truckW * 0.5f, pos.y - truckH * 0.5f}, Vector2{truckW, truckH}, col);
     }
+  };
+
+  // Base pass.
+  for (const Vehicle& v : m_vehicles) {
+    drawOne(v, false);
+  }
+
+  // Emissive pass.
+  if (doEmissive) {
+    BeginBlendMode(BLEND_ADDITIVE);
+    for (const Vehicle& v : m_vehicles) {
+      drawOne(v, true);
+    }
+    EndBlendMode();
   }
 
   EndMode2D();
@@ -4732,7 +4803,7 @@ void Game::handleInput(float dt)
       const int count = 7;
       m_policySelection = (m_policySelection + delta + count) % count;
     } else if (m_showTrafficModel) {
-      const int count = 6;
+      const int count = 9;
       m_trafficModelSelection = (m_trafficModelSelection + delta + count) % count;
     } else if (m_showDistrictPanel) {
       const int count = 9;
@@ -4820,6 +4891,9 @@ void Game::handleInput(float dt)
         tc.congestionBeta = tm.congestionBeta;
         tc.congestionCapacityScale = tm.congestionCapacityScale;
         tc.congestionRatioClamp = tm.congestionRatioClamp;
+        tc.capacityAwareJobs = tm.capacityAwareJobs;
+        tc.jobAssignmentIterations = tm.jobAssignmentIterations;
+        tc.jobPenaltyBaseMilli = tm.jobPenaltyBaseMilli;
       }
 
       // Traffic overlay should respect the sim's outside-connection rule even
@@ -4970,6 +5044,9 @@ void Game::handleInput(float dt)
         break;
       case 5: tm.congestionRatioClamp = clampF(tm.congestionRatioClamp + (shift ? -1.0f : -0.5f), 1.0f, 10.0f);
         break;
+      case 6: tm.capacityAwareJobs = !tm.capacityAwareJobs; break;
+      case 7: tm.jobAssignmentIterations = clampI(tm.jobAssignmentIterations + (shift ? -2 : -1), 1, 32); break;
+      case 8: tm.jobPenaltyBaseMilli = clampI(tm.jobPenaltyBaseMilli + (shift ? -4000 : -1000), 0, 50000); break;
       default: break;
       }
 
@@ -5078,6 +5155,9 @@ void Game::handleInput(float dt)
         break;
       case 5: tm.congestionRatioClamp = clampF(tm.congestionRatioClamp + (shift ? 1.0f : 0.5f), 1.0f, 10.0f);
         break;
+      case 6: tm.capacityAwareJobs = !tm.capacityAwareJobs; break;
+      case 7: tm.jobAssignmentIterations = clampI(tm.jobAssignmentIterations + (shift ? 2 : 1), 1, 32); break;
+      case 8: tm.jobPenaltyBaseMilli = clampI(tm.jobPenaltyBaseMilli + (shift ? 4000 : 1000), 0, 50000); break;
       default: break;
       }
 
@@ -6173,6 +6253,9 @@ void Game::draw()
       tc.congestionBeta = tm.congestionBeta;
       tc.congestionCapacityScale = tm.congestionCapacityScale;
       tc.congestionRatioClamp = tm.congestionRatioClamp;
+      tc.capacityAwareJobs = tm.capacityAwareJobs;
+      tc.jobAssignmentIterations = tm.jobAssignmentIterations;
+      tc.jobPenaltyBaseMilli = tm.jobPenaltyBaseMilli;
     }
 
     const std::vector<std::uint8_t>* pre = (tc.requireOutsideConnection ? roadToEdgeMask : nullptr);
@@ -6521,7 +6604,7 @@ void Game::draw()
     const Stats& st = m_world.stats();
 
     const int panelW = 420;
-    const int panelH = 248;
+    const int panelH = 314;
     const int x0 = uiW - panelW - 12;
     // Stack below policy if both are visible.
     const int y0 = m_showPolicy ? (96 + 280 + 12) : 96;
@@ -6552,6 +6635,10 @@ void Game::draw()
     row(3, "Beta", TextFormat("%.1f", static_cast<double>(tm.congestionBeta)));
     row(4, "Cap scale", TextFormat("%.2f", static_cast<double>(tm.congestionCapacityScale)));
     row(5, "Ratio clamp", TextFormat("%.1f", static_cast<double>(tm.congestionRatioClamp)));
+    row(6, "Job capacity assign", tm.capacityAwareJobs ? "ON" : "OFF");
+    row(7, "Job iters", TextFormat("%d", tm.jobAssignmentIterations));
+    row(8, "Job penalty",
+        TextFormat("%d (~%.1f tiles)", tm.jobPenaltyBaseMilli, static_cast<double>(tm.jobPenaltyBaseMilli) / 1000.0));
 
     y += 4;
     DrawLine(x, y, x0 + panelW - 12, y, Color{255, 255, 255, 70});
@@ -6572,7 +6659,7 @@ void Game::draw()
     const int x0 = uiW - panelW - 12;
     int y0 = 96;
     if (m_showPolicy) y0 += 280 + 12;
-    if (m_showTrafficModel) y0 += 248 + 12;
+    if (m_showTrafficModel) y0 += 314 + 12;
 
     DrawRectangle(x0, y0, panelW, panelH, Color{0, 0, 0, 180});
     DrawRectangleLines(x0, y0, panelW, panelH, Color{255, 255, 255, 70});

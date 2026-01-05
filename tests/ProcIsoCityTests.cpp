@@ -6029,6 +6029,125 @@ void TestTransitPlannerPicksHighDemandCorridor()
   EXPECT_EQ(l.edges[0], 1);
 }
 
+
+void TestPngReadersSupportDeflateAndFilters()
+{
+  // Tiny hand-crafted PNGs that exercise:
+  //  - zlib/DEFLATE Huffman blocks (not stored)
+  //  - scanline filters (non-zero filter bytes)
+  //
+  // These bytes were generated offline by constructing a minimal PNG container
+  // and compressing filtered scanlines via zlib.
+
+  static const unsigned char kPngRgbaFilterDeflate[] = {
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x02, 0x08, 0x06, 0x00, 0x00, 0x00, 0x9D, 0x74, 0x66,
+    0x1A, 0x00, 0x00, 0x00, 0x1E, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xFC, 0xCF, 0xC0, 0xF0,
+    0x9F, 0x11, 0x48, 0x30, 0x00, 0x09, 0x16, 0x86, 0xFF, 0xFF, 0x81, 0x3C, 0x86, 0x46, 0x46, 0x06,
+    0xC6, 0x7A, 0x00, 0x72, 0x2F, 0x08, 0x04, 0x06, 0x80, 0xD1, 0x38, 0x00, 0x00, 0x00, 0x00, 0x49,
+    0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+  };
+
+  static const unsigned char kPngRgbFilterDeflate[] = {
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x02, 0x00, 0x00, 0x00, 0xFD, 0xD4, 0x9A,
+    0x73, 0x00, 0x00, 0x00, 0x16, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xE2, 0x12, 0x91, 0xD3,
+    0x30, 0xB2, 0x61, 0x76, 0x74, 0xF3, 0xD6, 0xD5, 0xD5, 0x05, 0x00, 0x0D, 0x4B, 0x02, 0x31, 0x5A,
+    0x37, 0x61, 0x37, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+  };
+
+  const fs::path rgbaPath = fs::path("proc_isocity_test_rgba_filters.png");
+  {
+    std::ofstream o(rgbaPath, std::ios::binary);
+    o.write(reinterpret_cast<const char*>(kPngRgbaFilterDeflate), static_cast<std::streamsize>(sizeof(kPngRgbaFilterDeflate)));
+  }
+
+  {
+    RgbaImage img;
+    std::string err;
+    EXPECT_TRUE(ReadPngRGBA(rgbaPath.string(), img, err));
+    EXPECT_EQ(img.width, 3);
+    EXPECT_EQ(img.height, 2);
+
+    auto at = [&](int x, int y, int c) -> std::uint8_t {
+      const std::size_t i = (static_cast<std::size_t>(y) * static_cast<std::size_t>(img.width) + static_cast<std::size_t>(x)) * 4u + static_cast<std::size_t>(c);
+      return img.rgba[i];
+    };
+
+    // Row 0: red, green, blue (opaque)
+    EXPECT_EQ(at(0, 0, 0), 255u);
+    EXPECT_EQ(at(0, 0, 1), 0u);
+    EXPECT_EQ(at(0, 0, 2), 0u);
+    EXPECT_EQ(at(0, 0, 3), 255u);
+
+    EXPECT_EQ(at(1, 0, 0), 0u);
+    EXPECT_EQ(at(1, 0, 1), 255u);
+    EXPECT_EQ(at(1, 0, 2), 0u);
+    EXPECT_EQ(at(1, 0, 3), 255u);
+
+    EXPECT_EQ(at(2, 0, 0), 0u);
+    EXPECT_EQ(at(2, 0, 1), 0u);
+    EXPECT_EQ(at(2, 0, 2), 255u);
+    EXPECT_EQ(at(2, 0, 3), 255u);
+
+    // Row 1: white, magenta (alpha=128), black
+    EXPECT_EQ(at(0, 1, 0), 255u);
+    EXPECT_EQ(at(0, 1, 1), 255u);
+    EXPECT_EQ(at(0, 1, 2), 255u);
+    EXPECT_EQ(at(0, 1, 3), 255u);
+
+    EXPECT_EQ(at(1, 1, 0), 255u);
+    EXPECT_EQ(at(1, 1, 1), 0u);
+    EXPECT_EQ(at(1, 1, 2), 255u);
+    EXPECT_EQ(at(1, 1, 3), 128u);
+
+    EXPECT_EQ(at(2, 1, 0), 0u);
+    EXPECT_EQ(at(2, 1, 1), 0u);
+    EXPECT_EQ(at(2, 1, 2), 0u);
+    EXPECT_EQ(at(2, 1, 3), 255u);
+  }
+
+  fs::remove(rgbaPath);
+
+  const fs::path rgbPath = fs::path("proc_isocity_test_rgb_filters.png");
+  {
+    std::ofstream o(rgbPath, std::ios::binary);
+    o.write(reinterpret_cast<const char*>(kPngRgbFilterDeflate), static_cast<std::streamsize>(sizeof(kPngRgbFilterDeflate)));
+  }
+
+  {
+    PpmImage img;
+    std::string err;
+    EXPECT_TRUE(ReadPng(rgbPath.string(), img, err));
+    EXPECT_EQ(img.width, 2);
+    EXPECT_EQ(img.height, 2);
+
+    auto at = [&](int x, int y, int c) -> std::uint8_t {
+      const std::size_t i = (static_cast<std::size_t>(y) * static_cast<std::size_t>(img.width) + static_cast<std::size_t>(x)) * 3u + static_cast<std::size_t>(c);
+      return img.rgb[i];
+    };
+
+    // Row 0: (10,20,30), (40,50,60)
+    EXPECT_EQ(at(0, 0, 0), 10u);
+    EXPECT_EQ(at(0, 0, 1), 20u);
+    EXPECT_EQ(at(0, 0, 2), 30u);
+    EXPECT_EQ(at(1, 0, 0), 40u);
+    EXPECT_EQ(at(1, 0, 1), 50u);
+    EXPECT_EQ(at(1, 0, 2), 60u);
+
+    // Row 1: (70,80,90), (100,110,120)
+    EXPECT_EQ(at(0, 1, 0), 70u);
+    EXPECT_EQ(at(0, 1, 1), 80u);
+    EXPECT_EQ(at(0, 1, 2), 90u);
+    EXPECT_EQ(at(1, 1, 0), 100u);
+    EXPECT_EQ(at(1, 1, 1), 110u);
+    EXPECT_EQ(at(1, 1, 2), 120u);
+  }
+
+  fs::remove(rgbPath);
+}
+
+
 int main()
 {
   TestRoadAutoTilingMasks();
@@ -6043,6 +6162,7 @@ int main()
   TestSaveLoadRoundTrip();
   TestSaveLoadBytesRoundTrip();
   TestSLLZCompressionRoundTrip();
+  TestPngReadersSupportDeflateAndFilters();
   TestSaveV8UsesCompressionForLargeDeltaPayload();
   TestSaveLoadDetectsCorruption();
   TestOutsideConnectionAffectsZoneAccess();

@@ -1,4 +1,6 @@
 #include "isocity/Export.hpp"
+
+#include "isocity/GfxTilesetAtlas.hpp"
 #include "isocity/Random.hpp"
 #include "isocity/ZoneMetrics.hpp"
 
@@ -35,6 +37,204 @@ inline std::uint8_t ToByte(float v)
 {
   const float c = std::clamp(v, 0.0f, 255.0f);
   return static_cast<std::uint8_t>(std::lround(c));
+}
+
+inline void AlphaBlendPixel(PpmImage& dst, int x, int y,
+                            std::uint8_t sr, std::uint8_t sg, std::uint8_t sb, std::uint8_t sa,
+                            float rgbMul = 1.0f)
+{
+  if (sa == 0) return;
+  if (x < 0 || y < 0 || x >= dst.width || y >= dst.height) return;
+  const std::size_t di = (static_cast<std::size_t>(y) * static_cast<std::size_t>(dst.width) + static_cast<std::size_t>(x)) * 3u;
+
+  int rr = static_cast<int>(std::lround(static_cast<float>(sr) * rgbMul));
+  int gg = static_cast<int>(std::lround(static_cast<float>(sg) * rgbMul));
+  int bb = static_cast<int>(std::lround(static_cast<float>(sb) * rgbMul));
+  rr = std::clamp(rr, 0, 255);
+  gg = std::clamp(gg, 0, 255);
+  bb = std::clamp(bb, 0, 255);
+
+  const int a = static_cast<int>(sa);
+  const int inv = 255 - a;
+  const int dr = static_cast<int>(dst.rgb[di + 0]);
+  const int dg = static_cast<int>(dst.rgb[di + 1]);
+  const int db = static_cast<int>(dst.rgb[di + 2]);
+
+  dst.rgb[di + 0] = static_cast<std::uint8_t>((rr * a + dr * inv + 127) / 255);
+  dst.rgb[di + 1] = static_cast<std::uint8_t>((gg * a + dg * inv + 127) / 255);
+  dst.rgb[di + 2] = static_cast<std::uint8_t>((bb * a + db * inv + 127) / 255);
+}
+
+inline void MultiplyBlendPixel(PpmImage& dst, int x, int y, std::uint8_t maskA, float strength)
+{
+  if (maskA == 0) return;
+  if (strength <= 0.0f) return;
+  if (x < 0 || y < 0 || x >= dst.width || y >= dst.height) return;
+
+  const float s = std::clamp(strength, 0.0f, 1.0f);
+  const int k = std::clamp<int>(static_cast<int>(std::lround(static_cast<float>(maskA) * s)), 0, 255);
+  const int mul = 255 - k;
+  const std::size_t di = (static_cast<std::size_t>(y) * static_cast<std::size_t>(dst.width) + static_cast<std::size_t>(x)) * 3u;
+
+  dst.rgb[di + 0] = static_cast<std::uint8_t>((static_cast<int>(dst.rgb[di + 0]) * mul + 127) / 255);
+  dst.rgb[di + 1] = static_cast<std::uint8_t>((static_cast<int>(dst.rgb[di + 1]) * mul + 127) / 255);
+  dst.rgb[di + 2] = static_cast<std::uint8_t>((static_cast<int>(dst.rgb[di + 2]) * mul + 127) / 255);
+}
+
+struct TilesetLightingState {
+  const RgbaImage* normalAtlas = nullptr;
+  bool enabled = false;
+
+  float lx = 0.0f;
+  float ly = 0.0f;
+  float lz = 1.0f;
+  float flatDot = 1.0f; // dot((0,0,1), L)
+
+  float ambient = 0.35f;
+  float diffuse = 0.65f;
+  float strength = 0.0f; // blends towards normal lighting
+};
+
+inline void DecodeNormalRGB(std::uint8_t r, std::uint8_t g, std::uint8_t b, float& nx, float& ny, float& nz)
+{
+  // Tangent-space [-1,1] decode.
+  nx = static_cast<float>(r) / 127.5f - 1.0f;
+  ny = static_cast<float>(g) / 127.5f - 1.0f;
+  nz = static_cast<float>(b) / 127.5f - 1.0f;
+}
+
+inline float ComputeTilesetNormalLightingMul(const TilesetLightingState& st, float nx, float ny, float nz)
+{
+  // Use a normalized range where a flat normal yields 1.0.
+  const float ndotl = std::max(0.0f, nx * st.lx + ny * st.ly + nz * st.lz);
+  const float base = st.ambient + st.diffuse * (ndotl / std::max(1.0e-4f, st.flatDot));
+  return Lerp(1.0f, std::clamp(base, 0.0f, 2.0f), st.strength);
+}
+
+inline void AdditiveBlendPixel(PpmImage& dst, int x, int y,
+                               std::uint8_t sr, std::uint8_t sg, std::uint8_t sb, std::uint8_t sa,
+                               float intensity = 1.0f)
+{
+  if (sa == 0) return;
+  if (x < 0 || y < 0 || x >= dst.width || y >= dst.height) return;
+  const std::size_t di = (static_cast<std::size_t>(y) * static_cast<std::size_t>(dst.width) + static_cast<std::size_t>(x)) * 3u;
+
+  const float a = (static_cast<float>(sa) / 255.0f) * std::clamp(intensity, 0.0f, 8.0f);
+  int dr = static_cast<int>(dst.rgb[di + 0]);
+  int dg = static_cast<int>(dst.rgb[di + 1]);
+  int db = static_cast<int>(dst.rgb[di + 2]);
+
+  dr += static_cast<int>(std::lround(static_cast<float>(sr) * a));
+  dg += static_cast<int>(std::lround(static_cast<float>(sg) * a));
+  db += static_cast<int>(std::lround(static_cast<float>(sb) * a));
+
+  dst.rgb[di + 0] = static_cast<std::uint8_t>(std::clamp(dr, 0, 255));
+  dst.rgb[di + 1] = static_cast<std::uint8_t>(std::clamp(dg, 0, 255));
+  dst.rgb[di + 2] = static_cast<std::uint8_t>(std::clamp(db, 0, 255));
+}
+
+inline void BlitAtlasSpriteOver(PpmImage& dst, const RgbaImage& atlas, const GfxAtlasEntry& e, int dstX, int dstY, float rgbMul)
+{
+  if (atlas.width <= 0 || atlas.height <= 0) return;
+  if (atlas.rgba.empty()) return;
+
+  const int w = e.w;
+  const int h = e.h;
+  for (int y = 0; y < h; ++y) {
+    const int sy = e.y + y;
+    if (sy < 0 || sy >= atlas.height) continue;
+    for (int x = 0; x < w; ++x) {
+      const int sx = e.x + x;
+      if (sx < 0 || sx >= atlas.width) continue;
+      const std::size_t si = (static_cast<std::size_t>(sy) * static_cast<std::size_t>(atlas.width) + static_cast<std::size_t>(sx)) * 4u;
+      const std::uint8_t sr = atlas.rgba[si + 0];
+      const std::uint8_t sg = atlas.rgba[si + 1];
+      const std::uint8_t sb = atlas.rgba[si + 2];
+      const std::uint8_t sa = atlas.rgba[si + 3];
+      AlphaBlendPixel(dst, dstX + x, dstY + y, sr, sg, sb, sa, rgbMul);
+    }
+  }
+}
+
+inline void BlitAtlasSpriteOverLit(PpmImage& dst, const RgbaImage& atlas, const TilesetLightingState* lighting,
+                                  const GfxAtlasEntry& e, int dstX, int dstY, float rgbMul)
+{
+  if (!lighting || !lighting->enabled || !lighting->normalAtlas) {
+    BlitAtlasSpriteOver(dst, atlas, e, dstX, dstY, rgbMul);
+    return;
+  }
+  const RgbaImage& nrm = *lighting->normalAtlas;
+  if (nrm.width != atlas.width || nrm.height != atlas.height) {
+    BlitAtlasSpriteOver(dst, atlas, e, dstX, dstY, rgbMul);
+    return;
+  }
+
+  const int w = e.w;
+  const int h = e.h;
+  for (int y = 0; y < h; ++y) {
+    const int sy = e.y + y;
+    if (sy < 0 || sy >= atlas.height) continue;
+    for (int x = 0; x < w; ++x) {
+      const int sx = e.x + x;
+      if (sx < 0 || sx >= atlas.width) continue;
+      const std::size_t si = (static_cast<std::size_t>(sy) * static_cast<std::size_t>(atlas.width) + static_cast<std::size_t>(sx)) * 4u;
+      const std::uint8_t sr = atlas.rgba[si + 0];
+      const std::uint8_t sg = atlas.rgba[si + 1];
+      const std::uint8_t sb = atlas.rgba[si + 2];
+      const std::uint8_t sa = atlas.rgba[si + 3];
+      if (sa == 0) continue;
+
+      float nx = 0.0f, ny = 0.0f, nz = 1.0f;
+      DecodeNormalRGB(nrm.rgba[si + 0], nrm.rgba[si + 1], nrm.rgba[si + 2], nx, ny, nz);
+      const float shade = ComputeTilesetNormalLightingMul(*lighting, nx, ny, nz);
+      AlphaBlendPixel(dst, dstX + x, dstY + y, sr, sg, sb, sa, rgbMul * shade);
+    }
+  }
+}
+
+inline void BlitAtlasSpriteShadowMultiply(PpmImage& dst, const RgbaImage& shadowAtlas, const GfxAtlasEntry& e,
+                                         int dstX, int dstY, float strength)
+{
+  if (strength <= 0.0f) return;
+  if (shadowAtlas.width <= 0 || shadowAtlas.height <= 0) return;
+  if (shadowAtlas.rgba.empty()) return;
+
+  const int w = e.w;
+  const int h = e.h;
+  for (int y = 0; y < h; ++y) {
+    const int sy = e.y + y;
+    if (sy < 0 || sy >= shadowAtlas.height) continue;
+    for (int x = 0; x < w; ++x) {
+      const int sx = e.x + x;
+      if (sx < 0 || sx >= shadowAtlas.width) continue;
+      const std::size_t si = (static_cast<std::size_t>(sy) * static_cast<std::size_t>(shadowAtlas.width) + static_cast<std::size_t>(sx)) * 4u;
+      const std::uint8_t sa = shadowAtlas.rgba[si + 3];
+      MultiplyBlendPixel(dst, dstX + x, dstY + y, sa, strength);
+    }
+  }
+}
+
+inline void BlitAtlasSpriteAdditive(PpmImage& dst, const RgbaImage& atlas, const GfxAtlasEntry& e, int dstX, int dstY, float intensity)
+{
+  if (atlas.width <= 0 || atlas.height <= 0) return;
+  if (atlas.rgba.empty()) return;
+
+  const int w = e.w;
+  const int h = e.h;
+  for (int y = 0; y < h; ++y) {
+    const int sy = e.y + y;
+    if (sy < 0 || sy >= atlas.height) continue;
+    for (int x = 0; x < w; ++x) {
+      const int sx = e.x + x;
+      if (sx < 0 || sx >= atlas.width) continue;
+      const std::size_t si = (static_cast<std::size_t>(sy) * static_cast<std::size_t>(atlas.width) + static_cast<std::size_t>(sx)) * 4u;
+      const std::uint8_t sr = atlas.rgba[si + 0];
+      const std::uint8_t sg = atlas.rgba[si + 1];
+      const std::uint8_t sb = atlas.rgba[si + 2];
+      const std::uint8_t sa = atlas.rgba[si + 3];
+      AdditiveBlendPixel(dst, dstX + x, dstY + y, sr, sg, sb, sa, intensity);
+    }
+  }
 }
 
 inline void SetPixel(std::vector<std::uint8_t>& rgb, int w, int x, int y, std::uint8_t r, std::uint8_t g, std::uint8_t b)
@@ -632,7 +832,8 @@ PpmImage RenderPpmLayer(const World& world, ExportLayer layer, const LandValueRe
 }
 
 IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const IsoOverviewConfig& cfg,
-                                   const LandValueResult* landValue, const TrafficResult* traffic, const GoodsResult* goods)
+                                   const LandValueResult* landValue, const TrafficResult* traffic, const GoodsResult* goods,
+                                   const GfxTilesetAtlas* tileset)
 {
   IsoOverviewResult out{};
   out.tileW = cfg.tileW;
@@ -643,11 +844,13 @@ IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const
   const int mapH = world.height();
   if (mapW <= 0 || mapH <= 0) return out;
 
-  if (cfg.tileW <= 0 || cfg.tileH <= 0) return out;
-  if ((cfg.tileW % 2) != 0 || (cfg.tileH % 2) != 0) return out;
+  if (cfg.tileW < 2 || cfg.tileH < 2) return out;
 
+  // Support both even and odd tile sizes. Internally we use half-width/half-height "diamond"
+  // units for the iso projection.
   out.halfW = cfg.tileW / 2;
   out.halfH = cfg.tileH / 2;
+  if (out.halfW <= 0 || out.halfH <= 0) return out;
 
   // Compute bounds in iso-space.
   int minX = std::numeric_limits<int>::max();
@@ -698,6 +901,12 @@ IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const
   const bool allowAtmosphere = (layer == ExportLayer::Terrain || layer == ExportLayer::Overlay);
 
   const bool fancy = cfg.fancy && allowAtmosphere;
+
+  // Optional: sprite-based rendering using a generated tileset atlas.
+  // This is only used for the visual layers (Terrain/Overlay) and only when the atlas tile size
+  // matches the requested iso tile size.
+  const bool useTileset = fancy && tileset && tileset->valid() &&
+                          tileset->tileW == cfg.tileW && tileset->tileH == cfg.tileH;
   const float texStrength = fancy ? std::clamp(cfg.textureStrength, 0.0f, 1.0f) : 0.0f;
   const bool drawShore = fancy && cfg.drawShore && texStrength > 0.0f;
   const bool drawRoadMarks = fancy && cfg.drawRoadMarkings;
@@ -730,6 +939,72 @@ IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const
   auto popCount4 = [](std::uint8_t m) -> int {
     return ((m & 0x01u) ? 1 : 0) + ((m & 0x02u) ? 1 : 0) + ((m & 0x04u) ? 1 : 0) + ((m & 0x08u) ? 1 : 0);
   };
+
+  // Shared road connectivity mask for tileset-driven sprites and prop placement.
+  // Bits: 1=North, 2=East, 4=South, 8=West.
+  auto roadMaskAt = [&](int rx, int ry) -> std::uint8_t {
+    if (!world.inBounds(rx, ry)) return 0;
+    const Tile& rt = world.at(rx, ry);
+    if (rt.overlay != Overlay::Road) return 0;
+    std::uint8_t m = static_cast<std::uint8_t>(rt.variation & 0x0Fu);
+    if (m != 0) return m;
+    if (world.inBounds(rx, ry - 1) && world.at(rx, ry - 1).overlay == Overlay::Road) m |= 0x01u;
+    if (world.inBounds(rx + 1, ry) && world.at(rx + 1, ry).overlay == Overlay::Road) m |= 0x02u;
+    if (world.inBounds(rx, ry + 1) && world.at(rx, ry + 1).overlay == Overlay::Road) m |= 0x04u;
+    if (world.inBounds(rx - 1, ry) && world.at(rx - 1, ry).overlay == Overlay::Road) m |= 0x08u;
+    return m;
+  };
+
+  // Optional per-pixel lighting for tileset sprites (normal map shading) and shadow masks.
+  TilesetLightingState tilesetLight{};
+  const bool tilesetNormalMap = useTileset && tileset && cfg.tilesetLighting.enableNormals && tileset->normalValid();
+  if (tilesetNormalMap) {
+    // Key light intensity is reduced at night and with heavy overcast.
+    const float dayK = (allowAtmosphere && cfg.dayNight.enabled) ? dayNight.day : 1.0f;
+    const float overcastK = 1.0f - 0.75f * wxOvercast;
+    const float strength = std::clamp(cfg.tilesetLighting.normalStrength, 0.0f, 1.0f) * dayK * overcastK;
+
+    tilesetLight.normalAtlas = &tileset->normalAtlas;
+    tilesetLight.enabled = (strength > 0.001f);
+    tilesetLight.strength = strength;
+
+    // Normalize light direction.
+    float lx = cfg.tilesetLighting.lightDirX;
+    float ly = cfg.tilesetLighting.lightDirY;
+    float lz = cfg.tilesetLighting.lightDirZ;
+    const float len = std::sqrt(lx * lx + ly * ly + lz * lz);
+    if (len > 1.0e-6f) {
+      lx /= len;
+      ly /= len;
+      lz /= len;
+    } else {
+      lx = 0.0f;
+      ly = 0.0f;
+      lz = 1.0f;
+    }
+    tilesetLight.lx = lx;
+    tilesetLight.ly = ly;
+    tilesetLight.lz = lz;
+    tilesetLight.flatDot = std::max(1.0e-4f, lz);
+
+    tilesetLight.ambient = std::clamp(cfg.tilesetLighting.ambient, 0.0f, 1.0f);
+    tilesetLight.diffuse = std::clamp(cfg.tilesetLighting.diffuse, 0.0f, 2.0f);
+  }
+
+  const bool tilesetShadowMap = useTileset && tileset && cfg.tilesetLighting.enableShadows && tileset->shadowValid();
+  float tilesetShadowStrength = 0.0f;
+  if (tilesetShadowMap) {
+    const float dayK = (allowAtmosphere && cfg.dayNight.enabled) ? dayNight.day : 1.0f;
+    const float overcastK = 1.0f - 0.75f * wxOvercast;
+    tilesetShadowStrength = std::clamp(cfg.tilesetLighting.shadowStrength, 0.0f, 1.0f) * dayK * overcastK;
+  }
+
+  // Optional: decorative prop placement when using a tileset atlas.
+  const bool tilesetProps = useTileset && cfg.tilesetProps.enabled && allowAtmosphere && (layer == ExportLayer::Overlay);
+  const float parkTreeDensity = tilesetProps ? std::clamp(cfg.tilesetProps.treeDensity, 0.0f, 1.0f) : 0.0f;
+  const float parkConiferChance = tilesetProps ? std::clamp(cfg.tilesetProps.coniferChance, 0.0f, 1.0f) : 0.0f;
+  const bool tilesetStreetlights = tilesetProps && cfg.tilesetProps.drawStreetlights;
+  const float streetlightChance = tilesetStreetlights ? std::clamp(cfg.tilesetProps.streetlightChance, 0.0f, 1.0f) : 0.0f;
 
   auto distPointSegment = [](float px, float py, float ax, float ay, float bx, float by, float& outT) -> float {
     const float vx = bx - ax;
@@ -872,6 +1147,11 @@ IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const
     return std::clamp(b, 0.55f, 1.30f);
   };
 
+  auto terrainAt = [&](int tx, int ty) -> Terrain {
+    if (!world.inBounds(tx, ty)) return Terrain::Grass; // treat OOB as land for nicer borders
+    return world.at(tx, ty).terrain;
+  };
+
   // Draw order: back-to-front along diagonals (increasing x+y).
   for (int sum = 0; sum <= (mapW - 1) + (mapH - 1); ++sum) {
     for (int x = 0; x < mapW; ++x) {
@@ -922,6 +1202,240 @@ IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const
           MulPixel(fr, fg, fb, 0.55f);
           FillQuad(out.image, bottom, left, Ipt{left.x, left.y + dhL}, Ipt{bottom.x, bottom.y + dhL}, fr, fg, fb);
         }
+      }
+
+      // -------------------------------------------------------------------------------------
+      // Optional tileset-atlas path (Terrain/Overlay only).
+      // -------------------------------------------------------------------------------------
+      if (useTileset) {
+        const float tileB = computeTileBrightness(x, y);
+
+        auto pickTerrain = [&]() -> const GfxAtlasEntry* {
+          const int tv = std::max(1, tileset->terrainVariants > 0 ? tileset->terrainVariants : 8);
+          const int var = static_cast<int>(((t.variation >> 4) & 0x0Fu) % static_cast<std::uint8_t>(tv));
+
+          if (t.terrain == Terrain::Water && drawShore && tileset->transitionVariantsWS > 0) {
+            const bool nBase = (terrainAt(x, y - 1) == Terrain::Water);
+            const bool eBase = (terrainAt(x + 1, y) == Terrain::Water);
+            const bool sBase = (terrainAt(x, y + 1) == Terrain::Water);
+            const bool wBase = (terrainAt(x - 1, y) == Terrain::Water);
+            const bool need = !(nBase && eBase && sBase && wBase);
+            if (need) {
+              std::uint8_t mask = 0;
+              if (nBase) mask |= 0x01u;
+              if (eBase) mask |= 0x02u;
+              if (sBase) mask |= 0x04u;
+              if (wBase) mask |= 0x08u;
+              const int vv = std::max(1, tileset->transitionVariantsWS);
+              const int v = static_cast<int>(((t.variation >> 4) & 0x0Fu) % static_cast<std::uint8_t>(vv));
+              const std::string name = "terrain_shore_ws_m" + std::to_string(mask) + "_v" + std::to_string(v);
+              if (const GfxAtlasEntry* e = FindGfxAtlasEntry(*tileset, name)) return e;
+            }
+          }
+
+          if (t.terrain == Terrain::Sand && drawShore && tileset->transitionVariantsSG > 0) {
+            // Only apply sand->grass transitions when there is nearby grass.
+            const bool nGrass = (terrainAt(x, y - 1) == Terrain::Grass);
+            const bool eGrass = (terrainAt(x + 1, y) == Terrain::Grass);
+            const bool sGrass = (terrainAt(x, y + 1) == Terrain::Grass);
+            const bool wGrass = (terrainAt(x - 1, y) == Terrain::Grass);
+            const bool need = (nGrass || eGrass || sGrass || wGrass);
+            if (need) {
+              std::uint8_t mask = 0;
+              // Mask bits mean "neighbor is base sand". Treat water as "sand" here so we don't
+              // accidentally blend grass along coastlines.
+              if (terrainAt(x, y - 1) != Terrain::Grass) mask |= 0x01u;
+              if (terrainAt(x + 1, y) != Terrain::Grass) mask |= 0x02u;
+              if (terrainAt(x, y + 1) != Terrain::Grass) mask |= 0x04u;
+              if (terrainAt(x - 1, y) != Terrain::Grass) mask |= 0x08u;
+              const int vv = std::max(1, tileset->transitionVariantsSG);
+              const int v = static_cast<int>(((t.variation >> 4) & 0x0Fu) % static_cast<std::uint8_t>(vv));
+              const std::string name = "terrain_shore_sg_m" + std::to_string(mask) + "_v" + std::to_string(v);
+              if (const GfxAtlasEntry* e = FindGfxAtlasEntry(*tileset, name)) return e;
+            }
+          }
+
+          if (t.terrain == Terrain::Water) {
+            const std::string name = "terrain_water_v" + std::to_string(var);
+            return FindGfxAtlasEntry(*tileset, name);
+          }
+          if (t.terrain == Terrain::Sand) {
+            const std::string name = "terrain_sand_v" + std::to_string(var);
+            return FindGfxAtlasEntry(*tileset, name);
+          }
+          const std::string name = "terrain_grass_v" + std::to_string(var);
+          return FindGfxAtlasEntry(*tileset, name);
+        };
+
+        const GfxAtlasEntry* base = pickTerrain();
+        if (base) {
+          BlitAtlasSpriteOverLit(out.image, tileset->atlas, &tilesetLight, *base, cx - base->pivotX, cy - base->pivotY, tileB);
+        } else {
+          // Defensive fallback.
+          FillTriangle(out.image, top, right, bottom, br, bg, bb);
+          FillTriangle(out.image, top, bottom, left, br, bg, bb);
+        }
+
+        if (layer == ExportLayer::Overlay) {
+          // Roads.
+          if (t.overlay == Overlay::Road) {
+            std::uint8_t roadMask = roadMaskAt(x, y);
+
+            const int lvl = std::clamp<int>(t.level, 1, 3);
+            const int vv = static_cast<int>((t.variation >> 4) & 0x0Fu);
+            const bool isBridge = (t.terrain == Terrain::Water);
+
+            const int vcount = std::max(1, isBridge ? (tileset->bridgeVariants > 0 ? tileset->bridgeVariants : 4)
+                                                   : (tileset->roadVariants > 0 ? tileset->roadVariants : 4));
+            const int v = vv % vcount;
+
+            const std::string name = std::string(isBridge ? "bridge" : "road") +
+                                     "_L" + std::to_string(lvl) +
+                                     "_m" + std::to_string(static_cast<int>(roadMask)) +
+                                     "_v" + std::to_string(v);
+            if (const GfxAtlasEntry* re = FindGfxAtlasEntry(*tileset, name)) {
+              BlitAtlasSpriteOverLit(out.image, tileset->atlas, &tilesetLight, *re, cx - re->pivotX, cy - re->pivotY, tileB);
+            }
+          } else if (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial || t.overlay == Overlay::Industrial ||
+                     t.overlay == Overlay::Park) {
+            // Overlays.
+            if (t.overlay == Overlay::Park || drawZonePatterns) {
+              const char* oname = nullptr;
+              if (t.overlay == Overlay::Residential) oname = "overlay_residential";
+              else if (t.overlay == Overlay::Commercial) oname = "overlay_commercial";
+              else if (t.overlay == Overlay::Industrial) oname = "overlay_industrial";
+              else if (t.overlay == Overlay::Park) oname = "overlay_park";
+
+              if (oname) {
+                if (const GfxAtlasEntry* oe = FindGfxAtlasEntry(*tileset, std::string(oname))) {
+                  BlitAtlasSpriteOverLit(out.image, tileset->atlas, &tilesetLight, *oe, cx - oe->pivotX, cy - oe->pivotY, tileB);
+                }
+              }
+            }
+
+            // Buildings: only for occupied zones.
+            if (t.occupants > 0 && (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial || t.overlay == Overlay::Industrial)) {
+              const int lvl = std::clamp<int>(t.level, 1, 3);
+              int kind = 0;
+              const char* kname = "res";
+              if (t.overlay == Overlay::Commercial) { kind = 1; kname = "com"; }
+              else if (t.overlay == Overlay::Industrial) { kind = 2; kname = "ind"; }
+              const int vcount = tileset->buildingVariants[kind][lvl - 1];
+              if (vcount > 0) {
+                const std::uint32_t hv = HashCoords32(x, y, seed32 ^ 0xD15EA5E1u);
+                const int v = static_cast<int>(hv % static_cast<std::uint32_t>(vcount));
+                const std::string bname = std::string("building_") + kname + "_L" + std::to_string(lvl) + "_v" + std::to_string(v);
+                if (const GfxAtlasEntry* be = FindGfxAtlasEntry(*tileset, bname)) {
+                  if (tilesetShadowMap && tilesetShadowStrength > 0.001f && be->srcH > tileset->tileH) {
+                    BlitAtlasSpriteShadowMultiply(out.image, tileset->shadowAtlas, *be,
+                                                 cx - be->pivotX, cy - be->pivotY, tilesetShadowStrength);
+                  }
+                  BlitAtlasSpriteOverLit(out.image, tileset->atlas, &tilesetLight, *be, cx - be->pivotX, cy - be->pivotY, tileB);
+                }
+              }
+            }
+          }
+        }
+
+        // Optional deterministic decorative props for tileset-based rendering.
+        if (tilesetProps) {
+          auto hash01 = [](std::uint32_t u) -> float {
+            // 24-bit mantissa (same idea as RNG::nextF01).
+            return static_cast<float>(u >> 8) / static_cast<float>(1u << 24);
+          };
+
+          // Park trees.
+          if (t.overlay == Overlay::Park && parkTreeDensity > 0.001f &&
+              (tileset->propTreeDeciduousVariants > 0 || tileset->propTreeConiferVariants > 0)) {
+            // Up to 2 trees per park tile at high density.
+            const std::uint32_t h0 = HashCoords32(x, y, seed32 ^ 0x2D1B5A49u);
+            const std::uint32_t h1 = HashCoords32(x, y, seed32 ^ 0xA12F6B73u);
+            int count = 0;
+            if (hash01(h0) < parkTreeDensity) count += 1;
+            if (parkTreeDensity > 0.5f && hash01(h1) < (parkTreeDensity - 0.5f) * 2.0f) count += 1;
+
+            for (int i = 0; i < count; ++i) {
+              const std::uint32_t ht = HashCoords32(x, y, seed32 ^ (0x6C8E9CF5u + static_cast<std::uint32_t>(i) * 0x9E3779B9u));
+              const bool wantConifer = (hash01(ht ^ 0x93A5C4E1u) < parkConiferChance);
+              const int decidCount = tileset->propTreeDeciduousVariants;
+              const int conifCount = tileset->propTreeConiferVariants;
+              const bool useConifer = wantConifer && (conifCount > 0);
+              const int vcount = useConifer ? conifCount : decidCount;
+              if (vcount <= 0) continue;
+              const int v = static_cast<int>(ht % static_cast<std::uint32_t>(vcount));
+              const std::string pname = useConifer ? (std::string("prop_tree_conifer_v") + std::to_string(v))
+                                                  : (std::string("prop_tree_deciduous_v") + std::to_string(v));
+
+              if (const GfxAtlasEntry* pe = FindGfxAtlasEntry(*tileset, pname)) {
+                // Local offset inside the diamond to break up the grid.
+                float ox = (static_cast<float>((ht & 0xFFu)) / 255.0f) * 2.0f - 1.0f;
+                float oy = (static_cast<float>(((ht >> 8) & 0xFFu)) / 255.0f) * 2.0f - 1.0f;
+                const float ax = std::abs(ox);
+                const float ay = std::abs(oy);
+                if (ax + ay > 1.0f) {
+                  ox = std::copysign(1.0f - ay, ox);
+                  oy = std::copysign(1.0f - ax, oy);
+                }
+                const float spread = 0.38f;
+                const int px = cx + static_cast<int>(std::lround(ox * static_cast<float>(out.halfW) * spread));
+                const int py = cy + static_cast<int>(std::lround(oy * static_cast<float>(out.halfH) * spread));
+
+                if (tilesetShadowMap && tilesetShadowStrength > 0.001f && pe->srcH > tileset->tileH) {
+                  BlitAtlasSpriteShadowMultiply(out.image, tileset->shadowAtlas, *pe,
+                                               px - pe->pivotX, py - pe->pivotY, tilesetShadowStrength);
+                }
+                BlitAtlasSpriteOverLit(out.image, tileset->atlas, &tilesetLight, *pe,
+                                       px - pe->pivotX, py - pe->pivotY, tileB);
+              }
+            }
+          }
+
+          // Road streetlights.
+          if (tilesetStreetlights && t.overlay == Overlay::Road && streetlightChance > 0.001f && tileset->propStreetlightVariants > 0) {
+            const std::uint8_t roadMask = roadMaskAt(x, y);
+            const std::uint32_t hl = HashCoords32(x, y, seed32 ^ 0x57E371A1u);
+            if (hash01(hl) < streetlightChance) {
+              const int v = static_cast<int>(hl % static_cast<std::uint32_t>(tileset->propStreetlightVariants));
+              const std::string lname = std::string("prop_streetlight_v") + std::to_string(v);
+              if (const GfxAtlasEntry* le = FindGfxAtlasEntry(*tileset, lname)) {
+                const bool ns = (roadMask & 0x01u) || (roadMask & 0x04u);
+                const bool ew = (roadMask & 0x02u) || (roadMask & 0x08u);
+                const bool flip = ((hl >> 16) & 1u) != 0;
+                float ox = 0.0f;
+                float oy = 0.0f;
+                if (ns && !ew) {
+                  ox = flip ? 0.32f : -0.32f;
+                  oy = 0.02f;
+                } else if (ew && !ns) {
+                  ox = 0.0f;
+                  oy = flip ? 0.22f : -0.22f;
+                } else {
+                  ox = flip ? 0.28f : -0.28f;
+                  oy = 0.16f;
+                }
+                const int px = cx + static_cast<int>(std::lround(ox * static_cast<float>(out.halfW)));
+                const int py = cy + static_cast<int>(std::lround(oy * static_cast<float>(out.halfH)));
+
+                if (tilesetShadowMap && tilesetShadowStrength > 0.001f && le->srcH > tileset->tileH) {
+                  BlitAtlasSpriteShadowMultiply(out.image, tileset->shadowAtlas, *le,
+                                               px - le->pivotX, py - le->pivotY, tilesetShadowStrength);
+                }
+                BlitAtlasSpriteOverLit(out.image, tileset->atlas, &tilesetLight, *le,
+                                       px - le->pivotX, py - le->pivotY, tileB);
+              }
+            }
+          }
+        }
+
+        if (cfg.drawGrid) {
+          const std::uint8_t lr = 25, lg = 25, lb = 25;
+          DrawLine(out.image, top.x, top.y, right.x, right.y, lr, lg, lb);
+          DrawLine(out.image, right.x, right.y, bottom.x, bottom.y, lr, lg, lb);
+          DrawLine(out.image, bottom.x, bottom.y, left.x, left.y, lr, lg, lb);
+          DrawLine(out.image, left.x, left.y, top.x, top.y, lr, lg, lb);
+        }
+
+        continue;
       }
 
       if (!fancy) {
@@ -1406,10 +1920,44 @@ IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const
             const bool intersection = (conn >= 3);
             const bool major = (static_cast<int>(t.level) >= 2);
 
+            // If we have atlas streetlight props + an emissive atlas, prefer the sprite-based
+            // light over a generic point glow (avoids double-lighting and looks more stable).
+            bool usedStreetlightSprite = false;
+            if (useTileset && tileset && tileset->emissiveValid() && tilesetStreetlights && streetlightChance > 0.001f &&
+                tileset->propStreetlightVariants > 0) {
+              const std::uint32_t hl = HashCoords32(tx, ty, seed32 ^ 0x57E371A1u);
+              if (Frac01(hl) < streetlightChance) {
+                const int v = static_cast<int>(hl % static_cast<std::uint32_t>(tileset->propStreetlightVariants));
+                const std::string lname = std::string("prop_streetlight_v") + std::to_string(v);
+                if (const GfxAtlasEntry* le = FindGfxAtlasEntry(*tileset, lname)) {
+                  const bool ns = (mask & 0x01u) || (mask & 0x04u);
+                  const bool ew = (mask & 0x02u) || (mask & 0x08u);
+                  const bool flip = ((hl >> 16) & 1u) != 0;
+                  float ox = 0.0f;
+                  float oy = 0.0f;
+                  if (ns && !ew) {
+                    ox = flip ? 0.32f : -0.32f;
+                    oy = 0.02f;
+                  } else if (ew && !ns) {
+                    ox = 0.0f;
+                    oy = flip ? 0.22f : -0.22f;
+                  } else {
+                    ox = flip ? 0.28f : -0.28f;
+                    oy = 0.16f;
+                  }
+
+                  const int px = cx + static_cast<int>(std::lround(ox * static_cast<float>(out.halfW)));
+                  const int py = cy + static_cast<int>(std::lround(oy * static_cast<float>(out.halfH)));
+                  BlitAtlasSpriteAdditive(out.image, tileset->emissiveAtlas, *le, px - le->pivotX, py - le->pivotY, nightK);
+                  usedStreetlightSprite = true;
+                }
+              }
+            }
+
             // Deterministic sparsity: not every road tile gets a lamp.
             const std::uint32_t h = HashCoords32(tx, ty, seed32 ^ 0x4C1A55u);
             const float p = intersection ? 0.92f : major ? 0.45f : 0.28f;
-            if (Frac01(h) < p) {
+            if (!usedStreetlightSprite && Frac01(h) < p) {
               const int ly = cy - static_cast<int>(std::lround(static_cast<float>(out.tileH) * 0.10f));
               const float baseR = std::max(2.5f, static_cast<float>(out.tileH) * (intersection ? 1.10f : major ? 0.90f : 0.80f));
               const float inten = nightK * (intersection ? 0.95f : major ? 0.75f : 0.65f);
@@ -1428,6 +1976,34 @@ IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const
 
           // Zones: window/building glow scaled by occupancy.
           if (IsZoneOverlay(t.overlay)) {
+            // If we have an emissive tileset atlas and a matching building sprite, prefer it over
+            // the generic point-glow heuristic (gives stable, nicer-looking "window" lighting).
+            bool usedAtlasEmissive = false;
+            if (useTileset && tileset && tileset->emissiveValid() && t.occupants > 0) {
+              const int lvl = std::clamp<int>(t.level, 1, 3);
+              int kind = 0;
+              const char* kname = "res";
+              if (t.overlay == Overlay::Commercial) { kind = 1; kname = "com"; }
+              else if (t.overlay == Overlay::Industrial) { kind = 2; kname = "ind"; }
+              const int vcount = tileset->buildingVariants[kind][lvl - 1];
+              if (vcount > 0) {
+                const std::uint32_t hv = HashCoords32(tx, ty, seed32 ^ 0xE11A5EEDu);
+                const int v = static_cast<int>(hv % static_cast<std::uint32_t>(vcount));
+                const std::string bname = std::string("building_") + kname + "_L" + std::to_string(lvl) + "_v" + std::to_string(v);
+                if (const GfxAtlasEntry* be = FindGfxAtlasEntry(*tileset, bname)) {
+                  // Additive blend after the day/night grade (so it stays bright at night).
+                  BlitAtlasSpriteAdditive(out.image, tileset->emissiveAtlas, *be, cx - be->pivotX, cy - be->pivotY,
+                                          nightK * 1.15f);
+                  usedAtlasEmissive = true;
+                }
+              }
+            }
+
+            if (usedAtlasEmissive) {
+              // Skip generic per-tile glows to avoid double-lighting.
+              continue;
+            }
+
             const int cap = CapacityForTile(t);
             const float occ01 = (cap > 0) ? std::clamp(static_cast<float>(t.occupants) / static_cast<float>(cap), 0.0f, 1.0f) : 0.0f;
 
