@@ -233,6 +233,17 @@ struct HuffmanEntry {
   std::uint8_t len = 0;
 };
 
+inline std::uint32_t ReverseBits(std::uint32_t v, int bits)
+{
+  std::uint32_t r = 0u;
+  for (int i = 0; i < bits; ++i) {
+    r = (r << 1) | (v & 1u);
+    v >>= 1;
+  }
+  return r;
+}
+
+
 struct HuffmanTable {
   int maxLen = 0;
   std::vector<HuffmanEntry> table;
@@ -290,9 +301,10 @@ struct HuffmanTable {
         return false;
       }
 
+      const std::uint32_t codeRev = ReverseBits(static_cast<std::uint32_t>(codeVal), len);
       const int fill = 1 << (maxLen - len);
       for (int i = 0; i < fill; ++i) {
-        const int idx = codeVal | (i << len);
+        const int idx = static_cast<int>(codeRev | (static_cast<std::uint32_t>(i) << len));
         if (idx < 0 || static_cast<std::size_t>(idx) >= table.size()) continue;
         if (table[static_cast<std::size_t>(idx)].len != 0u) {
           outError = "Huffman table collision";
