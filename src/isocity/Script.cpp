@@ -1545,6 +1545,50 @@ static bool CmdProc(ScriptRunnerState& ctx, ScriptRunner& runner, const std::vec
     return ParseF32(val, &ctx.procCfg.parkChance);
   }
 
+  // Macro terrain presets (save v10+)
+  if (key == "terrainpreset" || key == "terrain_preset" || key == "preset") {
+    ProcGenTerrainPreset p{};
+    if (!ParseProcGenTerrainPreset(val, p)) {
+      return runner.fail(path, lineNo, "unknown terrain_preset (try: classic|island|archipelago|inland_sea|river_valley|mountain_ring)");
+    }
+    ctx.procCfg.terrainPreset = p;
+    return true;
+  }
+  if (key == "terrainpresetstrength" || key == "terrain_preset_strength" || key == "presetstrength" ||
+      key == "preset_strength") {
+    float s = ctx.procCfg.terrainPresetStrength;
+    if (!ParseF32(val, &s)) return false;
+    ctx.procCfg.terrainPresetStrength = std::clamp(s, 0.0f, 5.0f);
+    return true;
+  }
+
+  // Procedural road hierarchy pass (v11).
+  if (key == "roadhierarchy" || key == "road_hierarchy" || key == "road_hierarchy_enabled" ||
+      key == "road_hierarchy_enable") {
+    bool b = false;
+    if (!ParseBool01(val, &b)) return false;
+    ctx.procCfg.roadHierarchyEnabled = b;
+    return true;
+  }
+  if (key == "roadhierarchystrength" || key == "road_hierarchy_strength" || key == "road_strength" ||
+      key == "road_hierarchy_str") {
+    float s = ctx.procCfg.roadHierarchyStrength;
+    if (!ParseF32(val, &s)) return false;
+    ctx.procCfg.roadHierarchyStrength = std::clamp(s, 0.0f, 3.0f);
+    return true;
+  }
+
+  // Procedural district assignment (v12).
+  if (key == "districtingmode" || key == "districting_mode" || key == "district_mode" ||
+      key == "districts_mode") {
+    ProcGenDistrictingMode mode{};
+    if (!ParseProcGenDistrictingMode(val, mode)) {
+      return runner.fail(path, lineNo, "proc: districting_mode expects one of: voronoi|road_flow|block_graph");
+    }
+    ctx.procCfg.districtingMode = mode;
+    return true;
+  }
+
   // --- Erosion controls (new in save v9 / patch v2) ---
   if (key == "erosion" || key == "erosion_enabled" || key == "erode") {
     bool b = false;

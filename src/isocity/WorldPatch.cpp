@@ -214,6 +214,20 @@ bool WriteProcCfg(ByteWriter& w, const ProcGenConfig& cfg, std::uint32_t patchVe
     if (!w.writeI32(static_cast<std::int32_t>(cfg.erosion.quantizeScale))) return false;
   }
 
+  // v3+: terrain preset + road hierarchy settings.
+  if (patchVersion >= 3) {
+    if (!w.writeU8(static_cast<std::uint8_t>(cfg.terrainPreset))) return false;
+    if (!w.writeF32(cfg.terrainPresetStrength)) return false;
+
+    if (!w.writeU8(static_cast<std::uint8_t>(cfg.roadHierarchyEnabled ? 1 : 0))) return false;
+    if (!w.writeF32(cfg.roadHierarchyStrength)) return false;
+  }
+
+
+
+  if (patchVersion >= 4) {
+    if (!w.writeU8(static_cast<std::uint8_t>(cfg.districtingMode))) return false;
+  }
   return true;
 }
 
@@ -263,6 +277,45 @@ bool ReadProcCfg(ByteReader& r, ProcGenConfig& cfg, std::uint32_t patchVersion)
     // v1 patches predate erosion; preserve old behavior.
     cfg.erosion = ErosionConfig{};
     cfg.erosion.enabled = false;
+  }
+
+  // v3+: terrain preset + road hierarchy.
+  if (patchVersion >= 3) {
+    std::uint8_t presetU8 = 0;
+    std::uint8_t rhEnabled = 0;
+    if (!r.readU8(presetU8)) return false;
+    if (!r.readF32(cfg.terrainPresetStrength)) return false;
+    if (!r.readU8(rhEnabled)) return false;
+    if (!r.readF32(cfg.roadHierarchyStrength)) return false;
+
+    if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::MountainRing)) {
+      presetU8 = static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
+    }
+    cfg.terrainPreset = static_cast<ProcGenTerrainPreset>(presetU8);
+    cfg.terrainPresetStrength = std::clamp(cfg.terrainPresetStrength, 0.0f, 5.0f);
+
+    cfg.roadHierarchyEnabled = (rhEnabled != 0);
+    cfg.roadHierarchyStrength = std::clamp(cfg.roadHierarchyStrength, 0.0f, 3.0f);
+  } else {
+    // v1/v2 patches predate these settings; preserve old behavior.
+    cfg.terrainPreset = ProcGenTerrainPreset::Classic;
+    cfg.terrainPresetStrength = 1.0f;
+    cfg.roadHierarchyEnabled = false;
+    cfg.roadHierarchyStrength = 0.0f;
+  }
+
+
+
+  if (patchVersion >= 4) {
+    std::uint8_t dmU8 = 0;
+    if (!r.readU8(dmU8)) return false;
+    if (dmU8 > static_cast<std::uint8_t>(ProcGenDistrictingMode::BlockGraph)) {
+      dmU8 = static_cast<std::uint8_t>(ProcGenDistrictingMode::Voronoi);
+    }
+    cfg.districtingMode = static_cast<ProcGenDistrictingMode>(dmU8);
+  } else {
+    // Older patch versions did not persist districting mode.
+    cfg.districtingMode = ProcGenDistrictingMode::Voronoi;
   }
 
   return true;
@@ -473,7 +526,7 @@ bool ReadStats(ByteReader& r, Stats& s)
 //   u8  compressionMethod (WorldPatchCompression)
 //   u32 payloadSize (uncompressed)
 //   u32 payloadSizeCompressed
-inline constexpr std::uint32_t kPatchVersion = 2;
+inline constexpr std::uint32_t kPatchVersion = 4;
 inline constexpr std::uint8_t kMagic[8] = { 'I','S','O','P','A','T','C','H' };
 
 enum PatchFlags : std::uint32_t {

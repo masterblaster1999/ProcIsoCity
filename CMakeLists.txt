@@ -106,6 +106,7 @@ add_library(isocity_core
   src/isocity/EditHistory.cpp
   src/isocity/Pathfinding.cpp
   src/isocity/RoadGraph.cpp
+  src/isocity/RoadGraphRouting.cpp
   src/isocity/RoadGraphTraffic.cpp
   src/isocity/RoadGraphResilience.cpp
   src/isocity/RoadGraphCentrality.cpp
@@ -187,7 +188,9 @@ if (PROCISOCITY_BUILD_APP)
     src/isocity/EditHistory.hpp
 
     src/isocity/Renderer.hpp
+    src/isocity/VisualPrefs.hpp
     src/isocity/Renderer.cpp
+    src/isocity/VisualPrefs.cpp
   )
 
   target_include_directories(proc_isocity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

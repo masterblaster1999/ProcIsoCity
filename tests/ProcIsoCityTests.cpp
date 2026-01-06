@@ -1,6 +1,7 @@
 #include "isocity/EditHistory.hpp"
 #include "isocity/Pathfinding.hpp"
 #include "isocity/RoadGraph.hpp"
+#include "isocity/RoadGraphRouting.hpp"
 #include "isocity/TransitPlanner.hpp"
 #include "isocity/RoadGraphExport.hpp"
 #include "isocity/RoadGraphTraffic.hpp"
@@ -520,6 +521,10 @@ void TestSaveLoadRoundTrip()
   using namespace isocity;
 
   ProcGenConfig cfg{};
+  cfg.terrainPreset = ProcGenTerrainPreset::Island;
+  cfg.terrainPresetStrength = 1.35f;
+  cfg.roadHierarchyEnabled = true;
+  cfg.roadHierarchyStrength = 1.65f;
   const std::uint64_t seed = 0xC0FFEEu;
 
   World w = GenerateWorld(32, 32, seed, cfg);
@@ -596,7 +601,7 @@ void TestSaveLoadRoundTrip()
 
     EXPECT_TRUE(in.good());
     EXPECT_TRUE(std::memcmp(magic, "ISOCITY\0", 8) == 0);
-    EXPECT_EQ(version, static_cast<std::uint32_t>(9));
+    EXPECT_EQ(version, static_cast<std::uint32_t>(12));
   }
 
   // Save summary should parse without loading the full world.
@@ -604,7 +609,7 @@ void TestSaveLoadRoundTrip()
     SaveSummary sum{};
     std::string err3;
     EXPECT_TRUE(ReadSaveSummary(savePath.string(), sum, err3, true));
-    EXPECT_EQ(sum.version, static_cast<std::uint32_t>(9));
+    EXPECT_EQ(sum.version, static_cast<std::uint32_t>(12));
     EXPECT_EQ(sum.width, w.width());
     EXPECT_EQ(sum.height, w.height());
     EXPECT_EQ(sum.seed, w.seed());
@@ -613,6 +618,11 @@ void TestSaveLoadRoundTrip()
     EXPECT_EQ(sum.stats.money, w.stats().money);
     EXPECT_TRUE(sum.hasProcCfg);
     EXPECT_NEAR(sum.procCfg.waterLevel, cfg.waterLevel, 1e-6f);
+    EXPECT_EQ(sum.procCfg.terrainPreset, cfg.terrainPreset);
+    EXPECT_NEAR(sum.procCfg.terrainPresetStrength, cfg.terrainPresetStrength, 1e-6f);
+    EXPECT_EQ(sum.procCfg.roadHierarchyEnabled, cfg.roadHierarchyEnabled);
+    EXPECT_NEAR(sum.procCfg.roadHierarchyStrength, cfg.roadHierarchyStrength, 1e-6f);
+    EXPECT_EQ(sum.procCfg.districtingMode, cfg.districtingMode);
     EXPECT_TRUE(sum.hasSimCfg);
     EXPECT_EQ(sum.simCfg.taxResidential, simCfg.taxResidential);
     EXPECT_TRUE(sum.crcChecked);
@@ -624,6 +634,13 @@ void TestSaveLoadRoundTrip()
   SimConfig loadedSimCfg{};
   err.clear();
   EXPECT_TRUE(LoadWorldBinary(loaded, loadedCfg, loadedSimCfg, savePath.string(), err));
+
+  // ProcGenConfig should round-trip (at least for the persisted fields).
+  EXPECT_EQ(loadedCfg.terrainPreset, cfg.terrainPreset);
+  EXPECT_NEAR(loadedCfg.terrainPresetStrength, cfg.terrainPresetStrength, 1e-6f);
+  EXPECT_EQ(loadedCfg.roadHierarchyEnabled, cfg.roadHierarchyEnabled);
+  EXPECT_NEAR(loadedCfg.roadHierarchyStrength, cfg.roadHierarchyStrength, 1e-6f);
+  EXPECT_EQ(loadedCfg.districtingMode, cfg.districtingMode);
 
   // SimConfig should round-trip (within reasonable float epsilon).
   EXPECT_NEAR(loadedSimCfg.tickSeconds, simCfg.tickSeconds, 1e-6f);
@@ -643,6 +660,12 @@ void TestSaveLoadRoundTrip()
   EXPECT_EQ(loaded.width(), w.width());
   EXPECT_EQ(loaded.height(), w.height());
   EXPECT_EQ(loaded.seed(), w.seed());
+
+  // ProcGenConfig should round-trip (new v11 fields).
+  EXPECT_EQ(loadedCfg.terrainPreset, cfg.terrainPreset);
+  EXPECT_NEAR(loadedCfg.terrainPresetStrength, cfg.terrainPresetStrength, 1e-6f);
+  EXPECT_EQ(loadedCfg.roadHierarchyEnabled, cfg.roadHierarchyEnabled);
+  EXPECT_NEAR(loadedCfg.roadHierarchyStrength, cfg.roadHierarchyStrength, 1e-6f);
 
   // Check our edits survived.
   EXPECT_EQ(loaded.at(x, y).overlay, Overlay::Road);
@@ -740,6 +763,13 @@ void TestSaveV8UsesCompressionForLargeDeltaPayload()
     std::int32_t extraConnections;
     float zoneChance;
     float parkChance;
+
+    std::uint8_t terrainPreset;
+    std::uint8_t roadHierarchyEnabled;
+    std::uint8_t districtingMode;
+    std::uint8_t _pad0;
+    float terrainPresetStrength;
+    float roadHierarchyStrength;
   };
 
   struct StatsBinLocal {
@@ -806,7 +836,7 @@ void TestSaveV8UsesCompressionForLargeDeltaPayload()
   in.read(reinterpret_cast<char*>(&seedRead), static_cast<std::streamsize>(sizeof(seedRead)));
   EXPECT_TRUE(in.good());
   EXPECT_TRUE(std::memcmp(magic, "ISOCITY\0", 8) == 0);
-  EXPECT_EQ(version, static_cast<std::uint32_t>(9));
+  EXPECT_EQ(version, static_cast<std::uint32_t>(12));
   EXPECT_EQ(wDim, static_cast<std::uint32_t>(w.width()));
   EXPECT_EQ(hDim, static_cast<std::uint32_t>(w.height()));
   EXPECT_EQ(seedRead, w.seed());
@@ -879,6 +909,8 @@ void TestSaveLoadBytesRoundTrip()
   using namespace isocity;
 
   ProcGenConfig cfg{};
+  cfg.terrainPreset = ProcGenTerrainPreset::RiverValley;
+  cfg.terrainPresetStrength = 0.85f;
   const std::uint64_t seed = 0xBADDCAFEu;
 
   World w = GenerateWorld(24, 20, seed, cfg);
@@ -938,6 +970,9 @@ void TestSaveLoadBytesRoundTrip()
   std::string err2;
   EXPECT_TRUE(LoadWorldBinaryFromBytes(loaded, loadedCfg, loadedSim, bytes.data(), bytes.size(), err2));
   EXPECT_TRUE(err2.empty());
+
+  EXPECT_EQ(loadedCfg.terrainPreset, cfg.terrainPreset);
+  EXPECT_NEAR(loadedCfg.terrainPresetStrength, cfg.terrainPresetStrength, 1e-6f);
 
   // Hash includes tiles + stats (and should match after road mask reconstruction).
   EXPECT_EQ(HashWorld(loaded, true), HashWorld(w, true));
@@ -1588,6 +1623,69 @@ void TestRoadPathfindingAStar()
   EXPECT_EQ(static_cast<int>(path.size()), 6);
   EXPECT_EQ(path.front().x, 0);
   EXPECT_EQ(path.back().x, 5);
+}
+
+
+void TestRoadGraphRoutingInteriorToInterior()
+{
+  using namespace isocity;
+
+  World w(7, 3, 123u);
+  for (int x = 0; x < 7; ++x) {
+    w.setRoad(x, 1);
+  }
+
+  RoadGraph g = BuildRoadGraph(w);
+  RoadGraphIndex idx = BuildRoadGraphIndex(w, g);
+  RoadGraphWeights wts = BuildRoadGraphWeights(w, g);
+
+  RoadRouteResult r = FindRoadRouteAStar(w, g, idx, wts, Point{1, 1}, Point{5, 1});
+  EXPECT_TRUE(!r.path.empty());
+  EXPECT_EQ(r.path.front().x, 1);
+  EXPECT_EQ(r.path.front().y, 1);
+  EXPECT_EQ(r.path.back().x, 5);
+  EXPECT_EQ(r.path.back().y, 1);
+  EXPECT_EQ(static_cast<int>(r.path.size()), 5);
+  EXPECT_EQ(r.steps, 4);
+  for (const Point& p : r.path) {
+    EXPECT_EQ(p.y, 1);
+  }
+}
+
+void TestRoadGraphRoutingTravelTimeVsSteps()
+{
+  using namespace isocity;
+
+  // Two routes from (0,1) to (6,1):
+  //  - Direct street along y=1 (level 1)
+  //  - A longer detour via y=0 (level 3 highway) that should win on travel-time
+  World w(7, 3, 456u);
+
+  for (int x = 0; x < 7; ++x) {
+    w.setRoad(x, 1); // street
+    w.setRoad(x, 0); // highway row
+    w.at(x, 0).level = 3;
+  }
+
+  RoadGraph g = BuildRoadGraph(w);
+  RoadGraphIndex idx = BuildRoadGraphIndex(w, g);
+  RoadGraphWeights wts = BuildRoadGraphWeights(w, g);
+
+  RoadRouteConfig cfg;
+  cfg.metric = RoadRouteMetric::TravelTime;
+  RoadRouteResult rTime = FindRoadRouteAStar(w, g, idx, wts, Point{0, 1}, Point{6, 1}, cfg);
+  EXPECT_TRUE(rTime.path.size() >= 2);
+  // The fastest path should immediately go up to the highway row.
+  EXPECT_EQ(rTime.path[1].x, 0);
+  EXPECT_EQ(rTime.path[1].y, 0);
+
+  cfg.metric = RoadRouteMetric::Steps;
+  RoadRouteResult rSteps = FindRoadRouteAStar(w, g, idx, wts, Point{0, 1}, Point{6, 1}, cfg);
+  EXPECT_TRUE(rSteps.path.size() >= 2);
+  // The fewest-steps path should stay on the direct street row.
+  for (const Point& p : rSteps.path) {
+    EXPECT_EQ(p.y, 1);
+  }
 }
 
 void TestLandPathfindingAStarAvoidsWater()
@@ -2454,6 +2552,52 @@ void TestProcGenErosionToggleAffectsHash()
   World c = GenerateWorld(48, 48, seed, pcNoErosion);
   sim.refreshDerivedStats(c);
   EXPECT_EQ(hb, HashWorld(c));
+}
+
+void TestProcGenTerrainPresetIslandMakesCoastalWater()
+{
+  using namespace isocity;
+
+  ProcGenConfig pc{};
+  pc.zoneChance = 0.0f;
+  pc.parkChance = 0.0f;
+  pc.hubs = 1;
+  pc.extraConnections = 0;
+  pc.erosion.enabled = false;
+  pc.erosion.riversEnabled = false;
+  pc.terrainPreset = ProcGenTerrainPreset::Island;
+  pc.terrainPresetStrength = 1.0f;
+
+  const std::uint64_t seed = 0x12345678u;
+  const World w = GenerateWorld(64, 64, seed, pc);
+
+  int border = 0;
+  int borderWater = 0;
+
+  for (int y = 0; y < w.height(); ++y) {
+    for (int x = 0; x < w.width(); ++x) {
+      const bool isBorder = (x == 0 || y == 0 || x == w.width() - 1 || y == w.height() - 1);
+      if (!isBorder) continue;
+      ++border;
+      if (w.at(x, y).terrain == Terrain::Water) ++borderWater;
+    }
+  }
+
+  const float frac = (border > 0) ? (static_cast<float>(borderWater) / static_cast<float>(border)) : 0.0f;
+
+  // With the island preset enabled, the map edges should be *mostly* water.
+  EXPECT_TRUE(frac > 0.55f);
+
+  // Ensure there is some interior land.
+  bool foundLand = false;
+  const int cx = w.width() / 2;
+  const int cy = w.height() / 2;
+  for (int y = std::max(0, cy - 4); y <= std::min(w.height() - 1, cy + 4) && !foundLand; ++y) {
+    for (int x = std::max(0, cx - 4); x <= std::min(w.width() - 1, cx + 4) && !foundLand; ++x) {
+      if (w.at(x, y).terrain != Terrain::Water) foundLand = true;
+    }
+  }
+  EXPECT_TRUE(foundLand);
 }
 
 
@@ -3697,6 +3841,11 @@ void TestConfigJsonIO()
   proc.extraConnections = 7;
   proc.zoneChance = 0.10f;
   proc.parkChance = 0.99f;
+  proc.terrainPreset = ProcGenTerrainPreset::MountainRing;
+  proc.terrainPresetStrength = 1.7f;
+  proc.roadHierarchyEnabled = false;
+  proc.roadHierarchyStrength = 2.25f;
+  proc.districtingMode = ProcGenDistrictingMode::RoadFlow;
   proc.erosion.enabled = false;
   proc.erosion.thermalIterations = 7;
   proc.erosion.thermalTalus = 0.07f;
@@ -3724,6 +3873,11 @@ void TestConfigJsonIO()
   EXPECT_EQ(proc2.extraConnections, proc.extraConnections);
   EXPECT_TRUE(std::fabs(proc2.zoneChance - proc.zoneChance) < 1e-6f);
   EXPECT_TRUE(std::fabs(proc2.parkChance - proc.parkChance) < 1e-6f);
+  EXPECT_EQ(proc2.terrainPreset, proc.terrainPreset);
+  EXPECT_TRUE(std::fabs(proc2.terrainPresetStrength - proc.terrainPresetStrength) < 1e-6f);
+  EXPECT_EQ(proc2.roadHierarchyEnabled, proc.roadHierarchyEnabled);
+  EXPECT_TRUE(std::fabs(proc2.roadHierarchyStrength - proc.roadHierarchyStrength) < 1e-6f);
+  EXPECT_EQ(proc2.districtingMode, proc.districtingMode);
   EXPECT_EQ(proc2.erosion.enabled, proc.erosion.enabled);
   EXPECT_EQ(proc2.erosion.thermalIterations, proc.erosion.thermalIterations);
   EXPECT_TRUE(std::fabs(proc2.erosion.thermalTalus - proc.erosion.thermalTalus) < 1e-6f);
@@ -6148,6 +6302,49 @@ void TestPngReadersSupportDeflateAndFilters()
 }
 
 
+void TestExport3DHeightfieldAndSkirt()
+{
+  using namespace isocity;
+
+  World w = GenerateWorld(48, 48, 12345u);
+
+  Render3DConfig cfg;
+  cfg.width = 256;
+  cfg.height = 160;
+  cfg.supersample = 1;
+  cfg.drawOutlines = false;
+  cfg.meshCfg.heightScale = 10.0f;
+  cfg.meshCfg.heightQuantization = 0.0f;
+  cfg.meshCfg.includeBuildings = false;
+  cfg.meshCfg.includeCliffs = false;
+  cfg.meshCfg.overlayOffset = 0.0f;
+
+  auto hashImg = [&](const PpmImage& img) -> std::uint64_t {
+    std::uint64_t h = 1469598103934665603ull; // FNV-1a 64-bit offset basis
+    for (std::uint8_t b : img.rgb) {
+      h ^= static_cast<std::uint64_t>(b);
+      h *= 1099511628211ull; // FNV prime
+    }
+    return h;
+  };
+
+  cfg.heightfieldTopSurfaces = false;
+  cfg.addSkirt = false;
+  const PpmImage flat = RenderWorld3D(w, ExportLayer::Terrain, cfg);
+  EXPECT_EQ(flat.width, cfg.width);
+  EXPECT_EQ(flat.height, cfg.height);
+
+  cfg.heightfieldTopSurfaces = true;
+  cfg.addSkirt = true;
+  cfg.skirtDrop = 5.0f;
+  const PpmImage hf = RenderWorld3D(w, ExportLayer::Terrain, cfg);
+  EXPECT_EQ(hf.width, cfg.width);
+  EXPECT_EQ(hf.height, cfg.height);
+
+  EXPECT_NE(hashImg(flat), hashImg(hf));
+}
+
+
 int main()
 {
   TestRoadAutoTilingMasks();
@@ -6200,6 +6397,7 @@ int main()
   TestProcGenBlockZoningCreatesInteriorAccessibleZones();
   TestProcGenRiversAsWaterAddsWaterTiles();
   TestProcGenErosionToggleAffectsHash();
+  TestProcGenTerrainPresetIslandMakesCoastalWater();
   TestSimulationDeterministicHashAfterTicks();
   TestWorldDiffCounts();
   TestWorldPatchRoundTrip();
@@ -6216,6 +6414,7 @@ int main()
   TestExportPpmLayers();
   TestExportIsoOverview();
   TestExportIsoOverviewAtmosphere();
+  TestExport3DHeightfieldAndSkirt();
   TestPpmReadWriteAndCompare();
   TestHeightmapApplyReclassifyAndBulldoze();
   TestHeightmapApplyResampleNearest();
@@ -6258,6 +6457,8 @@ int main()
 
 
   TestRoadPathfindingAStar();
+  TestRoadGraphRoutingInteriorToInterior();
+  TestRoadGraphRoutingTravelTimeVsSteps();
   TestLandPathfindingAStarAvoidsWater();
   TestRoadBuildPathPrefersExistingRoads();
   TestRoadBuildPathMinimizesTurnsWhenStepsTie();

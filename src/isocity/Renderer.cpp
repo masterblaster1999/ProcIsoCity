@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace isocity {
 
@@ -1768,6 +1769,37 @@ static void DrawZoneTileIndicators(const Tile& t, float tileW, float tileH, floa
   DrawRectangleV(Vector2{barX, barY}, Vector2{barW * occRatio, barH}, Color{255, 255, 255, 170});
 }
 
+
+// Road indicators: show small pips for upgraded road class (2..3) when zoomed in.
+static void DrawRoadIndicators(const Tile& t, float tileW, float tileH, float zoom, const Vector2& tileCenter, float tileBrightness)
+{
+  (void)tileBrightness; // reserved for future shading tweaks
+
+  const float tileScreenW = tileW * zoom;
+  if (tileScreenW < 28.0f) return;
+
+  const int lvl = std::clamp<int>(static_cast<int>(t.level), 1, 3);
+  if (lvl <= 1) return;
+
+  const float invZoom = 1.0f / std::max(0.001f, zoom);
+  const float y0 = tileCenter.y - tileH * 0.02f;
+
+  const float pip = 4.0f * invZoom;
+  const float gap = 1.5f * invZoom;
+  const float groupW = pip * 3.0f + gap * 2.0f;
+  const float groupX0 = tileCenter.x - groupW * 0.5f;
+
+  for (int i = 0; i < 3; ++i) {
+    Rectangle r{groupX0 + static_cast<float>(i) * (pip + gap), y0, pip, pip};
+    DrawRectangleRec(r, Color{0, 0, 0, 110});
+    DrawRectangleLinesEx(r, 1.0f * invZoom, Color{255, 255, 255, 55});
+    if (i < lvl) {
+      Rectangle f{r.x + 1.0f * invZoom, r.y + 1.0f * invZoom, r.width - 2.0f * invZoom, r.height - 2.0f * invZoom};
+      DrawRectangleRec(f, Color{255, 255, 255, 160});
+    }
+  }
+}
+
 Renderer::Renderer(int tileW, int tileH, std::uint64_t seed)
     : m_tileW(tileW)
     , m_tileH(tileH)
@@ -1944,9 +1976,13 @@ void Renderer::unloadMinimap()
 void Renderer::unloadBaseCache()
 {
   for (auto& b : m_bands) {
-    if (b.rt.id != 0) {
-      UnloadRenderTexture(b.rt);
-      b.rt = RenderTexture2D{};
+    if (b.terrain.id != 0) {
+      UnloadRenderTexture(b.terrain);
+      b.terrain = RenderTexture2D{};
+    }
+    if (b.structures.id != 0) {
+      UnloadRenderTexture(b.structures);
+      b.structures = RenderTexture2D{};
     }
   }
   m_bands.clear();
@@ -1959,7 +1995,10 @@ void Renderer::unloadBaseCache()
 void Renderer::markBaseCacheDirtyAll()
 {
   m_bandCacheDirtyAll = true;
-  for (auto& b : m_bands) b.dirty = true;
+  for (auto& b : m_bands) {
+    b.dirtyTerrain = true;
+    b.dirtyStructures = true;
+  }
 }
 
 void Renderer::markBaseCacheDirtyForTiles(const std::vector<Point>& tiles, int mapW, int mapH)
@@ -1980,7 +2019,9 @@ void Renderer::markBaseCacheDirtyForTiles(const std::vector<Point>& tiles, int m
     if (sum < 0 || sum >= numSums) return;
     const int bi = sum / kBandSums;
     if (bi >= 0 && bi < static_cast<int>(m_bands.size())) {
-      m_bands[static_cast<std::size_t>(bi)].dirty = true;
+      BandCache& b = m_bands[static_cast<std::size_t>(bi)];
+      b.dirtyTerrain = true;
+      b.dirtyStructures = true;
     }
   };
 
@@ -2036,7 +2077,8 @@ void Renderer::ensureBaseCache(const World& world)
       BandCache& b = m_bands[static_cast<std::size_t>(i)];
       b.sum0 = i * kBandSums;
       b.sum1 = std::min(numSums - 1, b.sum0 + (kBandSums - 1));
-      b.dirty = true;
+      b.dirtyTerrain = true;
+      b.dirtyStructures = true;
 
       const BandBounds bb = ComputeBandBounds(b.sum0, b.sum1, mapW, mapH, tileW, tileH, std::max(0.0f, m_bandMaxPixels));
       b.origin = Vector2{bb.minX - pad, bb.minY - pad};
@@ -2044,10 +2086,16 @@ void Renderer::ensureBaseCache(const World& world)
       const int texW = std::max(1, static_cast<int>(std::ceil((bb.maxX - bb.minX) + pad * 2.0f)));
       const int texH = std::max(1, static_cast<int>(std::ceil((bb.maxY - bb.minY) + pad * 2.0f)));
 
-      b.rt = LoadRenderTexture(texW, texH);
-      if (b.rt.id != 0) {
-        // Keep cached layers crisp when scaling.
-        SetTextureFilter(b.rt.texture, TEXTURE_FILTER_POINT);
+      // Terrain base cache (terrain tops + cliffs).
+      b.terrain = LoadRenderTexture(texW, texH);
+      if (b.terrain.id != 0) {
+        SetTextureFilter(b.terrain.texture, TEXTURE_FILTER_POINT);
+      }
+
+      // Structures base cache (roads/zones/parks).
+      b.structures = LoadRenderTexture(texW, texH);
+      if (b.structures.id != 0) {
+        SetTextureFilter(b.structures.texture, TEXTURE_FILTER_POINT);
       }
     }
 
@@ -2055,15 +2103,18 @@ void Renderer::ensureBaseCache(const World& world)
   }
 
   if (m_bandCacheDirtyAll) {
-    for (auto& b : m_bands) b.dirty = true;
+    for (auto& b : m_bands) {
+      b.dirtyTerrain = true;
+      b.dirtyStructures = true;
+    }
     m_bandCacheDirtyAll = false;
   }
 }
 
-void Renderer::rebuildBaseCacheBand(const World& world, BandCache& band)
+void Renderer::rebuildTerrainCacheBand(const World& world, BandCache& band)
 {
-  if (band.rt.id == 0) {
-    band.dirty = false;
+  if (band.terrain.id == 0) {
+    band.dirtyTerrain = false;
     return;
   }
 
@@ -2076,7 +2127,7 @@ void Renderer::rebuildBaseCacheBand(const World& world, BandCache& band)
   const Rectangle src = Rectangle{0, 0, tileWf, tileHf};
   const Vector2 shift = Vector2{-band.origin.x, -band.origin.y};
 
-  BeginTextureMode(band.rt);
+  BeginTextureMode(band.terrain);
   ClearBackground(BLANK);
 
   for (int sum = band.sum0; sum <= band.sum1; ++sum) {
@@ -2092,14 +2143,15 @@ void Renderer::rebuildBaseCacheBand(const World& world, BandCache& band)
       const Vector2 center{baseCenter.x, baseCenter.y - elevPx};
 
       const Rectangle dst = Rectangle{center.x - tileWf * 0.5f, center.y - tileHf * 0.5f, tileWf, tileHf};
+
       // Per-tile lighting: base height/variation + slope/AO (no animated water shimmer in cache).
       const TileLighting light = ComputeTileLighting(world, x, y, tileWf, tileHf, m_elev, 0.0f, false);
       const float brightness = light.base;
 
-      // Draw terrain
+      // Draw terrain tops.
       DrawTexturePro(terrain(t.terrain, t.variation), src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
 
-      // Draw cliff walls for higher neighbors behind this tile (same logic as immediate path).
+      // Draw cliff walls for higher neighbors behind this tile.
       {
         Vector2 baseCorners[4];
         TileDiamondCorners(baseCenter, tileWf, tileHf, baseCorners);
@@ -2135,11 +2187,55 @@ void Renderer::rebuildBaseCacheBand(const World& world, BandCache& band)
           drawCliffEdge(baseCorners[0], baseCorners[1], ne, elevPx, Mul(base, 0.85f));
         }
       }
+    }
+  }
 
-      // Draw overlay (base view only: no traffic/goods/outside/heatmap tinting).
+  EndTextureMode();
+  band.dirtyTerrain = false;
+}
+
+void Renderer::rebuildStructureCacheBand(const World& world, BandCache& band)
+{
+  if (band.structures.id == 0) {
+    band.dirtyStructures = false;
+    return;
+  }
+
+  const int mapW = world.width();
+  const int mapH = world.height();
+
+  const float tileWf = static_cast<float>(m_tileW);
+  const float tileHf = static_cast<float>(m_tileH);
+
+  const Rectangle src = Rectangle{0, 0, tileWf, tileHf};
+  const Vector2 shift = Vector2{-band.origin.x, -band.origin.y};
+
+  BeginTextureMode(band.structures);
+  ClearBackground(BLANK);
+
+  for (int sum = band.sum0; sum <= band.sum1; ++sum) {
+    const int x0 = std::max(0, sum - (mapH - 1));
+    const int x1 = std::min(mapW - 1, sum);
+    for (int x = x0; x <= x1; ++x) {
+      const int y = sum - x;
+      const Tile& t = world.at(x, y);
+
+      const float elevPx = TileElevationPx(t, m_elev);
+      const Vector2 baseCenterW = TileToWorldCenter(x, y, tileWf, tileHf);
+      const Vector2 baseCenter{baseCenterW.x + shift.x, baseCenterW.y + shift.y};
+      const Vector2 center{baseCenter.x, baseCenter.y - elevPx};
+
+      const Rectangle dst = Rectangle{center.x - tileWf * 0.5f, center.y - tileHf * 0.5f, tileWf, tileHf};
+
+      // Per-tile lighting: base height/variation + slope/AO (no animated water shimmer in cache).
+      const TileLighting light = ComputeTileLighting(world, x, y, tileWf, tileHf, m_elev, 0.0f, false);
+      const float brightness = light.base;
+
+      // Draw base overlays (no traffic/goods/outside tinting).
       if (t.overlay == Overlay::Road) {
         const std::uint8_t mask = static_cast<std::uint8_t>(t.variation & 0x0Fu);
-        Texture2D& rtex = (t.terrain == Terrain::Water) ? bridge(mask, t.variation, t.level) : road(mask, t.variation, t.level);
+        Texture2D& rtex =
+            (t.terrain == Terrain::Water) ? bridge(mask, t.variation, t.level) : road(mask, t.variation, t.level);
         DrawTexturePro(rtex, src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
       } else if (t.overlay != Overlay::None) {
         DrawTexturePro(overlay(t.overlay), src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
@@ -2148,7 +2244,7 @@ void Renderer::rebuildBaseCacheBand(const World& world, BandCache& band)
   }
 
   EndTextureMode();
-  band.dirty = false;
+  band.dirtyStructures = false;
 }
 
 Renderer::MinimapLayout Renderer::minimapLayout(const World& world, int screenW, int screenH) const
@@ -2243,7 +2339,8 @@ bool Renderer::exportMinimapThumbnail(const World& world, const char* fileName, 
   return ok;
 }
 
-bool Renderer::exportWorldOverview(const World& world, const char* fileName, int maxSize)
+bool Renderer::exportWorldOverview(const World& world, const char* fileName, int maxSize,
+                                float timeSec, bool includeScreenFx)
 {
   if (fileName == nullptr || fileName[0] == '\0') return false;
 
@@ -2307,7 +2404,7 @@ bool Renderer::exportWorldOverview(const World& world, const char* fileName, int
   BeginTextureMode(rt);
   ClearBackground(BLANK);
   drawWorld(world, cam, texW, texH,
-            /*timeSec=*/0.0f,
+            /*timeSec=*/timeSec,
             /*hovered=*/std::nullopt,
             /*drawGrid=*/false,
             /*brushRadius=*/0,
@@ -2321,6 +2418,11 @@ bool Renderer::exportWorldOverview(const World& world, const char* fileName, int
             /*commercialGoodsFill=*/nullptr,
             /*heatmap=*/nullptr,
             /*heatmapRamp=*/HeatmapRamp::Good);
+
+  if (includeScreenFx) {
+    // Screen-space precipitation + fog pass (matches the in-game draw order).
+    drawWeatherScreenFX(texW, texH, timeSec, /*allowAestheticDetails=*/true);
+  }
   EndTextureMode();
 
   m_useBandCache = prevCache;
@@ -2870,6 +2972,293 @@ inline Color LerpColor(Color a, Color b, float t) {
   return Color{LerpU8(a.r, b.r, t), LerpU8(a.g, b.g, t), LerpU8(a.b, b.b, t), LerpU8(a.a, b.a, t)};
 }
 
+
+// -----------------------------
+// Building ground shadows (stylized 2D projection)
+// -----------------------------
+
+struct BuildingShadowCaster {
+  Vector2 base[4]{};      // base footprint polygon (world coords)
+  float heightPx = 0.0f;  // building height in world pixels
+  float alphaScale = 1.0f;
+};
+
+static Vector2 UnitDirFromAzimuthDeg(float deg) {
+  constexpr float kPi = 3.14159265358979323846f;
+  const float rad = deg * (kPi / 180.0f);
+  Vector2 d{static_cast<float>(std::cos(rad)), static_cast<float>(std::sin(rad))};
+  const float len = std::sqrt(d.x * d.x + d.y * d.y);
+  if (len > 0.0001f) {
+    d.x /= len;
+    d.y /= len;
+  } else {
+    d = Vector2{1.0f, 0.0f};
+  }
+  return d;
+}
+
+static bool BuildZoneTileShadowCaster(const Tile& t, float tileW, float tileH, float zoom, const Vector2& tileCenter,
+                                     BuildingShadowCaster& out) {
+  (void)zoom;
+
+  const Overlay ov = t.overlay;
+  if (!(ov == Overlay::Residential || ov == Overlay::Commercial || ov == Overlay::Industrial || ov == Overlay::Park)) {
+    return false;
+  }
+
+  int lvl = ClampZoneLevel(static_cast<int>(t.level));
+  float heightMul = 1.0f;
+  float baseShrink = 0.86f;
+  int cap = 0;
+
+  switch (ov) {
+    case Overlay::Residential:
+      heightMul = 0.95f;
+      baseShrink = 0.86f;
+      cap = CapacityForOverlayLevel(ov, lvl);
+      break;
+    case Overlay::Commercial:
+      heightMul = 1.10f;
+      baseShrink = 0.84f;
+      cap = CapacityForOverlayLevel(ov, lvl);
+      break;
+    case Overlay::Industrial:
+      heightMul = 1.25f;
+      baseShrink = 0.82f;
+      cap = CapacityForOverlayLevel(ov, lvl);
+      break;
+    case Overlay::Park:
+      // small pavilion / kiosk
+      heightMul = 0.45f;
+      baseShrink = 0.92f;
+      cap = 10;
+      lvl = 1;
+      break;
+    default:
+      return false;
+  }
+
+  const int occ = std::max(0, t.occupants);
+  const float occRatio = (cap > 0) ? std::clamp(static_cast<float>(occ) / static_cast<float>(cap), 0.0f, 1.0f) : 0.0f;
+  const float var = 0.15f + 0.85f * (static_cast<float>(t.variation) / 255.0f);
+
+  float heightPx = tileH * (0.55f + 0.65f * static_cast<float>(lvl)) + tileH * (0.25f + 0.45f * static_cast<float>(lvl)) * occRatio;
+  heightPx *= heightMul;
+  heightPx *= (0.85f + 0.35f * var);
+
+  const float maxH = tileH * (2.6f + 0.7f * static_cast<float>(lvl)) * heightMul;
+  heightPx = std::min(heightPx, maxH);
+
+  Vector2 outer[4];
+  TileDiamondCorners(tileCenter, tileW, tileH, outer);
+  ShrinkDiamond(out.base, outer, baseShrink);
+
+  out.heightPx = heightPx;
+  const float hNorm = std::clamp(heightPx / (tileH * 2.2f), 0.0f, 1.0f);
+  out.alphaScale = std::clamp(0.55f + 0.45f * hNorm, 0.45f, 1.0f) * (0.75f + 0.25f * occRatio);
+  return true;
+}
+
+static bool BuildZoneParcelShadowCaster(const World& world, const ZoneBuildingParcel& p, const ElevationSettings& elev, float tileW,
+                                       float tileH, float zoom, float timeSec, BuildingShadowCaster& out) {
+  (void)zoom;
+  (void)timeSec;
+
+  if (!p.isMultiTile()) {
+    return false;
+  }
+
+  const Overlay ov = p.overlay;
+  if (!IsZoneOverlay(ov)) {
+    return false;
+  }
+
+  const int lvl = ClampZoneLevel(static_cast<int>(p.level));
+  const int x0 = p.x0();
+  const int y0 = p.y0();
+  const int x1 = p.x1();
+  const int y1 = p.y1();
+
+  float baseElevPx = 0.0f;
+  int totalOcc = 0;
+  int tiles = 0;
+
+  for (int yy = y0; yy <= y1; ++yy) {
+    for (int xx = x0; xx <= x1; ++xx) {
+      const Tile& tt = world.tile(xx, yy);
+      if (tt.overlay != ov) {
+        continue;
+      }
+      baseElevPx = std::max(baseElevPx, TileElevationPx(tt, elev));
+      totalOcc += std::max(0, tt.occupants);
+      ++tiles;
+    }
+  }
+
+  if (tiles <= 0) {
+    return false;
+  }
+
+  const int capPerTile = CapacityForOverlayLevel(ov, lvl);
+  const int totalCap = capPerTile * tiles;
+  const float occRatio = (totalCap > 0) ? std::clamp(static_cast<float>(totalOcc) / static_cast<float>(totalCap), 0.0f, 1.0f) : 0.0f;
+
+  const float scale = std::sqrt(static_cast<float>(p.area()));
+
+  float shrinkK = 0.12f;
+  if (ov == Overlay::Commercial) {
+    shrinkK = 0.10f;
+  } else if (ov == Overlay::Industrial) {
+    shrinkK = 0.08f;
+  }
+  const float baseShrink = std::clamp(1.0f - shrinkK / std::max(1.0f, scale), 0.55f, 0.94f);
+
+  Vector2 outer[4];
+  outer[0] = TileCornerAtBaseElevation(x0, y0, tileW, tileH, baseElevPx, 0);
+  outer[1] = TileCornerAtBaseElevation(x1, y0, tileW, tileH, baseElevPx, 1);
+  outer[2] = TileCornerAtBaseElevation(x1, y1, tileW, tileH, baseElevPx, 2);
+  outer[3] = TileCornerAtBaseElevation(x0, y1, tileW, tileH, baseElevPx, 3);
+
+  ShrinkDiamond(out.base, outer, baseShrink);
+
+  float heightMul = 1.0f;
+  if (ov == Overlay::Residential) {
+    heightMul = 0.95f;
+  } else if (ov == Overlay::Commercial) {
+    heightMul = 1.10f;
+  } else if (ov == Overlay::Industrial) {
+    heightMul = 1.25f;
+  }
+
+  const float var = static_cast<float>((p.styleSeed >> 4) & 0x0Fu) / 15.0f;
+
+  float heightPx = tileH * (0.55f + 0.65f * static_cast<float>(lvl)) + tileH * (0.25f + 0.45f * static_cast<float>(lvl)) * occRatio;
+  const float footprintMul = 1.0f + 0.32f * (scale - 1.0f);
+  heightPx *= heightMul * footprintMul;
+  heightPx *= (0.85f + 0.35f * (0.15f + 0.85f * var));
+
+  const float maxH = tileH * (2.7f + 0.8f * static_cast<float>(lvl)) * heightMul * (1.0f + 0.25f * (scale - 1.0f));
+  heightPx = std::min(heightPx, maxH);
+
+  out.heightPx = heightPx;
+  const float hNorm = std::clamp(heightPx / (tileH * 3.2f), 0.0f, 1.0f);
+  out.alphaScale = std::clamp(0.60f + 0.40f * hNorm, 0.50f, 1.0f) * (0.80f + 0.20f * occRatio);
+  return true;
+}
+
+static void DrawBuildingShadowsPass(const std::vector<BuildingShadowCaster>& casters, const Renderer::ShadowSettings& settings,
+                                   const DayNightState& dayNight, const WeatherState& weather, float tileW, float tileH, float zoom) {
+  if (!settings.enabled || casters.empty()) {
+    return;
+  }
+
+  // Day/night disabled => we treat it as a perpetual day (dayNight is seeded accordingly in drawWorld).
+  const float day = std::clamp(dayNight.day, 0.0f, 1.0f);
+  if (day <= 0.03f) {
+    return;
+  }
+
+  float strength = std::clamp(settings.strength, 0.0f, 1.0f) * day;
+  const float overcast = std::clamp(weather.overcast, 0.0f, 1.0f);
+
+  // Overcast suppresses and softens shadows.
+  strength *= (1.0f - 0.75f * overcast);
+  if (strength <= 0.01f) {
+    return;
+  }
+
+  const float sun = std::clamp(dayNight.sun, 0.0f, 1.0f);
+  float altDeg = Lerp(settings.minAltitudeDeg, settings.maxAltitudeDeg, sun);
+  altDeg = std::clamp(altDeg, 1.0f, 89.0f);
+
+  constexpr float kPi = 3.14159265358979323846f;
+  const float altRad = altDeg * (kPi / 180.0f);
+  const float invTanAlt = 1.0f / std::max(0.08f, static_cast<float>(std::tan(altRad)));
+
+  const Vector2 dir = UnitDirFromAzimuthDeg(settings.azimuthDeg);
+
+  const float tileDiag = 0.5f * std::sqrt(tileW * tileW + tileH * tileH);
+  const float maxLenPx = std::max(0.0f, settings.maxLengthTiles) * tileDiag;
+
+  const float invZoom = 1.0f / std::max(0.001f, zoom);
+  float softnessPx = std::clamp(settings.softness, 0.0f, 1.0f) * 6.0f * invZoom;
+  softnessPx *= (1.0f + 1.25f * overcast);
+
+  const int rings = (softnessPx > 0.25f) ? 3 : 0;
+
+  // Base alpha is intentionally conservative: the scene already has time-of-day grading.
+  const float baseAlphaF = 140.0f * strength;
+
+  for (const BuildingShadowCaster& c : casters) {
+    if (c.heightPx <= 1.0f) {
+      continue;
+    }
+
+    Vector2 shift{dir.x * c.heightPx * invTanAlt, dir.y * c.heightPx * invTanAlt};
+
+    const float len = std::sqrt(shift.x * shift.x + shift.y * shift.y);
+    if (maxLenPx > 0.0f && len > maxLenPx) {
+      const float s = maxLenPx / len;
+      shift.x *= s;
+      shift.y *= s;
+    }
+
+    Vector2 poly[4];
+    for (int i = 0; i < 4; ++i) {
+      poly[i] = Vector2{c.base[i].x + shift.x, c.base[i].y + shift.y};
+    }
+
+    const float alphaF = std::clamp(baseAlphaF * c.alphaScale, 0.0f, 255.0f);
+    const unsigned char alphaMain = static_cast<unsigned char>(std::round(alphaF));
+    if (alphaMain == 0) {
+      continue;
+    }
+
+    // Compute center & radius for penumbra scaling.
+    Vector2 cen{0.0f, 0.0f};
+    for (int i = 0; i < 4; ++i) {
+      cen.x += poly[i].x;
+      cen.y += poly[i].y;
+    }
+    cen.x *= 0.25f;
+    cen.y *= 0.25f;
+
+    float maxR = 0.0f;
+    for (int i = 0; i < 4; ++i) {
+      const float dx = poly[i].x - cen.x;
+      const float dy = poly[i].y - cen.y;
+      maxR = std::max(maxR, std::sqrt(dx * dx + dy * dy));
+    }
+    maxR = std::max(1.0f, maxR);
+
+    // Penumbra rings (draw outer to inner).
+    for (int r = rings; r >= 1; --r) {
+      const float k = static_cast<float>(r) / static_cast<float>(rings + 1);
+      const float extra = softnessPx * k;
+      const float scale = 1.0f + extra / maxR;
+
+      const float aMul = 0.22f * (1.0f - 0.50f * k);
+      const unsigned char a = static_cast<unsigned char>(std::round(static_cast<float>(alphaMain) * aMul));
+      if (a == 0) {
+        continue;
+      }
+
+      Vector2 ring[4];
+      for (int i = 0; i < 4; ++i) {
+        ring[i] = Vector2{cen.x + (poly[i].x - cen.x) * scale, cen.y + (poly[i].y - cen.y) * scale};
+      }
+
+      const Color col{0, 0, 0, a};
+      DrawTriangle(ring[0], ring[1], ring[2], col);
+      DrawTriangle(ring[0], ring[2], ring[3], col);
+    }
+
+    const Color col{0, 0, 0, alphaMain};
+    DrawTriangle(poly[0], poly[1], poly[2], col);
+    DrawTriangle(poly[0], poly[2], poly[3], col);
+  }
+}
+
 Color HeatmapColor(float v, Renderer::HeatmapRamp ramp) {
   v = std::clamp(v, 0.0f, 1.0f);
   const float alphaF = std::clamp(70.0f + 110.0f * v, 0.0f, 255.0f);
@@ -2907,375 +3296,308 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
                          bool showDistrictOverlay,
                          int highlightDistrict,
                          bool showDistrictBorders,
-                         bool mergeZoneBuildings)
+                         bool mergeZoneBuildings,
+                         const WorldOverlayCallback& drawBeforeFx,
+                         const WorldOverlayCallback& drawAfterFx,
+                         const std::vector<WorldSprite>* sprites)
 {
-  const int w = world.width();
-  const int h = world.height();
+  const int mapW = world.width();
+  const int mapH = world.height();
+  if (mapW <= 0 || mapH <= 0) return;
 
-  const bool showOutside = (roadToEdgeMask && w > 0 && h > 0 &&
-                            roadToEdgeMask->size() ==
-                                static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
+  // -----------------------------
+  // Multi-layer rendering toggles
+  // -----------------------------
+  const std::uint32_t layerMask = m_layerMask;
+  const bool layerTerrain = (layerMask & kLayerTerrain) != 0u;
+  const bool layerDecals = (layerMask & kLayerDecals) != 0u;
+  const bool layerStructures = (layerMask & kLayerStructures) != 0u;
+  const bool layerOverlays = (layerMask & kLayerOverlays) != 0u;
 
+  // Overlay inputs are optional; validate their sizes before using.
+  const bool wantsOutside =
+    (roadToEdgeMask && roadToEdgeMask->size() == static_cast<std::size_t>(mapW * mapH));
+  const bool wantsTraffic =
+    (roadTraffic && trafficMax > 0 && roadTraffic->size() == static_cast<std::size_t>(mapW * mapH));
+  const bool wantsGoods =
+    (roadGoodsTraffic && goodsMax > 0 && roadGoodsTraffic->size() == static_cast<std::size_t>(mapW * mapH));
+  const bool wantsCommercialGoods =
+    (commercialGoodsFill && commercialGoodsFill->size() == static_cast<std::size_t>(mapW * mapH));
+  const bool wantsHeatmap = (heatmap && heatmap->size() == static_cast<std::size_t>(mapW * mapH));
+
+  // Respect the overlays layer: if it's disabled, we treat all overlays as off.
+  const bool showOutside = layerOverlays && wantsOutside;
+  const bool showTraffic = layerOverlays && wantsTraffic;
+  const bool showGoods = layerOverlays && wantsGoods;
+  const bool showCommercialGoods = layerOverlays && wantsCommercialGoods;
+  const bool showHeatmap = layerOverlays && wantsHeatmap;
+  const bool drawGridEff = layerOverlays && drawGrid;
+  const bool showDistrictOverlayEff = layerOverlays && showDistrictOverlay;
+  const bool showDistrictBordersEff = layerOverlays && showDistrictBorders;
+  const std::vector<Point>* highlightPathEff = (layerOverlays ? highlightPath : nullptr);
+
+  // -----------------------------
+  // Aesthetic detail gating
+  // -----------------------------
+  // When utility/debug overlays are active we suppress aesthetic details (sparkles, day/night grading, etc.)
+  // for readability (matching existing behavior). Decals layer also controls these purely-visual effects.
+  const bool suppressAesthetics = (showOutside || showTraffic || showGoods || showCommercialGoods || showHeatmap);
+  const bool drawAestheticDetails = layerDecals && !suppressAesthetics;
+
+  DayNightState dayNight{};
+  if (m_dayNight.enabled && drawAestheticDetails) {
+    dayNight = ComputeDayNightState(timeSec, m_dayNight);
+  } else {
+    dayNight.day = 1.0f;
+    dayNight.sun = 1.0f;
+    dayNight.dusk = 0.0f;
+  }
+  const WeatherState weather = (drawAestheticDetails) ? ComputeWeatherState(timeSec, m_weather) : WeatherState{};
+
+  // -----------------------------
+  // Outside connectivity overlay
+  // -----------------------------
   ZoneAccessMap zoneAccessOutside;
   if (showOutside) {
-    zoneAccessOutside = BuildZoneAccessMap(world, roadToEdgeMask);
+    zoneAccessOutside = BuildZoneAccessMap(world, *roadToEdgeMask);
   }
 
-  const bool showTraffic = (roadTraffic && trafficMax > 0 && w > 0 && h > 0 &&
-                            roadTraffic->size() ==
-                                static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
-
-  const bool showGoods = (roadGoodsTraffic && goodsMax > 0 && w > 0 && h > 0 &&
-                         roadGoodsTraffic->size() ==
-                             static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
-
-  const bool showCommercialGoods = (commercialGoodsFill && w > 0 && h > 0 &&
-                                  commercialGoodsFill->size() ==
-                                      static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
-
-  const bool showHeatmap = (heatmap && w > 0 && h > 0 &&
-                            heatmap->size() ==
-                                static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
-
-  // Aesthetic micro-details (procedural decals, sparkles) are intentionally suppressed when
-  // utility overlays are active so diagnostic views remain crisp/readable.
-  const bool drawAestheticDetails = (!showOutside && !showTraffic && !showGoods &&
-                                    !showCommercialGoods && !showHeatmap);
-
-  const DayNightState dayNight = drawAestheticDetails ? ComputeDayNightState(timeSec, m_dayNight)
-                                                     : DayNightState{};
-
-  const WeatherState weather = drawAestheticDetails ? ComputeWeatherState(timeSec, m_weather)
-                                                     : WeatherState{};
-
-  // Base-cache usage is only valid when the base view is being rendered. Any debug overlay that
-  // tints roads/zones per-tile (traffic, goods, outside-access, heatmap) falls back to the
-  // immediate path.
-  const bool useBaseCache = (m_useBandCache && !showOutside && !showTraffic && !showGoods &&
-                             !showCommercialGoods && !showHeatmap);
-
+  // -----------------------------
+  // View + visible tile range
+  // -----------------------------
   const float tileWf = static_cast<float>(m_tileW);
   const float tileHf = static_cast<float>(m_tileH);
   const float maxElev = std::max(0.0f, m_elev.maxPixels);
 
-  const WorldRect viewAABB = ComputeCameraWorldAABB(camera, screenW, screenH, tileWf, tileHf + maxElev);
+  const WorldRect viewAABB = ComputeCameraWorldAABB(camera, screenW, screenH, maxElev);
+  TileRect vis = ComputeVisibleTileRect(world, viewAABB, tileWf, tileHf, maxElev);
 
-  // Compute a conservative visible tile range based on the current camera view.
-  TileRect vis = ComputeVisibleTileRect(camera, screenW, screenH, w, h, tileWf, tileHf, maxElev);
+  // -----------------------------
+  // Depth-sorted dynamic sprites
+  // -----------------------------
+  std::vector<const WorldSprite*> preSprites;
+  std::vector<const WorldSprite*> emissiveSprites;
+  if (sprites && !sprites->empty()) {
+    preSprites.reserve(sprites->size());
+    emissiveSprites.reserve(sprites->size());
+    for (const WorldSprite& s : *sprites) {
+      if (!s.tex || s.tex->id == 0) continue;
+      if (s.emissive) emissiveSprites.push_back(&s);
+      else preSprites.push_back(&s);
+    }
 
-  bool baseCacheReady = false;
-  if (useBaseCache) {
+    auto cmp = [](const WorldSprite* a, const WorldSprite* b) {
+      if (a->sortSum != b->sortSum) return a->sortSum < b->sortSum;
+      if (a->sortX != b->sortX) return a->sortX < b->sortX;
+      return a < b;
+    };
+
+    std::sort(preSprites.begin(), preSprites.end(), cmp);
+    std::sort(emissiveSprites.begin(), emissiveSprites.end(), cmp);
+  }
+
+  // -----------------------------
+  // Band caches (terrain / structures)
+  // -----------------------------
+  const bool wantTerrainCache = m_useBandCache && layerTerrain;
+  // Structures cache is valid only when we don't need per-tile tinting of base overlays (traffic/goods/outside).
+  const bool wantStructureCache =
+    m_useBandCache && layerStructures && !(showOutside || showTraffic || showGoods || showCommercialGoods);
+
+  bool terrainCacheReady = false;
+  bool structureCacheReady = false;
+
+  if (wantTerrainCache || wantStructureCache) {
     ensureBaseCache(world);
 
-    // Lazy rebuild: only rebuild bands that intersect the current view (with a small prefetch pad).
-    WorldRect rebuildAABB = viewAABB;
-    const float padX = tileWf * 2.5f;
-    const float padY = tileHf * 2.5f + maxElev;
-    rebuildAABB.minX -= padX;
-    rebuildAABB.maxX += padX;
-    rebuildAABB.minY -= padY;
-    rebuildAABB.maxY += padY;
+    if (!m_bands.empty()) {
+      if (wantTerrainCache) {
+        terrainCacheReady = true;
+        for (const auto& b : m_bands) {
+          if (b.terrain.id == 0) {
+            terrainCacheReady = false;
+            break;
+          }
+        }
+      }
+      if (wantStructureCache) {
+        structureCacheReady = true;
+        for (const auto& b : m_bands) {
+          if (b.structures.id == 0) {
+            structureCacheReady = false;
+            break;
+          }
+        }
+      }
+    }
 
-    for (auto& b : m_bands) {
-      if (b.rt.id != 0) baseCacheReady = true;
+    // Rebuild dirty bands intersecting the view, with a small pad so panning doesn't thrash.
+    if (terrainCacheReady || structureCacheReady) {
+      WorldRect rebuildAABB = viewAABB;
+      const float pad = tileWf * 2.0f;
+      rebuildAABB.minX -= pad;
+      rebuildAABB.minY -= pad;
+      rebuildAABB.maxX += pad;
+      rebuildAABB.maxY += pad;
 
-      if (!b.dirty || b.rt.id == 0) continue;
+      for (auto& b : m_bands) {
+        int texW = 0;
+        int texH = 0;
+        if (terrainCacheReady && b.terrain.id != 0) {
+          texW = b.terrain.texture.width;
+          texH = b.terrain.texture.height;
+        } else if (structureCacheReady && b.structures.id != 0) {
+          texW = b.structures.texture.width;
+          texH = b.structures.texture.height;
+        } else {
+          continue;
+        }
 
-      const float bx0 = b.origin.x;
-      const float by0 = b.origin.y;
-      const float bx1 = bx0 + static_cast<float>(b.rt.texture.width);
-      const float by1 = by0 + static_cast<float>(b.rt.texture.height);
+        const float bx0 = b.origin.x;
+        const float by0 = b.origin.y;
+        const float bx1 = b.origin.x + static_cast<float>(texW);
+        const float by1 = b.origin.y + static_cast<float>(texH);
 
-      const bool intersects = !(bx1 < rebuildAABB.minX || bx0 > rebuildAABB.maxX ||
-                                by1 < rebuildAABB.minY || by0 > rebuildAABB.maxY);
-      if (intersects) {
-        rebuildBaseCacheBand(world, b);
+        const bool intersects = !(bx1 < rebuildAABB.minX || bx0 > rebuildAABB.maxX || by1 < rebuildAABB.minY ||
+                                  by0 > rebuildAABB.maxY);
+        if (!intersects) continue;
+
+        if (terrainCacheReady && b.dirtyTerrain) rebuildTerrainCacheBand(world, b);
+        if (structureCacheReady && b.dirtyStructures) rebuildStructureCacheBand(world, b);
       }
     }
   }
 
+  // -----------------------------
+  // Zone building merge scratch
+  // -----------------------------
+  const float tileScreenW = tileWf * camera.zoom;
+  const bool useMergedZoneBuildings = mergeZoneBuildings && layerStructures && tileScreenW >= 26.0f;
 
-  // Build merged multi-tile zone parcels if enabled and zoomed in enough to see buildings.
-  // (At lower zoom levels, buildings/indicators are skipped anyway.)
-  const float tileScreenWGlobal = static_cast<float>(m_tileW) * camera.zoom;
-  const bool useMergedZoneBuildings = (mergeZoneBuildings && tileScreenWGlobal >= 26.0f);
   if (useMergedZoneBuildings) {
     BuildZoneBuildingParcels(world, m_zoneParcelsScratch);
+    // Expand visible rect so merged parcels just outside the viewport can still render correctly.
+    vis.minX = std::max(0, vis.minX - 4);
+    vis.minY = std::max(0, vis.minY - 4);
+    vis.maxX = std::min(mapW - 1, vis.maxX + 4);
+    vis.maxY = std::min(mapH - 1, vis.maxY + 4);
   } else {
     m_zoneParcelsScratch.clear();
   }
 
-  if (useMergedZoneBuildings) {
-    // Parcels can extend up to 3 tiles beyond the visible rect (e.g., 4x2 / 4x1 footprints).
-    // Extend the draw rect so parcel anchors aren't culled when only the NW portion is on-screen.
-    vis.maxX = std::min(vis.maxX + 3, w - 1);
-    vis.maxY = std::min(vis.maxY + 3, h - 1);
+  // Building shadows (cast onto ground).
+  const bool drawShadows = drawAestheticDetails && layerStructures && m_shadows.enabled && (tileScreenW >= 26.0f);
+  std::vector<BuildingShadowCaster> shadowCasters;
+  if (drawShadows) {
+    // Rough heuristic: only a fraction of visible tiles have buildings.
+    const int visW = vis.maxX - vis.minX + 1;
+    const int visH = vis.maxY - vis.minY + 1;
+    shadowCasters.reserve(static_cast<std::size_t>(std::max(0, (visW * visH) / 6)));
   }
+
+  // -----------------------------
+  // Render
+  // -----------------------------
+  const Rectangle src = Rectangle{0, 0, tileWf, tileHf};
+  const bool animatedLighting = drawAestheticDetails && !terrainCacheReady;
 
   BeginMode2D(camera);
 
-  // Cached base path: draw the static base world (terrain + cliffs + base overlays) from
-  // off-screen render targets. Dynamic per-tile extras (grid, buildings, indicators) are drawn
-  // in-order on top.
-  if (useBaseCache && baseCacheReady) {
-    for (const auto& b : m_bands) {
-      if (b.rt.id == 0) continue;
+  // Depth-sorted sprite injection.
+  //
+  // We draw "pre" sprites during pass 2, between per-tile overlays and buildings, so they can be
+  // occluded by buildings on later diagonals (proper isometric painter's ordering).
+  std::size_t preSpriteIdx = 0;
+  auto drawWorldSprite = [&](const WorldSprite& s) {
+    if (!s.tex || s.tex->id == 0) return;
+    DrawTexturePro(*s.tex, s.src, s.dst, s.origin, s.rotation, s.tint);
+  };
 
-      // Band-level culling: only draw cache textures that intersect the camera view.
+  auto flushPreSprites = [&](int curSum, float curX) {
+    while (preSpriteIdx < preSprites.size()) {
+      const WorldSprite* s = preSprites[preSpriteIdx];
+      if (!s) {
+        ++preSpriteIdx;
+        continue;
+      }
+      if (s->sortSum < curSum) {
+        drawWorldSprite(*s);
+        ++preSpriteIdx;
+        continue;
+      }
+      if (s->sortSum > curSum) break;
+      if (s->sortX <= curX) {
+        drawWorldSprite(*s);
+        ++preSpriteIdx;
+        continue;
+      }
+      break;
+    }
+  };
+
+  // Draw cached bands (terrain then structures) in band order (back-to-front).
+  if (terrainCacheReady || structureCacheReady) {
+    for (const auto& b : m_bands) {
+      int texW = 0;
+      int texH = 0;
+      if (terrainCacheReady && b.terrain.id != 0) {
+        texW = b.terrain.texture.width;
+        texH = b.terrain.texture.height;
+      } else if (structureCacheReady && b.structures.id != 0) {
+        texW = b.structures.texture.width;
+        texH = b.structures.texture.height;
+      } else {
+        continue;
+      }
+
       const float bx0 = b.origin.x;
       const float by0 = b.origin.y;
-      const float bx1 = bx0 + static_cast<float>(b.rt.texture.width);
-      const float by1 = by0 + static_cast<float>(b.rt.texture.height);
-      if (bx1 < viewAABB.minX || bx0 > viewAABB.maxX || by1 < viewAABB.minY || by0 > viewAABB.maxY) continue;
+      const float bx1 = b.origin.x + static_cast<float>(texW);
+      const float by1 = b.origin.y + static_cast<float>(texH);
 
-      const Rectangle src = Rectangle{0.0f, 0.0f, static_cast<float>(b.rt.texture.width),
-                                      -static_cast<float>(b.rt.texture.height)};
-      DrawTextureRec(b.rt.texture, src, b.origin, WHITE);
+      const bool intersects =
+        !(bx1 < viewAABB.minX || bx0 > viewAABB.maxX || by1 < viewAABB.minY || by0 > viewAABB.maxY);
+      if (!intersects) continue;
+
+      const Rectangle srcRT = Rectangle{0, 0, static_cast<float>(texW), -static_cast<float>(texH)};
+      if (terrainCacheReady && layerTerrain) DrawTextureRec(b.terrain.texture, srcRT, b.origin, WHITE);
+      if (structureCacheReady && layerStructures) DrawTextureRec(b.structures.texture, srcRT, b.origin, WHITE);
     }
+  }
 
-    // Draw order: diagonals by (x+y) so nearer tiles draw last.
-    const int minSum = vis.minX + vis.minY;
-    const int maxSum = vis.maxX + vis.maxY;
-    for (int sum = minSum; sum <= maxSum; ++sum) {
-      const int x0 = std::max(vis.minX, sum - vis.maxY);
-      const int x1 = std::min(vis.maxX, sum - vis.minY);
-      for (int x = x0; x <= x1; ++x) {
-        const int y = sum - x;
-        if (y < vis.minY || y > vis.maxY) continue;
-
-        const Tile& t = world.at(x, y);
-
-        const std::size_t tileIdx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
-                                    static_cast<std::size_t>(x);
-
-        const float tileW = static_cast<float>(m_tileW);
-        const float tileH = static_cast<float>(m_tileH);
-
-        const float elevPx = TileElevationPx(t, m_elev);
-        const Vector2 baseCenter = TileToWorldCenter(x, y, tileW, tileH);
-        const Vector2 center{baseCenter.x, baseCenter.y - elevPx};
-        // Per-tile lighting: base height/variation + slope/AO (no animated shimmer in cache path).
-        const TileLighting light = ComputeTileLighting(world, x, y, tileW, tileH, m_elev, timeSec, false);
-        const float brightness = light.base;
-
-        if (drawAestheticDetails) {
-          DrawProceduralTileDetails(world, x, y, t, center, tileW, tileH, camera.zoom, brightness, m_gfxSeed32,
-                                    timeSec);
-
-          if (m_weather.affectGround) {
-            DrawWeatherGroundEffects(world, x, y, t, center, tileW, tileH, camera.zoom, brightness,
-                                  dayNight, weather, timeSec, m_gfxSeed32);
-          }
-        }
-
-        Vector2 corners[4];
-        bool haveCorners = false;
-        auto ensureCorners = [&]() {
-          if (!haveCorners) {
-            TileDiamondCorners(center, tileW, tileH, corners);
-            haveCorners = true;
-          }
-        };
-
-        // District overlay (fill). District 0 is treated as "unassigned" and is left transparent.
-        if (showDistrictOverlay) {
-          const std::uint8_t d = static_cast<std::uint8_t>(t.district) & 7u;
-          if (d != 0u) {
-            unsigned char alpha = 65;
-            if (highlightDistrict >= 0) {
-              alpha = (d == static_cast<std::uint8_t>(highlightDistrict & 7)) ? 95 : 22;
-            }
-
-            if (alpha > 0) {
-              ensureCorners();
-              const Color c = DistrictFillColor(d, alpha);
-              DrawTriangle(corners[0], corners[1], corners[2], c);
-              DrawTriangle(corners[0], corners[2], corners[3], c);
-            }
-          }
-        }
-
-        // Shoreline highlight (water <-> land boundary). Drawn after district fill so it stays readable.
-        if (tileW * camera.zoom >= 18.0f) {
-          auto drawShoreEdge = [&](int nx, int ny, int cornerA, int cornerB) {
-            if (nx < 0 || ny < 0 || nx >= w || ny >= h) return;
-            const Tile& nt = world.at(nx, ny);
-            const bool waterHere = (t.terrain == Terrain::Water);
-            const bool waterThere = (nt.terrain == Terrain::Water);
-            if (waterHere == waterThere) return;
-
-            // Keep bridges/roads crisp by avoiding shoreline strokes on bridge tiles.
-            if (t.terrain == Terrain::Water && t.overlay == Overlay::Road) return;
-
-            const int wx = waterHere ? x : nx;
-            const int wy = waterHere ? y : ny;
-            const Tile& wt = world.at(wx, wy);
-            const float wElev = TileElevationPx(wt, m_elev);
-
-            Vector2 waterCenter = TileToWorldCenter(wx, wy, tileW, tileH);
-            waterCenter.y -= wElev;
-
-            Vector2 edgeCorners[4];
-            Vector2 edgeCenter = baseCenter;
-            edgeCenter.y -= wElev;
-            TileDiamondCorners(edgeCenter, tileW, tileH, edgeCorners);
-
-            Vector2 a = edgeCorners[cornerA];
-            Vector2 b = edgeCorners[cornerB];
-
-            // Nudge towards water side (small, zoom-compensated) so it reads as foam.
-            const Vector2 mid{(a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f};
-            Vector2 dir{waterCenter.x - mid.x, waterCenter.y - mid.y};
-            const float dl2 = dir.x * dir.x + dir.y * dir.y;
-            if (dl2 > 1.0e-6f) {
-              const float inv = 1.0f / std::sqrt(dl2);
-              dir.x *= inv;
-              dir.y *= inv;
-              const float off = 0.75f / std::max(0.001f, camera.zoom);
-              a.x += dir.x * off;
-              a.y += dir.y * off;
-              b.x += dir.x * off;
-              b.y += dir.y * off;
-            }
-
-            const float thick = 1.55f / std::max(0.001f, camera.zoom);
-            DrawLineEx(a, b, thick * 1.35f, Color{255, 255, 255, 45});
-            DrawLineEx(a, b, thick * 0.85f, Color{255, 255, 255, 110});
-          };
-
-          // Only draw for the two "back" neighbors; the front tile owns the shoreline so it isn't overdrawn.
-          drawShoreEdge(x - 1, y, 3, 0);
-          drawShoreEdge(x, y - 1, 0, 1);
-        }
-
-        // Optional grid overlay.
-        if (drawGrid) {
-          ensureCorners();
-          const Color c = Color{255, 255, 255, 35};
-          DrawLineV(corners[0], corners[1], c);
-          DrawLineV(corners[1], corners[2], c);
-          DrawLineV(corners[2], corners[3], c);
-          DrawLineV(corners[3], corners[0], c);
-        }
-
-        // District borders (draw after grid so they stay visible).
-        if (showDistrictBorders) {
-          ensureCorners();
-          const Color border = Color{0, 0, 0, 170};
-          const float thick = 2.0f / std::max(0.001f, camera.zoom);
-          const std::uint8_t d = static_cast<std::uint8_t>(t.district) & 7u;
-          if (x + 1 < w) {
-            const std::uint8_t dn = static_cast<std::uint8_t>(world.at(x + 1, y).district) & 7u;
-            if (dn != d) DrawLineEx(corners[1], corners[2], thick, border);
-          }
-          if (y + 1 < h) {
-            const std::uint8_t dn = static_cast<std::uint8_t>(world.at(x, y + 1).district) & 7u;
-            if (dn != d) DrawLineEx(corners[2], corners[3], thick, border);
-          }
-        }
-
-        // Zone buildings + indicators.
-        const float tileScreenW = tileW * camera.zoom;
-        const bool isZone = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
-                             t.overlay == Overlay::Industrial);
-
-        if (useMergedZoneBuildings && isZone && tileIdx < m_zoneParcelsScratch.tileToParcel.size()) {
-          const int parcelAll = m_zoneParcelsScratch.tileToParcel[tileIdx];
-          const int parcelAnchor = m_zoneParcelsScratch.anchorToParcel[tileIdx];
-
-          if (parcelAll >= 0) {
-            // Only draw once per parcel (on the anchor tile).
-            if (parcelAnchor >= 0 && parcelAnchor < static_cast<int>(m_zoneParcelsScratch.parcels.size())) {
-              const ZoneBuildingParcel& p =
-                  m_zoneParcelsScratch.parcels[static_cast<std::size_t>(parcelAnchor)];
-
-              if (p.isMultiTile()) {
-                DrawMergedZoneBuildingAndIndicators(p, world, m_elev, tileW, tileH, camera.zoom, timeSec);
-              } else {
-                DrawZoneBuilding(t, tileW, tileH, camera.zoom, center, brightness);
-                DrawZoneTileIndicators(t, tileW, tileH, camera.zoom, center);
-              }
-            }
-          } else {
-            // Defensive fallback: zone tile not parcelized (should be rare).
-            DrawZoneBuilding(t, tileW, tileH, camera.zoom, center, brightness);
-            DrawZoneTileIndicators(t, tileW, tileH, camera.zoom, center);
-          }
-        } else {
-          // Per-tile fallback.
-          DrawZoneBuilding(t, tileW, tileH, camera.zoom, center, brightness);
-          DrawZoneTileIndicators(t, tileW, tileH, camera.zoom, center);
-        }
-
-// Road indicators: show small pips for upgraded road class (2..3) when zoomed in.
-        if (t.overlay == Overlay::Road && tileScreenW >= 28.0f) {
-          const int lvl = std::clamp<int>(static_cast<int>(t.level), 1, 3);
-          if (lvl > 1) {
-            const float invZoom = 1.0f / std::max(0.001f, camera.zoom);
-            const float y0 = center.y - static_cast<float>(m_tileH) * 0.02f;
-
-            const float pip = 4.0f * invZoom;
-            const float gap = 1.5f * invZoom;
-            const float groupW = pip * 3.0f + gap * 2.0f;
-            const float groupX0 = center.x - groupW * 0.5f;
-
-            for (int i = 0; i < 3; ++i) {
-              Rectangle r{groupX0 + static_cast<float>(i) * (pip + gap), y0, pip, pip};
-              DrawRectangleRec(r, Color{0, 0, 0, 110});
-              DrawRectangleLinesEx(r, 1.0f * invZoom, Color{255, 255, 255, 55});
-              if (i < lvl) {
-                Rectangle f{r.x + 1.0f * invZoom, r.y + 1.0f * invZoom, r.width - 2.0f * invZoom,
-                            r.height - 2.0f * invZoom};
-                DrawRectangleRec(f, Color{255, 255, 255, 160});
-              }
-            }
-          }
-        }
-      }
-    }
-  } else {
-
-  // Draw order: diagonals by (x+y) so nearer tiles draw last.
-  const int minSum = vis.minX + vis.minY;
-  const int maxSum = vis.maxX + vis.maxY;
-  for (int sum = minSum; sum <= maxSum; ++sum) {
+  // Main tile loop: diagonal back-to-front order for correct iso depth.
+  for (int sum = vis.minSum(); sum <= vis.maxSum(); ++sum) {
     const int x0 = std::max(vis.minX, sum - vis.maxY);
     const int x1 = std::min(vis.maxX, sum - vis.minY);
     for (int x = x0; x <= x1; ++x) {
       const int y = sum - x;
-      if (y < vis.minY || y > vis.maxY) continue;
+      if (!world.inBounds(x, y)) continue;
 
+      const std::size_t tileIdx = static_cast<std::size_t>(x + y * mapW);
       const Tile& t = world.at(x, y);
 
-      const std::size_t tileIdx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
-                                  static_cast<std::size_t>(x);
-
-      const float tileW = static_cast<float>(m_tileW);
-      const float tileH = static_cast<float>(m_tileH);
-
       const float elevPx = TileElevationPx(t, m_elev);
-      const Vector2 baseCenter = TileToWorldCenter(x, y, tileW, tileH);
-      const Vector2 center{baseCenter.x, baseCenter.y - elevPx};
 
-      const Rectangle dst = Rectangle{center.x - tileW * 0.5f, center.y - tileH * 0.5f, tileW, tileH};
-      const Rectangle src = Rectangle{0, 0, tileW, tileH};
-      // Per-tile lighting: base height/variation + slope/AO (+ optional water shimmer).
-      const TileLighting light = ComputeTileLighting(world, x, y, tileW, tileH, m_elev, timeSec, true);
+      const Vector2 baseCenter = TileToWorldCenter(x, y, tileWf, tileHf);
+      const Vector2 center = Vector2{baseCenter.x, baseCenter.y - elevPx};
+
+      const Rectangle dst = Rectangle{center.x - tileWf * 0.5f, center.y - tileHf * 0.5f, tileWf, tileHf};
+
+      const TileLighting light = ComputeTileLighting(world, x, y, tileWf, tileHf, m_elev, timeSec, animatedLighting);
       const float baseBrightness = light.base;
-      const float brightness = light.animated;
+      const float brightness = animatedLighting ? light.animated : light.base;
 
-      // Draw terrain
-      DrawTexturePro(terrain(t.terrain, t.variation), src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
+      // -----------------------------
+      // Terrain (if not cached)
+      // -----------------------------
+      if (layerTerrain && !terrainCacheReady) {
+        DrawTexturePro(terrain(t.terrain, t.variation), src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
 
-      // Draw cliff walls for higher neighbors behind this tile. We draw these AFTER the terrain top,
-      // but BEFORE overlays, so roads/zones stay on top.
-      {
-        // For the shared edges, we use the base (non-elevated) diamond corners.
+        // Cliff walls for higher tiles behind.
         Vector2 baseCorners[4];
-        TileDiamondCorners(baseCenter, tileW, tileH, baseCorners);
+        TileDiamondCorners(baseCenter, tileWf, tileHf, baseCorners);
 
         const float eps = 0.5f;
-
         auto drawCliffEdge = [&](Vector2 e0, Vector2 e1, float topElev, float botElev, Color c) {
           if (topElev <= botElev + eps) return;
           Vector2 top0 = e0;
@@ -3291,7 +3613,6 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
           DrawTriangle(top0, bot1, bot0, c);
         };
 
-        // Left neighbor (x-1, y) is behind; if it's higher, we see a cliff along our top-left edge (3-0).
         if (x > 0) {
           const Tile& n = world.at(x - 1, y);
           const float ne = TileElevationPx(n, m_elev);
@@ -3299,7 +3620,6 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
           drawCliffEdge(baseCorners[3], baseCorners[0], ne, elevPx, Mul(base, 0.70f));
         }
 
-        // Up neighbor (x, y-1) is behind; if it's higher, we see a cliff along our top-right edge (0-1).
         if (y > 0) {
           const Tile& n = world.at(x, y - 1);
           const float ne = TileElevationPx(n, m_elev);
@@ -3308,411 +3628,471 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
         }
       }
 
-      // Draw overlay
-      if (t.overlay == Overlay::Road) {
-        const std::uint8_t mask = static_cast<std::uint8_t>(t.variation & 0x0Fu);
+      // -----------------------------
+      // Base overlays (structures) if not cached
+      // -----------------------------
+      if (layerStructures && !structureCacheReady) {
+        if (t.overlay == Overlay::Road) {
+          const std::uint8_t mask = static_cast<std::uint8_t>(t.variation & 0x0Fu);
+          const float roadBrightness = (t.terrain == Terrain::Water) ? baseBrightness : brightness;
+          Color tint = BrightnessTint(roadBrightness);
 
-        Color tint = BrightnessTint((t.terrain == Terrain::Water) ? baseBrightness : brightness);
-
-        bool disconnected = false;
-
-        if (showOutside) {
-          const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
-                                  static_cast<std::size_t>(x);
-          if (idx < roadToEdgeMask->size() && (*roadToEdgeMask)[idx] == 0) {
-            // Disconnected road component: tint red so it's obvious why zones may not function.
+          bool disconnected = false;
+          if (showOutside && (*roadToEdgeMask)[tileIdx] == 0) {
             disconnected = true;
-            tint.g = ClampU8(static_cast<int>(std::round(static_cast<float>(tint.g) * 0.35f)));
-            tint.b = ClampU8(static_cast<int>(std::round(static_cast<float>(tint.b) * 0.35f)));
-            tint.r = ClampU8(static_cast<int>(
-                std::round(std::min(255.0f, static_cast<float>(tint.r) * 1.10f + 20.0f))));
+            tint = Color{
+              static_cast<unsigned char>(std::clamp<int>(tint.r + 80, 0, 255)),
+              static_cast<unsigned char>(std::clamp<int>(tint.g - 60, 0, 255)),
+              static_cast<unsigned char>(std::clamp<int>(tint.b - 60, 0, 255)),
+              255};
           }
-        }
 
-        if (!disconnected && showTraffic) {
-          const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
-                                  static_cast<std::size_t>(x);
-          if (idx < roadTraffic->size()) {
-            const int tv = static_cast<int>((*roadTraffic)[idx]);
-            if (tv > 0) {
-              const float tnorm = std::clamp(static_cast<float>(tv) / std::max(1.0f, static_cast<float>(trafficMax)),
-                                             0.0f, 1.0f);
-              // Emphasize low flows while keeping very busy roads distinct.
-              const float s = std::pow(tnorm, 0.35f);
+          if (!disconnected && showTraffic) {
+            const float tnorm =
+              std::clamp((*roadTraffic)[tileIdx] / static_cast<float>(trafficMax), 0.0f, 1.0f);
+            tint = Color{
+              static_cast<unsigned char>(std::clamp<int>(tint.r + static_cast<int>(220.0f * tnorm), 0, 255)),
+              static_cast<unsigned char>(std::clamp<int>(tint.g - static_cast<int>(70.0f * tnorm), 0, 255)),
+              static_cast<unsigned char>(std::clamp<int>(tint.b - static_cast<int>(70.0f * tnorm), 0, 255)),
+              255};
+            // Over-capacity highlight.
+            if ((*roadTraffic)[tileIdx] > roadCapacity(t.level)) {
+              tint = Color{255, 60, 60, 255};
+            }
+          }
 
-              const float rf = std::min(255.0f, static_cast<float>(tint.r) * (1.0f + 0.15f * s) + 85.0f * s);
-              const float gf = static_cast<float>(tint.g) * (1.0f - 0.70f * s);
-              const float bf = static_cast<float>(tint.b) * (1.0f - 0.70f * s);
+          if (!disconnected && showGoods) {
+            const float gnorm =
+              std::clamp((*roadGoodsTraffic)[tileIdx] / static_cast<float>(goodsMax), 0.0f, 1.0f);
+            tint = Color{
+              static_cast<unsigned char>(std::clamp<int>(tint.r - static_cast<int>(70.0f * gnorm), 0, 255)),
+              static_cast<unsigned char>(std::clamp<int>(tint.g - static_cast<int>(70.0f * gnorm), 0, 255)),
+              static_cast<unsigned char>(std::clamp<int>(tint.b + static_cast<int>(220.0f * gnorm), 0, 255)),
+              255};
+          }
 
-              tint.r = ClampU8(static_cast<int>(std::round(rf)));
-              tint.g = ClampU8(static_cast<int>(std::round(gf)));
-              tint.b = ClampU8(static_cast<int>(std::round(bf)));
+          Texture2D& rtex =
+            (t.terrain == Terrain::Water) ? bridge(mask, t.variation, t.level) : road(mask, t.variation, t.level);
+          DrawTexturePro(rtex, src, dst, Vector2{0, 0}, 0.0f, tint);
+        } else if (t.overlay != Overlay::None) {
+          Color tint = BrightnessTint(brightness);
 
-              // Extra hint: highlight tiles that exceed their class-dependent capacity.
-              const int baseCap = std::max(0, TrafficConfig{}.roadTileCapacity);
-              if (baseCap > 0) {
-                const int cap = RoadCapacityForLevel(baseCap, static_cast<int>(t.level));
-                if (cap > 0 && tv > cap) {
-                  const float over = std::clamp(static_cast<float>(tv - cap) / static_cast<float>(cap), 0.0f, 1.0f);
-                  tint = Lerp(tint, Color{255, 80, 80, 255}, 0.40f + 0.45f * over);
-                }
+          if (showOutside) {
+            if (t.overlay == Overlay::Park) {
+              if (!HasAdjacentRoadConnectedToEdge(world, *roadToEdgeMask, x, y)) {
+                tint = Mul(tint, 0.55f);
+              }
+            } else if (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial || t.overlay == Overlay::Industrial) {
+              if (!HasZoneAccess(zoneAccessOutside, x, y)) {
+                tint = Mul(tint, 0.55f);
               }
             }
           }
-        }
 
-
-        if (!disconnected && showGoods) {
-          const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
-                                  static_cast<std::size_t>(x);
-          if (idx < roadGoodsTraffic->size()) {
-            const int gv = static_cast<int>((*roadGoodsTraffic)[idx]);
-            if (gv > 0) {
-              const float gnorm = std::clamp(static_cast<float>(gv) / std::max(1.0f, static_cast<float>(goodsMax)),
-                                            0.0f, 1.0f);
-              const float s = std::pow(gnorm, 0.35f);
-
-              const float bf = std::min(255.0f, static_cast<float>(tint.b) * (1.0f + 0.15f * s) + 85.0f * s);
-              const float gf = static_cast<float>(tint.g) * (1.0f - 0.70f * s);
-              const float rf = static_cast<float>(tint.r) * (1.0f - 0.70f * s);
-
-              tint.b = ClampU8(static_cast<int>(std::round(bf)));
-              tint.g = ClampU8(static_cast<int>(std::round(gf)));
-              tint.r = ClampU8(static_cast<int>(std::round(rf)));
-            }
+          if (showCommercialGoods && t.overlay == Overlay::Commercial) {
+            const float fill = (*commercialGoodsFill)[tileIdx] / 255.0f;
+            tint = Color{
+              static_cast<unsigned char>(std::clamp<int>(tint.r + static_cast<int>(255.0f * (1.0f - fill)), 0, 255)),
+              static_cast<unsigned char>(std::clamp<int>(tint.g - static_cast<int>(60.0f * (1.0f - fill)), 0, 255)),
+              static_cast<unsigned char>(std::clamp<int>(tint.b - static_cast<int>(60.0f * (1.0f - fill)), 0, 255)),
+              255};
           }
+
+          DrawTexturePro(overlay(t.overlay), src, dst, Vector2{0, 0}, 0.0f, tint);
         }
-
-        Texture2D& rtex = (t.terrain == Terrain::Water) ? bridge(mask, t.variation, t.level) : road(mask, t.variation, t.level);
-        DrawTexturePro(rtex, src, dst, Vector2{0, 0}, 0.0f, tint);
-      } else if (t.overlay != Overlay::None) {
-        Color tint = BrightnessTint(brightness);
-
-        if (showOutside) {
-          const bool isZone = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
-                               t.overlay == Overlay::Industrial);
-          const bool isPark = (t.overlay == Overlay::Park);
-
-          if (isZone) {
-            // Zone access is component-based (multi-tile buildings can be served by a single road
-            // connection).
-            if (!HasZoneAccess(zoneAccessOutside, x, y)) {
-              tint = Mul(tint, 0.55f);
-            }
-          } else if (isPark) {
-            // Keep the park rule tile-local for now.
-            if (!HasAdjacentRoadConnectedToEdge(world, *roadToEdgeMask, x, y)) {
-              tint = Mul(tint, 0.55f);
-            }
-          }
-        }
-
-
-        if (showCommercialGoods && t.overlay == Overlay::Commercial) {
-          const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
-                                  static_cast<std::size_t>(x);
-          if (idx < commercialGoodsFill->size()) {
-            const float ratio = static_cast<float>((*commercialGoodsFill)[idx]) / 255.0f;
-            const float miss = std::clamp(1.0f - ratio, 0.0f, 1.0f);
-            if (miss > 0.01f) {
-              const float rf = std::min(255.0f, static_cast<float>(tint.r) * (1.0f + 0.10f * miss) + 70.0f * miss);
-              const float gf = static_cast<float>(tint.g) * (1.0f - 0.55f * miss);
-              const float bf = static_cast<float>(tint.b) * (1.0f - 0.55f * miss);
-              tint.r = ClampU8(static_cast<int>(std::round(rf)));
-              tint.g = ClampU8(static_cast<int>(std::round(gf)));
-              tint.b = ClampU8(static_cast<int>(std::round(bf)));
-            }
-          }
-        }
-
-        DrawTexturePro(overlay(t.overlay), src, dst, Vector2{0, 0}, 0.0f, tint);
       }
 
+      // -----------------------------
+      // Decals (procedural details + ground weather)
+      // -----------------------------
       if (drawAestheticDetails) {
-        DrawProceduralTileDetails(world, x, y, t, center, tileW, tileH, camera.zoom, brightness, m_gfxSeed32, timeSec);
+        // Procedural micro-detail pass (grass tufts, rocks, water sparkles, etc.)
+        DrawProceduralTileDetails(world, x, y, center, tileWf, tileHf, brightness, timeSec, m_gfxSeed32);
 
+        // Ground weather effects (wet sheen, snow cover, etc.)
         if (m_weather.affectGround) {
-          DrawWeatherGroundEffects(world, x, y, t, center, tileW, tileH, camera.zoom, brightness,
-                                dayNight, weather, timeSec, m_gfxSeed32);
+          DrawWeatherGroundEffects(world, x, y, baseCenter, tileWf, tileHf, baseBrightness, brightness, timeSec, weather, m_gfxSeed32);
         }
       }
 
-      // District overlay (fill). District 0 is treated as "unassigned" and is left transparent.
-      if (showDistrictOverlay) {
-        const std::uint8_t d = static_cast<std::uint8_t>(t.district) & 7u;
-        if (d != 0u) {
-          unsigned char alpha = 65;
-          if (highlightDistrict >= 0) {
-            alpha = (d == static_cast<std::uint8_t>(highlightDistrict & 7)) ? 95 : 22;
+      // Shoreline highlight is a subtle readability aid; keep it as a decal even when aesthetic details are suppressed.
+      if (layerDecals && tileScreenW >= 18.0f) {
+        const bool tileIsWater = (t.terrain == Terrain::Water);
+        if (tileIsWater) {
+          const bool leftLand = (x > 0) && world.at(x - 1, y).terrain != Terrain::Water;
+          const bool rightLand = (x < mapW - 1) && world.at(x + 1, y).terrain != Terrain::Water;
+          const bool upLand = (y > 0) && world.at(x, y - 1).terrain != Terrain::Water;
+          const bool downLand = (y < mapH - 1) && world.at(x, y + 1).terrain != Terrain::Water;
+
+          const bool hasLandNeighbor = leftLand || rightLand || upLand || downLand;
+          if (hasLandNeighbor) {
+            Vector2 c[4];
+            TileDiamondCorners(center, tileWf, tileHf, c);
+
+            const float t = 0.12f;
+            const Vector2 cTop = Lerp(c[0], c[1], 0.5f);
+            const Vector2 cRight = Lerp(c[1], c[2], 0.5f);
+            const Vector2 cBottom = Lerp(c[2], c[3], 0.5f);
+            const Vector2 cLeft = Lerp(c[3], c[0], 0.5f);
+
+            auto drawSeg = [&](Vector2 a, Vector2 b) {
+              const float thick = std::max(0.8f, 1.6f / std::max(0.25f, camera.zoom));
+              DrawLineEx(a, b, thick, Color{255, 255, 255, 60});
+              DrawLineEx(a, b, thick * 0.5f, Color{200, 220, 255, 60});
+            };
+
+            if (upLand) drawSeg(Lerp(c[0], cTop, t), Lerp(c[1], cTop, t));
+            if (rightLand) drawSeg(Lerp(c[1], cRight, t), Lerp(c[2], cRight, t));
+            if (downLand) drawSeg(Lerp(c[2], cBottom, t), Lerp(c[3], cBottom, t));
+            if (leftLand) drawSeg(Lerp(c[3], cLeft, t), Lerp(c[0], cLeft, t));
           }
-          if (alpha > 0) {
-            const Color c = DistrictFillColor(d, alpha);
+        }
+      }
+
+      // -----------------------------
+      // Building shadow casters (collected in pass 1, rendered in a later shadow pass)
+      // -----------------------------
+      if (drawShadows) {
+        const bool isZone = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
+                             t.overlay == Overlay::Industrial || t.overlay == Overlay::Park);
+        if (isZone) {
+          BuildingShadowCaster caster{};
+
+          if (useMergedZoneBuildings && IsZoneOverlay(t.overlay) &&
+              tileIdx < static_cast<int>(m_zoneParcelsScratch.anchorToParcel.size())) {
+            const int parcelId = m_zoneParcelsScratch.anchorToParcel[static_cast<std::size_t>(tileIdx)];
+            if (parcelId >= 0 && parcelId < static_cast<int>(m_zoneParcelsScratch.parcels.size())) {
+              const ZoneBuildingParcel& p =
+                  m_zoneParcelsScratch.parcels[static_cast<std::size_t>(parcelId)];
+
+              if (p.isMultiTile()) {
+                if (BuildZoneParcelShadowCaster(world, p, m_elev, tileWf, tileHf, camera.zoom, timeSec, caster)) {
+                  shadowCasters.push_back(caster);
+                }
+              } else {
+                if (BuildZoneTileShadowCaster(t, tileWf, tileHf, camera.zoom, center, caster)) {
+                  shadowCasters.push_back(caster);
+                }
+              }
+            }
+          } else if (!useMergedZoneBuildings || t.overlay == Overlay::Park) {
+            if (BuildZoneTileShadowCaster(t, tileWf, tileHf, camera.zoom, center, caster)) {
+              shadowCasters.push_back(caster);
+            }
+          }
+        }
+      }
+
+
+    }
+  }
+
+
+  // -----------------------------
+  // Shadow pass (decals)
+  // -----------------------------
+  if (drawShadows && !shadowCasters.empty()) {
+    DrawBuildingShadowsPass(shadowCasters, m_shadows, dayNight, weather, tileWf, tileHf, camera.zoom);
+  }
+
+  // -----------------------------
+  // Pass 2: overlays + structures
+  // -----------------------------
+  for (int sum = vis.minSum(); sum <= vis.maxSum(); ++sum) {
+    const int x0 = std::max(vis.minX, sum - vis.maxY);
+    const int x1 = std::min(vis.maxX, sum - vis.minY);
+
+    for (int x = x0; x <= x1; ++x) {
+      const int y = sum - x;
+      const int tileIdx = y * mapW + x;
+      const Tile& t = world.tile(x, y);
+
+      float elevPx = 0.0f;
+      if (m_elev.maxPixels > 0) {
+        elevPx = TileElevationPx(t, m_elev);
+      }
+
+      const Vector2 baseCenter{(x - y) * tileWf * 0.5f, (x + y) * tileHf * 0.5f};
+      Vector2 center = baseCenter;
+      center.y -= elevPx;
+
+      // Screen-space AABB for quick culling.
+      const Rectangle tileAABB{center.x - tileWf * 0.5f, center.y - tileHf * 0.5f, tileWf, tileHf};
+      if (!CheckCollisionRecs(tileAABB, viewAABB)) {
+        continue;
+      }
+
+      // Lighting (must match pass 1 so overlays/structures agree).
+      const TileLighting light = ComputeTileLighting(world, x, y, tileWf, tileHf, m_elev, timeSec, animatedLighting);
+      const float baseBrightness = light.base;
+      const float brightness = light.animated;
+
+      // -----------------------------
+      // District overlay fill (overlay layer)
+      // -----------------------------
+      if (showDistrictOverlayEff && tileScreenW >= 6.0f) {
+        const DistrictId did = t.district;
+        if (did >= 0 && did < static_cast<DistrictId>(districtColors.size())) {
+          const Color c = districtColors[static_cast<std::size_t>(did)];
+
+          // Soft fill; alpha reduced when zoomed out.
+          const float alphaK = std::clamp((tileScreenW - 6.0f) / 18.0f, 0.0f, 1.0f);
+          const unsigned char a = static_cast<unsigned char>(40.0f + 80.0f * alphaK);
+          DrawDiamond(center, tileWf, tileHf, Color{c.r, c.g, c.b, a});
+        }
+      }
+
+      // -----------------------------
+      // Heatmap overlay (overlay layer)
+      // -----------------------------
+      if (showHeatmap && heatmap) {
+        const float v = (*heatmap)[static_cast<std::size_t>(tileIdx)];
+        const Color c = HeatmapColor(heatmapRamp, v);
+        DrawDiamond(center, tileWf, tileHf, Color{c.r, c.g, c.b, 90});
+      }
+
+      // -----------------------------
+      // Grid overlay (overlay layer)
+      // -----------------------------
+      if (drawGridEff && tileScreenW >= 8.0f) {
+        const float invZoom = 1.0f / std::max(0.001f, camera.zoom);
+        const float w = std::clamp(invZoom * 1.25f, 0.6f * invZoom, 2.2f * invZoom);
+
+        Vector2 corners[4];
+        TileDiamondCorners(center, tileWf, tileHf, corners);
+        for (int i = 0; i < 4; ++i) {
+          const Vector2 a = corners[i];
+          const Vector2 b = corners[(i + 1) & 3];
+          DrawLineEx(a, b, w, Color{255, 255, 255, 55});
+        }
+      }
+
+      // -----------------------------
+      // District borders (overlay layer)
+      // -----------------------------
+      if (showDistrictBordersEff && tileScreenW >= 6.0f) {
+        const float invZoom = 1.0f / std::max(0.001f, camera.zoom);
+        const float w = std::clamp(invZoom * 1.6f, 0.6f * invZoom, 3.0f * invZoom);
+
+        // Check N/E neighbors (avoid double-drawing).
+        auto drawEdge = [&](int nx, int ny, int cornerA, int cornerB) {
+          if (nx < 0 || ny < 0 || nx >= mapW || ny >= mapH) return;
+          const DistrictId nd = world.tile(nx, ny).district;
+          if (nd != t.district) {
             Vector2 corners[4];
-            TileDiamondCorners(center, tileW, tileH, corners);
-            DrawTriangle(corners[0], corners[1], corners[2], c);
-            DrawTriangle(corners[0], corners[2], corners[3], c);
+            TileDiamondCorners(center, tileWf, tileHf, corners);
+            DrawLineEx(corners[cornerA], corners[cornerB], w, Color{0, 0, 0, 160});
+            DrawLineEx(corners[cornerA], corners[cornerB], w * 0.5f, Color{255, 255, 255, 70});
           }
-        }
-      }
-
-      // Heatmap overlay (drawn after tile overlays so it can tint zones/roads).
-      if (showHeatmap) {
-        if (tileIdx < heatmap->size()) {
-          const float hv = (*heatmap)[tileIdx];
-          const Color c = HeatmapColor(hv, heatmapRamp);
-          Vector2 corners[4];
-          TileDiamondCorners(center, tileW, tileH, corners);
-          DrawTriangle(corners[0], corners[1], corners[2], c);
-          DrawTriangle(corners[0], corners[2], corners[3], c);
-        }
-      }
-
-      // Shoreline highlight (water <-> land boundary). Kept subtle so it doesn't fight the heatmap.
-      if (tileW * camera.zoom >= 18.0f) {
-        auto drawShoreEdge = [&](int nx, int ny, int cornerA, int cornerB) {
-          if (nx < 0 || ny < 0 || nx >= w || ny >= h) return;
-          const Tile& nt = world.at(nx, ny);
-          const bool waterHere = (t.terrain == Terrain::Water);
-          const bool waterThere = (nt.terrain == Terrain::Water);
-          if (waterHere == waterThere) return;
-
-          if (t.terrain == Terrain::Water && t.overlay == Overlay::Road) return;
-
-          const int wx = waterHere ? x : nx;
-          const int wy = waterHere ? y : ny;
-          const Tile& wt = world.at(wx, wy);
-          const float wElev = TileElevationPx(wt, m_elev);
-
-          Vector2 waterCenter = TileToWorldCenter(wx, wy, tileW, tileH);
-          waterCenter.y -= wElev;
-
-          Vector2 edgeCorners[4];
-          Vector2 edgeCenter = baseCenter;
-          edgeCenter.y -= wElev;
-          TileDiamondCorners(edgeCenter, tileW, tileH, edgeCorners);
-
-          Vector2 a = edgeCorners[cornerA];
-          Vector2 b = edgeCorners[cornerB];
-
-          const Vector2 mid{(a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f};
-          Vector2 dir{waterCenter.x - mid.x, waterCenter.y - mid.y};
-          const float dl2 = dir.x * dir.x + dir.y * dir.y;
-          if (dl2 > 1.0e-6f) {
-            const float inv = 1.0f / std::sqrt(dl2);
-            dir.x *= inv;
-            dir.y *= inv;
-            const float off = 0.75f / std::max(0.001f, camera.zoom);
-            a.x += dir.x * off;
-            a.y += dir.y * off;
-            b.x += dir.x * off;
-            b.y += dir.y * off;
-          }
-
-          const float thick = 1.55f / std::max(0.001f, camera.zoom);
-          DrawLineEx(a, b, thick * 1.35f, Color{255, 255, 255, 45});
-          DrawLineEx(a, b, thick * 0.85f, Color{255, 255, 255, 110});
         };
 
-        drawShoreEdge(x - 1, y, 3, 0);
-        drawShoreEdge(x, y - 1, 0, 1);
+        // North edge: between TL (0) and TR (1)
+        drawEdge(x, y - 1, 0, 1);
+        // East edge: between TR (1) and BR (2)
+        drawEdge(x + 1, y, 1, 2);
       }
 
-      if (drawGrid) {
-        Vector2 corners[4];
-        TileDiamondCorners(center, static_cast<float>(m_tileW), static_cast<float>(m_tileH), corners);
-        const Color gc = Color{0, 0, 0, 40};
-        DrawLineV(corners[0], corners[1], gc);
-        DrawLineV(corners[1], corners[2], gc);
-        DrawLineV(corners[2], corners[3], gc);
-        DrawLineV(corners[3], corners[0], gc);
+      // -----------------------------
+      // Depth-sorted injected sprites (pre-FX)
+      // -----------------------------
+      // Draw after per-tile overlays but before buildings/indicators so sprites sit "on top" of ground
+      // overlays yet can still be occluded by structures on later diagonals.
+      if (!preSprites.empty()) {
+        flushPreSprites(sum, static_cast<float>(x));
       }
 
-      // District borders (drawn after grid/heatmap so boundaries stay readable).
-      if (showDistrictBorders) {
-        Vector2 corners[4];
-        TileDiamondCorners(center, tileW, tileH, corners);
-        const Color border = Color{0, 0, 0, 170};
-        const float thick = 2.0f / std::max(0.001f, camera.zoom);
-        const std::uint8_t d = static_cast<std::uint8_t>(t.district) & 7u;
+      // -----------------------------
+      // Zone buildings and indicators (structures)
+      // -----------------------------
+      if (layerStructures && tileScreenW >= 26.0f) {
+        const bool isZone = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
+                             t.overlay == Overlay::Industrial || t.overlay == Overlay::Park);
 
-        if (x + 1 < w) {
-          const std::uint8_t dn = static_cast<std::uint8_t>(world.at(x + 1, y).district) & 7u;
-          if (dn != d) {
-            DrawLineEx(corners[1], corners[2], thick, border);
-          }
-        }
-
-        if (y + 1 < h) {
-          const std::uint8_t dn = static_cast<std::uint8_t>(world.at(x, y + 1).district) & 7u;
-          if (dn != d) {
-            DrawLineEx(corners[2], corners[3], thick, border);
-          }
-        }
-      }
-
-      // Zone buildings + indicators.
-      const float tileScreenW = tileW * camera.zoom;
-      const bool isZone = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
-                           t.overlay == Overlay::Industrial);
-
-      if (useMergedZoneBuildings && isZone && tileIdx < m_zoneParcelsScratch.tileToParcel.size()) {
-        const int parcelAll = m_zoneParcelsScratch.tileToParcel[tileIdx];
-        const int parcelAnchor = m_zoneParcelsScratch.anchorToParcel[tileIdx];
-
-        if (parcelAll >= 0) {
-          // Only draw once per parcel (on the anchor tile).
-          if (parcelAnchor >= 0 && parcelAnchor < static_cast<int>(m_zoneParcelsScratch.parcels.size())) {
-            const ZoneBuildingParcel& p =
-                m_zoneParcelsScratch.parcels[static_cast<std::size_t>(parcelAnchor)];
-
-            if (p.isMultiTile()) {
-              DrawMergedZoneBuildingAndIndicators(p, world, m_elev, tileW, tileH, camera.zoom, timeSec);
+        if (isZone) {
+          if (useMergedZoneBuildings) {
+            // For R/C/I we render one building per parcel (at the anchor tile).
+            // Parks are not parcelized (keeps them as per-tile small structures).
+            if (IsZoneOverlay(t.overlay) && tileIdx < static_cast<int>(m_zoneParcelsScratch.anchorToParcel.size())) {
+              const int pid = m_zoneParcelsScratch.anchorToParcel[static_cast<std::size_t>(tileIdx)];
+              if (pid >= 0 && pid < static_cast<int>(m_zoneParcelsScratch.parcels.size())) {
+                const ZoneBuildingParcel& p = m_zoneParcelsScratch.parcels[static_cast<std::size_t>(pid)];
+                if (p.isMultiTile()) {
+                  DrawMergedZoneBuildingAndIndicators(p, world, m_elev, tileWf, tileHf, camera.zoom, timeSec);
+                } else {
+                  // Single-tile parcel: fall back to normal building + indicators.
+                  DrawZoneBuilding(t, tileWf, tileHf, camera.zoom, center, brightness);
+                  DrawZoneTileIndicators(t, tileWf, tileHf, camera.zoom, center);
+                }
+              }
             } else {
-              DrawZoneBuilding(t, tileW, tileH, camera.zoom, center, brightness);
-              DrawZoneTileIndicators(t, tileW, tileH, camera.zoom, center);
+              // Park or non-parcelized overlay
+              DrawZoneBuilding(t, tileWf, tileHf, camera.zoom, center, brightness);
+              DrawZoneTileIndicators(t, tileWf, tileHf, camera.zoom, center);
             }
-          }
-        } else {
-          // Defensive fallback: zone tile not parcelized (should be rare).
-          DrawZoneBuilding(t, tileW, tileH, camera.zoom, center, brightness);
-          DrawZoneTileIndicators(t, tileW, tileH, camera.zoom, center);
-        }
-      } else {
-        // Per-tile fallback.
-        DrawZoneBuilding(t, tileW, tileH, camera.zoom, center, brightness);
-        DrawZoneTileIndicators(t, tileW, tileH, camera.zoom, center);
-      }
-
-// Road indicators: show small pips for upgraded road class (2..3) when zoomed in.
-      if (t.overlay == Overlay::Road && tileScreenW >= 28.0f) {
-        const int lvl = std::clamp<int>(static_cast<int>(t.level), 1, 3);
-        if (lvl > 1) {
-          const float invZoom = 1.0f / std::max(0.001f, camera.zoom);
-          const float y0 = center.y - static_cast<float>(m_tileH) * 0.02f;
-
-          const float pip = 4.0f * invZoom;
-          const float gap = 1.5f * invZoom;
-          const float groupW = pip * 3.0f + gap * 2.0f;
-        const float groupX0 = center.x - groupW * 0.5f;
-
-          for (int i = 0; i < 3; ++i) {
-          Rectangle r{groupX0 + static_cast<float>(i) * (pip + gap), y0, pip, pip};
-            DrawRectangleRec(r, Color{0, 0, 0, 110});
-            DrawRectangleLinesEx(r, 1.0f * invZoom, Color{255, 255, 255, 55});
-            if (i < lvl) {
-              Rectangle f{r.x + 1.0f * invZoom, r.y + 1.0f * invZoom, r.width - 2.0f * invZoom,
-                          r.height - 2.0f * invZoom};
-              DrawRectangleRec(f, Color{255, 255, 255, 160});
-            }
+          } else {
+            DrawZoneBuilding(t, tileWf, tileHf, camera.zoom, center, brightness);
+            DrawZoneTileIndicators(t, tileWf, tileHf, camera.zoom, center);
           }
         }
       }
+
+      // -----------------------------
+      // Road indicators (upgrade pips, etc.)
+      // -----------------------------
+      if (layerStructures && t.overlay == Overlay::Road && tileScreenW >= 18.0f) {
+        DrawRoadIndicators(t, tileWf, tileHf, camera.zoom, center, brightness);
+      }
+    }
+
+    // Flush any remaining sprites anchored to this diagonal sum (including ones with sortX outside the visible range).
+    if (!preSprites.empty()) {
+      flushPreSprites(sum, std::numeric_limits<float>::infinity());
     }
   }
 
+  // Draw any remaining sprites (usually in front of the visible tile range).
+  while (preSpriteIdx < preSprites.size()) {
+    const WorldSprite* s = preSprites[preSpriteIdx];
+    if (s) drawWorldSprite(*s);
+    ++preSpriteIdx;
   }
 
+  // -----------------------------
+  // Game/world overlays (pre-FX)
+  // -----------------------------
+  if (drawBeforeFx) {
+    drawBeforeFx(camera);
+  }
 
+  // -----------------------------
+  // Weather + day/night grading (decals layer)
+  // -----------------------------
+  if (drawAestheticDetails && m_weather.affectScreen) {
+    const float w = std::clamp(weather.overcast, 0.0f, 1.0f);
+    const float dnMul = (m_dayNight.enabled) ? (0.65f + 0.35f * dayNight.day) : 1.0f;
+    const float a = std::clamp(w * dnMul, 0.0f, 1.0f);
 
-  // Weather overcast grading (suppressed in utility overlay mode).
-  if (drawAestheticDetails && weather.mode != WeatherSettings::Mode::Clear) {
-    const int aWx = static_cast<int>(90.0f * weather.overcast);
+    const int aWx = static_cast<int>(120.0f * a);
     if (aWx > 0) {
-      const float pad = std::max(tileWf, tileHf) * 2.5f;
-      Rectangle grade{viewAABB.minX - pad, viewAABB.minY - pad,
-                      (viewAABB.maxX - viewAABB.minX) + 2.0f * pad,
-                      (viewAABB.maxY - viewAABB.minY) + 2.0f * pad};
+      const float pad = tileWf * 2.0f;
+      const Vector2 pos{viewAABB.minX - pad, viewAABB.minY - pad};
+      const Vector2 size{(viewAABB.maxX - viewAABB.minX) + pad * 2.0f, (viewAABB.maxY - viewAABB.minY) + pad * 2.0f};
 
       if (weather.mode == WeatherSettings::Mode::Snow) {
-        DrawRectangleRec(grade, Color{220, 228, 235, ClampU8(aWx)});
-      } else { // Rain
-        DrawRectangleRec(grade, Color{55, 70, 85, ClampU8(aWx)});
+        DrawRectangleV(pos, size, Color{255, 255, 255, static_cast<unsigned char>(aWx)});
+      } else {
+        DrawRectangleV(pos, size, Color{70, 90, 110, static_cast<unsigned char>(aWx)});
       }
     }
   }
 
-  // Day/night grading + emissive lights (only when not in utility overlay mode).
   if (drawAestheticDetails && m_dayNight.enabled) {
-    const float nightStrength = std::clamp(m_dayNight.nightDarken, 0.0f, 1.0f);
-    const float duskStrength = std::clamp(m_dayNight.duskTint, 0.0f, 1.0f);
+    const float nightStrength = 1.0f - dayNight.day;
+    const float duskStrength = dayNight.dusk;
 
-    const int aNight = static_cast<int>(190.0f * dayNight.night * nightStrength);
-    const int aDusk = static_cast<int>(60.0f * dayNight.twilight * duskStrength);
+    const int aNight = static_cast<int>(220.0f * std::clamp(nightStrength * 0.65f, 0.0f, 1.0f));
+    const int aDusk = static_cast<int>(120.0f * std::clamp(duskStrength * 0.55f, 0.0f, 1.0f));
 
-    if (aNight > 0 || aDusk > 0) {
-      const float pad = std::max(tileWf, tileHf) * 2.5f;
-      Rectangle grade{viewAABB.minX - pad, viewAABB.minY - pad,
-                      (viewAABB.maxX - viewAABB.minX) + 2.0f * pad,
-                      (viewAABB.maxY - viewAABB.minY) + 2.0f * pad};
+    const float pad = tileWf * 2.0f;
+    const Vector2 pos{viewAABB.minX - pad, viewAABB.minY - pad};
+    const Vector2 size{(viewAABB.maxX - viewAABB.minX) + pad * 2.0f, (viewAABB.maxY - viewAABB.minY) + pad * 2.0f};
 
-      if (aNight > 0) {
-        DrawRectangleRec(grade, Color{8, 12, 45, ClampU8(aNight)});
+    if (aNight > 0) {
+      DrawRectangleV(pos, size, Color{0, 0, 0, static_cast<unsigned char>(aNight)});
+    }
+    if (aDusk > 0) {
+      DrawRectangleV(pos, size, Color{255, 120, 60, static_cast<unsigned char>(aDusk)});
+    }
+  }
+
+  const bool drawLights =
+    drawAestheticDetails && m_dayNight.enabled && dayNight.nightLights > 0.01f && tileScreenW >= 24.0f;
+  if (drawLights) {
+    DrawNightLightsPass(
+      world,
+      vis,
+      tileWf,
+      tileHf,
+      m_elev,
+      dayNight.nightLights,
+      weather.wetness,
+      m_weather.reflectLights,
+      timeSec,
+      m_gfxSeed32);
+  }
+
+  // -----------------------------
+  // Depth-sorted injected sprites (emissive)
+  // -----------------------------
+  // Draw after grading so emissive elements (e.g., headlights) stay bright at night.
+  if (!emissiveSprites.empty()) {
+    BeginBlendMode(BLEND_ADDITIVE);
+    for (const WorldSprite* s : emissiveSprites) {
+      if (s) drawWorldSprite(*s);
+    }
+    EndBlendMode();
+  }
+
+  // -----------------------------
+  // Game/world overlays (post-FX)
+  // -----------------------------
+  if (drawAfterFx) {
+    drawAfterFx(camera);
+  }
+
+  // -----------------------------
+  // Selection/highlight overlays (overlay layer)
+  // -----------------------------
+  if (layerOverlays) {
+    const float thick = std::max(1.0f, 2.0f / std::max(0.25f, camera.zoom));
+
+    const auto drawOutline = [&](int tx, int ty, Color c) {
+      if (!world.inBounds(tx, ty)) return;
+      const Tile& tt = world.at(tx, ty);
+      const float elevPx = TileElevationPx(tt, m_elev);
+      const Vector2 baseC = TileToWorldCenter(tx, ty, tileWf, tileHf);
+      const Vector2 cc = Vector2{baseC.x, baseC.y - elevPx};
+
+      Vector2 corners[4];
+      TileDiamondCorners(cc, tileWf, tileHf, corners);
+
+      DrawLineEx(corners[0], corners[1], thick, c);
+      DrawLineEx(corners[1], corners[2], thick, c);
+      DrawLineEx(corners[2], corners[3], thick, c);
+      DrawLineEx(corners[3], corners[0], thick, c);
+    };
+
+    if (highlightPathEff && !highlightPathEff->empty()) {
+      for (const Point& p : *highlightPathEff) {
+        drawOutline(p.x, p.y, Color{255, 215, 0, 110});
       }
-      if (aDusk > 0) {
-        DrawRectangleRec(grade, Color{255, 150, 90, ClampU8(aDusk)});
-      }
     }
 
-    if (m_dayNight.drawLights && dayNight.night > 0.05f) {
-      DrawNightLightsPass(world, vis, tileWf, tileHf, m_elev, camera.zoom, timeSec, dayNight.night,
-                         weather.wetness, m_weather.reflectLights, m_gfxSeed32);
+    if (selected) {
+      drawOutline(selected->x, selected->y, Color{255, 215, 0, 220});
     }
-  }
-  // Highlight helpers.
-  const float thickness = 2.0f / std::max(0.25f, camera.zoom);
 
-  auto drawOutline = [&](int tx, int ty, Color c) {
-    if (!world.inBounds(tx, ty)) return;
-    const float tileW = static_cast<float>(m_tileW);
-    const float tileH = static_cast<float>(m_tileH);
-    Vector2 center = TileToWorldCenter(tx, ty, tileW, tileH);
-    center.y -= TileElevationPx(world.at(tx, ty), m_elev);
-    Vector2 corners[4];
-    TileDiamondCorners(center, tileW, tileH, corners);
+    if (hovered) {
+      const int cx = hovered->x;
+      const int cy = hovered->y;
 
-    DrawLineEx(corners[0], corners[1], thickness, c);
-    DrawLineEx(corners[1], corners[2], thickness, c);
-    DrawLineEx(corners[2], corners[3], thickness, c);
-    DrawLineEx(corners[3], corners[0], thickness, c);
-  };
-
-  // Optional debug highlight: path to edge (inspect tool).
-  if (highlightPath && !highlightPath->empty()) {
-    const Color pc = Color{255, 215, 0, 110};
-    for (const Point& p : *highlightPath) {
-      drawOutline(p.x, p.y, pc);
-    }
-  }
-
-  // Selected tile highlight.
-  if (selected && world.inBounds(selected->x, selected->y)) {
-    drawOutline(selected->x, selected->y, Color{255, 215, 0, 220});
-  }
-
-  // Hover highlight (and brush outline)
-  if (hovered && world.inBounds(hovered->x, hovered->y)) {
-    const int cx = hovered->x;
-    const int cy = hovered->y;
-
-    const int r = std::max(0, brushRadius);
-    if (r > 0) {
-      const Color bc = Color{255, 255, 255, 70};
-      for (int dy = -r; dy <= r; ++dy) {
-        for (int dx = -r; dx <= r; ++dx) {
-          if (std::abs(dx) + std::abs(dy) > r) continue; // diamond brush
-          const int tx = cx + dx;
-          const int ty = cy + dy;
-          drawOutline(tx, ty, bc);
+      const int r = std::max(0, brushRadius);
+      if (r > 0) {
+        for (int dy = -r; dy <= r; ++dy) {
+          for (int dx = -r; dx <= r; ++dx) {
+            if (std::abs(dx) + std::abs(dy) > r) continue; // diamond brush
+            drawOutline(cx + dx, cy + dy, Color{255, 255, 255, 70});
+          }
         }
       }
-    }
 
-    // Center tile gets a brighter outline.
-    drawOutline(cx, cy, Color{255, 255, 255, 180});
+      drawOutline(cx, cy, Color{255, 255, 255, 180});
+    }
   }
 
   EndMode2D();
 }
+
 
 
 void Renderer::drawWeatherScreenFX(int screenW, int screenH, float timeSec, bool allowAestheticDetails)
@@ -3927,7 +4307,7 @@ void Renderer::drawHUD(const World& world, const Camera2D& camera, Tool tool, in
   if (m_useBandCache) {
     int dirtyBands = 0;
     for (const auto& b : m_bands) {
-      if (b.dirty) ++dirtyBands;
+      if (b.dirtyTerrain || b.dirtyStructures) ++dirtyBands;
     }
     std::snprintf(buf, sizeof(buf), "Undo: %d    Redo: %d    Slot: %d    Cache: ON (dirty %d)    D/N: %s    Wx: %s",
                   undoCount, redoCount, saveSlot, dirtyBands, m_dayNight.enabled ? "ON" : "OFF", wxBuf);
@@ -3970,7 +4350,7 @@ void Renderer::drawHUD(const World& world, const Camera2D& camera, Tool tool, in
   }
 
   if (showHelp) {
-    DrawText("Right drag: pan | Wheel: zoom | R regen | G grid | H help | M minimap | E elev | O outside | L heatmap | C vehicles | P policy | F1 report | F2 cache | Shift+F2 day/night | F3 model | F7 districts | T graph | V traffic | B goods", pad + 10, y + 10, 16,
+    DrawText("Right drag: pan | Wheel: zoom | R regen | G grid | H help | M minimap | E elev | O outside | L heatmap | C vehicles | P policy | F1 report | F2 cache | Shift+F2 day/night | F3 model | Shift+F3 weather | F7 districts | T graph | V traffic | B goods", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
     y += 22;
     DrawText("1 Road | 2 Res | 3 Com | 4 Ind | 5 Park | 0 Doze | 6 Raise | 7 Lower | 8 Smooth | 9 District | Q Inspect", pad + 10, y + 10, 16,
@@ -3979,10 +4359,10 @@ void Renderer::drawHUD(const World& world, const Camera2D& camera, Tool tool, in
     DrawText("[/] brush | ,/. district | Space: pause | N: step | +/-: speed | U: road type", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
     y += 22;
-    DrawText("F4 console | F5 save | F9 load | F6 slot | F10 saves | F12 shot | Ctrl+F12 map | Ctrl+Z undo | Ctrl+Y redo", pad + 10, y + 10, 16,
+    DrawText("F4 console | F5 save | F9 load | F6 slot | F10 saves | F12 shot | Ctrl+F12 map | Ctrl+Shift+F12 layers | Ctrl+Z undo | Ctrl+Y redo", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
     y += 22;
-    DrawText("F8 video | F11 fullscreen | Alt+Enter borderless | Ctrl+=/- UI scale | Ctrl+0 UI auto | Ctrl+Alt+=/- world scale", pad + 10, y + 10, 16,
+    DrawText("F8 video (Shift+F8 FX) | F11 fullscreen | Alt+Enter borderless | Ctrl+=/- UI scale | Ctrl+0 UI auto | Ctrl+Alt+=/- world scale", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
     y += 22;
     DrawText("Tip: re-place a zone to upgrade. Road: U selects class (paint to upgrade), Shift+drag builds path. Terraform: Shift=strong, Ctrl=fine. District: Alt+click pick, Shift+click fill.", pad + 10, y + 10, 16,

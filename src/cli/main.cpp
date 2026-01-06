@@ -6,6 +6,8 @@
 #include "isocity/GfxTilesetAtlas.hpp"
 #include "isocity/Pathfinding.hpp"
 
+#include <algorithm>
+
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
@@ -129,7 +131,10 @@ void PrintHelp()
   std::cout
       << "proc_isocity_cli (headless simulation runner)\n\n"
       << "Usage:\n"
-      << "  proc_isocity_cli [--load <save.bin>] [--seed <u64>] [--size <WxH>] [--days <N>]\n"
+      << "  proc_isocity_cli [--load <save.bin>] [--seed <u64>] [--size <WxH>]\n"
+      << "                 [--gen-preset <name>] [--gen-preset-strength <N>]\n"
+      << "                 [--gen-road-hierarchy <0|1>] [--gen-road-hierarchy-strength <N>]\n"
+      << "                 [--gen-districting-mode <voronoi|road_flow|block_graph>] [--days <N>]\n"
       << "                 [--out <summary.json>] [--csv <ticks.csv>] [--save <save.bin>]\n"
       << "                 [--require-outside <0|1>] [--tax-res <N>] [--tax-com <N>] [--tax-ind <N>]\n"
       << "                 [--maint-road <N>] [--maint-park <N>]\n"
@@ -138,7 +143,8 @@ void PrintHelp()
       << "                 [--export-3d <layer> <out.ppm|out.png>]... [--3d-size <WxH>] [--3d-proj <iso|persp>]\n"
       << "                 [--3d-yaw <deg>] [--3d-pitch <deg>] [--3d-roll <deg>] [--3d-fit <0|1>] [--3d-ssaa <N>]\n"
       << "                 [--3d-target <x,y,z>] [--3d-dist <N>] [--3d-fov <deg>] [--3d-ortho <N>]\n"
-      << "                 [--3d-outline <0|1>] [--3d-top <0|1>]\n"
+      << "                 [--3d-outline <0|1>] [--3d-top <0|1>] [--3d-heightfield <0|1>]\n"
+      << "                 [--3d-skirt <0|1>] [--3d-skirt-drop <N>]\n"
       << "                 [--3d-light <x,y,z>] [--3d-ambient <0..100>] [--3d-diffuse <0..100>] [--3d-bg <r,g,b>]\n"
       << "                 [--3d-fog <0|1>] [--3d-fog-strength <0..100>] [--3d-fog-start <0..100>] [--3d-fog-end <0..100>]\n"
       << "                 [--3d-heightscale <N>] [--3d-quant <N>] [--3d-buildings <0|1>] [--3d-cliffs <0|1>]\n"
@@ -163,6 +169,7 @@ void PrintHelp()
       << "Notes:\n"
       << "  - If --load is provided, the world + ProcGenConfig + SimConfig are loaded from the save.\n"
       << "  - Otherwise, a new world is generated from (--seed, --size).\n"
+      << "  - --gen-preset/--gen-preset-strength/--gen-road-hierarchy*/--gen-districting-mode only apply when generating a new world.\n"
       << "  - --days advances the simulator by N ticks via Simulator::stepOnce().\n"
       << "  - A stable 64-bit hash of the final world is included in the JSON output.\n";
 }
@@ -337,6 +344,54 @@ int main(int argc, char** argv)
         std::cerr << "--size requires format WxH (e.g. 128x128)\n";
         return 2;
       }
+    } else if (arg == "--gen-preset") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--gen-preset requires a name (classic|island|archipelago|inland_sea|river_valley|mountain_ring)\n";
+        return 2;
+      }
+      isocity::ProcGenTerrainPreset p{};
+      if (!isocity::ParseProcGenTerrainPreset(val, p)) {
+        std::cerr << "Unknown --gen-preset: " << val << "\n";
+        std::cerr << "Valid presets: classic, island, archipelago, inland_sea, river_valley, mountain_ring\n";
+        return 2;
+      }
+      procCfg.terrainPreset = p;
+    } else if (arg == "--gen-preset-strength") {
+      float s = 1.0f;
+      if (!requireValue(i, val) || !ParseF32(val, &s)) {
+        std::cerr << "--gen-preset-strength requires a float\n";
+        return 2;
+      }
+      procCfg.terrainPresetStrength = std::clamp(s, 0.0f, 5.0f);
+    } else if (arg == "--gen-road-hierarchy") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--gen-road-hierarchy requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--gen-road-hierarchy requires 0 or 1\n";
+        return 2;
+      }
+      procCfg.roadHierarchyEnabled = (b != 0);
+    } else if (arg == "--gen-road-hierarchy-strength") {
+      float s = 1.0f;
+      if (!requireValue(i, val) || !ParseF32(val, &s)) {
+        std::cerr << "--gen-road-hierarchy-strength requires a float\n";
+        return 2;
+      }
+      procCfg.roadHierarchyStrength = std::clamp(s, 0.0f, 3.0f);
+    } else if (arg == "--gen-districting-mode") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--gen-districting-mode requires a mode name\n";
+        return 2;
+      }
+      ProcGenDistrictingMode mode{};
+      if (!ParseProcGenDistrictingMode(val, mode)) {
+        std::cerr << "--gen-districting-mode expects one of: voronoi|road_flow|block_graph\n";
+        return 2;
+      }
+      procCfg.districtingMode = mode;
     } else if (arg == "--days" || arg == "--ticks") {
       if (!requireValue(i, val) || !ParseI32(val, &days) || days < 0) {
         std::cerr << arg << " requires a non-negative integer\n";
@@ -435,7 +490,7 @@ int main(int argc, char** argv)
         return 2;
       }
       if (val == "iso" || val == "isometric" || val == "ortho" || val == "orthographic") {
-        render3dCfg.projection = Render3DConfig::Projection::Isometric;
+        render3dCfg.projection = Render3DConfig::Projection::IsometricOrtho;
       } else if (val == "persp" || val == "perspective") {
         render3dCfg.projection = Render3DConfig::Projection::Perspective;
       } else {
@@ -657,6 +712,36 @@ int main(int argc, char** argv)
         return 2;
       }
       render3dCfg.meshCfg.includeTopSurfaces = (b != 0);
+
+    } else if (arg == "--3d-heightfield") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-heightfield requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--3d-heightfield requires 0 or 1\n";
+        return 2;
+      }
+      render3dCfg.heightfieldTopSurfaces = (b != 0);
+    } else if (arg == "--3d-skirt") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-skirt requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--3d-skirt requires 0 or 1\n";
+        return 2;
+      }
+      render3dCfg.addSkirt = (b != 0);
+    } else if (arg == "--3d-skirt-drop") {
+      float d = 0.0f;
+      if (!requireValue(i, val) || !ParseF32(val, &d) || !(d > 0.0f)) {
+        std::cerr << "--3d-skirt-drop requires a float > 0 (world units)\n";
+        return 2;
+      }
+      render3dCfg.skirtDrop = d;
     } else if (arg == "--iso-tile") {
       int tw = 0;
       int th = 0;

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <optional>
 #include <vector>
+#include <functional>
 
 // raylib on Windows pulls in <windows.h>, which by default defines the `min` and
 // `max` macros. Those macros break std::min/std::max and can lead to very
@@ -46,6 +47,26 @@ public:
     // 0 => good (green), 1 => bad (red)
     Bad = 1,
   };
+
+  // Multi-layer rendering (useful for debugging, capture, and future compositing).
+  //
+  // These are purely render-time toggles; they do not change simulation state.
+  enum class RenderLayer : std::uint8_t {
+    Terrain = 0,
+    Decals = 1,
+    Structures = 2,
+    Overlays = 3,
+  };
+
+  static constexpr std::uint32_t LayerBit(RenderLayer layer) {
+    return 1u << static_cast<std::uint32_t>(layer);
+  }
+
+  static constexpr std::uint32_t kLayerTerrain = LayerBit(RenderLayer::Terrain);
+  static constexpr std::uint32_t kLayerDecals = LayerBit(RenderLayer::Decals);
+  static constexpr std::uint32_t kLayerStructures = LayerBit(RenderLayer::Structures);
+  static constexpr std::uint32_t kLayerOverlays = LayerBit(RenderLayer::Overlays);
+  static constexpr std::uint32_t kLayerAll = kLayerTerrain | kLayerDecals | kLayerStructures | kLayerOverlays;
 
   // Purely-visual day/night cycle controls.
   //
@@ -106,6 +127,34 @@ public:
     // When raining at night, draw a cheap "reflection" under lights on roads.
     bool reflectLights = true;
   };
+
+  // Ground shadow casting from structures (buildings).
+  //
+  // This is a cheap, purely-2D "drop shadow" rendered as a darkened polygon projected from the
+  // building footprint based on a sun altitude + azimuth. It is intentionally stylized and fast:
+  // no raytracing, no per-tile intersection.
+  struct ShadowSettings {
+    bool enabled = true;
+
+    // 0..1 overall opacity multiplier.
+    float strength = 0.65f;
+
+    // 0..1 soft edge amount (draws a few expanded copies with low alpha).
+    float softness = 0.55f;
+
+    // Maximum shadow length in tiles (prevents extreme sunrise/sunset streaks).
+    float maxLengthTiles = 4.5f;
+
+    // Shadow direction in degrees (screen-space): 0=right, 90=down.
+    // (Think "where the shadow goes", not "where the sun is".)
+    float azimuthDeg = 45.0f;
+
+    // Sun altitude range used when day/night is enabled.
+    // At sunrise/sunset we use minAltitudeDeg, at noon we use maxAltitudeDeg.
+    float minAltitudeDeg = 12.0f;
+    float maxAltitudeDeg = 70.0f;
+  };
+
   // Lightweight procedural vehicle sprites (used by the vehicle micro-sim overlay).
   //
   // These are generated at runtime (like terrain/road textures) so the project stays asset-free.
@@ -115,6 +164,30 @@ public:
     Texture2D emissive{}; // optional (headlights)
     int pivotX = 0;
     int pivotY = 0;
+  };
+
+  // Simple depth-sorted sprite primitive that can be injected into the world render.
+  //
+  // The renderer's world pass is drawn in a deterministic isometric order (diagonals / x+y).
+  // Dynamic entities (vehicles, effects, etc.) can be supplied as sprites and will be composited
+  // into that order so they can be properly occluded by buildings in front of them.
+  //
+  // Sort key:
+  //  - sortSum: primary diagonal order (tileX + tileY anchor)
+  //  - sortX: secondary order within the same diagonal (typically tileX)
+  //
+  // Sprites with emissive=true are drawn after the grading/night pass in additive blend mode.
+  struct WorldSprite {
+    int sortSum = 0;
+    float sortX = 0.0f;
+
+    const Texture2D* tex = nullptr;
+    Rectangle src{0.0f, 0.0f, 0.0f, 0.0f};
+    Rectangle dst{0.0f, 0.0f, 0.0f, 0.0f};
+    Vector2 origin{0.0f, 0.0f};
+    float rotation = 0.0f;
+    Color tint{255, 255, 255, 255};
+    bool emissive = false;
   };
 
   // Fetch a deterministic variant for the requested diagonal orientation.
@@ -144,9 +217,29 @@ public:
   }
   const ElevationSettings& elevationSettings() const { return m_elev; }
 
-  // Performance: optional render cache for the static base world (terrain + cliffs + base overlays).
+  // Performance: optional render cache for the static base world.
+  //
+  // Note: the cache only covers the *static* parts of the scene (terrain/cliffs and, when possible,
+  // base overlays like roads/zones). Per-tile debug overlays, weather FX, and zone buildings are
+  // still drawn dynamically on top.
   void setBaseCacheEnabled(bool enabled) { m_useBandCache = enabled; }
   bool baseCacheEnabled() const { return m_useBandCache; }
+
+  // Multi-layer rendering controls.
+  void setLayerMask(std::uint32_t mask) { m_layerMask = mask; }
+  std::uint32_t layerMask() const { return m_layerMask; }
+
+  void setLayerEnabled(RenderLayer layer, bool enabled)
+  {
+    const std::uint32_t bit = LayerBit(layer);
+    if (enabled) m_layerMask |= bit;
+    else m_layerMask &= ~bit;
+  }
+
+  bool layerEnabled(RenderLayer layer) const
+  {
+    return (m_layerMask & LayerBit(layer)) != 0u;
+  }
 
   // Day/night cycle controls.
   void setDayNightSettings(const DayNightSettings& s) { m_dayNight = s; }
@@ -163,6 +256,14 @@ public:
   void setWeatherMode(WeatherSettings::Mode mode) { m_weather.mode = mode; }
   WeatherSettings::Mode weatherMode() const { return m_weather.mode; }
   bool weatherEnabled() const { return m_weather.mode != WeatherSettings::Mode::Clear; }
+
+  // Shadow controls (stylized building ground shadows).
+  void setShadowSettings(const ShadowSettings& s) { m_shadows = s; }
+  const ShadowSettings& shadowSettings() const { return m_shadows; }
+
+  void setShadowsEnabled(bool enabled) { m_shadows.enabled = enabled; }
+  bool shadowsEnabled() const { return m_shadows.enabled; }
+
 
   // Mark cached base world dirty (re-rendered lazily when drawn).
   void markBaseCacheDirtyAll();
@@ -192,7 +293,14 @@ public:
   // If the resulting image would be large, it is scaled down so its max dimension is <= maxSize.
   //
   // Returns true on success.
-  bool exportWorldOverview(const World& world, const char* fileName, int maxSize = 4096);
+  bool exportWorldOverview(const World& world, const char* fileName, int maxSize = 4096,
+                         float timeSec = 0.0f, bool includeScreenFx = true);
+
+  // Optional callbacks invoked inside the world pass (after base terrain/decals/structures draw).
+  //
+  // This lets the game integrate world-space overlays (e.g. vehicles) so they inherit
+  // day/night grading, wetness, and other post effects.
+  using WorldOverlayCallback = std::function<void(const Camera2D& camera)>;
 
   void drawWorld(const World& world, const Camera2D& camera, int screenW, int screenH, float timeSec,
                  std::optional<Point> hovered,
@@ -206,7 +314,10 @@ public:
                  bool showDistrictOverlay = false,
                  int highlightDistrict = -1,
                  bool showDistrictBorders = false,
-                 bool mergeZoneBuildings = true);
+                 bool mergeZoneBuildings = true,
+                 const WorldOverlayCallback& drawBeforeFx = WorldOverlayCallback{},
+                 const WorldOverlayCallback& drawAfterFx = WorldOverlayCallback{},
+                 const std::vector<WorldSprite>* sprites = nullptr);
 
   // Screen-space weather effects (particles + fog). Draw after the world pass but before UI/HUD.
   void drawWeatherScreenFX(int screenW, int screenH, float timeSec, bool allowAestheticDetails = true);
@@ -234,6 +345,8 @@ private:
   DayNightSettings m_dayNight{};
 
   WeatherSettings m_weather{};
+
+  ShadowSettings m_shadows{};
 
   std::array<std::array<Texture2D, kTerrainVariants>, kTerrainTypes> m_terrainTex{};
   std::array<Texture2D, 6> m_overlayTex{};
@@ -267,16 +380,23 @@ private:
 
   // Base world render cache (static layers baked into render textures).
   struct BandCache {
-    RenderTexture2D rt{};
-    int sum0 = 0;   // inclusive
-    int sum1 = 0;   // inclusive
-    Vector2 origin{}; // world-space top-left where this texture should be drawn
-    bool dirty = true;
+    // Static base layers are cached separately to support multi-layer rendering and to allow
+    // some overlays to remain dynamic without invalidating everything.
+    RenderTexture2D terrain{};     // terrain tops + cliff walls
+    RenderTexture2D structures{};  // roads/zones/parks (only when not in utility overlay mode)
+
+    int sum0 = 0;     // inclusive
+    int sum1 = 0;     // inclusive
+    Vector2 origin{}; // world-space top-left where this band texture should be drawn
+
+    bool dirtyTerrain = true;
+    bool dirtyStructures = true;
   };
 
   static constexpr int kBandSums = 8; // how many (x+y) diagonals are baked per band
 
   bool m_useBandCache = true;
+  std::uint32_t m_layerMask = kLayerAll;
   int m_bandMapW = 0;
   int m_bandMapH = 0;
   float m_bandMaxPixels = 0.0f;
@@ -290,7 +410,8 @@ private:
 
   void unloadBaseCache();
   void ensureBaseCache(const World& world);
-  void rebuildBaseCacheBand(const World& world, BandCache& band);
+  void rebuildTerrainCacheBand(const World& world, BandCache& band);
+  void rebuildStructureCacheBand(const World& world, BandCache& band);
 
   void unloadMinimap();
   void ensureMinimapUpToDate(const World& world);

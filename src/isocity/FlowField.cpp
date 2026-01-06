@@ -153,7 +153,10 @@ RoadFlowField BuildRoadFlowField(const World& world, const std::vector<int>& sou
         if (out.dist[nu] != -1) continue;
 
         out.dist[nu] = dcur + 1;
-        int moveCost = RoadTravelTimeMilliForLevel(static_cast<int>(world.at(nx, ny).level));
+        const Tile& nt = world.at(nx, ny);
+        const int lvl = static_cast<int>(nt.level);
+        int moveCost = (nt.terrain == Terrain::Water) ? RoadBridgeTravelTimeMilliForLevel(lvl)
+                                                  : RoadTravelTimeMilliForLevel(lvl);
         if (extraCost) {
           // Extra per-tile penalty (e.g., congestion). Treated as cost to ENTER the tile.
           moveCost += std::max(0, (*extraCost)[nu]);
@@ -223,7 +226,10 @@ RoadFlowField BuildRoadFlowField(const World& world, const std::vector<int>& sou
       if (!isTraversableRoad(nidx)) continue;
 
       const std::size_t nu = static_cast<std::size_t>(nidx);
-      int moveCost = RoadTravelTimeMilliForLevel(static_cast<int>(world.at(nx, ny).level));
+      const Tile& nt = world.at(nx, ny);
+      const int lvl = static_cast<int>(nt.level);
+      int moveCost = (nt.terrain == Terrain::Water) ? RoadBridgeTravelTimeMilliForLevel(lvl)
+                                                : RoadTravelTimeMilliForLevel(lvl);
       if (extraCost) {
         // Extra per-tile penalty (e.g., congestion). Treated as cost to ENTER the tile.
         moveCost += std::max(0, (*extraCost)[nu]);

@@ -3,13 +3,16 @@
 #include "isocity/Config.hpp"
 #include "isocity/Console.hpp"
 #include "isocity/EditHistory.hpp"
+#include "isocity/Export.hpp"
 #include "isocity/FloodRisk.hpp"
 #include "isocity/FlowField.hpp"
 #include "isocity/Blueprint.hpp"
 #include "isocity/Iso.hpp"
 #include "isocity/ProcGen.hpp"
 #include "isocity/Renderer.hpp"
+#include "isocity/VisualPrefs.hpp"
 #include "isocity/RoadGraph.hpp"
+#include "isocity/RoadGraphRouting.hpp"
 #include "isocity/RoadGraphResilience.hpp"
 #include "isocity/SaveLoad.hpp"
 #include "isocity/Traffic.hpp"
@@ -86,7 +89,7 @@ private:
   // Visual micro-sim: moving vehicles along roads (commute + goods).
   void rebuildVehiclesRoutingCache();
   void updateVehicles(float dt);
-  void drawVehicles();
+  void appendVehicleSprites(const Camera2D& camera, std::vector<Renderer::WorldSprite>& out);
 
   // Quick save/load supports multiple slots (UI convenience).
   // Slot 1 intentionally uses the legacy filename so existing quick-saves keep working.
@@ -147,6 +150,13 @@ private:
   void toggleFullscreen();
   void toggleBorderlessWindowed();
   void toggleVsync();
+
+  // Persisted visual/display preferences (defaults to isocity_visual.json next to the executable).
+  VisualPrefs captureVisualPrefs() const;
+  void applyVisualPrefs(const VisualPrefs& prefs);
+  bool loadVisualPrefsFile(const std::string& path, bool showToast = false);
+  bool saveVisualPrefsFile(const std::string& path, bool showToast = false);
+  void updateVisualPrefsAutosave(float dt);
 
   struct StrokeFeedback {
     bool noMoney = false;
@@ -292,6 +302,10 @@ private:
   bool m_showRoadGraphOverlay = false;
   bool m_roadGraphDirty = true;
   RoadGraph m_roadGraph;
+
+  // Cached routing helpers built alongside the road graph (used for road A* routing).
+  RoadGraphIndex m_roadGraphIndex;
+  RoadGraphWeights m_roadGraphWeights;
 
   // Cached lookups for road-graph overlays (rebuilt with the road graph).
   // Indexing uses idx = y*w + x.
@@ -452,7 +466,17 @@ private:
   int m_worldRenderRTHeight = 0;
 
   bool m_showVideoSettings = false;
+  int m_videoPage = 0; // 0=Display, 1=Visual FX
   int m_videoSelection = 0;
+  int m_videoSelectionDisplay = 0;
+  int m_videoSelectionVisual = 0;
+
+  // Visual prefs persistence (autosave throttled).
+  std::string m_visualPrefsPath = "isocity_visual.json";
+  bool m_visualPrefsAutosave = true;
+  bool m_visualPrefsDirty = false;
+  float m_visualPrefsSaveTimer = 0.0f;
+  VisualPrefs m_visualPrefsLastSnapshot{};
 
   // Window mode tracking for borderless fullscreen restore.
   bool m_borderlessWindowed = false;
@@ -472,6 +496,29 @@ private:
   bool m_pendingMapExport = false;
   std::string m_pendingMapExportPath;
   int m_pendingMapExportMaxSize = 4096;
+
+  // Layered world export capture (terrain/decals/structures/overlays as separate PNGs)
+  bool m_pendingMapLayersExport = false;
+  std::string m_pendingMapLayersPrefix;
+  int m_pendingMapLayersMaxSize = 4096;
+
+  // Software 3D render export (headless CPU renderer in Export3D/Soft3D).
+  bool m_pendingRender3D = false;
+  std::string m_pendingRender3DPath;
+  Render3DConfig m_pendingRender3DCfg{};
+  ExportLayer m_pendingRender3DLayer = ExportLayer::Overlay;
+  bool m_pendingRender3DApplyGrade = true; // apply current day/night + weather grade
+
+  // Optional in-game 3D preview (small, throttled, updated when the world changes).
+  bool m_show3DPreview = false;
+  bool m_3dPreviewDirty = true;
+  float m_3dPreviewTimer = 0.0f;
+  Render3DConfig m_3dPreviewCfg{};
+  ExportLayer m_3dPreviewLayer = ExportLayer::Overlay;
+  bool m_3dPreviewApplyGrade = true;
+  Texture2D m_3dPreviewTex{};
+  int m_3dPreviewTexW = 0;
+  int m_3dPreviewTexH = 0;
 
   std::optional<Point> m_hovered;
 

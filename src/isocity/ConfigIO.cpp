@@ -198,6 +198,23 @@ static void WriteProcGenConfig(std::ostringstream& oss, const ProcGenConfig& cfg
   Indent(oss, base + indent);
   oss << "\"park_chance\": " << FloatToJson(cfg.parkChance) << ",\n";
 
+  // Macro terrain preset (v10). These are optional; "classic" is the default.
+  Indent(oss, base + indent);
+  oss << "\"terrain_preset\": \"" << ToString(cfg.terrainPreset) << "\",\n";
+  Indent(oss, base + indent);
+  oss << "\"terrain_preset_strength\": " << FloatToJson(cfg.terrainPresetStrength) << ",\n";
+
+  Indent(oss, base + indent);
+  oss << "\"road_hierarchy_enabled\": ";
+  WriteBool(oss, cfg.roadHierarchyEnabled);
+  oss << ",\n";
+
+  Indent(oss, base + indent);
+  oss << "\"road_hierarchy_strength\": " << FloatToJson(cfg.roadHierarchyStrength) << ",\n";
+
+  Indent(oss, base + indent);
+  oss << "\"districting_mode\": \"" << ToString(cfg.districtingMode) << "\",\n";
+
   Indent(oss, base + indent);
   oss << "\"erosion\": ";
   WriteErosionConfig(oss, cfg.erosion, indent, depth + 1);
@@ -381,6 +398,57 @@ bool ApplyProcGenConfigJson(const JsonValue& root, ProcGenConfig& ioCfg, std::st
   if (!ApplyF32(root, "park_chance", ioCfg.parkChance, err)) {
     outError = err;
     return false;
+  }
+
+  // Macro preset overrides (v10).
+  const JsonValue* preset = FindJsonMember(root, "terrain_preset");
+  if (preset) {
+    if (!preset->isString()) {
+      outError = "expected string for key 'terrain_preset'";
+      return false;
+    }
+    ProcGenTerrainPreset p{};
+    if (!ParseProcGenTerrainPreset(preset->stringValue, p)) {
+      outError = "unknown terrain_preset: '" + preset->stringValue + "'";
+      return false;
+    }
+    ioCfg.terrainPreset = p;
+  }
+
+  if (!ApplyF32(root, "terrain_preset_strength", ioCfg.terrainPresetStrength, err)) {
+    outError = err;
+    return false;
+  }
+
+  // Keep within a sane range (also matches save-file clamps).
+  ioCfg.terrainPresetStrength = std::clamp(ioCfg.terrainPresetStrength, 0.0f, 5.0f);
+
+  // Procedural road hierarchy pass (v11).
+  if (!ApplyBool(root, "road_hierarchy_enabled", ioCfg.roadHierarchyEnabled, err)) {
+    outError = err;
+    return false;
+  }
+  if (!ApplyF32(root, "road_hierarchy_strength", ioCfg.roadHierarchyStrength, err)) {
+    outError = err;
+    return false;
+  }
+  ioCfg.roadHierarchyStrength = std::clamp(ioCfg.roadHierarchyStrength, 0.0f, 3.0f);
+
+  // Procedural district assignment mode (v12).
+  {
+    const JsonValue* districtingMode = FindJsonMember(root, "districting_mode");
+    if (districtingMode) {
+      if (!districtingMode->isString()) {
+        outError = "expected string for key 'districting_mode'";
+        return false;
+      }
+      ProcGenDistrictingMode mode{};
+      if (!ParseProcGenDistrictingMode(districtingMode->stringValue, mode)) {
+        outError = "unknown districting_mode: '" + districtingMode->stringValue + "'";
+        return false;
+      }
+      ioCfg.districtingMode = mode;
+    }
   }
 
   const JsonValue* erosion = nullptr;

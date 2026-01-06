@@ -55,6 +55,8 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
 // v7: v6 + districts (per-tile district IDs) + optional district policy multipliers
 // v8: v7 + compressed delta payload (smaller saves; faster disk IO)
 // v9: v8 + ProcGen erosion config
+// v10: v9 + ProcGen terrain preset config
+// v11: v10 + ProcGen road hierarchy config
 
 // Save using an explicit ProcGenConfig + SimConfig (recommended for v2+ delta saves).
 bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const SimConfig& simCfg, const std::string& path,
@@ -71,6 +73,8 @@ bool SaveWorldBinary(const World& world, const std::string& path, std::string& o
 // v7 additionally persists per-tile district IDs and optional district policy multipliers.
 // v8 stores the same data as v7 but compresses the delta section.
 // v9 additionally persists ProcGen erosion settings.
+// v10 additionally persists ProcGen terrain preset settings.
+// v11 additionally persists ProcGen road hierarchy settings.
 bool LoadWorldBinary(World& outWorld, ProcGenConfig& outProcCfg, SimConfig& outSimCfg, const std::string& path,
                      std::string& outError);
 

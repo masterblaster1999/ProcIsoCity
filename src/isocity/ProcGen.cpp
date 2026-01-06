@@ -1,8 +1,13 @@
 #include "isocity/ProcGen.hpp"
 
 #include "isocity/CityBlocks.hpp"
+
+#include "isocity/BlockDistricting.hpp"
+#include "isocity/Districting.hpp"
 #include "isocity/Noise.hpp"
 #include "isocity/Pathfinding.hpp"
+#include "isocity/RoadGraph.hpp"
+#include "isocity/RoadGraphRouting.hpp"
 #include "isocity/LandValue.hpp"
 #include "isocity/Hydrology.hpp"
 #include "isocity/Road.hpp"
@@ -10,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -17,6 +23,98 @@
 #include <vector>
 
 namespace isocity {
+
+const char* ToString(ProcGenTerrainPreset p)
+{
+  switch (p) {
+  case ProcGenTerrainPreset::Classic: return "classic";
+  case ProcGenTerrainPreset::Island: return "island";
+  case ProcGenTerrainPreset::Archipelago: return "archipelago";
+  case ProcGenTerrainPreset::InlandSea: return "inland_sea";
+  case ProcGenTerrainPreset::RiverValley: return "river_valley";
+  case ProcGenTerrainPreset::MountainRing: return "mountain_ring";
+  default: return "classic";
+  }
+}
+
+static std::string LowerCopy(std::string s)
+{
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return s;
+}
+
+bool ParseProcGenTerrainPreset(const std::string& s, ProcGenTerrainPreset& out)
+{
+  const std::string t = LowerCopy(s);
+  if (t.empty()) return false;
+
+  auto eq = [&](const char* a) { return t == a; };
+
+  if (eq("classic") || eq("default") || eq("continent") || eq("continental")) {
+    out = ProcGenTerrainPreset::Classic;
+    return true;
+  }
+  if (eq("island") || eq("islands")) {
+    out = ProcGenTerrainPreset::Island;
+    return true;
+  }
+  if (eq("archipelago") || eq("arch") || eq("isle") || eq("isles")) {
+    out = ProcGenTerrainPreset::Archipelago;
+    return true;
+  }
+  if (eq("inlandsea") || eq("inland_sea") || eq("sea") || eq("lake") || eq("inlandse") || eq("inland")) {
+    out = ProcGenTerrainPreset::InlandSea;
+    return true;
+  }
+  if (eq("river") || eq("rivervalley") || eq("river_valley") || eq("valley") || eq("river-valley")) {
+    out = ProcGenTerrainPreset::RiverValley;
+    return true;
+  }
+  if (eq("mountain") || eq("mountains") || eq("ring") || eq("mountainring") || eq("mountain_ring") ||
+      eq("crater")) {
+    out = ProcGenTerrainPreset::MountainRing;
+    return true;
+  }
+
+  return false;
+}
+
+const char* ToString(ProcGenDistrictingMode m)
+{
+  switch (m) {
+  case ProcGenDistrictingMode::Voronoi: return "voronoi";
+  case ProcGenDistrictingMode::RoadFlow: return "road_flow";
+  case ProcGenDistrictingMode::BlockGraph: return "block_graph";
+  default: return "voronoi";
+  }
+}
+
+bool ParseProcGenDistrictingMode(const std::string& s, ProcGenDistrictingMode& out)
+{
+  const std::string t = LowerCopy(s);
+  if (t.empty()) return false;
+
+  auto eq = [&](const char* a) { return t == a; };
+
+  if (eq("voronoi") || eq("legacy") || eq("tile") || eq("tiles") || eq("tile_voronoi") || eq("tile-voronoi")) {
+    out = ProcGenDistrictingMode::Voronoi;
+    return true;
+  }
+
+  if (eq("road") || eq("roads") || eq("roadflow") || eq("road_flow") || eq("road-flow") || eq("flow") ||
+      eq("auto") || eq("travel") || eq("traveltime") || eq("travel_time") || eq("travel-time")) {
+    out = ProcGenDistrictingMode::RoadFlow;
+    return true;
+  }
+
+  if (eq("block") || eq("blocks") || eq("blockgraph") || eq("block_graph") || eq("block-graph") ||
+      eq("neighborhood") || eq("neighbourhood") || eq("neighborhoods") || eq("neighbourhoods")) {
+    out = ProcGenDistrictingMode::BlockGraph;
+    return true;
+  }
+
+  return false;
+}
 
 namespace {
 
@@ -2981,6 +3079,648 @@ static void AssignDistricts(World& world, const std::vector<P>& hubs, RNG& rng, 
   }
 }
 
+// -----------------------------
+// Macro terrain presets
+// -----------------------------
+//
+// These operate purely on the heightfield before erosion/classification.
+//
+// IMPORTANT: ProcGenTerrainPreset::Classic MUST preserve the previous
+// generation behavior exactly so that existing delta-saves remain stable.
+
+static float Smoothstep(float e0, float e1, float x)
+{
+  if (e0 == e1) return (x < e0) ? 0.0f : 1.0f;
+  const float t = Clamp01((x - e0) / (e1 - e0));
+  return t * t * (3.0f - 2.0f * t);
+}
+
+static void ApplyTerrainPreset(std::vector<float>& heights, int width, int height, std::uint32_t seed32,
+                              const ProcGenConfig& cfg)
+{
+  if (width <= 0 || height <= 0) return;
+  if (heights.size() != static_cast<std::size_t>(width) * static_cast<std::size_t>(height)) return;
+
+  const ProcGenTerrainPreset preset = cfg.terrainPreset;
+  const float strength = std::clamp(cfg.terrainPresetStrength, 0.0f, 2.5f);
+
+  // Classic means: don't touch the heightfield at all.
+  if (preset == ProcGenTerrainPreset::Classic || strength <= 0.0001f) {
+    return;
+  }
+
+  const float cx = (static_cast<float>(width) - 1.0f) * 0.5f;
+  const float cy = (static_cast<float>(height) - 1.0f) * 0.5f;
+  const float invCx = (cx > 0.0f) ? (1.0f / cx) : 0.0f;
+  const float invCy = (cy > 0.0f) ? (1.0f / cy) : 0.0f;
+  const float minDim = static_cast<float>(std::min(width, height));
+
+  const float coastScale = std::max(0.0001f, cfg.terrainScale * 0.65f);
+
+  auto radial = [&](int x, int y) -> float {
+    const float nx = (static_cast<float>(x) - cx) * invCx;
+    const float ny = (static_cast<float>(y) - cy) * invCy;
+    return std::sqrt(nx * nx + ny * ny);
+  };
+
+  // Local preset RNG (do NOT perturb the main ProcGen RNG stream).
+  RNG prng(static_cast<std::uint64_t>(seed32) ^ 0x9E3779B97F4A7C15ULL);
+
+  // Precompute a meandering river centerline for RiverValley.
+  bool riverHorizontal = false;
+  std::vector<float> riverLine;
+  float riverBase = 0.0f;
+
+  if (preset == ProcGenTerrainPreset::RiverValley) {
+    riverHorizontal = ((HashCoords32(width, height, seed32 ^ 0xBADC0FFEu) & 1u) != 0u);
+    const int len = riverHorizontal ? width : height;
+    const int oth = riverHorizontal ? height : width;
+    riverLine.resize(static_cast<std::size_t>(std::max(0, len)), 0.0f);
+
+    const float base01 = 0.35f + 0.30f * prng.nextF01();
+    riverBase = base01 * static_cast<float>(oth);
+
+    const float amp = static_cast<float>(oth) * (0.18f + 0.10f * prng.nextF01());
+    const float smallAmp = amp * 0.35f;
+
+    for (int i = 0; i < len; ++i) {
+      const float t = (len > 1) ? (static_cast<float>(i) / static_cast<float>(len - 1)) : 0.0f;
+      // Use 1D fbm (x=t*k, y=const) to get a smooth meander.
+      const float n0 = fbmNormalized(t * 2.2f, 7.3f, seed32 ^ 0xC0FFEEu, 4) * 2.0f - 1.0f;
+      const float n1 = fbmNormalized(t * 6.8f, 1.1f, seed32 ^ 0xFACEB00Cu, 2) * 2.0f - 1.0f;
+      float p = riverBase + n0 * amp + n1 * smallAmp;
+      // Mild smooth drift so rivers don't always stay centered.
+      const float drift = fbmNormalized(t * 1.15f, 3.9f, seed32 ^ 0x13579BDFu, 2) * 2.0f - 1.0f;
+      p += (t - 0.5f) * static_cast<float>(oth) * (0.10f * drift);
+      // Keep river away from the very edges so it can have banks.
+      p = std::clamp(p, 2.0f, static_cast<float>(oth) - 3.0f);
+      riverLine[static_cast<std::size_t>(i)] = p;
+    }
+  }
+
+  struct Island {
+    float x = 0.0f;
+    float y = 0.0f;
+    float r = 10.0f;
+  };
+
+  std::vector<Island> islands;
+  if (preset == ProcGenTerrainPreset::Archipelago) {
+    const int n = std::clamp(static_cast<int>(std::round(minDim / 36.0f)) + 2, 3, 7);
+    const float baseR = minDim * 0.20f;
+    const float maxR = minDim * 0.34f;
+
+    for (int i = 0; i < n; ++i) {
+      Island isl;
+      bool ok = false;
+      for (int tries = 0; tries < 200 && !ok; ++tries) {
+        isl.x = prng.rangeFloat(0.0f, static_cast<float>(width - 1));
+        isl.y = prng.rangeFloat(0.0f, static_cast<float>(height - 1));
+        isl.r = prng.rangeFloat(baseR, maxR);
+
+        ok = true;
+        for (const Island& other : islands) {
+          const float dx = isl.x - other.x;
+          const float dy = isl.y - other.y;
+          const float d = std::sqrt(dx * dx + dy * dy);
+          if (d < (isl.r + other.r) * 0.55f) {
+            ok = false;
+            break;
+          }
+        }
+      }
+      islands.push_back(isl);
+    }
+  }
+
+  // Apply per-tile modification.
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const std::size_t i = Idx(x, y, width);
+      float h = heights[i];
+
+      const float r = radial(x, y);
+
+      if (preset == ProcGenTerrainPreset::Island) {
+        float fall = Smoothstep(0.78f, 1.22f, r);
+        const float jitter = (fbmNormalized(static_cast<float>(x) * coastScale, static_cast<float>(y) * coastScale,
+                                           seed32 ^ 0xA11CEB0Bu, 3) * 2.0f - 1.0f) * 0.16f;
+        fall = Clamp01(fall + jitter);
+
+        h -= fall * (0.52f * strength);
+        h += (1.0f - fall) * (0.06f * strength);
+      } else if (preset == ProcGenTerrainPreset::Archipelago) {
+        // Multi-island mask.
+        float mask = 0.0f;
+        for (const Island& isl : islands) {
+          const float dx = static_cast<float>(x) - isl.x;
+          const float dy = static_cast<float>(y) - isl.y;
+          const float d = std::sqrt(dx * dx + dy * dy);
+          float t = 1.0f - (d / std::max(1.0f, isl.r));
+          t = Clamp01(t);
+          // Smooth edges.
+          t = t * t * (3.0f - 2.0f * t);
+          mask = std::max(mask, t);
+        }
+
+        // Ragged coastlines.
+        const float rag = (fbmNormalized(static_cast<float>(x) * coastScale * 1.25f,
+                                        static_cast<float>(y) * coastScale * 1.25f,
+                                        seed32 ^ 0xB16B00B5u, 3) * 2.0f - 1.0f) * 0.18f;
+        mask = Clamp01(mask + rag);
+
+        // Edge falloff so we get surrounding ocean.
+        const float edge = Smoothstep(0.85f, 1.30f, r);
+
+        // Outside islands + near edges => push down aggressively.
+        const float sea = std::max(edge, 1.0f - mask);
+
+        // Blend: keep original noise for land interiors, but compress water areas.
+        h = h * (0.45f + 0.90f * mask) - sea * (0.56f * strength);
+      } else if (preset == ProcGenTerrainPreset::InlandSea) {
+        // Central depression.
+        const float sea = std::exp(-(r * r) / (2.0f * 0.42f * 0.42f));
+        h -= sea * (0.62f * strength);
+
+        // Surrounding ring uplift to keep land around the sea.
+        const float dr = (r - 0.92f);
+        const float ring = std::exp(-(dr * dr) / (2.0f * 0.18f * 0.18f));
+        h += ring * (0.10f * strength);
+
+        // A little coastline noise.
+        const float n = (fbmNormalized(static_cast<float>(x) * coastScale * 0.85f,
+                                      static_cast<float>(y) * coastScale * 0.85f,
+                                      seed32 ^ 0xD00DFEEDu, 2) * 2.0f - 1.0f);
+        h += n * (0.03f * strength);
+      } else if (preset == ProcGenTerrainPreset::RiverValley) {
+        if (!riverLine.empty()) {
+          if (riverHorizontal) {
+            const float y0 = riverLine[static_cast<std::size_t>(x)];
+            const float d = std::abs(static_cast<float>(y) - y0);
+            const float w01 = fbmNormalized(static_cast<float>(x) * 0.06f, 0.0f, seed32 ^ 0x1234ABCDu, 3);
+            const float widthBase = 2.2f + w01 * 3.6f;
+            const float bank = widthBase * 2.2f;
+            const float t = Clamp01(1.0f - (d / widthBase));
+            const float t2 = t * t;
+            h -= t2 * (0.56f * strength);
+
+            // Gentle banks/outwash.
+            const float tb = Clamp01(1.0f - (d / bank));
+            h -= tb * tb * (0.10f * strength);
+
+            // Ensure a continuous wet core regardless of waterLevel.
+            if (d < widthBase * 0.35f) {
+              h = std::min(h, cfg.waterLevel - 0.12f - 0.04f * strength);
+            }
+          } else {
+            const float x0 = riverLine[static_cast<std::size_t>(y)];
+            const float d = std::abs(static_cast<float>(x) - x0);
+            const float w01 = fbmNormalized(static_cast<float>(y) * 0.06f, 0.0f, seed32 ^ 0x5678DCBAu, 3);
+            const float widthBase = 2.2f + w01 * 3.6f;
+            const float bank = widthBase * 2.2f;
+            const float t = Clamp01(1.0f - (d / widthBase));
+            const float t2 = t * t;
+            h -= t2 * (0.56f * strength);
+            const float tb = Clamp01(1.0f - (d / bank));
+            h -= tb * tb * (0.10f * strength);
+            if (d < widthBase * 0.35f) {
+              h = std::min(h, cfg.waterLevel - 0.12f - 0.04f * strength);
+            }
+          }
+        }
+      } else if (preset == ProcGenTerrainPreset::MountainRing) {
+        // Ring-like ridge.
+        const float ringR = 0.78f + (fbmNormalized(static_cast<float>(x) * coastScale * 0.40f,
+                                                  static_cast<float>(y) * coastScale * 0.40f,
+                                                  seed32 ^ 0xFEEDBEEFu, 2) - 0.5f) * 0.08f;
+        const float dr = r - ringR;
+        const float ring = std::exp(-(dr * dr) / (2.0f * 0.16f * 0.16f));
+        h += ring * (0.32f * strength);
+
+        // Basin inside the ring.
+        const float basin = std::exp(-(r * r) / (2.0f * 0.55f * 0.55f));
+        h -= basin * (0.14f * strength);
+      }
+
+      // Keep range stable-ish.
+      heights[i] = std::clamp(h, -0.35f, 1.15f);
+    }
+  }
+}
+
+// -----------------------------
+// Road hierarchy post-pass (v11)
+//
+// After the initial road carve (hubs/arterials/locals), we run a light-weight
+// "centrality sampling" pass on the *road graph*:
+//
+//  1) Pick a set of "activity centers" (hubs, district centers, edges, plus a few
+//     deterministic activity points).
+//  2) Route between many center pairs using A* on the road graph.
+//  3) Count per-tile traversal frequency (an approximation of betweenness
+//     centrality / all-pairs flow).
+//  4) Upgrade the most-used corridors to Avenue/Highway classes.
+//
+// The result is a clearer arterial structure and more believable zoning
+// gradients (since road level influences initial zoning density).
+// -----------------------------
+
+enum class CenterKind : std::uint8_t { Hub = 0, District = 1, Edge = 2, Activity = 3 };
+
+struct Center {
+  Point p{};
+  CenterKind kind = CenterKind::Activity;
+  int id = 0;
+};
+
+static bool SnapToRoad(const World& world, const Point& in, int maxR, std::uint32_t seed32, Point& out)
+{
+  if (!world.inBounds(in.x, in.y)) return false;
+  if (world.at(in.x, in.y).overlay == Overlay::Road) {
+    out = in;
+    return true;
+  }
+
+  bool found = false;
+  int bestDist = std::numeric_limits<int>::max();
+  std::uint32_t bestHash = 0xFFFFFFFFu;
+
+  for (int dy = -maxR; dy <= maxR; ++dy) {
+    for (int dx = -maxR; dx <= maxR; ++dx) {
+      const int dist = std::abs(dx) + std::abs(dy);
+      if (dist > maxR) continue;
+      const int x = in.x + dx;
+      const int y = in.y + dy;
+      if (!world.inBounds(x, y)) continue;
+      const Tile& t = world.at(x, y);
+      if (t.overlay != Overlay::Road) continue;
+
+      const std::uint32_t h = HashCoords32(x, y, seed32);
+      if (!found || dist < bestDist || (dist == bestDist && h < bestHash)) {
+        out = Point{x, y};
+        bestDist = dist;
+        bestHash = h;
+        found = true;
+      }
+    }
+  }
+  return found;
+}
+
+static void AddCenter(std::vector<Center>& centers, const World& world, const Point& p, CenterKind kind, int id,
+                      std::uint32_t seed32)
+{
+  Point snapped{};
+  const std::uint32_t salt = static_cast<std::uint32_t>(kind) * 0x9E3779B1u ^ static_cast<std::uint32_t>(id) * 0x85EBCA6Bu;
+  if (!SnapToRoad(world, p, /*maxR=*/12, seed32 ^ salt, snapped)) return;
+
+  for (const Center& c : centers) {
+    if (c.p.x == snapped.x && c.p.y == snapped.y) return;
+  }
+  centers.push_back(Center{snapped, kind, id});
+}
+
+static void FillRoadLevelGaps(World& world, int targetLevel, int passes)
+{
+  const int w = world.width();
+  const int h = world.height();
+  for (int pass = 0; pass < passes; ++pass) {
+    std::vector<Point> toUpgrade;
+    toUpgrade.reserve(256);
+
+    for (int y = 1; y < h - 1; ++y) {
+      for (int x = 1; x < w - 1; ++x) {
+        Tile& t = world.at(x, y);
+        if (t.overlay != Overlay::Road) continue;
+        const int cur = ClampRoadLevel(static_cast<int>(t.level));
+        if (cur >= targetLevel) continue;
+
+        const int up = (world.at(x, y - 1).overlay == Overlay::Road)
+                           ? ClampRoadLevel(static_cast<int>(world.at(x, y - 1).level))
+                           : 0;
+        const int dn = (world.at(x, y + 1).overlay == Overlay::Road)
+                           ? ClampRoadLevel(static_cast<int>(world.at(x, y + 1).level))
+                           : 0;
+        const int lf = (world.at(x - 1, y).overlay == Overlay::Road)
+                           ? ClampRoadLevel(static_cast<int>(world.at(x - 1, y).level))
+                           : 0;
+        const int rt = (world.at(x + 1, y).overlay == Overlay::Road)
+                           ? ClampRoadLevel(static_cast<int>(world.at(x + 1, y).level))
+                           : 0;
+
+        const bool verticalGap = (up >= targetLevel && dn >= targetLevel);
+        const bool horizontalGap = (lf >= targetLevel && rt >= targetLevel);
+        if (verticalGap || horizontalGap) {
+          toUpgrade.push_back(Point{x, y});
+        }
+      }
+    }
+
+    if (toUpgrade.empty()) break;
+
+    for (const Point& p : toUpgrade) {
+      Tile& t = world.at(p.x, p.y);
+      if (t.overlay == Overlay::Road) {
+        t.level = static_cast<std::uint8_t>(ClampRoadLevel(targetLevel));
+      }
+    }
+  }
+}
+
+static int PairWeight(CenterKind a, CenterKind b)
+{
+  // Symmetric weights; intentionally coarse.
+  if (a > b) std::swap(a, b);
+
+  if (a == CenterKind::Hub && b == CenterKind::Hub) return 7;
+  if (a == CenterKind::Hub && b == CenterKind::District) return 6;
+  if (a == CenterKind::Hub && b == CenterKind::Edge) return 6;
+  if (a == CenterKind::District && b == CenterKind::District) return 4;
+  if (a == CenterKind::District && b == CenterKind::Edge) return 5;
+  if (a == CenterKind::Edge && b == CenterKind::Edge) return 3;
+  return 2; // Activity combos
+}
+
+static void UpgradeRoadHierarchyFromCentrality(World& world, const std::vector<P>& hubs, std::uint32_t seed32,
+                                               const ProcGenConfig& cfg)
+{
+  if (!cfg.roadHierarchyEnabled) return;
+  if (cfg.roadHierarchyStrength <= 0.0001f) return;
+
+  const int w = world.width();
+  const int h = world.height();
+
+  RoadGraph graph = BuildRoadGraph(world);
+  if (graph.nodes.empty()) return;
+
+  RoadGraphIndex index = BuildRoadGraphIndex(world, graph);
+  RoadGraphWeights weights = BuildRoadGraphWeights(world, graph);
+
+  // Collect centers.
+  std::vector<Center> centers;
+  centers.reserve(32);
+
+  // Hubs (already roads due to CarveHubGrid).
+  for (std::size_t i = 0; i < hubs.size(); ++i) {
+    AddCenter(centers, world, Point{hubs[i].x, hubs[i].y}, CenterKind::Hub, static_cast<int>(i), seed32);
+  }
+
+  // District centers based on road tiles.
+  struct Acc {
+    std::int64_t sx = 0;
+    std::int64_t sy = 0;
+    std::int32_t n = 0;
+  };
+  std::array<Acc, static_cast<std::size_t>(kDistrictCount)> acc{};
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const Tile& t = world.at(x, y);
+      if (t.overlay != Overlay::Road) continue;
+      const int d = static_cast<int>(t.district);
+      if (d < 0 || d >= kDistrictCount) continue;
+      Acc& a = acc[static_cast<std::size_t>(d)];
+      a.sx += x;
+      a.sy += y;
+      a.n += 1;
+    }
+  }
+
+  for (int d = 0; d < kDistrictCount; ++d) {
+    const Acc& a = acc[static_cast<std::size_t>(d)];
+    if (a.n <= 0) continue;
+    const int cx = static_cast<int>(a.sx / a.n);
+    const int cy = static_cast<int>(a.sy / a.n);
+    AddCenter(centers, world, Point{cx, cy}, CenterKind::District, d, seed32 ^ 0xD15D1C7u);
+  }
+
+  // Edge connectors (search a thin border strip so we don't miss off-by-1 edge roads).
+  auto addEdge = [&](int id, int x0, int y0, int x1, int y1) {
+    bool found = false;
+    Point best{};
+    int bestScore = std::numeric_limits<int>::max();
+    std::uint32_t bestHash = 0xFFFFFFFFu;
+
+    const int cx = w / 2;
+    const int cy = h / 2;
+
+    for (int y = y0; y <= y1; ++y) {
+      for (int x = x0; x <= x1; ++x) {
+        if (!world.inBounds(x, y)) continue;
+        const Tile& t = world.at(x, y);
+        if (t.overlay != Overlay::Road) continue;
+
+        const int score = std::abs(x - cx) + std::abs(y - cy); // prefer "central" edge exits
+        const std::uint32_t hv = HashCoords32(x, y, seed32 ^ 0xED6EED6Eu);
+
+        if (!found || score < bestScore || (score == bestScore && hv < bestHash)) {
+          found = true;
+          best = Point{x, y};
+          bestScore = score;
+          bestHash = hv;
+        }
+      }
+    }
+
+    if (found) {
+      AddCenter(centers, world, best, CenterKind::Edge, id, seed32 ^ 0xE0E0E0E0u);
+    }
+  };
+
+  // North, South, West, East strips.
+  addEdge(0, 0, 0, w - 1, std::min(1, h - 1));
+  addEdge(1, 0, std::max(0, h - 2), w - 1, h - 1);
+  addEdge(2, 0, 0, std::min(1, w - 1), h - 1);
+  addEdge(3, std::max(0, w - 2), 0, w - 1, h - 1);
+
+  // Deterministic "activity" points scattered over the road network.
+  const int minDim = std::min(w, h);
+  const float s = std::clamp(cfg.roadHierarchyStrength, 0.0f, 3.0f);
+  int targetActivity = std::clamp(minDim / 20, 4, 14);
+  targetActivity = static_cast<int>(std::round(static_cast<float>(targetActivity) * std::sqrt(s)));
+
+  struct Cand {
+    std::uint32_t h = 0;
+    Point p{};
+  };
+  std::vector<Cand> cands;
+  cands.reserve(1024);
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const Tile& t = world.at(x, y);
+      if (t.overlay != Overlay::Road) continue;
+      const std::uint32_t hv = HashCoords32(x, y, seed32 ^ 0xA11AC71Bu);
+      cands.push_back(Cand{hv, Point{x, y}});
+    }
+  }
+
+  std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.h < b.h; });
+
+  auto farEnough = [&](const Point& p) {
+    for (const Center& c : centers) {
+      const int md = std::abs(c.p.x - p.x) + std::abs(c.p.y - p.y);
+      if (md < 14) return false;
+    }
+    return true;
+  };
+
+  int addedActivity = 0;
+  for (const Cand& cand : cands) {
+    if (addedActivity >= targetActivity) break;
+    if (!farEnough(cand.p)) continue;
+    centers.push_back(Center{cand.p, CenterKind::Activity, addedActivity});
+    ++addedActivity;
+  }
+
+  if (centers.size() < 2) return;
+
+  // Accumulate traversal counts.
+  std::vector<int> usage;
+  usage.resize(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), 0);
+
+  RoadRouteConfig routeCfg;
+  routeCfg.metric = RoadRouteMetric::TravelTime;
+
+  for (std::size_t i = 0; i < centers.size(); ++i) {
+    for (std::size_t j = i + 1; j < centers.size(); ++j) {
+      const int weight = PairWeight(centers[i].kind, centers[j].kind);
+      if (weight <= 0) continue;
+
+      const RoadRouteResult rr = FindRoadRouteAStar(world, graph, index, weights, centers[i].p, centers[j].p, routeCfg);
+      if (rr.path.empty()) continue;
+      if (rr.path.size() < 2) continue;
+
+      for (const Point& p : rr.path) {
+        if (!world.inBounds(p.x, p.y)) continue;
+        if (world.at(p.x, p.y).overlay != Overlay::Road) continue;
+        usage[Idx(p.x, p.y, w)] += weight;
+      }
+    }
+  }
+
+  // Rank road tiles by usage.
+  int roadCount = 0;
+  int maxUse = 0;
+  std::vector<int> scored;
+  scored.reserve(2048);
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const Tile& t = world.at(x, y);
+      if (t.overlay != Overlay::Road) continue;
+      ++roadCount;
+      const int u = usage[Idx(x, y, w)];
+      if (u > 0) scored.push_back(y * w + x);
+      maxUse = std::max(maxUse, u);
+    }
+  }
+
+  if (scored.empty() || maxUse <= 0) return;
+
+  std::sort(scored.begin(), scored.end(), [&](int ia, int ib) {
+    const int ua = usage[static_cast<std::size_t>(ia)];
+    const int ub = usage[static_cast<std::size_t>(ib)];
+    if (ua != ub) return ua > ub;
+
+    const int ax = ia % w, ay = ia / w;
+    const int bx = ib % w, by = ib / w;
+    const std::uint32_t ha = HashCoords32(ax, ay, seed32 ^ 0xC0FFEE00u);
+    const std::uint32_t hb = HashCoords32(bx, by, seed32 ^ 0xC0FFEE00u);
+    return ha < hb;
+  });
+
+  const int baseHighway = std::clamp(roadCount / 45, 10, 260);
+  const int baseAvenue = std::clamp(roadCount / 11, 50, 1100);
+
+  int highwayBudget = static_cast<int>(std::round(static_cast<float>(baseHighway) * s));
+  int avenueBudget = static_cast<int>(std::round(static_cast<float>(baseAvenue) * s));
+  highwayBudget = std::clamp(highwayBudget, 0, static_cast<int>(scored.size()));
+  avenueBudget = std::clamp(avenueBudget, 0, static_cast<int>(scored.size()));
+
+  const int minAvenueUse = std::max(3, maxUse / 6);
+  const int minHighwayUse = std::max(8, maxUse / 3);
+
+  // Upgrade to highways (level 3).
+  int hiUp = 0;
+  for (int idxFlat : scored) {
+    if (hiUp >= highwayBudget) break;
+    const int u = usage[static_cast<std::size_t>(idxFlat)];
+    if (u < minHighwayUse) break; // sorted; the rest will be lower
+
+    const int x = idxFlat % w;
+    const int y = idxFlat / w;
+    Tile& t = world.at(x, y);
+    if (t.overlay != Overlay::Road) continue;
+
+    const int cur = ClampRoadLevel(static_cast<int>(t.level));
+    if (cur < 3) {
+      t.level = static_cast<std::uint8_t>(3);
+      ++hiUp;
+    }
+  }
+
+  // Upgrade to avenues (level 2).
+  int avUp = 0;
+  for (int idxFlat : scored) {
+    if (avUp >= avenueBudget) break;
+    const int u = usage[static_cast<std::size_t>(idxFlat)];
+    if (u < minAvenueUse) break;
+
+    const int x = idxFlat % w;
+    const int y = idxFlat / w;
+    Tile& t = world.at(x, y);
+    if (t.overlay != Overlay::Road) continue;
+
+    const int cur = ClampRoadLevel(static_cast<int>(t.level));
+    if (cur < 2) {
+      t.level = static_cast<std::uint8_t>(2);
+      ++avUp;
+    }
+  }
+
+  // Fill single-tile gaps so arterial lines don't look broken.
+  FillRoadLevelGaps(world, 3, /*passes=*/2);
+  FillRoadLevelGaps(world, 2, /*passes=*/2);
+}
+
+
+
+static void ApplyProcGenDistrictingMode(World& world, const ProcGenConfig& cfg)
+{
+  switch (cfg.districtingMode) {
+  case ProcGenDistrictingMode::Voronoi:
+    // Legacy behavior already assigned earlier.
+    return;
+
+  case ProcGenDistrictingMode::RoadFlow: {
+    // Seed + partition from the road network. Travel-time weighting uses road class
+    // so highways "reach" farther than streets.
+    AutoDistrictConfig dc{};
+    dc.districts = kDistrictCount;
+    dc.requireOutsideConnection = false;
+    dc.useTravelTime = true;
+    dc.fillAllTiles = true;
+    dc.includeWater = true;
+    AutoAssignDistricts(world, dc);
+    return;
+  }
+
+  case ProcGenDistrictingMode::BlockGraph: {
+    // Neighborhood-style districts based on contiguous CityBlocks.
+    BlockDistrictConfig bc{};
+    bc.districts = kDistrictCount;
+    bc.fillRoadTiles = true;
+    bc.includeWater = true;
+    AssignDistrictsByBlocks(world, bc, nullptr);
+    return;
+  }
+
+  default:
+    return;
+  }
+}
+
 } // namespace
 
 World GenerateWorld(int width, int height, std::uint64_t seed, const ProcGenConfig& cfg)
@@ -3019,6 +3759,9 @@ World GenerateWorld(int width, int height, std::uint64_t seed, const ProcGenConf
       heights[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)] = n01 * 1.2f - 0.2f;
     }
   }
+
+  // Optional macro shaping (presets). Classic is a no-op.
+  ApplyTerrainPreset(heights, width, height, seed32, cfg);
 
   // Optional post-pass: erosion + rivers + smoothing.
   ApplyErosion(heights, width, height, cfg.erosion, seed);
@@ -3342,6 +4085,17 @@ World GenerateWorld(int width, int height, std::uint64_t seed, const ProcGenConf
   CarveInternalStreets(world, hubPts, seed32 ^ 0x1337C0DEu);
   // Opportunistically stitch disconnected local networks across narrow water gaps.
   StitchNarrowWaterBridges(world, hubPts, seed32 ^ 0xB16B00B5u);
+
+  // v11: post-process the generated road network to create a clearer
+  // hierarchy of streets/avenues/highways based on sampled road-graph centrality.
+  UpgradeRoadHierarchyFromCentrality(world, hubPts, seed32 ^ 0x51A71D00u, cfg);
+
+  // v12: optionally reassign districts based on the generated road network.
+  //
+  // This produces cleaner, street-following district boundaries and gives the
+  // zoning pass more coherent "neighborhood" inputs.
+  ApplyProcGenDistrictingMode(world, cfg);
+
   // Place zones and parks using block-aware inward growth.
   PlaceZonesAndParksFromBlocks(world, hubPts, seed32 ^ 0xD15EA5E5u, cfg);
 

@@ -444,6 +444,22 @@ struct Render3DConfig {
   float fogStart = 0.35f; // [0..1] depth
   float fogEnd = 1.0f;
 
+  // Terrain surface mode.
+  //
+  // When disabled (default), top surfaces are generated as flat per-tile quads.
+  // When enabled, top surfaces are generated as a continuous heightfield using
+  // per-tile-corner heights (averaged from neighboring tiles). This produces
+  // smoother slopes in the software 3D renderer.
+  bool heightfieldTopSurfaces = false;
+
+  // Add a terrain "skirt" around the exported bounds to visually close the mesh
+  // (a common trick for heightfields in engines).
+  //
+  // When enabled, vertical walls are generated along the crop/world boundary
+  // down to (minHeight - skirtDrop).
+  bool addSkirt = false;
+  float skirtDrop = 6.0f;
+
   // Mesh extraction parameters (world units).
   //
   // Note: RenderWorld3D always produces per-tile *top* surfaces colored using

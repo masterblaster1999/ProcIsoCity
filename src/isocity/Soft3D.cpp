@@ -509,11 +509,14 @@ PpmImage RenderQuadsSoft3D(const std::vector<MeshQuad>& quads,
 
   // --- Rasterize ---
   for (const MeshQuad& q : quads) {
-    // Per-quad color (flat) with lambert shading.
-    const MeshC4 shaded = shadeColor(q.color, q.n, 1.0f);
-    std::uint8_t baseR = shaded.r;
-    std::uint8_t baseG = shaded.g;
-    std::uint8_t baseB = shaded.b;
+    // Decide whether to shade using the author-provided normal (q.n) or geometric
+    // normals derived from the actual triangle plane.
+    //
+    // We keep q.n for perfectly-flat quads so callers can provide a smooth/"fake"
+    // heightfield normal even when the emitted geometry is a flat tile.
+    const float minY = std::min({q.a.y, q.b.y, q.c.y, q.d.y});
+    const float maxY = std::max({q.a.y, q.b.y, q.c.y, q.d.y});
+    const bool useGeomNormals = (maxY - minY) > 1e-6f;
 
     // Project quad vertices.
     const Vec4 ca = project(q.a);
@@ -531,7 +534,43 @@ PpmImage RenderQuadsSoft3D(const std::vector<MeshQuad>& quads,
     const SVtx sc = toScreen(cc);
     const SVtx sd = toScreen(cd);
 
-    auto rasterTri = [&](SVtx v0, SVtx v1, SVtx v2) {
+    std::uint8_t tri0R = 0, tri0G = 0, tri0B = 0;
+    std::uint8_t tri1R = 0, tri1G = 0, tri1B = 0;
+
+    if (!useGeomNormals) {
+      // Flat quad: use the caller's provided normal (preserves previous behavior).
+      const MeshC4 shaded = shadeColor(q.color, q.n, 1.0f);
+      tri0R = tri1R = shaded.r;
+      tri0G = tri1G = shaded.g;
+      tri0B = tri1B = shaded.b;
+    } else {
+      // Non-flat quad: shade each triangle with its geometric normal.
+      const Vec3 refN = Normalize(V3(q.n.x, q.n.y, q.n.z));
+
+      auto triNormal = [&](const MeshV3& p0, const MeshV3& p1, const MeshV3& p2) -> Vec3 {
+        const Vec3 a = V3(p0.x, p0.y, p0.z);
+        const Vec3 b = V3(p1.x, p1.y, p1.z);
+        const Vec3 c = V3(p2.x, p2.y, p2.z);
+        Vec3 n = Normalize(Cross(Sub(b, a), Sub(c, a)));
+        if (Dot(n, refN) < 0.0f) n = Mul(n, -1.0f);
+        return n;
+      };
+
+      const Vec3 n0 = triNormal(q.a, q.b, q.c);
+      const Vec3 n1 = triNormal(q.a, q.c, q.d);
+
+      const MeshC4 s0 = shadeColor(q.color, MeshN3{n0.x, n0.y, n0.z}, 1.0f);
+      const MeshC4 s1 = shadeColor(q.color, MeshN3{n1.x, n1.y, n1.z}, 1.0f);
+      tri0R = s0.r;
+      tri0G = s0.g;
+      tri0B = s0.b;
+      tri1R = s1.r;
+      tri1G = s1.g;
+      tri1B = s1.b;
+    }
+
+    auto rasterTri = [&](SVtx v0, SVtx v1, SVtx v2,
+                         std::uint8_t baseR, std::uint8_t baseG, std::uint8_t baseB) {
       // Compute signed area.
       const float area = (v1.sx - v0.sx) * (v2.sy - v0.sy) - (v1.sy - v0.sy) * (v2.sx - v0.sx);
       if (!(std::fabs(area) > 1e-6f)) return;
@@ -579,8 +618,8 @@ PpmImage RenderQuadsSoft3D(const std::vector<MeshQuad>& quads,
     };
 
     // Two triangles: (a,b,c) and (a,c,d)
-    rasterTri(sa, sb, sc);
-    rasterTri(sa, sc, sd);
+    rasterTri(sa, sb, sc, tri0R, tri0G, tri0B);
+    rasterTri(sa, sc, sd, tri1R, tri1G, tri1B);
 
     if (cfg.drawOutlines) {
       const SVtx e0 = sa;

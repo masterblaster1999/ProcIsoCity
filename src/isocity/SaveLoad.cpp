@@ -31,7 +31,10 @@ constexpr std::uint32_t kVersionV6 = 6; // v5 + SimConfig (policy/economy settin
 constexpr std::uint32_t kVersionV7 = 7; // v6 + districts + district policy multipliers
 constexpr std::uint32_t kVersionV8 = 8; // v7 + compressed delta payload
 constexpr std::uint32_t kVersionV9 = 9; // v8 + ProcGen erosion config
-constexpr std::uint32_t kVersionCurrent = kVersionV9;
+constexpr std::uint32_t kVersionV10 = 10; // v9 + ProcGen terrain preset config
+constexpr std::uint32_t kVersionV11 = 11; // v10 + ProcGen road hierarchy config
+constexpr std::uint32_t kVersionV12 = 12; // v11 + ProcGen districting mode config
+constexpr std::uint32_t kVersionCurrent = kVersionV12;
 
 // --- CRC32 ---
 // Used by v3+ saves to detect corruption/truncation.
@@ -284,6 +287,62 @@ struct ProcGenConfigBin {
   float parkChance = 0.06f;
 };
 
+// v10 extends ProcGenConfigBin with macro terrain preset information.
+struct ProcGenConfigBinV10 {
+  float terrainScale = 0.08f;
+  float waterLevel = 0.35f;
+  float sandLevel = 0.42f;
+  std::int32_t hubs = 4;
+  std::int32_t extraConnections = 2;
+  float zoneChance = 0.22f;
+  float parkChance = 0.06f;
+
+  std::uint8_t terrainPreset = 0; // ProcGenTerrainPreset
+  std::uint8_t _pad0 = 0;
+  std::uint8_t _pad1 = 0;
+  std::uint8_t _pad2 = 0;
+
+  float terrainPresetStrength = 1.0f;
+};
+
+// v11 extends ProcGenConfigBinV10 with road hierarchy settings.
+struct ProcGenConfigBinV11 {
+  float terrainScale = 0.08f;
+  float waterLevel = 0.35f;
+  float sandLevel = 0.42f;
+  std::int32_t hubs = 4;
+  std::int32_t extraConnections = 2;
+  float zoneChance = 0.22f;
+  float parkChance = 0.06f;
+
+  std::uint8_t terrainPreset = 0;        // ProcGenTerrainPreset
+  std::uint8_t roadHierarchyEnabled = 0; // bool
+  std::uint8_t _pad0 = 0;
+  std::uint8_t _pad1 = 0;
+
+  float terrainPresetStrength = 1.0f;
+  float roadHierarchyStrength = 0.0f;
+};
+
+// v12 extends ProcGenConfigBinV11 with districting mode settings.
+struct ProcGenConfigBinV12 {
+  float terrainScale = 0.08f;
+  float waterLevel = 0.35f;
+  float sandLevel = 0.42f;
+  std::int32_t hubs = 4;
+  std::int32_t extraConnections = 2;
+  float zoneChance = 0.22f;
+  float parkChance = 0.06f;
+
+  std::uint8_t terrainPreset = 0;        // ProcGenTerrainPreset
+  std::uint8_t roadHierarchyEnabled = 0; // bool
+  std::uint8_t districtingMode = 0;      // ProcGenDistrictingMode
+  std::uint8_t _pad0 = 0;
+
+  float terrainPresetStrength = 1.0f;
+  float roadHierarchyStrength = 0.0f;
+};
+
 ProcGenConfigBin ToBin(const ProcGenConfig& cfg)
 {
   ProcGenConfigBin b;
@@ -297,6 +356,58 @@ ProcGenConfigBin ToBin(const ProcGenConfig& cfg)
   return b;
 }
 
+ProcGenConfigBinV10 ToBinV10(const ProcGenConfig& cfg)
+{
+  ProcGenConfigBinV10 b;
+  b.terrainScale = cfg.terrainScale;
+  b.waterLevel = cfg.waterLevel;
+  b.sandLevel = cfg.sandLevel;
+  b.hubs = static_cast<std::int32_t>(cfg.hubs);
+  b.extraConnections = static_cast<std::int32_t>(cfg.extraConnections);
+  b.zoneChance = cfg.zoneChance;
+  b.parkChance = cfg.parkChance;
+  b.terrainPreset = static_cast<std::uint8_t>(cfg.terrainPreset);
+  b.terrainPresetStrength = cfg.terrainPresetStrength;
+  return b;
+}
+
+ProcGenConfigBinV11 ToBinV11(const ProcGenConfig& cfg)
+{
+  ProcGenConfigBinV11 b;
+  b.terrainScale = cfg.terrainScale;
+  b.waterLevel = cfg.waterLevel;
+  b.sandLevel = cfg.sandLevel;
+  b.hubs = static_cast<std::int32_t>(cfg.hubs);
+  b.extraConnections = static_cast<std::int32_t>(cfg.extraConnections);
+  b.zoneChance = cfg.zoneChance;
+  b.parkChance = cfg.parkChance;
+
+  b.terrainPreset = static_cast<std::uint8_t>(cfg.terrainPreset);
+  b.roadHierarchyEnabled = static_cast<std::uint8_t>(cfg.roadHierarchyEnabled ? 1u : 0u);
+  b.terrainPresetStrength = cfg.terrainPresetStrength;
+  b.roadHierarchyStrength = cfg.roadHierarchyStrength;
+  return b;
+}
+
+ProcGenConfigBinV12 ToBinV12(const ProcGenConfig& cfg)
+{
+  ProcGenConfigBinV12 b;
+  b.terrainScale = cfg.terrainScale;
+  b.waterLevel = cfg.waterLevel;
+  b.sandLevel = cfg.sandLevel;
+  b.hubs = static_cast<std::int32_t>(cfg.hubs);
+  b.extraConnections = static_cast<std::int32_t>(cfg.extraConnections);
+  b.zoneChance = cfg.zoneChance;
+  b.parkChance = cfg.parkChance;
+
+  b.terrainPreset = static_cast<std::uint8_t>(cfg.terrainPreset);
+  b.roadHierarchyEnabled = static_cast<std::uint8_t>(cfg.roadHierarchyEnabled ? 1u : 0u);
+  b.districtingMode = static_cast<std::uint8_t>(cfg.districtingMode);
+  b.terrainPresetStrength = cfg.terrainPresetStrength;
+  b.roadHierarchyStrength = cfg.roadHierarchyStrength;
+  return b;
+}
+
 void FromBin(ProcGenConfig& cfg, const ProcGenConfigBin& b)
 {
   cfg.terrainScale = b.terrainScale;
@@ -307,11 +418,105 @@ void FromBin(ProcGenConfig& cfg, const ProcGenConfigBin& b)
   cfg.zoneChance = b.zoneChance;
   cfg.parkChance = b.parkChance;
 
+  // v9 and older: no terrain preset or road hierarchy settings were stored.
+  cfg.terrainPreset = ProcGenTerrainPreset::Classic;
+  cfg.terrainPresetStrength = 1.0f;
+  cfg.roadHierarchyEnabled = false;
+  cfg.roadHierarchyStrength = 0.0f;
+
+  // v11 and older did not persist districting mode; default to legacy Voronoi to preserve determinism.
+  cfg.districtingMode = ProcGenDistrictingMode::Voronoi;
+
   // Older save versions did not persist erosion settings. Default to disabled and let newer versions override.
   cfg.erosion = ErosionConfig{};
   cfg.erosion.enabled = false;
 }
 
+void FromBinV10(ProcGenConfig& cfg, const ProcGenConfigBinV10& b)
+{
+  cfg.terrainScale = b.terrainScale;
+  cfg.waterLevel = b.waterLevel;
+  cfg.sandLevel = b.sandLevel;
+  cfg.hubs = static_cast<int>(b.hubs);
+  cfg.extraConnections = static_cast<int>(b.extraConnections);
+  cfg.zoneChance = b.zoneChance;
+  cfg.parkChance = b.parkChance;
+
+  // Defensive enum validation (avoid UB on corrupted saves).
+  std::uint8_t presetU8 = b.terrainPreset;
+  if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::MountainRing)) {
+    presetU8 = static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
+  }
+  cfg.terrainPreset = static_cast<ProcGenTerrainPreset>(presetU8);
+  cfg.terrainPresetStrength = std::clamp(b.terrainPresetStrength, 0.0f, 5.0f);
+
+  // v10 did not include the road hierarchy pass; default it to disabled to preserve determinism.
+  cfg.roadHierarchyEnabled = false;
+  cfg.roadHierarchyStrength = 0.0f;
+
+  // v11 and older did not persist districting mode; default to legacy Voronoi to preserve determinism.
+  cfg.districtingMode = ProcGenDistrictingMode::Voronoi;
+
+  // Erosion settings are persisted separately starting in v9; loader will override.
+  cfg.erosion = ErosionConfig{};
+}
+
+void FromBinV11(ProcGenConfig& cfg, const ProcGenConfigBinV11& b)
+{
+  cfg.terrainScale = b.terrainScale;
+  cfg.waterLevel = b.waterLevel;
+  cfg.sandLevel = b.sandLevel;
+  cfg.hubs = static_cast<int>(b.hubs);
+  cfg.extraConnections = static_cast<int>(b.extraConnections);
+  cfg.zoneChance = b.zoneChance;
+  cfg.parkChance = b.parkChance;
+
+  std::uint8_t presetU8 = b.terrainPreset;
+  if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::MountainRing)) {
+    presetU8 = static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
+  }
+  cfg.terrainPreset = static_cast<ProcGenTerrainPreset>(presetU8);
+  cfg.terrainPresetStrength = std::clamp(b.terrainPresetStrength, 0.0f, 5.0f);
+
+  cfg.roadHierarchyEnabled = (b.roadHierarchyEnabled != 0);
+  cfg.roadHierarchyStrength = std::clamp(b.roadHierarchyStrength, 0.0f, 3.0f);
+
+  // v11 did not persist districting mode; default to legacy Voronoi to preserve determinism.
+  cfg.districtingMode = ProcGenDistrictingMode::Voronoi;
+
+  // Erosion settings are persisted separately starting in v9; loader will override.
+  cfg.erosion = ErosionConfig{};
+}
+
+void FromBinV12(ProcGenConfig& cfg, const ProcGenConfigBinV12& b)
+{
+  cfg.terrainScale = b.terrainScale;
+  cfg.waterLevel = b.waterLevel;
+  cfg.sandLevel = b.sandLevel;
+  cfg.hubs = static_cast<int>(b.hubs);
+  cfg.extraConnections = static_cast<int>(b.extraConnections);
+  cfg.zoneChance = b.zoneChance;
+  cfg.parkChance = b.parkChance;
+
+  std::uint8_t presetU8 = b.terrainPreset;
+  if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::MountainRing)) {
+    presetU8 = static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
+  }
+  cfg.terrainPreset = static_cast<ProcGenTerrainPreset>(presetU8);
+  cfg.terrainPresetStrength = std::clamp(b.terrainPresetStrength, 0.0f, 5.0f);
+
+  cfg.roadHierarchyEnabled = (b.roadHierarchyEnabled != 0);
+  cfg.roadHierarchyStrength = std::clamp(b.roadHierarchyStrength, 0.0f, 3.0f);
+
+  std::uint8_t modeU8 = b.districtingMode;
+  if (modeU8 > static_cast<std::uint8_t>(ProcGenDistrictingMode::BlockGraph)) {
+    modeU8 = static_cast<std::uint8_t>(ProcGenDistrictingMode::Voronoi);
+  }
+  cfg.districtingMode = static_cast<ProcGenDistrictingMode>(modeU8);
+
+  // Erosion settings are persisted separately starting in v9; loader will override.
+  cfg.erosion = ErosionConfig{};
+}
 
 
 struct ErosionConfigBin {
@@ -1630,9 +1835,387 @@ bool LoadBodyV9(std::istream& is, std::uint32_t w, std::uint32_t h, std::uint64_
   return true;
 }
 
+bool LoadBodyV10(std::istream& is, std::uint32_t w, std::uint32_t h, std::uint64_t seed, World& outWorld,
+                 ProcGenConfig& outProcCfg, SimConfig& outSimCfg, std::string& outError)
+{
+  // v10: v9 + ProcGen terrain preset config.
+  //
+  // Payload:
+  //   ProcGenConfigBinV10
+  //   ErosionConfigBin
+  //   StatsBin
+  //   SimConfigBin
+  //   u8 districtPoliciesEnabled
+  //   DistrictPolicyBin[kDistrictCount]
+  //   u8 compressionMethod (0=None, 1=SLLZ)
+  //   varint(uncompressedSize)
+  //   varint(storedSize)
+  //   stored bytes
+  //
+  // The uncompressed bytes are a v7-style delta stream (see ApplyDeltasV7).
+
+  ProcGenConfigBinV10 pcb{};
+  if (!Read(is, pcb)) {
+    outError = "Read failed (procgen config)";
+    return false;
+  }
+  FromBinV10(outProcCfg, pcb);
+
+  ErosionConfigBin ecb{};
+  if (!Read(is, ecb)) {
+    outError = "Read failed (erosion config)";
+    return false;
+  }
+  FromBin(outProcCfg.erosion, ecb);
+
+  StatsBin sb{};
+  if (!Read(is, sb)) {
+    outError = "Read failed (stats)";
+    return false;
+  }
+
+  SimConfigBin scb{};
+  if (!Read(is, scb)) {
+    outError = "Read failed (sim config)";
+    return false;
+  }
+  FromBin(outSimCfg, scb);
+
+  // District policy chunk (v7+).
+  std::uint8_t dpEnabled = 0;
+  if (!Read(is, dpEnabled)) {
+    outError = "Read failed (district policy enabled)";
+    return false;
+  }
+  outSimCfg.districtPoliciesEnabled = (dpEnabled != 0);
+
+  for (int d = 0; d < kDistrictCount; ++d) {
+    DistrictPolicyBin dpb{};
+    if (!Read(is, dpb)) {
+      outError = "Read failed (district policy)";
+      return false;
+    }
+    FromBin(outSimCfg.districtPolicies[static_cast<std::size_t>(d)], dpb);
+  }
+
+  // Compressed delta payload.
+  std::uint8_t methodU8 = 0;
+  if (!Read(is, methodU8)) {
+    outError = "Read failed (compression method)";
+    return false;
+  }
+
+  std::uint32_t uncompressedSize = 0;
+  std::uint32_t storedSize = 0;
+  if (!ReadVarU32(is, uncompressedSize) || !ReadVarU32(is, storedSize)) {
+    outError = "Read failed (compressed payload sizes)";
+    return false;
+  }
+
+  const std::uint64_t tileCount = static_cast<std::uint64_t>(w) * static_cast<std::uint64_t>(h);
+  const std::uint64_t maxReasonable = tileCount * 32ull + 1024ull;
+  if (static_cast<std::uint64_t>(uncompressedSize) > maxReasonable ||
+      static_cast<std::uint64_t>(storedSize) > maxReasonable) {
+    outError = "Invalid compressed payload size";
+    return false;
+  }
+
+  std::vector<std::uint8_t> stored(storedSize);
+  if (storedSize > 0) {
+    is.read(reinterpret_cast<char*>(stored.data()), static_cast<std::streamsize>(storedSize));
+    if (!is.good()) {
+      outError = "Read failed (compressed payload bytes)";
+      return false;
+    }
+  }
+
+  std::vector<std::uint8_t> delta;
+  if (methodU8 == static_cast<std::uint8_t>(CompressionMethod::None)) {
+    if (storedSize != uncompressedSize) {
+      outError = "Invalid payload sizes for uncompressed delta stream";
+      return false;
+    }
+    delta = std::move(stored);
+  } else if (methodU8 == static_cast<std::uint8_t>(CompressionMethod::SLLZ)) {
+    std::string decErr;
+    if (!DecompressSLLZ(stored.data(), stored.size(), static_cast<std::size_t>(uncompressedSize), delta, decErr)) {
+      outError = "Delta payload decompression failed: " + decErr;
+      return false;
+    }
+  } else {
+    outError = "Unknown compression method in save file";
+    return false;
+  }
+
+  World loaded = GenerateWorld(static_cast<int>(w), static_cast<int>(h), seed, outProcCfg);
+
+  // Parse delta stream from an in-memory buffer.
+  std::string deltaStr(reinterpret_cast<const char*>(delta.data()), delta.size());
+  std::istringstream ds(deltaStr, std::ios::binary);
+  if (!ApplyDeltasV7(ds, w, h, loaded, outProcCfg, outError)) {
+    return false;
+  }
+
+  FromBin(loaded.stats(), sb);
+  outWorld = std::move(loaded);
+  return true;
+}
+
+bool LoadBodyV11(std::istream& is, std::uint32_t w, std::uint32_t h, std::uint64_t seed, World& outWorld,
+                 ProcGenConfig& outProcCfg, SimConfig& outSimCfg, std::string& outError)
+{
+  // v11: v10 + ProcGen road hierarchy config.
+  //
+  // Payload:
+  //   ProcGenConfigBinV11
+  //   ErosionConfigBin
+  //   StatsBin
+  //   SimConfigBin
+  //   u8 districtPoliciesEnabled
+  //   DistrictPolicyBin[kDistrictCount]
+  //   u8 compressionMethod (0=None, 1=SLLZ)
+  //   varint(uncompressedSize)
+  //   varint(storedSize)
+  //   stored bytes
+  //
+  // The uncompressed bytes are a v7-style delta stream (see ApplyDeltasV7).
+
+  ProcGenConfigBinV11 pcb{};
+  if (!Read(is, pcb)) {
+    outError = "Read failed (procgen config)";
+    return false;
+  }
+  FromBinV11(outProcCfg, pcb);
+
+  ErosionConfigBin ecb{};
+  if (!Read(is, ecb)) {
+    outError = "Read failed (erosion config)";
+    return false;
+  }
+  FromBin(outProcCfg.erosion, ecb);
+
+  StatsBin sb{};
+  if (!Read(is, sb)) {
+    outError = "Read failed (stats)";
+    return false;
+  }
+
+  SimConfigBin scb{};
+  if (!Read(is, scb)) {
+    outError = "Read failed (sim config)";
+    return false;
+  }
+  FromBin(outSimCfg, scb);
+
+  // District policy chunk (v7+).
+  std::uint8_t dpEnabled = 0;
+  if (!Read(is, dpEnabled)) {
+    outError = "Read failed (district policy enabled)";
+    return false;
+  }
+  outSimCfg.districtPoliciesEnabled = (dpEnabled != 0);
+
+  for (int d = 0; d < kDistrictCount; ++d) {
+    DistrictPolicyBin dpb{};
+    if (!Read(is, dpb)) {
+      outError = "Read failed (district policy)";
+      return false;
+    }
+    FromBin(outSimCfg.districtPolicies[static_cast<std::size_t>(d)], dpb);
+  }
+
+  // Compressed delta payload.
+  std::uint8_t methodU8 = 0;
+  if (!Read(is, methodU8)) {
+    outError = "Read failed (compression method)";
+    return false;
+  }
+
+  std::uint32_t uncompressedSize = 0;
+  std::uint32_t storedSize = 0;
+  if (!ReadVarU32(is, uncompressedSize) || !ReadVarU32(is, storedSize)) {
+    outError = "Read failed (compressed payload sizes)";
+    return false;
+  }
+
+  const std::uint64_t tileCount = static_cast<std::uint64_t>(w) * static_cast<std::uint64_t>(h);
+  const std::uint64_t maxReasonable = tileCount * 32ull + 1024ull;
+  if (static_cast<std::uint64_t>(uncompressedSize) > maxReasonable ||
+      static_cast<std::uint64_t>(storedSize) > maxReasonable) {
+    outError = "Invalid compressed payload size";
+    return false;
+  }
+
+  std::vector<std::uint8_t> stored(storedSize);
+  if (storedSize > 0) {
+    is.read(reinterpret_cast<char*>(stored.data()), static_cast<std::streamsize>(storedSize));
+    if (!is.good()) {
+      outError = "Read failed (compressed payload bytes)";
+      return false;
+    }
+  }
+
+  std::vector<std::uint8_t> delta;
+  if (methodU8 == static_cast<std::uint8_t>(CompressionMethod::None)) {
+    if (storedSize != uncompressedSize) {
+      outError = "Invalid payload sizes for uncompressed delta stream";
+      return false;
+    }
+    delta = std::move(stored);
+  } else if (methodU8 == static_cast<std::uint8_t>(CompressionMethod::SLLZ)) {
+    std::string decErr;
+    if (!DecompressSLLZ(stored.data(), stored.size(), static_cast<std::size_t>(uncompressedSize), delta, decErr)) {
+      outError = "Delta payload decompression failed: " + decErr;
+      return false;
+    }
+  } else {
+    outError = "Unknown compression method in save file";
+    return false;
+  }
+
+  World loaded = GenerateWorld(static_cast<int>(w), static_cast<int>(h), seed, outProcCfg);
+
+  // Parse delta stream from an in-memory buffer.
+  std::string deltaStr(reinterpret_cast<const char*>(delta.data()), delta.size());
+  std::istringstream ds(deltaStr, std::ios::binary);
+  if (!ApplyDeltasV7(ds, w, h, loaded, outProcCfg, outError)) {
+    return false;
+  }
+
+  FromBin(loaded.stats(), sb);
+  outWorld = std::move(loaded);
+  return true;
+}
+
 
 
 } // namespace
+
+bool LoadBodyV12(std::istream& is, std::uint32_t w, std::uint32_t h, std::uint64_t seed, World& outWorld,
+                 ProcGenConfig& outProcCfg, SimConfig& outSimCfg, std::string& outError)
+{
+  // v12: v11 + ProcGen districting mode config.
+  //
+  // Payload:
+  //   ProcGenConfigBinV12
+  //   ErosionConfigBin
+  //   StatsBin
+  //   SimConfigBin
+  //   u8 districtPoliciesEnabled
+  //   DistrictPolicyBin[kDistrictCount]
+  //   u8 compressionMethod (0=None, 1=SLLZ)
+  //   varint(uncompressedSize)
+  //   varint(storedSize)
+  //   stored bytes
+  //
+  // The uncompressed bytes are a v7-style delta stream (see ApplyDeltasV7).
+
+  ProcGenConfigBinV12 pcb{};
+  if (!Read(is, pcb)) {
+    outError = "Read failed (procgen config)";
+    return false;
+  }
+  FromBinV12(outProcCfg, pcb);
+
+  ErosionConfigBin ecb{};
+  if (!Read(is, ecb)) {
+    outError = "Read failed (erosion config)";
+    return false;
+  }
+  FromBin(outProcCfg.erosion, ecb);
+
+  StatsBin sb{};
+  if (!Read(is, sb)) {
+    outError = "Read failed (stats)";
+    return false;
+  }
+
+  SimConfigBin scb{};
+  if (!Read(is, scb)) {
+    outError = "Read failed (sim config)";
+    return false;
+  }
+  FromBin(outSimCfg, scb);
+
+  // District policy chunk (v7+).
+  std::uint8_t dpEnabled = 0;
+  if (!Read(is, dpEnabled)) {
+    outError = "Read failed (district policy enabled)";
+    return false;
+  }
+  outSimCfg.districtPoliciesEnabled = (dpEnabled != 0);
+
+  for (int d = 0; d < kDistrictCount; ++d) {
+    DistrictPolicyBin dpb{};
+    if (!Read(is, dpb)) {
+      outError = "Read failed (district policy)";
+      return false;
+    }
+    FromBin(outSimCfg.districtPolicies[static_cast<std::size_t>(d)], dpb);
+  }
+
+  // Compressed delta payload.
+  std::uint8_t methodU8 = 0;
+  if (!Read(is, methodU8)) {
+    outError = "Read failed (compression method)";
+    return false;
+  }
+
+  std::uint32_t uncompressedSize = 0;
+  std::uint32_t storedSize = 0;
+  if (!ReadVarU32(is, uncompressedSize) || !ReadVarU32(is, storedSize)) {
+    outError = "Read failed (compressed payload sizes)";
+    return false;
+  }
+
+  const std::uint64_t tileCount = static_cast<std::uint64_t>(w) * static_cast<std::uint64_t>(h);
+  const std::uint64_t maxReasonable = tileCount * 32ull + 1024ull;
+  if (static_cast<std::uint64_t>(uncompressedSize) > maxReasonable ||
+      static_cast<std::uint64_t>(storedSize) > maxReasonable) {
+    outError = "Invalid compressed payload size";
+    return false;
+  }
+
+  std::vector<std::uint8_t> stored(storedSize);
+  if (storedSize > 0) {
+    is.read(reinterpret_cast<char*>(stored.data()), static_cast<std::streamsize>(storedSize));
+    if (!is.good()) {
+      outError = "Read failed (compressed payload bytes)";
+      return false;
+    }
+  }
+
+  std::vector<std::uint8_t> delta;
+  if (methodU8 == static_cast<std::uint8_t>(CompressionMethod::None)) {
+    if (storedSize != uncompressedSize) {
+      outError = "Invalid payload sizes for uncompressed delta stream";
+      return false;
+    }
+    delta = std::move(stored);
+  } else if (methodU8 == static_cast<std::uint8_t>(CompressionMethod::SLLZ)) {
+    std::string decErr;
+    if (!DecompressSLLZ(stored.data(), stored.size(), static_cast<std::size_t>(uncompressedSize), delta, decErr)) {
+      outError = "Delta payload decompression failed: " + decErr;
+      return false;
+    }
+  } else {
+    outError = "Unknown compression method in save file";
+    return false;
+  }
+
+  World loaded = GenerateWorld(static_cast<int>(w), static_cast<int>(h), seed, outProcCfg);
+
+  // Parse delta stream from an in-memory buffer.
+  std::string deltaStr(reinterpret_cast<const char*>(delta.data()), delta.size());
+  std::istringstream ds(deltaStr, std::ios::binary);
+  if (!ApplyDeltasV7(ds, w, h, loaded, outProcCfg, outError)) {
+    return false;
+  }
+
+  FromBin(loaded.stats(), sb);
+  outWorld = std::move(loaded);
+  return true;
+}
 
 bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::string& outError, bool verifyCrc)
 {
@@ -1708,30 +2291,178 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
       outError = "Unsupported save version";
       return false;
     }
+    if (version >= kVersionV12) {
+      struct ProcGenConfigBinLocalV12 {
+        float terrainScale = 0.08f;
+        float waterLevel = 0.35f;
+        float sandLevel = 0.42f;
+        std::int32_t hubs = 4;
+        std::int32_t extraConnections = 2;
+        float zoneChance = 0.22f;
+        float parkChance = 0.06f;
 
-    struct ProcGenConfigBinLocal {
-      float terrainScale = 0.08f;
-      float waterLevel = 0.35f;
-      float sandLevel = 0.42f;
-      std::int32_t hubs = 4;
-      std::int32_t extraConnections = 2;
-      float zoneChance = 0.22f;
-      float parkChance = 0.06f;
-    };
+        std::uint8_t terrainPreset = 0;
+        std::uint8_t roadHierarchyEnabled = 0;
+        std::uint8_t districtingMode = 0;
+        std::uint8_t _pad0 = 0;
 
-    ProcGenConfigBinLocal pcb{};
-    if (!readPOD(pcb)) {
-      outError = "Read failed (procgen config)";
-      return false;
+        float terrainPresetStrength = 1.0f;
+        float roadHierarchyStrength = 0.0f;
+      };
+
+      ProcGenConfigBinLocalV12 pcb{};
+      if (!readPOD(pcb)) {
+        outError = "Read failed (procgen config)";
+        return false;
+      }
+
+      outSummary.procCfg.terrainScale = pcb.terrainScale;
+      outSummary.procCfg.waterLevel = pcb.waterLevel;
+      outSummary.procCfg.sandLevel = pcb.sandLevel;
+      outSummary.procCfg.hubs = static_cast<int>(pcb.hubs);
+      outSummary.procCfg.extraConnections = static_cast<int>(pcb.extraConnections);
+      outSummary.procCfg.zoneChance = pcb.zoneChance;
+      outSummary.procCfg.parkChance = pcb.parkChance;
+
+      std::uint8_t presetU8 = pcb.terrainPreset;
+      if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::MountainRing)) {
+        presetU8 = static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
+      }
+      outSummary.procCfg.terrainPreset = static_cast<ProcGenTerrainPreset>(presetU8);
+      outSummary.procCfg.terrainPresetStrength = std::clamp(pcb.terrainPresetStrength, 0.0f, 5.0f);
+
+      outSummary.procCfg.roadHierarchyEnabled = (pcb.roadHierarchyEnabled != 0);
+      outSummary.procCfg.roadHierarchyStrength = std::clamp(pcb.roadHierarchyStrength, 0.0f, 3.0f);
+
+      std::uint8_t dmU8 = pcb.districtingMode;
+      if (dmU8 > static_cast<std::uint8_t>(ProcGenDistrictingMode::BlockGraph)) {
+        dmU8 = static_cast<std::uint8_t>(ProcGenDistrictingMode::Voronoi);
+      }
+      outSummary.procCfg.districtingMode = static_cast<ProcGenDistrictingMode>(dmU8);
+    } else if (version >= kVersionV11) {
+      struct ProcGenConfigBinLocalV11 {
+        float terrainScale = 0.08f;
+        float waterLevel = 0.35f;
+        float sandLevel = 0.42f;
+        std::int32_t hubs = 4;
+        std::int32_t extraConnections = 2;
+        float zoneChance = 0.22f;
+        float parkChance = 0.06f;
+
+        std::uint8_t terrainPreset = 0;
+        std::uint8_t roadHierarchyEnabled = 0;
+        std::uint8_t _pad0 = 0;
+        std::uint8_t _pad1 = 0;
+
+        float terrainPresetStrength = 1.0f;
+        float roadHierarchyStrength = 0.0f;
+      };
+
+      ProcGenConfigBinLocalV11 pcb{};
+      if (!readPOD(pcb)) {
+        outError = "Read failed (procgen config)";
+        return false;
+      }
+
+      outSummary.procCfg.terrainScale = pcb.terrainScale;
+      outSummary.procCfg.waterLevel = pcb.waterLevel;
+      outSummary.procCfg.sandLevel = pcb.sandLevel;
+      outSummary.procCfg.hubs = static_cast<int>(pcb.hubs);
+      outSummary.procCfg.extraConnections = static_cast<int>(pcb.extraConnections);
+      outSummary.procCfg.zoneChance = pcb.zoneChance;
+      outSummary.procCfg.parkChance = pcb.parkChance;
+
+      std::uint8_t presetU8 = pcb.terrainPreset;
+      if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::MountainRing)) {
+        presetU8 = static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
+      }
+      outSummary.procCfg.terrainPreset = static_cast<ProcGenTerrainPreset>(presetU8);
+      outSummary.procCfg.terrainPresetStrength = std::clamp(pcb.terrainPresetStrength, 0.0f, 5.0f);
+
+      outSummary.procCfg.roadHierarchyEnabled = (pcb.roadHierarchyEnabled != 0);
+      outSummary.procCfg.roadHierarchyStrength = std::clamp(pcb.roadHierarchyStrength, 0.0f, 3.0f);
+
+      // v11 did not include districting mode settings.
+      outSummary.procCfg.districtingMode = ProcGenDistrictingMode::Voronoi;
+    } else if (version >= kVersionV10) {
+      struct ProcGenConfigBinLocalV10 {
+        float terrainScale = 0.08f;
+        float waterLevel = 0.35f;
+        float sandLevel = 0.42f;
+        std::int32_t hubs = 4;
+        std::int32_t extraConnections = 2;
+        float zoneChance = 0.22f;
+        float parkChance = 0.06f;
+
+        std::uint8_t terrainPreset = 0;
+        std::uint8_t _pad0 = 0;
+        std::uint8_t _pad1 = 0;
+        std::uint8_t _pad2 = 0;
+
+        float terrainPresetStrength = 1.0f;
+      };
+
+      ProcGenConfigBinLocalV10 pcb{};
+      if (!readPOD(pcb)) {
+        outError = "Read failed (procgen config)";
+        return false;
+      }
+
+      outSummary.procCfg.terrainScale = pcb.terrainScale;
+      outSummary.procCfg.waterLevel = pcb.waterLevel;
+      outSummary.procCfg.sandLevel = pcb.sandLevel;
+      outSummary.procCfg.hubs = static_cast<int>(pcb.hubs);
+      outSummary.procCfg.extraConnections = static_cast<int>(pcb.extraConnections);
+      outSummary.procCfg.zoneChance = pcb.zoneChance;
+      outSummary.procCfg.parkChance = pcb.parkChance;
+
+      std::uint8_t presetU8 = pcb.terrainPreset;
+      if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::MountainRing)) {
+        presetU8 = static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
+      }
+      outSummary.procCfg.terrainPreset = static_cast<ProcGenTerrainPreset>(presetU8);
+      outSummary.procCfg.terrainPresetStrength = std::clamp(pcb.terrainPresetStrength, 0.0f, 5.0f);
+
+      // v10 did not include road hierarchy settings.
+      outSummary.procCfg.roadHierarchyEnabled = false;
+      outSummary.procCfg.roadHierarchyStrength = 0.0f;
+
+      // v11 and older did not include districting mode settings.
+      outSummary.procCfg.districtingMode = ProcGenDistrictingMode::Voronoi;
+    } else {
+      struct ProcGenConfigBinLocal {
+        float terrainScale = 0.08f;
+        float waterLevel = 0.35f;
+        float sandLevel = 0.42f;
+        std::int32_t hubs = 4;
+        std::int32_t extraConnections = 2;
+        float zoneChance = 0.22f;
+        float parkChance = 0.06f;
+      };
+
+      ProcGenConfigBinLocal pcb{};
+      if (!readPOD(pcb)) {
+        outError = "Read failed (procgen config)";
+        return false;
+      }
+      outSummary.procCfg.terrainScale = pcb.terrainScale;
+      outSummary.procCfg.waterLevel = pcb.waterLevel;
+      outSummary.procCfg.sandLevel = pcb.sandLevel;
+      outSummary.procCfg.hubs = static_cast<int>(pcb.hubs);
+      outSummary.procCfg.extraConnections = static_cast<int>(pcb.extraConnections);
+      outSummary.procCfg.zoneChance = pcb.zoneChance;
+      outSummary.procCfg.parkChance = pcb.parkChance;
+
+      // Older versions did not store macro presets or road hierarchy.
+      outSummary.procCfg.terrainPreset = ProcGenTerrainPreset::Classic;
+      outSummary.procCfg.terrainPresetStrength = 1.0f;
+      outSummary.procCfg.roadHierarchyEnabled = false;
+      outSummary.procCfg.roadHierarchyStrength = 0.0f;
+
+      // v11 and older did not include districting mode settings.
+      outSummary.procCfg.districtingMode = ProcGenDistrictingMode::Voronoi;
     }
-    outSummary.procCfg.terrainScale = pcb.terrainScale;
-    outSummary.procCfg.waterLevel = pcb.waterLevel;
-    outSummary.procCfg.sandLevel = pcb.sandLevel;
-    outSummary.procCfg.hubs = static_cast<int>(pcb.hubs);
-    outSummary.procCfg.extraConnections = static_cast<int>(pcb.extraConnections);
-    outSummary.procCfg.zoneChance = pcb.zoneChance;
-    outSummary.procCfg.parkChance = pcb.parkChance;
-    
+
     // Erosion config (v9+). Older versions did not persist it.
     if (version >= kVersionV9) {
       struct ErosionConfigBinLocal {
@@ -1942,7 +2673,7 @@ bool WriteWorldBinaryPayload(Writer& cw, const World& world, const ProcGenConfig
   }
 
   // Procgen config (needed to regenerate the baseline for delta saves).
-  const ProcGenConfigBin pcb = ToBin(procCfg);
+  const ProcGenConfigBinV12 pcb = ToBinV12(procCfg);
   if (!cw.write(pcb)) {
     outError = "Write failed (procgen config)";
     return false;
@@ -2356,7 +3087,8 @@ bool LoadWorldBinary(World& outWorld, ProcGenConfig& outProcCfg, SimConfig& outS
   }
 
   if (version == kVersionV3 || version == kVersionV4 || version == kVersionV5 || version == kVersionV6 ||
-      version == kVersionV7 || version == kVersionV8 || version == kVersionV9) {
+      version == kVersionV7 || version == kVersionV8 || version == kVersionV9 || version == kVersionV10 ||
+      version == kVersionV11 || version == kVersionV12) {
     // v3+ saves append a CRC32 at the end of the file.
     //
     // We validate the CRC before parsing to detect corruption/truncation.
@@ -2402,14 +3134,30 @@ bool LoadWorldBinary(World& outWorld, ProcGenConfig& outProcCfg, SimConfig& outS
       return LoadBodyV8(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
     }
 
-    // v9: v8 + ProcGen erosion config.
-    return LoadBodyV9(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
+    if (version == kVersionV9) {
+      // v9: v8 + ProcGen erosion config.
+      return LoadBodyV9(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
+    }
+
+    if (version == kVersionV10) {
+      // v10: v9 + ProcGen terrain preset config.
+      return LoadBodyV10(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
+    }
+
+    if (version == kVersionV11) {
+      // v11: v10 + ProcGen road hierarchy config.
+      return LoadBodyV11(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
+    }
+
+    // v12: v11 + ProcGen districting mode config.
+    return LoadBodyV12(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
   }
 
   std::ostringstream oss;
   oss << "Unsupported save version: " << version << " (supported: " << kVersionV1 << ", " << kVersionV2 << ", "
       << kVersionV3 << ", " << kVersionV4 << ", " << kVersionV5 << ", " << kVersionV6 << ", "
-      << kVersionV7 << ", " << kVersionV8 << ", " << kVersionV9 << ")";
+      << kVersionV7 << ", " << kVersionV8 << ", " << kVersionV9 << ", " << kVersionV10 << ", "
+      << kVersionV11 << ", " << kVersionV12 << ")";
   outError = oss.str();
   return false;
 }
@@ -2462,7 +3210,8 @@ bool LoadWorldBinaryFromBytes(World& outWorld, ProcGenConfig& outProcCfg, SimCon
   }
 
   if (version == kVersionV3 || version == kVersionV4 || version == kVersionV5 || version == kVersionV6 ||
-      version == kVersionV7 || version == kVersionV8 || version == kVersionV9) {
+      version == kVersionV7 || version == kVersionV8 || version == kVersionV9 || version == kVersionV10 ||
+      version == kVersionV11 || version == kVersionV12) {
     // v3+ saves append a CRC32 at the end of the file.
     //
     // For in-memory loads we validate the CRC over the buffer (excluding the final CRC field).
@@ -2503,14 +3252,30 @@ bool LoadWorldBinaryFromBytes(World& outWorld, ProcGenConfig& outProcCfg, SimCon
       return LoadBodyV8(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
     }
 
-    // v9: v8 + ProcGen erosion config.
-    return LoadBodyV9(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
+    if (version == kVersionV9) {
+      // v9: v8 + ProcGen erosion config.
+      return LoadBodyV9(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
+    }
+
+    if (version == kVersionV10) {
+      // v10: v9 + ProcGen terrain preset config.
+      return LoadBodyV10(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
+    }
+
+    if (version == kVersionV11) {
+      // v11: v10 + ProcGen road hierarchy config.
+      return LoadBodyV11(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
+    }
+
+    // v12: v11 + ProcGen districting mode config.
+    return LoadBodyV12(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
   }
 
   std::ostringstream oss;
   oss << "Unsupported save version: " << version << " (supported: " << kVersionV1 << ", " << kVersionV2 << ", "
       << kVersionV3 << ", " << kVersionV4 << ", " << kVersionV5 << ", " << kVersionV6 << ", "
-      << kVersionV7 << ", " << kVersionV8 << ", " << kVersionV9 << ")";
+      << kVersionV7 << ", " << kVersionV8 << ", " << kVersionV9 << ", " << kVersionV10 << ", "
+      << kVersionV11 << ", " << kVersionV12 << ")";
   outError = oss.str();
   return false;
 }

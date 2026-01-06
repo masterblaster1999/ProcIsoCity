@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cstring>
 #include <ctime>
 #include <cmath>
 #include <cstdio>
@@ -87,6 +88,172 @@ constexpr float kWorldRenderScaleAbsMax = 2.0f;
 constexpr float kWorldRenderAutoAdjustInterval = 0.35f; // seconds
 constexpr float kWorldRenderDtSmoothing = 0.10f;        // EMA factor
 constexpr int kWorldRenderRTMaxDim = 8192;              // safety guard
+
+// Software 3D preview update throttle (seconds). The preview is CPU rendered,
+// so we update it infrequently and primarily on world changes.
+constexpr float k3DPreviewUpdateInterval = 0.85f;
+
+constexpr float kPi = 3.14159265358979323846f;
+
+inline float SmoothStep(float edge0, float edge1, float x)
+{
+  if (std::abs(edge1 - edge0) < 1e-6f) {
+    return (x < edge0) ? 0.0f : 1.0f;
+  }
+  float t = (x - edge0) / (edge1 - edge0);
+  t = std::clamp(t, 0.0f, 1.0f);
+  return t * t * (3.0f - 2.0f * t);
+}
+
+struct SimpleDayNightState {
+  float phase = 0.0f;
+  float sun = 0.0f;
+  float day = 1.0f;
+  float night = 0.0f;
+  float twilight = 0.0f;
+};
+
+SimpleDayNightState ComputeSimpleDayNightState(float timeSec, const Renderer::DayNightSettings& s)
+{
+  SimpleDayNightState out{};
+  if (!s.enabled) {
+    out.day = 1.0f;
+    out.night = 0.0f;
+    out.twilight = 0.0f;
+    return out;
+  }
+
+  const float len = std::max(1.0f, s.dayLengthSec);
+  float t = std::fmod(timeSec + s.timeOffsetSec, len);
+  if (t < 0.0f) t += len;
+
+  out.phase = t / len;
+  out.sun = std::sin(out.phase * 2.0f * kPi);
+  out.day = SmoothStep(-0.18f, 0.22f, out.sun);
+  out.night = 1.0f - out.day;
+  out.twilight = SmoothStep(0.28f, 0.0f, std::abs(out.sun));
+  return out;
+}
+
+inline void BlendRgb(std::uint8_t& r, std::uint8_t& g, std::uint8_t& b,
+                     std::uint8_t tr, std::uint8_t tg, std::uint8_t tb, float a)
+{
+  a = std::clamp(a, 0.0f, 1.0f);
+  const float ia = 1.0f - a;
+  r = static_cast<std::uint8_t>(std::clamp(std::lround(ia * r + a * tr), 0l, 255l));
+  g = static_cast<std::uint8_t>(std::clamp(std::lround(ia * g + a * tg), 0l, 255l));
+  b = static_cast<std::uint8_t>(std::clamp(std::lround(ia * b + a * tb), 0l, 255l));
+}
+
+void ApplyInGameAtmosphereGradeToPpm(PpmImage& img, float timeSec,
+                                     const Renderer::DayNightSettings& dn,
+                                     const Renderer::WeatherSettings& wx)
+{
+  if (img.width <= 0 || img.height <= 0 || img.rgb.empty()) return;
+
+  const SimpleDayNightState st = ComputeSimpleDayNightState(timeSec, dn);
+  const float nightStrength = std::clamp(st.night * std::clamp(dn.nightDarken, 0.0f, 1.0f), 0.0f, 1.0f);
+  const float duskStrength = std::clamp(st.twilight * std::clamp(dn.duskTint, 0.0f, 1.0f), 0.0f, 1.0f);
+
+  // Overcast is only user-adjustable when a weather mode is active.
+  const float overcast = (wx.mode == Renderer::WeatherSettings::Mode::Clear)
+                             ? 0.0f
+                             : std::clamp(wx.overcast, 0.0f, 1.0f);
+
+  // Blend targets tuned to roughly match the in-renderer grades.
+  const std::uint8_t nightR = 8, nightG = 12, nightB = 45;
+  const std::uint8_t duskR = 255, duskG = 150, duskB = 90;
+  const std::uint8_t ocR = 85, ocG = 95, ocB = 108;
+
+  const float nightA = nightStrength * (210.0f / 255.0f);
+  const float duskA = duskStrength * (110.0f / 255.0f) * (1.0f - nightStrength);
+  const float ocA = overcast * 0.32f;
+
+  const int w = img.width;
+  const int h = img.height;
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const std::size_t i = (static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x)) * 3u;
+      std::uint8_t& r = img.rgb[i + 0];
+      std::uint8_t& g = img.rgb[i + 1];
+      std::uint8_t& b = img.rgb[i + 2];
+
+      if (ocA > 0.001f) {
+        BlendRgb(r, g, b, ocR, ocG, ocB, ocA);
+      }
+      if (nightA > 0.001f) {
+        BlendRgb(r, g, b, nightR, nightG, nightB, nightA);
+      }
+      if (duskA > 0.001f) {
+        BlendRgb(r, g, b, duskR, duskG, duskB, duskA);
+      }
+    }
+  }
+}
+
+void ApplyWeatherTo3DCfg(Render3DConfig& cfg, const Renderer::WeatherSettings& wx)
+{
+  // Drive the CPU renderer fog from the in-game weather settings.
+  const float fog01 = (wx.mode == Renderer::WeatherSettings::Mode::Clear) ? 0.0f : std::clamp(wx.fog, 0.0f, 1.0f);
+  cfg.fog = (fog01 > 0.01f);
+  cfg.fogStrength = std::clamp(0.2f + 0.8f * fog01, 0.0f, 1.0f);
+
+  // A soft cool-grey fog works well across day/night.
+  const int r = 200;
+  const int g = 210;
+  const int b = 225;
+  cfg.fogColor = (static_cast<std::uint32_t>(r) << 24) |
+                 (static_cast<std::uint32_t>(g) << 16) |
+                 (static_cast<std::uint32_t>(b) << 8) |
+                 255u;
+
+  // Overcast reduces contrast a bit in the 3D renderer itself (in addition to the post-grade).
+  const float overcast = (wx.mode == Renderer::WeatherSettings::Mode::Clear) ? 0.0f : std::clamp(wx.overcast, 0.0f, 1.0f);
+  cfg.diffuse = std::clamp(cfg.diffuse * (1.0f - 0.35f * overcast), 0.0f, 1.0f);
+  cfg.ambient = std::clamp(cfg.ambient * (1.0f + 0.15f * overcast), 0.0f, 1.0f);
+}
+
+bool UploadPpmToTexture(Texture2D& tex, int& texW, int& texH, const PpmImage& img)
+{
+  if (img.width <= 0 || img.height <= 0) return false;
+  if (img.rgb.size() != static_cast<std::size_t>(img.width) * static_cast<std::size_t>(img.height) * 3u) return false;
+
+  const int w = img.width;
+  const int h = img.height;
+
+  // Recreate the texture if the size changed.
+  if (tex.id != 0 && (texW != w || texH != h)) {
+    UnloadTexture(tex);
+    tex = Texture2D{};
+    texW = 0;
+    texH = 0;
+  }
+
+  if (tex.id == 0) {
+    Image im{};
+    im.width = w;
+    im.height = h;
+    im.mipmaps = 1;
+    im.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8;
+    const std::size_t bytes = static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 3u;
+    im.data = MemAlloc(static_cast<int>(bytes));
+    if (!im.data) return false;
+    std::memcpy(im.data, img.rgb.data(), bytes);
+
+    tex = LoadTextureFromImage(im);
+    UnloadImage(im);
+
+    if (tex.id == 0) return false;
+    SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
+    texW = w;
+    texH = h;
+    return true;
+  }
+
+  UpdateTexture(tex, img.rgb.data());
+  return true;
+}
 } // namespace
 
 std::string Game::savePathForSlot(int slot) const
@@ -276,6 +443,16 @@ RaylibContext::~RaylibContext() { CloseWindow(); }
 
 Game::~Game()
 {
+  // Ensure any last-minute visual settings changes are persisted.
+  if (m_visualPrefsDirty) {
+    saveVisualPrefsFile(m_visualPrefsPath, false);
+  }
+
+  if (m_3dPreviewTex.id != 0) {
+    UnloadTexture(m_3dPreviewTex);
+    m_3dPreviewTex = Texture2D{};
+  }
+
   unloadWorldRenderTarget();
   unloadSaveMenuThumbnails();
 }
@@ -331,6 +508,32 @@ Game::Game(Config cfg)
   m_elevDefault.flattenWater = true;
   m_elev = m_elevDefault;
   m_renderer.setElevationSettings(m_elev);
+
+  // Load persisted display/visual preferences if present (defaults to isocity_visual.json).
+  if (std::filesystem::exists(m_visualPrefsPath)) {
+    loadVisualPrefsFile(m_visualPrefsPath, false);
+  }
+  // Prime change detection for autosave (even if no prefs file exists yet).
+  m_visualPrefsLastSnapshot = captureVisualPrefs();
+
+  // --- Software 3D preview/export defaults ---
+  // Keep the in-game defaults modest so the feature is usable without long stalls.
+  // The dev console command (render3d) can request higher resolutions / SSAA.
+  m_pendingRender3DCfg = Render3DConfig{};
+  m_pendingRender3DCfg.width = 1600;
+  m_pendingRender3DCfg.height = 900;
+  m_pendingRender3DCfg.supersample = 1;
+  m_pendingRender3DCfg.proj = Render3DConfig::Projection::IsometricOrtho;
+  m_pendingRender3DCfg.camYawDeg = 45.0f;
+  m_pendingRender3DCfg.camPitchDeg = 35.264f;
+  m_pendingRender3DCfg.autoFit = true;
+  m_pendingRender3DCfg.drawOutlines = true;
+
+  m_3dPreviewCfg = m_pendingRender3DCfg;
+  m_3dPreviewCfg.width = 384;
+  m_3dPreviewCfg.height = 216;
+  m_3dPreviewCfg.supersample = 1;
+  m_3dPreviewCfg.outlineAlpha = 0.70f;
 
   resetWorld(m_cfg.seed);
 
@@ -468,12 +671,167 @@ void Game::setupDevConsole()
         c.print(TextFormat("World regenerated with seed %llu", static_cast<unsigned long long>(s)));
       });
 
-  m_console.registerCommand("regen", "regen        - regenerate the world with a time-based seed",
-                            [this](DevConsole& c, const DevConsole::Args&) {
-                              endPaintStroke();
-                              resetWorld(0);
-                              c.print("World regenerated.");
-                            });
+  m_console.registerCommand(
+      "proc",
+      "proc [key] [value]  - show/tweak ProcGen settings (try: proc list, proc preset island)",
+      [this, toLower, parseF32, parseI32](DevConsole& c, const DevConsole::Args& args) {
+        auto printCfg = [&]() {
+          c.print("ProcGenConfig:");
+          c.print(TextFormat("  terrain_scale = %.4f", m_procCfg.terrainScale));
+          c.print(TextFormat("  water_level = %.3f", m_procCfg.waterLevel));
+          c.print(TextFormat("  sand_level = %.3f", m_procCfg.sandLevel));
+          c.print(TextFormat("  hubs = %d", m_procCfg.hubs));
+          c.print(TextFormat("  extra_connections = %d", m_procCfg.extraConnections));
+          c.print(TextFormat("  zone_chance = %.3f", m_procCfg.zoneChance));
+          c.print(TextFormat("  park_chance = %.3f", m_procCfg.parkChance));
+          c.print(TextFormat("  terrain_preset = %s", ToString(m_procCfg.terrainPreset)));
+          c.print(TextFormat("  terrain_preset_strength = %.3f", m_procCfg.terrainPresetStrength));
+          c.print(TextFormat("  road_hierarchy_enabled = %s", m_procCfg.roadHierarchyEnabled ? "true" : "false"));
+          c.print(TextFormat("  road_hierarchy_strength = %.3f", m_procCfg.roadHierarchyStrength));
+          c.print(TextFormat("  erosion.enabled = %s", m_procCfg.erosion.enabled ? "true" : "false"));
+        };
+
+        auto listPresets = [&]() {
+          c.print("Terrain presets:");
+          c.print("  classic");
+          c.print("  island");
+          c.print("  archipelago");
+          c.print("  inland_sea");
+          c.print("  river_valley");
+          c.print("  mountain_ring");
+        };
+
+        if (args.empty()) {
+          printCfg();
+          c.print("Usage: proc <key> <value>   (or 'proc list')");
+          return;
+        }
+
+        const std::string key = toLower(args[0]);
+        if (key == "list" || key == "presets") {
+          listPresets();
+          return;
+        }
+        if (key == "show" || key == "get") {
+          printCfg();
+          return;
+        }
+
+        if (args.size() != 2) {
+          c.print("Usage: proc <key> <value>   (try: proc list)");
+          return;
+        }
+
+        const std::string val = args[1];
+
+        if (key == "preset" || key == "terrain_preset") {
+          ProcGenTerrainPreset p{};
+          if (!ParseProcGenTerrainPreset(val, p)) {
+            c.print("Unknown preset: " + val);
+            listPresets();
+            return;
+          }
+          m_procCfg.terrainPreset = p;
+          showToast(TextFormat("Preset: %s", ToString(p)));
+          c.print(std::string("terrain_preset = ") + ToString(p));
+          return;
+        }
+
+        if (key == "strength" || key == "terrain_preset_strength") {
+          float s = 1.0f;
+          if (!parseF32(val, s)) {
+            c.print("Invalid float: " + val);
+            return;
+          }
+          m_procCfg.terrainPresetStrength = std::clamp(s, 0.0f, 5.0f);
+          showToast(TextFormat("Preset strength: %.2f", m_procCfg.terrainPresetStrength));
+          return;
+        }
+
+        auto setF32 = [&](float& target, float lo, float hi, const char* label) {
+          float f = 0.0f;
+          if (!parseF32(val, f)) {
+            c.print(std::string("Invalid float: ") + val);
+            return;
+          }
+          target = std::clamp(f, lo, hi);
+          showToast(TextFormat("%s = %.3f", label, target));
+        };
+
+        auto setI32 = [&](int& target, int lo, int hi, const char* label) {
+          int n = 0;
+          if (!parseI32(val, n)) {
+            c.print(std::string("Invalid int: ") + val);
+            return;
+          }
+          target = std::clamp(n, lo, hi);
+          showToast(TextFormat("%s = %d", label, target));
+        };
+
+        if (key == "terrain_scale") {
+          setF32(m_procCfg.terrainScale, 0.005f, 1.0f, "terrain_scale");
+        } else if (key == "water_level") {
+          setF32(m_procCfg.waterLevel, 0.0f, 1.0f, "water_level");
+        } else if (key == "sand_level") {
+          setF32(m_procCfg.sandLevel, 0.0f, 1.0f, "sand_level");
+        } else if (key == "hubs") {
+          setI32(m_procCfg.hubs, 1, 64, "hubs");
+        } else if (key == "extra_connections") {
+          setI32(m_procCfg.extraConnections, 0, 256, "extra_connections");
+        } else if (key == "zone_chance") {
+          setF32(m_procCfg.zoneChance, 0.0f, 1.0f, "zone_chance");
+        } else if (key == "park_chance") {
+          setF32(m_procCfg.parkChance, 0.0f, 1.0f, "park_chance");
+        } else if (key == "road_hierarchy" || key == "road_hierarchy_enabled" || key == "roadhierarchy") {
+          int b = 0;
+          if (!parseI32(val, b) || (b != 0 && b != 1)) {
+            c.print("Usage: proc road_hierarchy <0|1>");
+            return;
+          }
+          m_procCfg.roadHierarchyEnabled = (b != 0);
+          showToast(m_procCfg.roadHierarchyEnabled ? "Road hierarchy: on" : "Road hierarchy: off");
+        } else if (key == "road_hierarchy_strength" || key == "roadhierarchystrength") {
+          setF32(m_procCfg.roadHierarchyStrength, 0.0f, 3.0f, "road_hierarchy_strength");
+        } else if (key == "erosion" || key == "erosion_enabled") {
+          int b = 0;
+          if (!parseI32(val, b) || (b != 0 && b != 1)) {
+            c.print("Usage: proc erosion <0|1>");
+            return;
+          }
+          m_procCfg.erosion.enabled = (b != 0);
+          showToast(m_procCfg.erosion.enabled ? "Erosion: on" : "Erosion: off");
+        } else {
+          c.print("Unknown proc key: " + args[0]);
+          c.print("Try: proc show, proc list, proc preset <name>, proc strength <f>");
+        }
+      });
+
+  m_console.registerCommand(
+      "regen",
+      "regen [same|<seed>] - regenerate the world (default: time-based seed)",
+      [this, toLower, parseU64](DevConsole& c, const DevConsole::Args& args) {
+        endPaintStroke();
+        if (args.empty()) {
+          resetWorld(0);
+          c.print("World regenerated (time seed).");
+          return;
+        }
+
+        const std::string a0 = toLower(args[0]);
+        if (a0 == "same" || a0 == "current") {
+          resetWorld(m_cfg.seed);
+          c.print("World regenerated (same seed).");
+          return;
+        }
+
+        std::uint64_t s = 0;
+        if (!parseU64(args[0], s)) {
+          c.print("Usage: regen [same|<uint64>]");
+          return;
+        }
+        resetWorld(s);
+        c.print(TextFormat("World regenerated with seed %llu", static_cast<unsigned long long>(s)));
+      });
 
   m_console.registerCommand(
       "pause", "pause        - toggle simulation pause", [this](DevConsole& c, const DevConsole::Args&) {
@@ -781,6 +1139,7 @@ void Game::setupDevConsole()
         if (w <= 0 || h <= 0) {
           c.print("World is empty");
           return;
+
         }
 
         const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
@@ -935,6 +1294,84 @@ void Game::setupDevConsole()
         c.print("ok");
       });
 
+
+  m_console.registerCommand(
+      "layer",
+      "layer <terrain|decals|structures|overlays|all|none|status> [on|off|toggle]",
+      [this, toLower](DevConsole& c, const DevConsole::Args& args) {
+        auto printStatus = [&]() {
+          c.print(TextFormat(
+              "Layers: terrain=%s decals=%s structures=%s overlays=%s  mask=0x%X",
+              m_renderer.layerEnabled(Renderer::RenderLayer::Terrain) ? "ON" : "OFF",
+              m_renderer.layerEnabled(Renderer::RenderLayer::Decals) ? "ON" : "OFF",
+              m_renderer.layerEnabled(Renderer::RenderLayer::Structures) ? "ON" : "OFF",
+              m_renderer.layerEnabled(Renderer::RenderLayer::Overlays) ? "ON" : "OFF",
+              static_cast<unsigned int>(m_renderer.layerMask())));
+        };
+
+        if (args.empty()) {
+          printStatus();
+          return;
+        }
+
+        const std::string name = toLower(args[0]);
+        const std::string mode = (args.size() >= 2) ? toLower(args[1]) : "toggle";
+
+        auto want = [&](bool current) {
+          if (mode == "on" || mode == "1" || mode == "true") return true;
+          if (mode == "off" || mode == "0" || mode == "false") return false;
+          return !current;
+        };
+
+        auto applyAndToast = [&](const std::string& label) {
+          // Layer changes can affect cached render content.
+          m_renderer.markBaseCacheDirtyAll();
+          showToast(label.c_str(), 2.0f);
+        };
+
+        if (name == "status") {
+          printStatus();
+          c.print("ok");
+          return;
+        }
+
+        if (name == "all") {
+          m_renderer.setLayerMask(Renderer::kLayerAll);
+          applyAndToast("Layers: ALL");
+          printStatus();
+          c.print("ok");
+          return;
+        }
+
+        if (name == "none") {
+          m_renderer.setLayerMask(0u);
+          applyAndToast("Layers: NONE");
+          printStatus();
+          c.print("ok");
+          return;
+        }
+
+        auto setOne = [&](Renderer::RenderLayer layer, const char* label) {
+          const bool enabled = want(m_renderer.layerEnabled(layer));
+          m_renderer.setLayerEnabled(layer, enabled);
+          applyAndToast(std::string(label) + (enabled ? ": ON" : ": OFF"));
+          printStatus();
+          c.print("ok");
+        };
+
+        if (name == "terrain") {
+          setOne(Renderer::RenderLayer::Terrain, "Terrain");
+        } else if (name == "decals") {
+          setOne(Renderer::RenderLayer::Decals, "Decals");
+        } else if (name == "structures") {
+          setOne(Renderer::RenderLayer::Structures, "Structures");
+        } else if (name == "overlays") {
+          setOne(Renderer::RenderLayer::Overlays, "Overlays");
+        } else {
+          c.print("Unknown layer: " + args[0]);
+        }
+      });
+
   m_console.registerCommand(
       "daynight",
       "daynight [on|off|toggle] | daynight len <sec> | daynight strength <0..1> | daynight dusk <0..1> | "
@@ -1047,6 +1484,103 @@ void Game::setupDevConsole()
       });
 
 
+
+
+  // --- shadow ---
+  m_console.registerCommand(
+      "shadow",
+      "shadow [on|off|toggle] | shadow strength <0..1> | shadow softness <0..1> | shadow dir <deg> | shadow maxlen <tiles> | shadow alt <minDeg> <maxDeg>",
+      [this, toLower, parseF32](DevConsole& c, const DevConsole::Args& args) {
+        auto s = m_renderer.shadowSettings();
+
+        auto clamp01 = [&](float v) { return std::max(0.0f, std::min(1.0f, v)); };
+
+        auto printStatus = [&]() {
+          c.print(TextFormat("Shadows: %s  strength=%.2f  softness=%.2f  dir=%.1fdeg  maxlen=%.1ftiles  alt=[%.1f..%.1f]deg",
+                             s.enabled ? "ON" : "OFF", s.strength, s.softness, s.azimuthDeg, s.maxLengthTiles,
+                             s.minAltitudeDeg, s.maxAltitudeDeg));
+        };
+
+        if (args.empty()) {
+          printStatus();
+          return;
+        }
+
+        const std::string a0 = toLower(args[0]);
+
+        if (a0 == "on" || a0 == "off" || a0 == "toggle") {
+          if (a0 == "toggle") s.enabled = !s.enabled;
+          else s.enabled = (a0 == "on");
+
+          m_renderer.setShadowSettings(s);
+          showToast(s.enabled ? "Shadows: ON" : "Shadows: OFF");
+          printStatus();
+          c.print("ok");
+          return;
+        }
+
+        if ((a0 == "strength" || a0 == "alpha") && args.size() >= 2) {
+          float v = 0.0f;
+          if (!parseF32(args[1], v)) { c.print("Bad strength value."); return; }
+          s.strength = clamp01(v);
+          m_renderer.setShadowSettings(s);
+          printStatus();
+          c.print("ok");
+          return;
+        }
+
+        if ((a0 == "soft" || a0 == "softness") && args.size() >= 2) {
+          float v = 0.0f;
+          if (!parseF32(args[1], v)) { c.print("Bad softness value."); return; }
+          s.softness = clamp01(v);
+          m_renderer.setShadowSettings(s);
+          printStatus();
+          c.print("ok");
+          return;
+        }
+
+        if ((a0 == "dir" || a0 == "azimuth" || a0 == "angle") && args.size() >= 2) {
+          float v = 0.0f;
+          if (!parseF32(args[1], v)) { c.print("Bad direction angle."); return; }
+          s.azimuthDeg = v;
+          m_renderer.setShadowSettings(s);
+          printStatus();
+          c.print("ok");
+          return;
+        }
+
+        if ((a0 == "max" || a0 == "maxlen" || a0 == "length") && args.size() >= 2) {
+          float v = 0.0f;
+          if (!parseF32(args[1], v)) { c.print("Bad max length."); return; }
+          s.maxLengthTiles = std::max(0.0f, v);
+          m_renderer.setShadowSettings(s);
+          printStatus();
+          c.print("ok");
+          return;
+        }
+
+        if ((a0 == "alt" || a0 == "altitude") && args.size() >= 3) {
+          float a = 0.0f, b = 0.0f;
+          if (!parseF32(args[1], a) || !parseF32(args[2], b)) { c.print("Bad altitude range."); return; }
+          if (b < a) { const float tmp = a; a = b; b = tmp; }
+          s.minAltitudeDeg = std::clamp(a, 1.0f, 89.0f);
+          s.maxAltitudeDeg = std::clamp(b, 1.0f, 89.0f);
+          if (s.maxAltitudeDeg < s.minAltitudeDeg) s.maxAltitudeDeg = s.minAltitudeDeg;
+          m_renderer.setShadowSettings(s);
+          printStatus();
+          c.print("ok");
+          return;
+        }
+
+        c.print("Usage:");
+        c.print("  shadow");
+        c.print("  shadow on|off|toggle");
+        c.print("  shadow strength <0..1>");
+        c.print("  shadow softness <0..1>");
+        c.print("  shadow dir <deg>");
+        c.print("  shadow maxlen <tiles>");
+        c.print("  shadow alt <minDeg> <maxDeg>");
+      });
   // --- weather ---
   m_console.registerCommand(
       "weather",
@@ -1255,6 +1789,185 @@ void Game::setupDevConsole()
       });
 
   m_console.registerCommand(
+      "map_layers",
+      "map_layers [maxSize] [prefix] - export layered world overview PNGs (queued; writes *_terrain/_decals/_structures/_overlays/_weather_fx)",
+      [this, parseI64, joinArgs](DevConsole& c, const DevConsole::Args& args) {
+        namespace fs = std::filesystem;
+        fs::create_directories("captures");
+
+        // Defaults
+        int maxSize = 4096;
+        std::string prefix = TextFormat("captures/maplayers_seed%llu_%s.png",
+                                        static_cast<unsigned long long>(m_cfg.seed),
+                                        FileTimestamp().c_str());
+
+        auto clampSize = [](long long v) {
+          // Keep this sane; exportWorldOverview may allocate a large render texture.
+          return std::clamp(static_cast<int>(v), 64, 16384);
+        };
+
+        if (!args.empty()) {
+          long long v = 0;
+          // Allow either:
+          //   map_layers 4096
+          //   map_layers 4096 myprefix.png
+          //   map_layers myprefix.png
+          //   map_layers myprefix.png 4096
+          if (parseI64(args[0], v)) {
+            maxSize = clampSize(v);
+            if (args.size() >= 2) {
+              prefix = joinArgs(args, 1);
+            }
+          } else {
+            // Prefix first.
+            prefix = joinArgs(args, 0);
+
+            // If the last token is a number, treat it as maxSize.
+            if (args.size() >= 2 && parseI64(args.back(), v)) {
+              maxSize = clampSize(v);
+              std::string p;
+              for (std::size_t i = 0; i + 1 < args.size(); ++i) {
+                if (!p.empty()) p.push_back(' ');
+                p += args[i];
+              }
+              if (!p.empty()) prefix = p;
+            }
+          }
+        }
+
+        if (prefix.empty()) {
+          c.print("Usage: map_layers [maxSize] [prefix]");
+          return;
+        }
+
+        m_pendingMapLayersExport = true;
+        m_pendingMapLayersPrefix = prefix;
+        m_pendingMapLayersMaxSize = maxSize;
+        showToast(TextFormat("Queued layer export (%dpx): %s", maxSize, prefix.c_str()), 2.0f);
+        c.print(TextFormat("queued: %s (maxSize=%d)", prefix.c_str(), maxSize));
+      });
+
+  m_console.registerCommand(
+      "render3d",
+      "render3d [WxH] [layer] [iso|persp] [ssaa=N] [grade|nograde] [path] - export a software 3D render (queued; Ctrl+F11)",
+      [this, joinArgs, toLower, parseI64](DevConsole& c, const DevConsole::Args& args) {
+        namespace fs = std::filesystem;
+        fs::create_directories("captures");
+
+        auto parseWxH = [&](const std::string& s, int& w, int& h) -> bool {
+          const std::size_t x = s.find_first_of("xX");
+          if (x == std::string::npos) return false;
+          long long a = 0, b = 0;
+          if (!parseI64(s.substr(0, x), a)) return false;
+          if (!parseI64(s.substr(x + 1), b)) return false;
+          w = static_cast<int>(a);
+          h = static_cast<int>(b);
+          return (w > 0 && h > 0);
+        };
+
+        auto parseSsaa = [&](const std::string& s, int& out) -> bool {
+          const std::string t = toLower(s);
+          const std::string k0 = "ssaa=";
+          const std::string k1 = "ss=";
+          const std::string k2 = "supersample=";
+          std::string v;
+          if (t.rfind(k0, 0) == 0) v = t.substr(k0.size());
+          else if (t.rfind(k1, 0) == 0) v = t.substr(k1.size());
+          else if (t.rfind(k2, 0) == 0) v = t.substr(k2.size());
+          else return false;
+          long long n = 0;
+          if (!parseI64(v, n)) return false;
+          out = std::clamp(static_cast<int>(n), 1, 4);
+          return true;
+        };
+
+        auto parseLayer = [&](const std::string& s, ExportLayer& out) -> bool {
+          const std::string t = toLower(s);
+          if (t == "terrain") { out = ExportLayer::Terrain; return true; }
+          if (t == "overlay" || t == "overlays") { out = ExportLayer::Overlay; return true; }
+          if (t == "height" || t == "heightmap") { out = ExportLayer::Height; return true; }
+          if (t == "land" || t == "landvalue" || t == "value") { out = ExportLayer::LandValue; return true; }
+          if (t == "traffic") { out = ExportLayer::Traffic; return true; }
+          if (t == "goodstraffic" || t == "goods_traffic" || t == "goods") { out = ExportLayer::GoodsTraffic; return true; }
+          if (t == "goodsfill" || t == "goods_fill" || t == "fill") { out = ExportLayer::GoodsFill; return true; }
+          if (t == "district" || t == "districts") { out = ExportLayer::District; return true; }
+          if (t == "flood" || t == "flooddepth") { out = ExportLayer::FloodDepth; return true; }
+          return false;
+        };
+
+        Render3DConfig cfg = m_pendingRender3DCfg;
+        ExportLayer layer = m_pendingRender3DLayer;
+        bool applyGrade = m_pendingRender3DApplyGrade;
+
+        std::string path = TextFormat("captures/render3d_seed%llu_%s.png",
+                                      static_cast<unsigned long long>(m_cfg.seed),
+                                      FileTimestamp().c_str());
+
+        // Parse args: first unrecognized token becomes the path.
+        for (std::size_t i = 0; i < args.size(); ++i) {
+          const std::string t = toLower(args[i]);
+
+          int w = 0, h = 0;
+          if (parseWxH(args[i], w, h)) {
+            cfg.width = std::clamp(w, 64, 16384);
+            cfg.height = std::clamp(h, 64, 16384);
+            continue;
+          }
+
+          int ss = 0;
+          if (parseSsaa(args[i], ss)) {
+            cfg.supersample = ss;
+            continue;
+          }
+
+          if (t == "iso" || t == "ortho" || t == "isometric") {
+            cfg.proj = Render3DConfig::Projection::IsometricOrtho;
+            continue;
+          }
+
+          if (t == "persp" || t == "perspective") {
+            cfg.proj = Render3DConfig::Projection::Perspective;
+            continue;
+          }
+
+          if (t == "grade" || t == "graded") {
+            applyGrade = true;
+            continue;
+          }
+          if (t == "nograde" || t == "raw") {
+            applyGrade = false;
+            continue;
+          }
+
+          ExportLayer parsedLayer;
+          if (parseLayer(t, parsedLayer)) {
+            layer = parsedLayer;
+            continue;
+          }
+
+          // Treat the remaining tokens as a path.
+          path = joinArgs(args, i);
+          break;
+        }
+
+        if (path.empty()) {
+          c.print("Usage: render3d [WxH] [layer] [iso|persp] [ssaa=N] [grade|nograde] [path]");
+          return;
+        }
+
+        m_pendingRender3D = true;
+        m_pendingRender3DPath = path;
+        m_pendingRender3DCfg = cfg;
+        m_pendingRender3DLayer = layer;
+        m_pendingRender3DApplyGrade = applyGrade;
+
+        showToast(TextFormat("Queued 3D render: %s", path.c_str()), 2.0f);
+        c.print(TextFormat("queued: %s (%dx%d ssaa=%d %s %s)", path.c_str(), cfg.width, cfg.height, cfg.supersample,
+                           (cfg.proj == Render3DConfig::Projection::Perspective) ? "persp" : "iso",
+                           applyGrade ? "grade" : "raw"));
+      });
+
+  m_console.registerCommand(
       "tiles_csv",
       "tiles_csv [path] - export per-tile world data to CSV (x,y,terrain,overlay,level,district,height,variation,occupants)",
       [this, joinArgs](DevConsole& c, const DevConsole::Args& args) {
@@ -1460,6 +2173,72 @@ void Game::setupDevConsole()
         }
         toggleVsync();
         c.print(TextFormat("vsync -> %s", m_cfg.vsync ? "on" : "off"));
+      });
+
+  m_console.registerCommand(
+      "prefs",
+      "prefs [status|dump|save|load|autosave] - visual/display preferences\n"
+      "  prefs status                     - show current prefs path + autosave state\n"
+      "  prefs dump                       - print current prefs JSON\n"
+      "  prefs save [path]                - write prefs to file (default: isocity_visual.json)\n"
+      "  prefs load [path]                - load prefs from file and apply\n"
+      "  prefs autosave on|off|toggle     - enable/disable autosave\n",
+      [this, joinArgs, toLower](DevConsole& c, const DevConsole::Args& args) {
+        if (args.empty() || toLower(args[0]) == "status") {
+          c.print(TextFormat("prefs path = %s", m_visualPrefsPath.c_str()));
+          c.print(TextFormat("autosave = %s", m_visualPrefsAutosave ? "on" : "off"));
+          c.print(TextFormat("dirty = %s", m_visualPrefsDirty ? "yes" : "no"));
+          return;
+        }
+
+        const std::string sub = toLower(args[0]);
+        if (sub == "dump") {
+          c.print(VisualPrefsToJson(captureVisualPrefs()));
+          return;
+        }
+
+        if (sub == "save") {
+          const std::string path = (args.size() >= 2) ? joinArgs(args, 1) : m_visualPrefsPath;
+          if (!saveVisualPrefsFile(path, true)) {
+            c.print("save failed");
+          } else {
+            c.print("saved: " + path);
+          }
+          return;
+        }
+
+        if (sub == "load") {
+          const std::string path = (args.size() >= 2) ? joinArgs(args, 1) : m_visualPrefsPath;
+          if (!std::filesystem::exists(path)) {
+            c.print("file not found: " + path);
+            return;
+          }
+          if (!loadVisualPrefsFile(path, true)) {
+            c.print("load failed");
+          } else {
+            c.print("loaded: " + path);
+          }
+          return;
+        }
+
+        if (sub == "autosave") {
+          if (args.size() == 1) {
+            m_visualPrefsAutosave = !m_visualPrefsAutosave;
+          } else {
+            const std::string mode = toLower(args[1]);
+            if (mode == "on") m_visualPrefsAutosave = true;
+            else if (mode == "off") m_visualPrefsAutosave = false;
+            else if (mode == "toggle") m_visualPrefsAutosave = !m_visualPrefsAutosave;
+            else {
+              c.print("Usage: prefs autosave on|off|toggle");
+              return;
+            }
+          }
+          c.print(TextFormat("autosave -> %s", m_visualPrefsAutosave ? "on" : "off"));
+          return;
+        }
+
+        c.print("Unknown subcommand. Try: prefs status");
       });
 
   m_console.registerCommand(
@@ -2177,115 +2956,299 @@ void Game::updateDynamicWorldRenderScale(float dt)
 
 void Game::adjustVideoSettings(int dir)
 {
+  const bool shift = (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT));
   const int d = (dir < 0) ? -1 : 1;
 
   auto toastScale = [&](float scale) {
     showToast(TextFormat("World render scale: %.0f%%", scale * 100.0f));
   };
 
+  auto clamp01 = [](float v) { return std::clamp(v, 0.0f, 1.0f); };
+  auto wrapDeg = [](float deg) {
+    while (deg < 0.0f) deg += 360.0f;
+    while (deg >= 360.0f) deg -= 360.0f;
+    return deg;
+  };
+
+  // ----------------------------
+  // Display page (existing)
+  // ----------------------------
+  if (m_videoPage == 0) {
+    switch (m_videoSelection) {
+      case 0:
+        toggleFullscreen();
+        break;
+      case 1:
+        toggleBorderlessWindowed();
+        break;
+      case 2:
+        m_cfg.vsync = !m_cfg.vsync;
+        SetWindowState(m_cfg.vsync ? FLAG_VSYNC_HINT : 0);
+        showToast(m_cfg.vsync ? "VSync: ON" : "VSync: OFF");
+        break;
+      case 3:
+        m_uiScaleAuto = !m_uiScaleAuto;
+        if (m_uiScaleAuto) {
+          // Reset to 1x immediately; we’ll compute a new best-fit scale next update.
+          m_uiScale = 1.0f;
+        }
+        showToast(m_uiScaleAuto ? "UI scale: Auto" : "UI scale: Manual");
+        break;
+      case 4:
+        if (!m_uiScaleAuto) {
+          m_uiScale = std::clamp(m_uiScale + d * 0.1f, 0.5f, 3.0f);
+          showToast(TextFormat("UI scale: %.2fx", m_uiScale));
+        }
+        break;
+
+      case 5:
+        m_worldRenderScaleAuto = !m_worldRenderScaleAuto;
+        showToast(m_worldRenderScaleAuto ? "World render scale: Auto" : "World render scale: Manual");
+        break;
+      case 6:
+        if (m_worldRenderScaleAuto) break;
+        setWorldRenderScale(std::clamp(m_worldRenderScale + d * 0.05f, 0.25f, 2.0f));
+        toastScale(m_worldRenderScale);
+        break;
+      case 7:
+        if (!m_worldRenderScaleAuto) break;
+        setWorldRenderScaleMin(std::clamp(m_worldRenderScaleMin + d * 0.05f, 0.25f, 2.0f));
+        showToast(TextFormat("World scale min: %.0f%%", m_worldRenderScaleMin * 100.0f));
+        break;
+      case 8:
+        if (!m_worldRenderScaleAuto) break;
+        setWorldRenderScaleMax(std::clamp(m_worldRenderScaleMax + d * 0.05f, 0.25f, 2.0f));
+        showToast(TextFormat("World scale max: %.0f%%", m_worldRenderScaleMax * 100.0f));
+        break;
+      case 9:
+        if (!m_worldRenderScaleAuto) break;
+        m_worldRenderTargetFps = std::clamp(m_worldRenderTargetFps + d * 5, 15, 240);
+        showToast(TextFormat("World target FPS: %d", m_worldRenderTargetFps));
+        break;
+      case 10:
+        m_worldRenderFilterPoint = !m_worldRenderFilterPoint;
+        updateWorldRenderFilter();
+        showToast(m_worldRenderFilterPoint ? "World filter: Point" : "World filter: Bilinear");
+        break;
+      default:
+        break;
+    }
+
+    // Keep runtime values mirrored in config for consistency.
+    m_cfg.worldRenderScaleAuto = m_worldRenderScaleAuto;
+    m_cfg.worldRenderScale = m_worldRenderScale;
+    m_cfg.worldRenderScaleMin = m_worldRenderScaleMin;
+    m_cfg.worldRenderScaleMax = m_worldRenderScaleMax;
+    m_cfg.worldRenderTargetFps = m_worldRenderTargetFps;
+    m_cfg.worldRenderFilterPoint = m_worldRenderFilterPoint;
+
+    m_videoSelectionDisplay = m_videoSelection;
+    return;
+  }
+
+  // ----------------------------
+  // Visual FX page (new)
+  // ----------------------------
+  auto toggleLayer = [&](Renderer::RenderLayer layer, const char* name) {
+    const bool en = !m_renderer.layerEnabled(layer);
+    m_renderer.setLayerEnabled(layer, en);
+    showToast(TextFormat("%s layer: %s", name, en ? "ON" : "OFF"));
+  };
+
   switch (m_videoSelection) {
     case 0: {
-      toggleFullscreen();
+      const bool en = !m_renderer.baseCacheEnabled();
+      m_renderer.setBaseCacheEnabled(en);
+      m_renderer.markBaseCacheDirtyAll();
+      showToast(en ? "Render cache: ON" : "Render cache: OFF");
+    } break;
+
+    case 1:
+      toggleLayer(Renderer::RenderLayer::Terrain, "Terrain");
       break;
-    }
-    case 1: {
-      toggleBorderlessWindowed();
-      showToast(m_borderlessWindowed ? "Borderless: ON" : "Borderless: OFF");
+    case 2:
+      toggleLayer(Renderer::RenderLayer::Decals, "Decals");
       break;
-    }
-    case 2: {
-      toggleVsync();
-      showToast(m_cfg.vsync ? "VSync: ON" : "VSync: OFF");
+    case 3:
+      toggleLayer(Renderer::RenderLayer::Structures, "Structures");
       break;
-    }
-    case 3: {
-      // UI scale mode: toggle auto/manual.
-      m_uiScaleAuto = !m_uiScaleAuto;
-      if (m_uiScaleAuto) {
-        m_uiScale = computeAutoUiScale(GetScreenWidth(), GetScreenHeight());
-        showToast(TextFormat("UI scale: AUTO (%.2fx)", m_uiScale));
-      } else {
-        // Seed manual scale from the current value when switching out of auto,
-        // so toggling doesn't unexpectedly jump to 1.0x.
-        m_uiScaleManual = std::clamp(m_uiScale, 0.5f, 4.0f);
-        m_uiScale = m_uiScaleManual;
-        showToast(TextFormat("UI scale: %.2fx", m_uiScale));
-      }
+    case 4:
+      toggleLayer(Renderer::RenderLayer::Overlays, "Overlays");
       break;
-    }
-    case 4: {
-      // UI scale value (manual only).
-      if (!m_uiScaleAuto) {
-        m_uiScaleManual = std::clamp(m_uiScaleManual + d * 0.25f, 0.5f, 4.0f);
-        m_uiScale = m_uiScaleManual;
-        showToast(TextFormat("UI scale: %.2fx", m_uiScale));
-      }
-      break;
-    }
+
     case 5: {
-      // World render auto/manual.
-      m_worldRenderScaleAuto = !m_worldRenderScaleAuto;
-      if (m_worldRenderScaleMin > m_worldRenderScaleMax) {
-        std::swap(m_worldRenderScaleMin, m_worldRenderScaleMax);
-      }
-      if (m_worldRenderScaleAuto) {
-        m_worldRenderScale = std::clamp(m_worldRenderScaleMax, m_worldRenderScaleMin, m_worldRenderScaleMax);
-        showToast("World render scale: AUTO");
-      } else {
-        showToast("World render scale: MANUAL");
-      }
-      break;
-    }
+      m_mergedZoneBuildings = !m_mergedZoneBuildings;
+      m_cfg.mergedZoneBuildings = m_mergedZoneBuildings;
+      showToast(m_mergedZoneBuildings ? "Merged zone buildings: ON" : "Merged zone buildings: OFF");
+    } break;
+
     case 6: {
-      // World render scale (manual).
-      m_worldRenderScaleAuto = false;
-      m_worldRenderScale = clampWorldRenderScale(m_worldRenderScale + d * kWorldRenderScaleStep);
-      toastScale(m_worldRenderScale);
-      break;
-    }
+      auto sh = m_renderer.shadowSettings();
+      sh.enabled = !sh.enabled;
+      m_renderer.setShadowSettings(sh);
+      showToast(sh.enabled ? "Shadows: ON" : "Shadows: OFF");
+    } break;
+
     case 7: {
-      // Auto min.
-      m_worldRenderScaleMin = clampWorldRenderScale(m_worldRenderScaleMin + d * kWorldRenderScaleStep);
-      m_worldRenderScaleMin = std::min(m_worldRenderScaleMin, m_worldRenderScaleMax);
-      showToast(TextFormat("World render min: %.0f%%", m_worldRenderScaleMin * 100.0f));
-      break;
-    }
+      auto sh = m_renderer.shadowSettings();
+      const float step = shift ? 0.10f : 0.03f;
+      sh.strength = clamp01(sh.strength + static_cast<float>(d) * step);
+      m_renderer.setShadowSettings(sh);
+      showToast(TextFormat("Shadow strength: %.0f%%", sh.strength * 100.0f));
+    } break;
+
     case 8: {
-      // Auto max.
-      m_worldRenderScaleMax = clampWorldRenderScale(m_worldRenderScaleMax + d * kWorldRenderScaleStep);
-      m_worldRenderScaleMax = std::max(m_worldRenderScaleMax, m_worldRenderScaleMin);
-      showToast(TextFormat("World render max: %.0f%%", m_worldRenderScaleMax * 100.0f));
-      break;
-    }
+      auto sh = m_renderer.shadowSettings();
+      const float step = shift ? 0.10f : 0.03f;
+      sh.softness = clamp01(sh.softness + static_cast<float>(d) * step);
+      m_renderer.setShadowSettings(sh);
+      showToast(TextFormat("Shadow softness: %.0f%%", sh.softness * 100.0f));
+    } break;
+
     case 9: {
-      // Auto target FPS.
-      m_worldRenderTargetFps = std::clamp(m_worldRenderTargetFps + d * 5, 30, 240);
-      showToast(TextFormat("World render target: %d FPS", m_worldRenderTargetFps));
-      break;
-    }
+      auto sh = m_renderer.shadowSettings();
+      const float step = shift ? 1.0f : 0.25f;
+      sh.maxLengthTiles = std::clamp(sh.maxLengthTiles + static_cast<float>(d) * step, 0.0f, 20.0f);
+      m_renderer.setShadowSettings(sh);
+      showToast(TextFormat("Shadow max len: %.1f tiles", sh.maxLengthTiles));
+    } break;
+
     case 10: {
-      // Upscale filter.
-      m_worldRenderFilterPoint = !m_worldRenderFilterPoint;
-      if (m_worldRenderRTValid) {
-        SetTextureFilter(m_worldRenderRT.texture,
-                         m_worldRenderFilterPoint ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
-      }
-      showToast(m_worldRenderFilterPoint ? "World filter: POINT" : "World filter: BILINEAR");
-      break;
-    }
+      auto sh = m_renderer.shadowSettings();
+      const float step = shift ? 15.0f : 5.0f;
+      sh.azimuthDeg = wrapDeg(sh.azimuthDeg + static_cast<float>(d) * step);
+      m_renderer.setShadowSettings(sh);
+      showToast(TextFormat("Shadow direction: %.0f°", sh.azimuthDeg));
+    } break;
+
+    case 11: {
+      auto dn = m_renderer.dayNightSettings();
+      dn.enabled = !dn.enabled;
+      m_renderer.setDayNightSettings(dn);
+      showToast(dn.enabled ? "Day/night: ON" : "Day/night: OFF");
+    } break;
+
+    case 12: {
+      auto dn = m_renderer.dayNightSettings();
+      const float step = shift ? 60.0f : 15.0f;
+      dn.dayLengthSec = std::clamp(dn.dayLengthSec + static_cast<float>(d) * step, 30.0f, 1800.0f);
+      dn.timeOffsetSec = std::clamp(dn.timeOffsetSec, 0.0f, std::max(0.0f, dn.dayLengthSec));
+      m_renderer.setDayNightSettings(dn);
+      showToast(TextFormat("Day length: %.0f s", dn.dayLengthSec));
+    } break;
+
+    case 13: {
+      auto dn = m_renderer.dayNightSettings();
+      const float step = shift ? 60.0f : 15.0f;
+      dn.timeOffsetSec += static_cast<float>(d) * step;
+      // Wrap within [0, dayLengthSec).
+      while (dn.timeOffsetSec < 0.0f) dn.timeOffsetSec += dn.dayLengthSec;
+      while (dn.timeOffsetSec >= dn.dayLengthSec) dn.timeOffsetSec -= dn.dayLengthSec;
+      m_renderer.setDayNightSettings(dn);
+      showToast(TextFormat("Time offset: %.0f s", dn.timeOffsetSec));
+    } break;
+
+    case 14: {
+      auto dn = m_renderer.dayNightSettings();
+      const float step = shift ? 0.10f : 0.03f;
+      dn.nightDarken = clamp01(dn.nightDarken + static_cast<float>(d) * step);
+      m_renderer.setDayNightSettings(dn);
+      showToast(TextFormat("Night darken: %.0f%%", dn.nightDarken * 100.0f));
+    } break;
+
+    case 15: {
+      auto dn = m_renderer.dayNightSettings();
+      const float step = shift ? 0.10f : 0.03f;
+      dn.duskTint = clamp01(dn.duskTint + static_cast<float>(d) * step);
+      m_renderer.setDayNightSettings(dn);
+      showToast(TextFormat("Dusk tint: %.0f%%", dn.duskTint * 100.0f));
+    } break;
+
+    case 16: {
+      auto dn = m_renderer.dayNightSettings();
+      dn.drawLights = !dn.drawLights;
+      m_renderer.setDayNightSettings(dn);
+      showToast(dn.drawLights ? "Night lights: ON" : "Night lights: OFF");
+    } break;
+
+    case 17: {
+      auto wx = m_renderer.weatherSettings();
+      using M = Renderer::WeatherSettings::Mode;
+      const int cur = static_cast<int>(wx.mode);
+      const int next = (cur + (d > 0 ? 1 : 2)) % 3;
+      wx.mode = static_cast<M>(next);
+      m_renderer.setWeatherSettings(wx);
+      const char* modeStr = (wx.mode == M::Rain) ? "Rain" : (wx.mode == M::Snow) ? "Snow" : "Clear";
+      showToast(TextFormat("Weather: %s", modeStr));
+    } break;
+
+    case 18: {
+      auto wx = m_renderer.weatherSettings();
+      const float step = shift ? 0.10f : 0.05f;
+      wx.intensity = clamp01(wx.intensity + static_cast<float>(d) * step);
+      m_renderer.setWeatherSettings(wx);
+      showToast(TextFormat("Weather intensity: %.0f%%", wx.intensity * 100.0f));
+    } break;
+
+    case 19: {
+      auto wx = m_renderer.weatherSettings();
+      const float step = shift ? 15.0f : 5.0f;
+      wx.windAngleDeg = wrapDeg(wx.windAngleDeg + static_cast<float>(d) * step);
+      m_renderer.setWeatherSettings(wx);
+      showToast(TextFormat("Wind dir: %.0f°", wx.windAngleDeg));
+    } break;
+
+    case 20: {
+      auto wx = m_renderer.weatherSettings();
+      const float step = shift ? 0.25f : 0.05f;
+      wx.windSpeed = std::clamp(wx.windSpeed + static_cast<float>(d) * step, 0.10f, 5.0f);
+      m_renderer.setWeatherSettings(wx);
+      showToast(TextFormat("Wind speed: %.2fx", wx.windSpeed));
+    } break;
+
+    case 21: {
+      auto wx = m_renderer.weatherSettings();
+      const float step = shift ? 0.10f : 0.05f;
+      wx.overcast = clamp01(wx.overcast + static_cast<float>(d) * step);
+      m_renderer.setWeatherSettings(wx);
+      showToast(TextFormat("Overcast: %.0f%%", wx.overcast * 100.0f));
+    } break;
+
+    case 22: {
+      auto wx = m_renderer.weatherSettings();
+      const float step = shift ? 0.10f : 0.05f;
+      wx.fog = clamp01(wx.fog + static_cast<float>(d) * step);
+      m_renderer.setWeatherSettings(wx);
+      showToast(TextFormat("Fog: %.0f%%", wx.fog * 100.0f));
+    } break;
+
+    case 23: {
+      auto wx = m_renderer.weatherSettings();
+      wx.drawParticles = !wx.drawParticles;
+      m_renderer.setWeatherSettings(wx);
+      showToast(wx.drawParticles ? "Weather particles: ON" : "Weather particles: OFF");
+    } break;
+
+    case 24: {
+      auto wx = m_renderer.weatherSettings();
+      wx.affectGround = !wx.affectGround;
+      m_renderer.setWeatherSettings(wx);
+      showToast(wx.affectGround ? "Ground effects: ON" : "Ground effects: OFF");
+    } break;
+
+    case 25: {
+      auto wx = m_renderer.weatherSettings();
+      wx.reflectLights = !wx.reflectLights;
+      m_renderer.setWeatherSettings(wx);
+      showToast(wx.reflectLights ? "Reflect lights: ON" : "Reflect lights: OFF");
+    } break;
+
     default:
       break;
   }
 
-  // Keep runtime settings mirrored in config for consistency.
-  m_cfg.worldRenderScaleAuto = m_worldRenderScaleAuto;
-  m_cfg.worldRenderScale = m_worldRenderScale;
-  m_cfg.worldRenderScaleMin = m_worldRenderScaleMin;
-  m_cfg.worldRenderScaleMax = m_worldRenderScaleMax;
-  m_cfg.worldRenderTargetFps = m_worldRenderTargetFps;
-  m_cfg.worldRenderFilterPoint = m_worldRenderFilterPoint;
+  m_videoSelectionVisual = m_videoSelection;
 }
-
 void Game::toggleFullscreen()
 {
   // If we are in borderless-windowed mode, disable it first.
@@ -2355,6 +3318,174 @@ void Game::toggleVsync()
   } else {
     ClearWindowState(FLAG_VSYNC_HINT);
     showToast("VSync: off", 1.5f);
+  }
+}
+
+
+VisualPrefs Game::captureVisualPrefs() const
+{
+  VisualPrefs p{};
+  p.vsync = m_cfg.vsync;
+
+  p.uiScaleAuto = m_uiScaleAuto;
+  p.uiScaleManual = m_uiScaleManual;
+
+  p.worldRenderScaleAuto = m_worldRenderScaleAuto;
+  p.worldRenderScale = m_worldRenderScale;
+  p.worldRenderScaleMin = m_worldRenderScaleMin;
+  p.worldRenderScaleMax = m_worldRenderScaleMax;
+  p.worldRenderTargetFps = m_worldRenderTargetFps;
+  p.worldRenderFilterPoint = m_worldRenderFilterPoint;
+
+  p.mergedZoneBuildings = m_mergedZoneBuildings;
+
+  p.baseCacheEnabled = m_renderer.baseCacheEnabled();
+  p.layerMask = m_renderer.layerMask();
+  p.shadows = m_renderer.shadowSettings();
+  p.dayNight = m_renderer.dayNightSettings();
+  p.weather = m_renderer.weatherSettings();
+  p.elevation = m_elev;
+  return p;
+}
+
+void Game::applyVisualPrefs(const VisualPrefs& prefs)
+{
+  // Display
+  m_cfg.vsync = prefs.vsync;
+  if (m_cfg.vsync) {
+    SetWindowState(FLAG_VSYNC_HINT);
+  } else {
+    ClearWindowState(FLAG_VSYNC_HINT);
+  }
+
+  // UI scale
+  m_uiScaleAuto = prefs.uiScaleAuto;
+  m_uiScaleManual = std::clamp(prefs.uiScaleManual, 0.5f, 4.0f);
+  if (m_uiScaleAuto) {
+    m_uiScale = computeAutoUiScale(GetScreenWidth(), GetScreenHeight());
+  } else {
+    m_uiScale = m_uiScaleManual;
+  }
+
+  // World render scaling
+  m_worldRenderScaleAuto = prefs.worldRenderScaleAuto;
+  m_worldRenderScale = clampWorldRenderScale(prefs.worldRenderScale);
+  m_worldRenderScaleMin = clampWorldRenderScale(prefs.worldRenderScaleMin);
+  m_worldRenderScaleMax = clampWorldRenderScale(prefs.worldRenderScaleMax);
+  if (m_worldRenderScaleMin > m_worldRenderScaleMax) {
+    std::swap(m_worldRenderScaleMin, m_worldRenderScaleMax);
+  }
+
+  m_worldRenderTargetFps = std::clamp(prefs.worldRenderTargetFps, 15, 240);
+  m_worldRenderFilterPoint = prefs.worldRenderFilterPoint;
+
+  if (m_worldRenderScaleAuto) {
+    m_worldRenderScale = std::clamp(m_worldRenderScale, m_worldRenderScaleMin, m_worldRenderScaleMax);
+  }
+
+  // Mirror into cfg so console/info panels show consistent state.
+  m_cfg.worldRenderScaleAuto = m_worldRenderScaleAuto;
+  m_cfg.worldRenderScale = m_worldRenderScale;
+  m_cfg.worldRenderScaleMin = m_worldRenderScaleMin;
+  m_cfg.worldRenderScaleMax = m_worldRenderScaleMax;
+  m_cfg.worldRenderTargetFps = m_worldRenderTargetFps;
+  m_cfg.worldRenderFilterPoint = m_worldRenderFilterPoint;
+
+  // Update / release the world render target if the mode changed.
+  if (!wantsWorldRenderTarget()) {
+    unloadWorldRenderTarget();
+  } else if (m_worldRenderRTValid) {
+    SetTextureFilter(
+        m_worldRenderRT.texture,
+        m_worldRenderFilterPoint ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
+  }
+
+  // World visuals
+  m_mergedZoneBuildings = prefs.mergedZoneBuildings;
+  m_cfg.mergedZoneBuildings = m_mergedZoneBuildings;
+
+  // Elevation
+  m_elev = prefs.elevation;
+  m_renderer.setElevationSettings(m_elev);
+
+  // Renderer visuals
+  m_renderer.setBaseCacheEnabled(prefs.baseCacheEnabled);
+  m_renderer.setLayerMask(prefs.layerMask);
+  m_renderer.setShadowSettings(prefs.shadows);
+  m_renderer.setDayNightSettings(prefs.dayNight);
+  m_renderer.setWeatherSettings(prefs.weather);
+
+  // Safe: force caches to rebuild under the new toggles.
+  m_renderer.markBaseCacheDirtyAll();
+}
+
+bool Game::loadVisualPrefsFile(const std::string& path, bool toast)
+{
+  VisualPrefs prefs = captureVisualPrefs();
+  std::string err;
+  if (!LoadVisualPrefsJsonFile(path, prefs, err)) {
+    if (toast) {
+      showToast(std::string("Prefs load failed: ") + err, 3.0f);
+    }
+    return false;
+  }
+
+  applyVisualPrefs(prefs);
+
+  m_visualPrefsPath = path;
+  m_visualPrefsDirty = false;
+  m_visualPrefsSaveTimer = 0.0f;
+  m_visualPrefsLastSnapshot = captureVisualPrefs();
+
+  if (toast) {
+    showToast(std::string("Loaded prefs: ") + path, 1.5f);
+  }
+  return true;
+}
+
+bool Game::saveVisualPrefsFile(const std::string& path, bool toast)
+{
+  VisualPrefs prefs = captureVisualPrefs();
+  std::string err;
+  if (!WriteVisualPrefsJsonFile(path, prefs, err, 2)) {
+    if (toast) {
+      showToast(std::string("Prefs save failed: ") + err, 3.0f);
+    }
+    return false;
+  }
+
+  m_visualPrefsPath = path;
+  m_visualPrefsDirty = false;
+  m_visualPrefsSaveTimer = 0.0f;
+  m_visualPrefsLastSnapshot = prefs;
+
+  if (toast) {
+    showToast(std::string("Saved prefs: ") + path, 1.5f);
+  }
+  return true;
+}
+
+void Game::updateVisualPrefsAutosave(float dt)
+{
+  if (!m_visualPrefsAutosave) return;
+
+  const VisualPrefs current = captureVisualPrefs();
+  if (!VisualPrefsEqual(current, m_visualPrefsLastSnapshot)) {
+    m_visualPrefsLastSnapshot = current;
+    m_visualPrefsDirty = true;
+    // Debounce: wait until the user stops dragging sliders / spamming hotkeys.
+    m_visualPrefsSaveTimer = 0.75f;
+  }
+
+  if (!m_visualPrefsDirty) return;
+
+  m_visualPrefsSaveTimer -= dt;
+  if (m_visualPrefsSaveTimer > 0.0f) return;
+
+  // Try to write; if it fails keep dirty and back off.
+  if (!saveVisualPrefsFile(m_visualPrefsPath, false)) {
+    m_visualPrefsDirty = true;
+    m_visualPrefsSaveTimer = 2.0f;
   }
 }
 
@@ -2667,6 +3798,9 @@ bool BuildPathFollowingParents(int startRoadIdx, int w, int h, const std::vector
 void Game::rebuildVehiclesRoutingCache()
 {
   m_vehiclesDirty = false;
+
+  // Ensure road graph + routing helpers are ready for per-vehicle A* routes.
+  ensureRoadGraphUpToDate();
   m_vehicleSpawnAccum = 0.0f;
 
   m_vehicles.clear();
@@ -2771,7 +3905,7 @@ void Game::rebuildVehiclesRoutingCache()
 
   RoadFlowFieldConfig commuteCfg;
   commuteCfg.requireOutsideConnection = requireOutside;
-  commuteCfg.computeOwner = false;
+  commuteCfg.computeOwner = true;
   commuteCfg.useTravelTime = true;
   m_commuteField = BuildRoadFlowField(m_world, m_commuteJobSources, commuteCfg, roadToEdge);
 
@@ -3018,22 +4152,80 @@ void Game::updateVehicles(float dt)
     return 1;
   };
 
+  // Vehicle route geometry: use A* on the road graph to build point-to-point routes.
+  const int worldW = m_world.width();
+  const int worldH = m_world.height();
+  if (worldW <= 0 || worldH <= 0) return;
+
+  ensureRoadGraphUpToDate();
+
+  RoadRouteConfig routeCfg;
+  routeCfg.metric = RoadRouteMetric::TravelTime;
+
+  auto routeRoadIdx = [&](int startIdx, int goalIdx, std::vector<Point>& outPath) -> bool {
+    const int n = worldW * worldH;
+    if (startIdx < 0 || goalIdx < 0 || startIdx >= n || goalIdx >= n) return false;
+    if (startIdx == goalIdx) return false;
+
+    const Point start{startIdx % worldW, startIdx / worldW};
+    const Point goal{goalIdx % worldW, goalIdx / worldW};
+    RoadRouteResult rr = FindRoadRouteAStar(m_world, m_roadGraph, m_roadGraphIndex, m_roadGraphWeights, start, goal, routeCfg);
+    if (rr.path.size() < 2) return false;
+
+    outPath = std::move(rr.path);
+    return true;
+  };
+
+  auto traceRoot = [&](int startIdx, const std::vector<int>& parent) -> int {
+    const int n = worldW * worldH;
+    if (static_cast<int>(parent.size()) != n) return -1;
+    int cur = startIdx;
+    for (int guard = 0; guard < n + 8; ++guard) {
+      if (cur < 0 || cur >= n) return -1;
+      const int p = parent[static_cast<std::size_t>(cur)];
+      if (p < 0) return cur;
+      cur = p;
+    }
+    return -1;
+  };
+
   auto spawnCommute = [&]() -> bool {
-    if (m_commuteOrigins.empty()) return false;
     if (m_commuteField.dist.empty() || m_commuteField.parent.empty()) return false;
 
-    const int idx = PickWeightedIndex(m_vehicleRngState, m_commuteOrigins, m_commuteOriginWeightTotal, getOriginWeight);
-    if (idx < 0 || idx >= static_cast<int>(m_commuteOrigins.size())) return false;
+    const int w = m_commuteField.w;
+    const int h = m_commuteField.h;
+    const auto& parent = m_commuteField.parent;
 
-    const int start = m_commuteOrigins[static_cast<std::size_t>(idx)].first;
-    if (start < 0 || static_cast<std::size_t>(start) >= m_commuteField.dist.size()) return false;
-    if (m_commuteField.dist[static_cast<std::size_t>(start)] < 0) return false;
+    const int idx = PickWeightedIndex(m_vehicleRngState, m_commuteOrigins, m_commuteOriginWeightTotal, getOriginWeight);
+    if (idx < 0 || static_cast<std::size_t>(idx) >= m_commuteOrigins.size()) return false;
+
+    const int startRoadIdx = m_commuteOrigins[static_cast<std::size_t>(idx)].roadIdx;
+
+    // Preferred destination: nearest job source for this origin (flow-field owner).
+    int goalRoadIdx = -1;
+    if (!m_commuteField.owner.empty()) {
+      const int owner = m_commuteField.owner[static_cast<std::size_t>(startRoadIdx)];
+      if (owner >= 0 && owner < static_cast<int>(m_commuteJobSources.size())) {
+        goalRoadIdx = m_commuteJobSources[static_cast<std::size_t>(owner)];
+      }
+    }
 
     std::vector<Point> path;
-    if (!BuildPathFollowingParents(start, m_commuteField.w, m_commuteField.h, m_commuteField.parent, path)) return false;
+    if (goalRoadIdx >= 0) {
+      if (!routeRoadIdx(startRoadIdx, goalRoadIdx, path)) {
+        // Fallback: follow flow-field parents (still reaches a job source).
+        if (!BuildPathFollowingParents(startRoadIdx, w, h, parent, path)) return false;
+      }
+    } else {
+      if (!BuildPathFollowingParents(startRoadIdx, w, h, parent, path)) return false;
+    }
+
+    if (path.size() < 2) return false;
+    path = simplifyPath(path);
 
     const float baseSpeed = 7.5f * speedMultForPath(path);
     makeVehicle(VehicleKind::Commute, std::move(path), baseSpeed, 1);
+    m_commuteVehiclesSpawnedThisFrame++;
     return true;
   };
 
@@ -3072,8 +4264,14 @@ void Game::updateVehicles(float dt)
       if (start < 0 || static_cast<std::size_t>(start) >= m_goodsEdgeField.dist.size()) return false;
       if (m_goodsEdgeField.dist[static_cast<std::size_t>(start)] < 0) return false;
 
+      const int end = traceRoot(start, m_goodsEdgeField.parent);
+      if (end < 0) return false;
+
       std::vector<Point> path;
-      if (!BuildPathFollowingParents(start, m_goodsEdgeField.w, m_goodsEdgeField.h, m_goodsEdgeField.parent, path)) return false;
+      if (!routeRoadIdx(start, end, path)) {
+        if (!BuildPathFollowingParents(start, m_goodsEdgeField.w, m_goodsEdgeField.h, m_goodsEdgeField.parent, path)) return false;
+      }
+      if (path.size() < 2) return false;
       const float baseSpeed = 5.5f * speedMultForPath(path);
       makeVehicle(VehicleKind::GoodsExport, std::move(path), baseSpeed, 0);
       return true;
@@ -3092,9 +4290,15 @@ void Game::updateVehicles(float dt)
       if (m_goodsEdgeField.parent.empty() || m_goodsEdgeField.dist.empty()) return false;
       if (static_cast<std::size_t>(c.roadIdx) >= m_goodsEdgeField.dist.size()) return false;
       if (m_goodsEdgeField.dist[static_cast<std::size_t>(c.roadIdx)] < 0) return false;
+      const int start = traceRoot(c.roadIdx, m_goodsEdgeField.parent);
+      if (start < 0) return false;
+
       std::vector<Point> path;
-      if (!BuildPathFollowingParents(c.roadIdx, m_goodsEdgeField.w, m_goodsEdgeField.h, m_goodsEdgeField.parent, path)) return false;
-      std::reverse(path.begin(), path.end());
+      if (!routeRoadIdx(start, c.roadIdx, path)) {
+        if (!BuildPathFollowingParents(c.roadIdx, m_goodsEdgeField.w, m_goodsEdgeField.h, m_goodsEdgeField.parent, path)) return false;
+        std::reverse(path.begin(), path.end());
+      }
+      if (path.size() < 2) return false;
       const float baseSpeed = 5.0f * speedMultForPath(path);
       makeVehicle(VehicleKind::GoodsImport, std::move(path), baseSpeed, 0);
       return true;
@@ -3108,9 +4312,15 @@ void Game::updateVehicles(float dt)
       const int own = m_goodsProducerField.owner[static_cast<std::size_t>(c.roadIdx)];
       if (own < 0 || own >= static_cast<int>(m_goodsProducerRoads.size())) return false;
 
+      const int start = m_goodsProducerRoads[static_cast<std::size_t>(own)];
+      if (start < 0) return false;
+
       std::vector<Point> path;
-      if (!BuildPathFollowingParents(c.roadIdx, m_goodsProducerField.w, m_goodsProducerField.h, m_goodsProducerField.parent, path)) return false;
-      std::reverse(path.begin(), path.end());
+      if (!routeRoadIdx(start, c.roadIdx, path)) {
+        if (!BuildPathFollowingParents(c.roadIdx, m_goodsProducerField.w, m_goodsProducerField.h, m_goodsProducerField.parent, path)) return false;
+        std::reverse(path.begin(), path.end());
+      }
+      if (path.size() < 2) return false;
       const float baseSpeed = 5.2f * speedMultForPath(path);
       makeVehicle(VehicleKind::GoodsDelivery, std::move(path), baseSpeed, 0);
       return true;
@@ -3140,29 +4350,25 @@ void Game::updateVehicles(float dt)
   }
 }
 
-void Game::drawVehicles()
+void Game::appendVehicleSprites(const Camera2D& camera, std::vector<Renderer::WorldSprite>& out)
 {
   if (!m_showVehicles) return;
   if (m_vehicles.empty()) return;
 
-  BeginMode2D(m_camera);
-
-  const float zoom = std::max(0.25f, m_camera.zoom);
+  const float zoom = std::max(0.25f, camera.zoom);
   const float invZoom = 1.0f / zoom;
-
-  // Primitive LOD (kept as fallback / for extreme zoom-out).
-  const float carR = 2.4f / zoom;
-  const float truckW = 7.0f / zoom;
-  const float truckH = 4.2f / zoom;
 
   const float tileScreenW = static_cast<float>(m_cfg.tileWidth) * zoom;
 
-  // Night emissive pass (headlights) based on the renderer's day/night cycle.
+  // Emissive contribution (headlights) based on the renderer's day/night cycle.
   const float night = m_renderer.nightFactor(m_timeSec);
   const bool doEmissive = (night > 0.02f);
 
-  auto drawOne = [&](const Vehicle& v, bool emissivePass) {
-    if (v.path.size() < 2) return;
+  // Worst-case: 2 sprites per vehicle (color + emissive).
+  out.reserve(out.size() + m_vehicles.size() * (doEmissive ? 2u : 1u));
+
+  for (const Vehicle& v : m_vehicles) {
+    if (v.path.size() < 2) continue;
 
     const float maxS = static_cast<float>(static_cast<int>(v.path.size()) - 1);
     const float s = std::clamp(v.s, 0.0f, maxS);
@@ -3204,10 +4410,27 @@ void Game::drawVehicles()
 
     const Renderer::VehicleSprite* spr =
         isTruck ? m_renderer.truckSprite(slopePositive, v.style) : m_renderer.carSprite(slopePositive, v.style);
+    if (!spr || spr->color.id == 0) {
+      // Texture generation failed (should be rare) - skip.
+      continue;
+    }
 
-    if (spr && spr->color.id != 0) {
-      const Texture2D& tex = emissivePass ? spr->emissive : spr->color;
-      if (emissivePass && tex.id == 0) return;
+    // Depth anchor: snap to the nearest path node so sprites interleave with the renderer's tile order.
+    int anchorIdx = (t > 0.5f) ? (seg + 1) : seg;
+    anchorIdx = std::clamp(anchorIdx, 0, static_cast<int>(v.path.size()) - 1);
+    const Point anchor = v.path[static_cast<std::size_t>(anchorIdx)];
+
+    const int sortSum = anchor.x + anchor.y;
+    const float sortX = static_cast<float>(anchor.x);
+
+    auto pushSprite = [&](const Texture2D& tex, bool emissive) {
+      if (tex.id == 0) return;
+
+      Renderer::WorldSprite ws;
+      ws.sortSum = sortSum;
+      ws.sortX = sortX;
+      ws.tex = &tex;
+      ws.emissive = emissive;
 
       Rectangle src{0.0f, 0.0f, static_cast<float>(tex.width), static_cast<float>(tex.height)};
       if (flipX) {
@@ -3219,54 +4442,32 @@ void Game::drawVehicles()
       const float px = static_cast<float>(pivotX) * scale;
       const float py = static_cast<float>(spr->pivotY) * scale;
 
-      Rectangle dst{pos.x - px, pos.y - py, static_cast<float>(tex.width) * scale,
-                    static_cast<float>(tex.height) * scale};
+      ws.src = src;
+      ws.dst = Rectangle{pos.x - px, pos.y - py, static_cast<float>(tex.width) * scale,
+                         static_cast<float>(tex.height) * scale};
+      ws.origin = Vector2{0.0f, 0.0f};
+      ws.rotation = 0.0f;
 
       Color tint = WHITE;
-      if (!emissivePass) {
+      if (!emissive) {
         tint.a = 230;
       } else {
         const int a8 = static_cast<int>(std::round(255.0f * std::clamp(night, 0.0f, 1.0f)));
         tint.a = static_cast<unsigned char>(std::clamp(a8, 0, 255));
       }
+      ws.tint = tint;
 
-      DrawTexturePro(tex, src, dst, Vector2{0.0f, 0.0f}, 0.0f, tint);
-      return;
+      out.push_back(ws);
+    };
+
+    // Base color sprite.
+    pushSprite(spr->color, /*emissive=*/false);
+
+    // Optional emissive headlights sprite.
+    if (doEmissive) {
+      pushSprite(spr->emissive, /*emissive=*/true);
     }
-
-    // Fallback primitives (should be rare unless texture generation failed).
-    if (emissivePass) return;
-
-    Color col = Color{255, 255, 255, 200};
-    switch (v.kind) {
-    case VehicleKind::Commute: col = Color{245, 245, 245, 200}; break;
-    case VehicleKind::GoodsDelivery: col = Color{255, 190, 80, 200}; break;
-    case VehicleKind::GoodsImport: col = Color{110, 190, 255, 200}; break;
-    case VehicleKind::GoodsExport: col = Color{255, 110, 200, 200}; break;
-    }
-
-    if (v.kind == VehicleKind::Commute) {
-      DrawCircleV(pos, carR, col);
-    } else {
-      DrawRectangleV(Vector2{pos.x - truckW * 0.5f, pos.y - truckH * 0.5f}, Vector2{truckW, truckH}, col);
-    }
-  };
-
-  // Base pass.
-  for (const Vehicle& v : m_vehicles) {
-    drawOne(v, false);
   }
-
-  // Emissive pass.
-  if (doEmissive) {
-    BeginBlendMode(BLEND_ADDITIVE);
-    for (const Vehicle& v : m_vehicles) {
-      drawOne(v, true);
-    }
-    EndBlendMode();
-  }
-
-  EndMode2D();
 }
 
 void Game::applyToolBrush(int centerX, int centerY)
@@ -3276,14 +4477,6 @@ void Game::applyToolBrush(int centerX, int centerY)
   // Terrain editing (Raise/Lower/Smooth) uses modifier keys for strength.
   const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
   const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
-
-  // Display toggles
-  if (IsKeyPressed(KEY_F11)) {
-    toggleFullscreen();
-  }
-  if ((IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT)) && IsKeyPressed(KEY_ENTER)) {
-    toggleBorderlessWindowed();
-  }
 
   const int r = std::max(0, m_brushRadius);
   for (int dy = -r; dy <= r; ++dy) {
@@ -3409,14 +4602,17 @@ void Game::applyToolBrush(int centerX, int centerY)
           m_landValueDirty = true;
         }
 
-        if (overlayChanged) {
+        const bool roadRelevant = (beforeOverlay == Overlay::Road || afterOverlay == Overlay::Road);
+        const bool roadCostChanged = terrainChanged && roadRelevant;
+
+        if (overlayChanged || roadCostChanged) {
           m_trafficDirty = true;
           m_goodsDirty = true;
           m_vehiclesDirty = true;
         }
 
-        // Road graph only changes if a road was added/removed.
-        if (overlayChanged && (beforeOverlay == Overlay::Road || afterOverlay == Overlay::Road)) {
+        // Road-graph routing depends on both topology (roads) and whether they're bridges.
+        if ((overlayChanged || roadCostChanged) && roadRelevant) {
           m_roadGraphDirty = true;
         }
       } else {
@@ -3505,6 +4701,12 @@ void Game::endPaintStroke()
   // Also refresh the (optional) cached base render for any edited tiles.
   m_renderer.markBaseCacheDirtyForTiles(m_tilesEditedThisStroke, m_world.width(), m_world.height());
   m_tilesEditedThisStroke.clear();
+
+  // The software 3D preview is an expensive but useful "sanity view".
+  // Only refresh it when the world changes (stroke ends) or when its throttle
+  // timer expires.
+  m_3dPreviewDirty = true;
+  m_3dPreviewTimer = 0.0f;
 
   // Height snapshot is only valid for the current stroke.
   m_heightSnapshot.clear();
@@ -3797,38 +4999,13 @@ void Game::ensureRoadGraphUpToDate()
   m_roadGraph = BuildRoadGraph(m_world);
   m_roadGraphDirty = false;
 
-  const int w = m_world.width();
-  const int h = m_world.height();
-  const std::size_t n = static_cast<std::size_t>(std::max(0, w) * std::max(0, h));
+  // Build fast tile->(node/edge) lookups + precompute edge traversal costs for A* routing.
+  m_roadGraphIndex = BuildRoadGraphIndex(m_world, m_roadGraph);
+  m_roadGraphWeights = BuildRoadGraphWeights(m_world, m_roadGraph);
 
-  m_roadGraphTileToNode.assign(n, -1);
-  m_roadGraphTileToEdge.assign(n, -1);
-
-  if (w > 0 && h > 0) {
-    // Nodes: direct tile->node lookup.
-    for (int ni = 0; ni < static_cast<int>(m_roadGraph.nodes.size()); ++ni) {
-      const Point p = m_roadGraph.nodes[static_cast<std::size_t>(ni)].pos;
-      if (p.x < 0 || p.y < 0 || p.x >= w || p.y >= h) continue;
-      const std::size_t idx = static_cast<std::size_t>(p.y) * static_cast<std::size_t>(w) +
-                              static_cast<std::size_t>(p.x);
-      if (idx < n) m_roadGraphTileToNode[idx] = ni;
-    }
-
-    // Edges: fill interior tiles (skip endpoints so intersections map to nodes).
-    for (int ei = 0; ei < static_cast<int>(m_roadGraph.edges.size()); ++ei) {
-      const RoadGraphEdge& e = m_roadGraph.edges[static_cast<std::size_t>(ei)];
-      if (e.tiles.size() <= 2) continue;
-      for (std::size_t i = 1; i + 1 < e.tiles.size(); ++i) {
-        const Point p = e.tiles[i];
-        if (p.x < 0 || p.y < 0 || p.x >= w || p.y >= h) continue;
-        const std::size_t idx = static_cast<std::size_t>(p.y) * static_cast<std::size_t>(w) +
-                                static_cast<std::size_t>(p.x);
-        if (idx < n && m_roadGraphTileToEdge[idx] < 0) {
-          m_roadGraphTileToEdge[idx] = ei;
-        }
-      }
-    }
-  }
+  // Reuse the same lookup tables for road-graph debug overlays.
+  m_roadGraphTileToNode = m_roadGraphIndex.tileToNode;
+  m_roadGraphTileToEdge = m_roadGraphIndex.tileToEdge;
 
   // Any road-graph change invalidates downstream road-resilience caches.
   m_resilienceDirty = true;
@@ -4294,6 +5471,10 @@ void Game::resetWorld(std::uint64_t newSeed)
   m_renderer.rebuildTextures(newSeed);
   m_renderer.markBaseCacheDirtyAll();
 
+  // Any world reset invalidates the software 3D preview.
+  m_3dPreviewDirty = true;
+  m_3dPreviewTimer = 0.0f;
+
   // Make HUD stats immediately correct (without waiting for the first sim tick).
   m_sim.refreshDerivedStats(m_world);
 
@@ -4539,10 +5720,82 @@ void Game::handleInput(float dt)
 
   // Fullscreen/borderless toggles (common PC shortcuts).
   if (IsKeyPressed(KEY_F11)) {
-    toggleFullscreen();
+    if (ctrl) {
+      // Ctrl+F11: queue a software 3D render export (CPU renderer).
+      namespace fs = std::filesystem;
+      fs::create_directories("captures");
+
+      Render3DConfig cfg = m_pendingRender3DCfg;
+      // Ctrl+Shift+F11 requests a higher-quality export (SSAA bump).
+      if (shift) cfg.supersample = std::clamp(std::max(2, cfg.supersample), 1, 4);
+
+      const std::string path =
+          TextFormat("captures/render3d_seed%llu_%s.png", static_cast<unsigned long long>(m_cfg.seed),
+                     FileTimestamp().c_str());
+
+      m_pendingRender3D = true;
+      m_pendingRender3DPath = path;
+      m_pendingRender3DCfg = cfg;
+      // Keep current defaults for layer/grade.
+      showToast(TextFormat("Queued 3D render (%dx%d ssaa=%d): %s", cfg.width, cfg.height, cfg.supersample,
+                           path.c_str()),
+                2.5f);
+    } else if (shift) {
+      // Shift+F11: toggle the in-game 3D preview panel.
+      m_show3DPreview = !m_show3DPreview;
+      m_3dPreviewDirty = true;
+      m_3dPreviewTimer = 0.0f;
+      showToast(m_show3DPreview ? "3D preview: ON" : "3D preview: OFF", 2.0f);
+    } else {
+      toggleFullscreen();
+    }
   }
   if ((IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT)) && IsKeyPressed(KEY_ENTER)) {
     toggleBorderlessWindowed();
+  }
+
+  // 3D preview camera nudge controls (hold Ctrl while the preview panel is open).
+  // Keeping this modifier-heavy prevents accidental conflicts with normal play.
+  if (m_show3DPreview && ctrl && !m_showVideoSettings && !m_showSaveMenu && !m_console.isOpen()) {
+    bool changed = false;
+    const float stepYaw = shift ? 12.0f : 4.0f;
+    const float stepPitch = shift ? 8.0f : 3.0f;
+
+    if (IsKeyPressed(KEY_LEFT)) {
+      m_3dPreviewCfg.camYawDeg -= stepYaw;
+      changed = true;
+    }
+    if (IsKeyPressed(KEY_RIGHT)) {
+      m_3dPreviewCfg.camYawDeg += stepYaw;
+      changed = true;
+    }
+    if (IsKeyPressed(KEY_UP)) {
+      m_3dPreviewCfg.camPitchDeg = std::clamp(m_3dPreviewCfg.camPitchDeg + stepPitch, 10.0f, 80.0f);
+      changed = true;
+    }
+    if (IsKeyPressed(KEY_DOWN)) {
+      m_3dPreviewCfg.camPitchDeg = std::clamp(m_3dPreviewCfg.camPitchDeg - stepPitch, 10.0f, 80.0f);
+      changed = true;
+    }
+    if (IsKeyPressed(KEY_R)) {
+      m_3dPreviewCfg.camYawDeg = 45.0f;
+      m_3dPreviewCfg.camPitchDeg = 35.264f;
+      m_3dPreviewCfg.proj = Render3DConfig::Projection::IsometricOrtho;
+      m_3dPreviewCfg.autoFit = true;
+      changed = true;
+    }
+    if (IsKeyPressed(KEY_P)) {
+      // Toggle projection between isometric orthographic and a mild perspective.
+      m_3dPreviewCfg.proj = (m_3dPreviewCfg.proj == Render3DConfig::Projection::IsometricOrtho)
+                                ? Render3DConfig::Projection::Perspective
+                                : Render3DConfig::Projection::IsometricOrtho;
+      changed = true;
+    }
+
+    if (changed) {
+      m_3dPreviewDirty = true;
+      m_3dPreviewTimer = 0.0f;
+    }
   }
 
   // Developer console (toggle with F4). When open it captures keyboard input.
@@ -4610,13 +5863,24 @@ void Game::handleInput(float dt)
     };
 
     if (ctrl) {
-      const std::filesystem::path outPath = makeFileName("map");
-      const bool ok = m_renderer.exportWorldOverview(m_world, outPath.string().c_str(), 4096);
-      showToast(ok ? (std::string("Map exported: ") + outPath.string()) : "Map export failed", 3.0f);
+      if (shift) {
+        const std::filesystem::path prefixPath = makeFileName("maplayers");
+        m_pendingMapLayersExport = true;
+        m_pendingMapLayersPrefix = prefixPath.string();
+        m_pendingMapLayersMaxSize = 4096;
+        showToast(std::string("Queued layer export: ") + prefixPath.string(), 2.5f);
+      } else {
+        const std::filesystem::path outPath = makeFileName("map");
+        m_pendingMapExport = true;
+        m_pendingMapExportPath = outPath.string();
+        m_pendingMapExportMaxSize = 4096;
+        showToast(std::string("Queued map export: ") + outPath.string(), 2.5f);
+      }
     } else {
       // Queue the screenshot so it's captured after the frame is drawn.
       m_pendingScreenshotPath = makeFileName("screenshot").string();
       m_pendingScreenshot = true;
+      showToast(std::string("Queued screenshot: ") + m_pendingScreenshotPath, 2.5f);
     }
   }
 
@@ -4781,9 +6045,35 @@ void Game::handleInput(float dt)
   }
 
   if (IsKeyPressed(KEY_F8)) {
-    m_showVideoSettings = !m_showVideoSettings;
-    showToast(m_showVideoSettings ? "Video settings: ON" : "Video settings: OFF");
     endPaintStroke();
+
+    if (!m_showVideoSettings) {
+      m_showVideoSettings = true;
+      m_showHelp = false;
+
+      // Shift+F8 opens directly on the Visual FX page.
+      m_videoPage = shift ? 1 : 0;
+      m_videoSelection = (m_videoPage == 0) ? m_videoSelectionDisplay : m_videoSelectionVisual;
+      showToast(m_videoPage == 0 ? "Video settings: ON" : "Visual FX: ON");
+    } else {
+      // When the panel is already open:
+      //  - F8 closes it.
+      //  - Shift+F8 switches pages without closing.
+      if (shift) {
+        if (m_videoPage == 0) m_videoSelectionDisplay = m_videoSelection;
+        else m_videoSelectionVisual = m_videoSelection;
+
+        m_videoPage = (m_videoPage == 0) ? 1 : 0;
+        m_videoSelection = (m_videoPage == 0) ? m_videoSelectionDisplay : m_videoSelectionVisual;
+        showToast(m_videoPage == 0 ? "Video settings: Display" : "Video settings: Visual FX");
+      } else {
+        if (m_videoPage == 0) m_videoSelectionDisplay = m_videoSelection;
+        else m_videoSelectionVisual = m_videoSelection;
+
+        m_showVideoSettings = false;
+        showToast("Video settings: OFF");
+      }
+    }
   }
 
   if (IsKeyPressed(KEY_P)) {
@@ -4809,8 +6099,10 @@ void Game::handleInput(float dt)
       const int count = 9;
       m_districtSelection = (m_districtSelection + delta + count) % count;
     } else if (m_showVideoSettings) {
-      const int count = 11;
+      const int count = (m_videoPage == 0) ? 11 : 26;
       m_videoSelection = (m_videoSelection + delta + count) % count;
+      if (m_videoPage == 0) m_videoSelectionDisplay = m_videoSelection;
+      else m_videoSelectionVisual = m_videoSelection;
     }
   }
 
@@ -5829,6 +7121,9 @@ void Game::update(float dt)
       m_landValueDirty = true;
       m_vehiclesDirty = true;
 
+      // Keep the software 3D preview in sync with sim-driven changes.
+      m_3dPreviewDirty = true;
+
       for (const Stats& s : tickStats) {
         recordHistorySample(s);
       }
@@ -5866,8 +7161,23 @@ void Game::update(float dt)
     m_saveMenuRefreshTimer = 0.0f;
   }
 
+  // Throttle the software 3D preview (CPU renderer) so it doesn't constantly
+  // rebuild every frame. We rebuild on world changes (endPaintStroke / sim tick)
+  // and also periodically while the panel is visible so day/night/weather
+  // updates are reflected.
+  if (m_show3DPreview) {
+    m_3dPreviewTimer += dt;
+    if (m_3dPreviewTimer >= k3DPreviewUpdateInterval) {
+      m_3dPreviewTimer = 0.0f;
+      m_3dPreviewDirty = true;
+    }
+  } else {
+    m_3dPreviewTimer = 0.0f;
+  }
+
   // Optional dynamic resolution scaling for the world layer.
   updateDynamicWorldRenderScale(dt);
+  updateVisualPrefsAutosave(dt);
 }
 
 
@@ -6124,9 +7434,9 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
   // parameter for possible future responsive layouts.
   static_cast<void>(uiW);
 
-  const int panelW = 520;
+  const int panelW = 560;
   const int rowH = 22;
-  const int rows = 11;
+  const int rows = (m_videoPage == 0) ? 11 : 26;
   const int panelH = 10 + 24 + 24 + rows * rowH + 28;
 
   const int x0 = 12;
@@ -6145,12 +7455,13 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
   DrawRectangle(x0, y0, panelW, panelH, Color{0, 0, 0, 180});
   DrawRectangleLines(x0, y0, panelW, panelH, Color{255, 255, 255, 70});
 
-  int x = x0 + 12;
+  const int x = x0 + 12;
   int y = y0 + 10;
 
-  DrawText("Video / Display", x, y, 20, RAYWHITE);
+  DrawText((m_videoPage == 0) ? "Video / Display" : "Video / Visual FX", x, y, 20, RAYWHITE);
   y += 24;
-  DrawText("Tab: select    [ / ]: adjust/toggle    Ctrl+Alt +/-: world scale    F8: toggle", x, y, 16,
+
+  DrawText("Tab: select    [ / ]: adjust/toggle    Shift: coarse    F8: close    Shift+F8: switch page", x, y, 16,
            Color{220, 220, 220, 255});
   y += 24;
 
@@ -6171,19 +7482,69 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
     y += rowH;
   };
 
-  // 0..10 must match adjustVideoSettings() and Tab cycling.
-  drawRow(0, "Fullscreen", IsWindowFullscreen() ? "On" : "Off");
-  drawRow(1, "Borderless windowed", m_borderlessWindowed ? "On" : "Off");
-  drawRow(2, "VSync", m_cfg.vsync ? "On" : "Off");
-  drawRow(3, "UI scale mode", m_uiScaleAuto ? "Auto" : "Manual");
-  drawRow(4, "UI scale", TextFormat("%.2fx", m_uiScale), !m_uiScaleAuto);
+  if (m_videoPage == 0) {
+    // 0..10 must match adjustVideoSettings() and Tab cycling.
+    drawRow(0, "Fullscreen", IsWindowFullscreen() ? "On" : "Off");
+    drawRow(1, "Borderless windowed", m_borderlessWindowed ? "On" : "Off");
+    drawRow(2, "VSync", m_cfg.vsync ? "On" : "Off");
+    drawRow(3, "UI scale mode", m_uiScaleAuto ? "Auto" : "Manual");
+    drawRow(4, "UI scale", TextFormat("%.2fx", m_uiScale), !m_uiScaleAuto);
 
-  drawRow(5, "World render mode", m_worldRenderScaleAuto ? "Auto" : "Manual");
-  drawRow(6, "World render scale", TextFormat("%.0f%%", m_worldRenderScale * 100.0f), m_worldRenderScaleAuto);
-  drawRow(7, "World scale min", TextFormat("%.0f%%", m_worldRenderScaleMin * 100.0f), !m_worldRenderScaleAuto);
-  drawRow(8, "World scale max", TextFormat("%.0f%%", m_worldRenderScaleMax * 100.0f), !m_worldRenderScaleAuto);
-  drawRow(9, "World target FPS", TextFormat("%d", m_worldRenderTargetFps), !m_worldRenderScaleAuto);
-  drawRow(10, "World filter", m_worldRenderFilterPoint ? "Point" : "Bilinear");
+    drawRow(5, "World render mode", m_worldRenderScaleAuto ? "Auto" : "Manual");
+    drawRow(6, "World render scale", TextFormat("%.0f%%", m_worldRenderScale * 100.0f), m_worldRenderScaleAuto);
+    drawRow(7, "World scale min", TextFormat("%.0f%%", m_worldRenderScaleMin * 100.0f), !m_worldRenderScaleAuto);
+    drawRow(8, "World scale max", TextFormat("%.0f%%", m_worldRenderScaleMax * 100.0f), !m_worldRenderScaleAuto);
+    drawRow(9, "World target FPS", TextFormat("%d", m_worldRenderTargetFps), !m_worldRenderScaleAuto);
+    drawRow(10, "World filter", m_worldRenderFilterPoint ? "Point" : "Bilinear");
+  } else {
+    const Renderer::ShadowSettings sh = m_renderer.shadowSettings();
+    const Renderer::DayNightSettings dn = m_renderer.dayNightSettings();
+    const Renderer::WeatherSettings wx = m_renderer.weatherSettings();
+
+    auto onOff = [](bool v) -> const char* { return v ? "On" : "Off"; };
+
+    auto weatherModeStr = [](Renderer::WeatherSettings::Mode m) -> const char* {
+      using M = Renderer::WeatherSettings::Mode;
+      switch (m) {
+        case M::Rain: return "Rain";
+        case M::Snow: return "Snow";
+        default: return "Clear";
+      }
+    };
+
+    drawRow(0, "Render cache (banded)", onOff(m_renderer.baseCacheEnabled()));
+
+    drawRow(1, "Layer: Terrain", onOff(m_renderer.layerEnabled(Renderer::RenderLayer::Terrain)));
+    drawRow(2, "Layer: Decals", onOff(m_renderer.layerEnabled(Renderer::RenderLayer::Decals)));
+    drawRow(3, "Layer: Structures", onOff(m_renderer.layerEnabled(Renderer::RenderLayer::Structures)));
+    drawRow(4, "Layer: Overlays", onOff(m_renderer.layerEnabled(Renderer::RenderLayer::Overlays)));
+
+    drawRow(5, "Merged zone buildings", onOff(m_mergedZoneBuildings));
+
+    drawRow(6, "Shadows", onOff(sh.enabled));
+    drawRow(7, "Shadow strength", TextFormat("%.0f%%", sh.strength * 100.0f), !sh.enabled);
+    drawRow(8, "Shadow softness", TextFormat("%.0f%%", sh.softness * 100.0f), !sh.enabled);
+    drawRow(9, "Shadow max len", TextFormat("%.1f tiles", sh.maxLengthTiles), !sh.enabled);
+    drawRow(10, "Shadow direction", TextFormat("%.0f°", sh.azimuthDeg), !sh.enabled);
+
+    drawRow(11, "Day/night cycle", onOff(dn.enabled));
+    drawRow(12, "Day length", TextFormat("%.0f s", dn.dayLengthSec), !dn.enabled);
+    drawRow(13, "Time offset", TextFormat("%.0f s", dn.timeOffsetSec), !dn.enabled);
+    drawRow(14, "Night darken", TextFormat("%.0f%%", dn.nightDarken * 100.0f), !dn.enabled);
+    drawRow(15, "Dusk tint", TextFormat("%.0f%%", dn.duskTint * 100.0f), !dn.enabled);
+    drawRow(16, "Night lights", onOff(dn.drawLights), !dn.enabled);
+
+    drawRow(17, "Weather mode", weatherModeStr(wx.mode));
+    drawRow(18, "Intensity", TextFormat("%.0f%%", wx.intensity * 100.0f), wx.mode == Renderer::WeatherSettings::Mode::Clear);
+    drawRow(19, "Wind dir", TextFormat("%.0f°", wx.windAngleDeg), wx.mode == Renderer::WeatherSettings::Mode::Clear);
+    drawRow(20, "Wind speed", TextFormat("%.2fx", wx.windSpeed), wx.mode == Renderer::WeatherSettings::Mode::Clear);
+    drawRow(21, "Overcast", TextFormat("%.0f%%", wx.overcast * 100.0f), wx.mode == Renderer::WeatherSettings::Mode::Clear);
+    drawRow(22, "Fog", TextFormat("%.0f%%", wx.fog * 100.0f), wx.mode == Renderer::WeatherSettings::Mode::Clear);
+    drawRow(23, "Particles", onOff(wx.drawParticles), wx.mode == Renderer::WeatherSettings::Mode::Clear);
+    drawRow(24, "Ground effects", onOff(wx.affectGround), wx.mode == Renderer::WeatherSettings::Mode::Clear);
+    drawRow(25, "Reflect lights", onOff(wx.reflectLights),
+            (wx.mode != Renderer::WeatherSettings::Mode::Rain) || (wx.mode == Renderer::WeatherSettings::Mode::Clear));
+  }
 
   // Footer: show current effective world RT size and smoothed FPS.
   const float fps = 1.0f / std::max(0.0001f, m_frameTimeSmoothed);
@@ -6191,6 +7552,7 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
   DrawText(TextFormat("Smoothed FPS: %.1f    World RT: %s", fps, rtStr), x0 + 12, y0 + panelH - 22, 14,
            Color{220, 220, 220, 255});
 }
+
 
 
 void Game::draw()
@@ -6386,13 +7748,20 @@ void Game::draw()
   }
 
   auto drawWorldDirect = [&]() {
+    std::vector<Renderer::WorldSprite> sprites;
+    appendVehicleSprites(m_camera, sprites);
+
     m_renderer.drawWorld(m_world, m_camera, screenW, screenH, m_timeSec, m_hovered, m_drawGrid, worldBrush, selected,
                          pathPtr, outsideMask,
                          trafficMask, trafficMax,
                          goodsTrafficMask, goodsMax,
                          commercialGoodsFill,
                          heatmap, heatmapRamp,
-                         showDistrictOverlay, highlightDistrict, showDistrictBorders);
+                         showDistrictOverlay, highlightDistrict, showDistrictBorders,
+                         /*mergeZoneBuildings=*/m_mergedZoneBuildings,
+                         /*drawBeforeFx=*/{},
+                         /*drawAfterFx=*/{},
+                         /*sprites=*/sprites.empty() ? nullptr : &sprites);
   };
 
   if (!wantsWorldRenderTarget() || !m_worldRenderRTValid) {
@@ -6406,6 +7775,9 @@ void Game::draw()
     BeginTextureMode(m_worldRenderRT);
     ClearBackground(Color{30, 32, 38, 255});
 
+    std::vector<Renderer::WorldSprite> sprites;
+    appendVehicleSprites(camRT, sprites);
+
     m_renderer.drawWorld(m_world, camRT, m_worldRenderRTWidth, m_worldRenderRTHeight, m_timeSec, m_hovered,
                          m_drawGrid, worldBrush, selected,
                          pathPtr, outsideMask,
@@ -6413,7 +7785,11 @@ void Game::draw()
                          goodsTrafficMask, goodsMax,
                          commercialGoodsFill,
                          heatmap, heatmapRamp,
-                         showDistrictOverlay, highlightDistrict, showDistrictBorders);
+                         showDistrictOverlay, highlightDistrict, showDistrictBorders,
+                         /*mergeZoneBuildings=*/m_mergedZoneBuildings,
+                         /*drawBeforeFx=*/{},
+                         /*drawAfterFx=*/{},
+                         /*sprites=*/sprites.empty() ? nullptr : &sprites);
 
     EndTextureMode();
 
@@ -6423,17 +7799,14 @@ void Game::draw()
     DrawTexturePro(m_worldRenderRT.texture, src, dst, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
   }
 
-  // Vehicle micro-sim overlay (commuters + goods trucks).
   // Screen-space weather (fog/precip). Suppressed in utility overlays for readability.
+  // (Vehicles are drawn inside the world pass so they're affected by day/night + wetness grading.)
   const bool allowWeatherFx =
     (outsideMask == nullptr) && (trafficMask == nullptr) && (goodsTrafficMask == nullptr) && (commercialGoodsFill == nullptr) &&
     (heatmap == nullptr);
   m_renderer.drawWeatherScreenFX(screenW, screenH, m_timeSec, allowWeatherFx);
 
-
   drawBlueprintOverlay();
-
-  drawVehicles();
 
   // Road graph overlay (debug): nodes/edges extracted from the current road tiles.
   if (m_showRoadGraphOverlay) {
@@ -6786,6 +8159,69 @@ void Game::draw()
     DrawText(line2, x + pad, y + pad + fontSize + 6, fontSize, Color{220, 220, 220, 255});
   }
 
+  // In-game software 3D preview (Shift+F11). This renders the *actual world mesh*
+  // through the CPU renderer (Soft3D) and then uploads it as a texture.
+  //
+  // Controls:
+  //   Shift+F11: toggle panel
+  //   Ctrl+Arrows: rotate camera (Shift for bigger steps)
+  //   Ctrl+P: toggle projection (iso/persp)
+  //   Ctrl+R: reset view
+  //   Ctrl+F11: export a high-res 3D render to /captures
+  if (m_show3DPreview) {
+    if (m_3dPreviewDirty || m_3dPreviewTex.id == 0) {
+      Render3DConfig cfg = m_3dPreviewCfg;
+      // Keep previews aligned with the current visual mood.
+      ApplyWeatherTo3DCfg(cfg, m_renderer.weatherSettings());
+
+      // Preview defaults to the main visual layer.
+      const LandValueResult* lv = nullptr;
+      const TrafficResult* tr = nullptr;
+      const GoodsResult* gr = nullptr;
+      PpmImage img = RenderWorld3D(m_world, m_3dPreviewLayer, cfg, lv, tr, gr);
+      if (m_3dPreviewApplyGrade) {
+        ApplyInGameAtmosphereGradeToPpm(img, m_timeSec, m_renderer.dayNightSettings(), m_renderer.weatherSettings());
+      }
+
+      (void)UploadPpmToTexture(m_3dPreviewTex, m_3dPreviewTexW, m_3dPreviewTexH, img);
+      m_3dPreviewDirty = false;
+    }
+
+    const int panelW = 440;
+    const int panelH = 292;
+    const int x0 = 12;
+    const int y0 = uiH - panelH - 12;
+    DrawRectangle(x0, y0, panelW, panelH, Color{0, 0, 0, 180});
+    DrawRectangleLines(x0, y0, panelW, panelH, Color{255, 255, 255, 70});
+
+    int x = x0 + 12;
+    int y = y0 + 10;
+    DrawText("3D Preview", x, y, 20, RAYWHITE);
+    y += 22;
+    DrawText("Shift+F11 toggle  |  Ctrl+F11 export", x, y, 14, Color{220, 220, 220, 255});
+    y += 16;
+    DrawText("Ctrl+Arrows rotate (Shift=faster)  |  Ctrl+P proj  |  Ctrl+R reset", x, y, 14,
+             Color{200, 200, 200, 255});
+
+    const int pad = 10;
+    const int imgX = x0 + pad;
+    const int imgY = y0 + 64;
+    const int imgW = panelW - pad * 2;
+    const int imgH = panelH - 74;
+
+    DrawRectangle(imgX, imgY, imgW, imgH, Color{20, 22, 26, 255});
+    DrawRectangleLines(imgX, imgY, imgW, imgH, Color{255, 255, 255, 30});
+
+    if (m_3dPreviewTex.id != 0) {
+      Rectangle src{0.0f, 0.0f, static_cast<float>(m_3dPreviewTexW), static_cast<float>(m_3dPreviewTexH)};
+      Rectangle dst{static_cast<float>(imgX), static_cast<float>(imgY), static_cast<float>(imgW),
+                    static_cast<float>(imgH)};
+      DrawTexturePro(m_3dPreviewTex, src, dst, Vector2{0, 0}, 0.0f, WHITE);
+    } else {
+      DrawText("(rendering...)", imgX + 12, imgY + 12, 18, Color{220, 220, 220, 255});
+    }
+  }
+
   // Developer console draws above the HUD/panels but below transient toasts.
   if (m_console.isOpen()) {
     m_console.draw(uiW, uiH);
@@ -6827,11 +8263,185 @@ void Game::draw()
     m_pendingMapExportPath.clear();
     m_pendingMapExportMaxSize = 4096;
 
-    const bool ok = m_renderer.exportWorldOverview(m_world, path.c_str(), maxSize);
+    const bool ok = m_renderer.exportWorldOverview(m_world, path.c_str(), maxSize, m_timeSec, /*includeScreenFx=*/true);
     showToast(ok ? (std::string("Map exported: ") + path)
                  : (std::string("Map export failed: ") + path),
              4.0f);
   }
+  // Layered map export (terrain/decals/structures/overlays, plus optional weather-only FX layer).
+  // Must run *outside* any active BeginMode2D() to avoid nested mode state.
+  if (m_pendingMapLayersExport && !m_pendingMapLayersPrefix.empty()) {
+    const std::string prefix = m_pendingMapLayersPrefix;
+    const int maxSize = m_pendingMapLayersMaxSize;
+    m_pendingMapLayersExport = false;
+    m_pendingMapLayersPrefix.clear();
+    m_pendingMapLayersMaxSize = 4096;
+
+    namespace fs = std::filesystem;
+
+    // Ensure the output directory exists (best effort).
+    {
+      std::error_code ec;
+      const fs::path parent = fs::path(prefix).parent_path();
+      if (!parent.empty()) {
+        fs::create_directories(parent, ec);
+      }
+    }
+
+    auto withSuffix = [&](const char* suffix) -> std::string {
+      const fs::path p(prefix);
+      const fs::path dir = p.parent_path();
+      const std::string stem = p.stem().string();
+      std::string ext = p.extension().string();
+      if (ext.empty()) ext = ".png";
+      return (dir / (stem + suffix + ext)).string();
+    };
+
+    const std::uint32_t prevMask = m_renderer.layerMask();
+    bool ok = true;
+
+    // 1) Composite (current layer mask + full screen FX) so the set contains a "what you see" reference.
+    {
+      const std::string out = withSuffix("_composite");
+      ok = ok && m_renderer.exportWorldOverview(m_world, out.c_str(), maxSize, m_timeSec, /*includeScreenFx=*/true);
+    }
+
+    // 2) Per-layer exports (transparent background; screen-space FX disabled).
+    auto exportLayer = [&](std::uint32_t mask, const char* suffix) {
+      m_renderer.setLayerMask(mask);
+      const std::string out = withSuffix(suffix);
+      ok = ok && m_renderer.exportWorldOverview(m_world, out.c_str(), maxSize, m_timeSec, /*includeScreenFx=*/false);
+    };
+
+    exportLayer(Renderer::kLayerTerrain, "_terrain");
+    exportLayer(Renderer::kLayerDecals, "_decals");
+    exportLayer(Renderer::kLayerStructures, "_structures");
+    exportLayer(Renderer::kLayerOverlays, "_overlays");
+
+    // 3) Weather-only screen FX (drawn over a blank world), useful for compositing.
+    {
+      m_renderer.setLayerMask(0u);
+      const std::string out = withSuffix("_weather_fx");
+      ok = ok && m_renderer.exportWorldOverview(m_world, out.c_str(), maxSize, m_timeSec, /*includeScreenFx=*/true);
+    }
+
+    // Restore user layer mask.
+    m_renderer.setLayerMask(prevMask);
+
+    const fs::path p(prefix);
+    const std::string ext = p.extension().empty() ? ".png" : p.extension().string();
+    const std::string base = (p.parent_path() / p.stem()).string();
+
+    showToast(ok ? (std::string("Layer exports: ") + base + "_*" + ext)
+                 : (std::string("Layer export failed: ") + prefix),
+             4.0f);
+  }
+
+  // Software 3D render export (queued from dev console or Ctrl+F11).
+  if (m_pendingRender3D && !m_pendingRender3DPath.empty()) {
+    namespace fs = std::filesystem;
+
+    const std::string path = m_pendingRender3DPath;
+    Render3DConfig cfg = m_pendingRender3DCfg;
+    const ExportLayer layer = m_pendingRender3DLayer;
+    const bool applyGrade = m_pendingRender3DApplyGrade;
+
+    m_pendingRender3D = false;
+    m_pendingRender3DPath.clear();
+
+    // Ensure output directory exists (best effort).
+    {
+      std::error_code ec;
+      const fs::path parent = fs::path(path).parent_path();
+      if (!parent.empty()) fs::create_directories(parent, ec);
+    }
+
+    // Align fog/lighting to current weather (the software renderer supports true depth fog).
+    ApplyWeatherTo3DCfg(cfg, m_renderer.weatherSettings());
+
+    // Prepare derived inputs if the selected layer needs them.
+    const LandValueResult* lvPtr = nullptr;
+    const TrafficResult* trPtr = nullptr;
+    const GoodsResult* grPtr = nullptr;
+
+    const bool requireOutside = m_sim.config().requireOutsideConnection;
+    const bool needRoadToEdgeMask = requireOutside &&
+        (layer == ExportLayer::Traffic || layer == ExportLayer::LandValue || layer == ExportLayer::GoodsTraffic ||
+         layer == ExportLayer::GoodsFill);
+
+    const std::vector<std::uint8_t>* roadToEdgeMask = nullptr;
+    if (needRoadToEdgeMask) {
+      ComputeRoadsConnectedToEdge(m_world, m_outsideOverlayRoadToEdge);
+      roadToEdgeMask = &m_outsideOverlayRoadToEdge;
+    }
+
+    // Traffic (commute)
+    if (layer == ExportLayer::Traffic || layer == ExportLayer::LandValue) {
+      if (m_trafficDirty) {
+        const float share = (m_world.stats().population > 0)
+                                ? (static_cast<float>(m_world.stats().employed) /
+                                   static_cast<float>(m_world.stats().population))
+                                : 0.0f;
+
+        TrafficConfig tc;
+        tc.requireOutsideConnection = requireOutside;
+        {
+          const TrafficModelSettings& tm = m_sim.trafficModel();
+          tc.congestionAwareRouting = tm.congestionAwareRouting;
+          tc.congestionIterations = tm.congestionIterations;
+          tc.congestionAlpha = tm.congestionAlpha;
+          tc.congestionBeta = tm.congestionBeta;
+          tc.congestionCapacityScale = tm.congestionCapacityScale;
+          tc.congestionRatioClamp = tm.congestionRatioClamp;
+          tc.capacityAwareJobs = tm.capacityAwareJobs;
+          tc.jobAssignmentIterations = tm.jobAssignmentIterations;
+          tc.jobPenaltyBaseMilli = tm.jobPenaltyBaseMilli;
+        }
+
+        const std::vector<std::uint8_t>* pre = (tc.requireOutsideConnection ? roadToEdgeMask : nullptr);
+        m_traffic = ComputeCommuteTraffic(m_world, tc, share, pre);
+        m_trafficDirty = false;
+      }
+      trPtr = &m_traffic;
+    }
+
+    // Goods
+    if (layer == ExportLayer::GoodsTraffic || layer == ExportLayer::GoodsFill) {
+      if (m_goodsDirty) {
+        GoodsConfig gc;
+        gc.requireOutsideConnection = requireOutside;
+        const std::vector<std::uint8_t>* pre = (gc.requireOutsideConnection ? roadToEdgeMask : nullptr);
+        m_goods = ComputeGoodsFlow(m_world, gc, pre);
+        m_goodsDirty = false;
+      }
+      grPtr = &m_goods;
+    }
+
+    // Land value
+    if (layer == ExportLayer::LandValue) {
+      if (m_landValueDirty ||
+          m_landValue.value.size() != static_cast<std::size_t>(std::max(0, m_world.width()) * std::max(0, m_world.height()))) {
+        LandValueConfig lc;
+        lc.requireOutsideConnection = requireOutside;
+        lvPtr = nullptr;
+        m_landValue = ComputeLandValue(m_world, lc, trPtr, roadToEdgeMask);
+        m_landValueDirty = false;
+      }
+      lvPtr = &m_landValue;
+    }
+
+    PpmImage img = RenderWorld3D(m_world, layer, cfg, lvPtr, trPtr, grPtr);
+    if (applyGrade) {
+      ApplyInGameAtmosphereGradeToPpm(img, m_timeSec, m_renderer.dayNightSettings(), m_renderer.weatherSettings());
+    }
+
+    std::string err;
+    const bool ok = WriteImageAuto(path, img, err);
+    showToast(ok ? (std::string("3D render: ") + path)
+                 : (std::string("3D render failed: ") + (err.empty() ? path : err)),
+             4.0f);
+  }
+
 
   EndDrawing();
 }
