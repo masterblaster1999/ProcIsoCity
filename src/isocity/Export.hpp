@@ -30,6 +30,12 @@ enum class ExportLayer : std::uint8_t {
   GoodsTraffic = 5, // GoodsResult::roadGoodsTraffic heatmap (requires goods)
   GoodsFill = 6,    // GoodsResult::commercialFill heatmap (requires goods)
   District = 7,     // per-tile district id palette (v7+ saves)
+
+  // Sea-level coastal flooding depth (derived from heightfield + edge connectivity).
+  FloodDepth = 8,
+
+  // Depression-fill depth (Priority-Flood): ponding potential in closed basins.
+  PondingDepth = 9,
 };
 
 struct PpmImage {
@@ -113,6 +119,14 @@ struct PpmDiffStats {
 
   // Peak signal-to-noise ratio in dB (computed from MSE). +inf when mse == 0.
   double psnr = 0.0;
+
+  // Structural Similarity Index (SSIM) computed on luma (Y') in [0,1].
+  // Range is typically [-1,1], where 1 means identical.
+  //
+  // We compute SSIM using a local window for robustness to small local
+  // differences. The default ComparePpm() window is 11x11, but callers can
+  // override it.
+  double ssim = 1.0;
 };
 
 // Read a binary PPM (P6) file.
@@ -131,7 +145,7 @@ bool ReadPpm(const std::string& path, PpmImage& outImg, std::string& outError);
 // Returns false only on invalid inputs (dimension mismatch, bad buffers, etc).
 // Use outStats.pixelsDifferent to determine match/mismatch.
 bool ComparePpm(const PpmImage& a, const PpmImage& b, PpmDiffStats& outStats, int threshold = 0,
-                PpmImage* outDiff = nullptr);
+                PpmImage* outDiff = nullptr, int ssimWindow = 11);
 
 // -----------------------------------------------------------------------------------------------
 // PNG IO (minimal, dependency-free)
@@ -425,6 +439,9 @@ struct Render3DConfig {
   std::uint8_t outlineG = 0;
   std::uint8_t outlineB = 0;
   float outlineDepthEps = 0.002f;
+  // Blend factor for outlines over the filled surface.
+  // 1.0 = fully opaque outlines, 0.0 = disabled.
+  float outlineAlpha = 1.0f;
 
   // Lighting (Lambert).
   float lightDirX = -0.55f;
@@ -437,6 +454,12 @@ struct Render3DConfig {
   std::uint8_t bgR = 30;
   std::uint8_t bgG = 32;
   std::uint8_t bgB = 42;
+
+  // Fog blend target color (RGB) used when fog is enabled.
+  // Defaults to a cool gray independent of the background clear color.
+  std::uint8_t fogR = 200;
+  std::uint8_t fogG = 210;
+  std::uint8_t fogB = 225;
 
   // Simple depth fog.
   bool fog = false;

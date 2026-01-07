@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 
 namespace isocity {
@@ -200,13 +201,9 @@ void ApplyWeatherTo3DCfg(Render3DConfig& cfg, const Renderer::WeatherSettings& w
   cfg.fogStrength = std::clamp(0.2f + 0.8f * fog01, 0.0f, 1.0f);
 
   // A soft cool-grey fog works well across day/night.
-  const int r = 200;
-  const int g = 210;
-  const int b = 225;
-  cfg.fogColor = (static_cast<std::uint32_t>(r) << 24) |
-                 (static_cast<std::uint32_t>(g) << 16) |
-                 (static_cast<std::uint32_t>(b) << 8) |
-                 255u;
+  cfg.fogR = 200;
+  cfg.fogG = 210;
+  cfg.fogB = 225;
 
   // Overcast reduces contrast a bit in the 3D renderer itself (in addition to the post-grade).
   const float overcast = (wx.mode == Renderer::WeatherSettings::Mode::Clear) ? 0.0f : std::clamp(wx.overcast, 0.0f, 1.0f);
@@ -349,7 +346,7 @@ bool Game::loadFromPath(const std::string& path, const char* toastLabel)
   m_trafficDirty = true;
   m_goodsDirty = true;
   m_landValueDirty = true;
-  m_seaFloodDirty = true;
+  invalidateHydrology();
   m_vehiclesDirty = true;
   m_vehicles.clear();
 
@@ -457,6 +454,13 @@ Game::~Game()
   unloadSaveMenuThumbnails();
 }
 
+void Game::invalidateHydrology()
+{
+  m_seaFloodDirty = true;
+  m_pondingDirty = true;
+}
+
+
 Game::Game(Config cfg)
     : m_cfg(cfg)
     , m_rl(cfg, "ProcIsoCity")
@@ -523,9 +527,9 @@ Game::Game(Config cfg)
   m_pendingRender3DCfg.width = 1600;
   m_pendingRender3DCfg.height = 900;
   m_pendingRender3DCfg.supersample = 1;
-  m_pendingRender3DCfg.proj = Render3DConfig::Projection::IsometricOrtho;
-  m_pendingRender3DCfg.camYawDeg = 45.0f;
-  m_pendingRender3DCfg.camPitchDeg = 35.264f;
+  m_pendingRender3DCfg.projection = Render3DConfig::Projection::IsometricOrtho;
+  m_pendingRender3DCfg.yawDeg = 45.0f;
+  m_pendingRender3DCfg.pitchDeg = 35.264f;
   m_pendingRender3DCfg.autoFit = true;
   m_pendingRender3DCfg.drawOutlines = true;
 
@@ -583,6 +587,22 @@ void Game::setupDevConsole()
     }
   };
 
+  auto parseI32 = [](const std::string& s, int& out) -> bool {
+    try {
+      std::size_t idx = 0;
+      const long long v = std::stoll(s, &idx, 10);
+      if (idx != s.size()) return false;
+      if (v < static_cast<long long>(std::numeric_limits<int>::min()) ||
+          v > static_cast<long long>(std::numeric_limits<int>::max())) {
+        return false;
+      }
+      out = static_cast<int>(v);
+      return true;
+    } catch (...) {
+      return false;
+    }
+  };
+
   auto parseU64 = [](const std::string& s, std::uint64_t& out) -> bool {
     try {
       std::size_t idx = 0;
@@ -614,6 +634,7 @@ void Game::setupDevConsole()
     case HeatmapOverlay::Pollution: return "pollution";
     case HeatmapOverlay::TrafficSpill: return "traffic";
     case HeatmapOverlay::FloodDepth: return "flood";
+    case HeatmapOverlay::PondingDepth: return "pond";
     default: return "?";
     }
   };
@@ -995,10 +1016,10 @@ void Game::setupDevConsole()
       });
 
   m_console.registerCommand(
-      "heatmap", "heatmap <off|land|park|water|pollution|traffic|flood> - set heatmap overlay",
+      "heatmap", "heatmap <off|land|park|water|pollution|traffic|flood|pond> - set heatmap overlay",
       [this, toLower, heatmapName](DevConsole& c, const DevConsole::Args& args) {
         if (args.size() != 1) {
-          c.print("Usage: heatmap <off|land|park|water|pollution|traffic|flood>");
+          c.print("Usage: heatmap <off|land|park|water|pollution|traffic|flood|pond>");
           return;
         }
         const std::string h = toLower(args[0]);
@@ -1009,6 +1030,7 @@ void Game::setupDevConsole()
         else if (h == "pollution") m_heatmapOverlay = HeatmapOverlay::Pollution;
         else if (h == "traffic") m_heatmapOverlay = HeatmapOverlay::TrafficSpill;
         else if (h == "flood") m_heatmapOverlay = HeatmapOverlay::FloodDepth;
+        else if (h == "pond" || h == "ponding") m_heatmapOverlay = HeatmapOverlay::PondingDepth;
         else {
           c.print("Unknown heatmap: " + args[0]);
           return;
@@ -1016,7 +1038,7 @@ void Game::setupDevConsole()
 
         // Mark derived fields dirty. Which ones get recomputed depends on which heatmap is active.
         m_landValueDirty = true;
-        m_seaFloodDirty = true;
+        invalidateHydrology();
 
         showToast(TextFormat("Heatmap: %s", heatmapName(m_heatmapOverlay)));
         c.print(TextFormat("heatmap = %s", heatmapName(m_heatmapOverlay)));
@@ -1070,7 +1092,7 @@ void Game::setupDevConsole()
         }
 
         if (changed) {
-          m_seaFloodDirty = true;
+          invalidateHydrology();
           showToast(TextFormat("Sea level: %.2f (%s,%s)", static_cast<double>(m_seaLevel),
                                m_seaFloodCfg.requireEdgeConnection ? "edge" : "all",
                                m_seaFloodCfg.eightConnected ? "8c" : "4c"));
@@ -1082,7 +1104,51 @@ void Game::setupDevConsole()
       });
 
   m_console.registerCommand(
-      "floodapply",
+        m_console.registerCommand(
+      "pond",
+      "pond [eps] [edge|noedge]  - configure depression-fill ponding overlay (used by heatmap pond)",
+      [this, toLower, parseF32](DevConsole& c, const DevConsole::Args& args) {
+        if (args.size() > 2) {
+          c.print("Usage: pond [eps] [edge|noedge]");
+          return;
+        }
+
+        bool changed = false;
+
+        if (!args.empty()) {
+          float eps = 0.0f;
+          if (!parseF32(args[0], eps)) {
+            c.print("Invalid eps: " + args[0]);
+            return;
+          }
+          m_pondingCfg.epsilon = std::max(0.0f, eps);
+          changed = true;
+        }
+
+        if (args.size() >= 2) {
+          const std::string mode = toLower(args[1]);
+          if (mode == "edge" || mode == "edges" || mode == "open") {
+            m_pondingCfg.includeEdges = true;
+          } else if (mode == "noedge" || mode == "closed" || mode == "none") {
+            m_pondingCfg.includeEdges = false;
+          } else {
+            c.print("Unknown mode: " + args[1] + " (use edge|noedge)");
+            return;
+          }
+          changed = true;
+        }
+
+        if (changed) {
+          m_pondingDirty = true;
+          showToast(TextFormat("Ponding: eps %.4f (%s)", static_cast<double>(m_pondingCfg.epsilon),
+                               m_pondingCfg.includeEdges ? "edge" : "noedge"));
+        }
+
+        c.print(TextFormat("pond = eps %.6f  edges=%s", static_cast<double>(m_pondingCfg.epsilon),
+                           m_pondingCfg.includeEdges ? "edge" : "noedge"));
+      });
+
+"floodapply",
       "floodapply [level] [edge|all] [4|8]  - apply sea flooding to the world (undoable)",
       [this, toLower, parseF32](DevConsole& c, const DevConsole::Args& args) {
         if (args.size() > 3) {
@@ -1132,7 +1198,7 @@ void Game::setupDevConsole()
         // Make the overlay configuration reflect the parameters we just used.
         m_seaLevel = seaLevel;
         m_seaFloodCfg = cfg;
-        m_seaFloodDirty = true;
+        invalidateHydrology();
 
         const int w = m_world.width();
         const int h = m_world.height();
@@ -1200,7 +1266,7 @@ void Game::setupDevConsole()
         m_landValueDirty = true;
         m_vehiclesDirty = true;
         m_roadGraphDirty = true;
-        m_seaFloodDirty = true;
+        invalidateHydrology();
 
         showToast(TextFormat("Flood applied: %d tiles (sea %.2f)", changedTiles, static_cast<double>(seaLevel)), 3.0f);
         c.print(TextFormat("flooded %d tiles (sea %.3f)", changedTiles, static_cast<double>(seaLevel)));
@@ -1715,6 +1781,128 @@ void Game::setupDevConsole()
       });
 
 
+  // --- cloud shadows ---
+  m_console.registerCommand(
+      "cloud",
+      "cloud [on|off|toggle] | cloud strength <0..1> | cloud scale <0.25..8> | cloud speed <0..3> | "
+      "cloud coverage <0..1> | cloud softness <0..1>",
+      [this, toLower, parseF32](DevConsole& c, const DevConsole::Args& args) {
+        auto s = m_renderer.cloudShadowSettings();
+
+        auto clamp01 = [&](float v) { return std::max(0.0f, std::min(1.0f, v)); };
+
+        auto printStatus = [&]() {
+          c.print(TextFormat("CloudShadows: %s  strength=%.2f  scale=%.2f  speed=%.2f  coverage=%.2f  softness=%.2f",
+                             s.enabled ? "ON" : "OFF", s.strength, s.scale, s.speed, s.coverage, s.softness));
+        };
+
+        auto parseOnOffToggle = [&](const std::string& v, bool cur, bool& out) -> bool {
+          const std::string t = toLower(v);
+          if (t == "on" || t == "1" || t == "true" || t == "yes") {
+            out = true;
+            return true;
+          }
+          if (t == "off" || t == "0" || t == "false" || t == "no") {
+            out = false;
+            return true;
+          }
+          if (t == "toggle") {
+            out = !cur;
+            return true;
+          }
+          return false;
+        };
+
+        if (args.empty()) {
+          printStatus();
+          return;
+        }
+
+        const std::string a0 = toLower(args[0]);
+
+        // on/off/toggle
+        {
+          bool v = s.enabled;
+          if (parseOnOffToggle(a0, s.enabled, v)) {
+            s.enabled = v;
+            m_renderer.setCloudShadowSettings(s);
+            printStatus();
+            showToast(TextFormat("Cloud shadows: %s", s.enabled ? "ON" : "OFF"), 1.5f);
+            return;
+          }
+        }
+
+        if (a0 == "strength" && args.size() >= 2) {
+          float v = 0.0f;
+          if (!parseF32(args[1], v)) {
+            c.print("Bad strength value.");
+            return;
+          }
+          s.strength = clamp01(v);
+          m_renderer.setCloudShadowSettings(s);
+          printStatus();
+          return;
+        }
+
+        if (a0 == "scale" && args.size() >= 2) {
+          float v = 1.0f;
+          if (!parseF32(args[1], v)) {
+            c.print("Bad scale value.");
+            return;
+          }
+          s.scale = std::clamp(v, 0.25f, 8.0f);
+          m_renderer.setCloudShadowSettings(s);
+          printStatus();
+          return;
+        }
+
+        if (a0 == "speed" && args.size() >= 2) {
+          float v = 0.0f;
+          if (!parseF32(args[1], v)) {
+            c.print("Bad speed value.");
+            return;
+          }
+          s.speed = std::clamp(v, 0.0f, 3.0f);
+          m_renderer.setCloudShadowSettings(s);
+          printStatus();
+          return;
+        }
+
+        if ((a0 == "coverage" || a0 == "cover") && args.size() >= 2) {
+          float v = 0.0f;
+          if (!parseF32(args[1], v)) {
+            c.print("Bad coverage value.");
+            return;
+          }
+          s.coverage = clamp01(v);
+          m_renderer.setCloudShadowSettings(s);
+          printStatus();
+          return;
+        }
+
+        if ((a0 == "softness" || a0 == "soft") && args.size() >= 2) {
+          float v = 0.0f;
+          if (!parseF32(args[1], v)) {
+            c.print("Bad softness value.");
+            return;
+          }
+          s.softness = clamp01(v);
+          m_renderer.setCloudShadowSettings(s);
+          printStatus();
+          return;
+        }
+
+        c.print("Usage:");
+        c.print("  cloud                               (show status)");
+        c.print("  cloud on|off|toggle");
+        c.print("  cloud strength <0..1>");
+        c.print("  cloud scale <0.25..8>");
+        c.print("  cloud speed <0..3>");
+        c.print("  cloud coverage <0..1>");
+        c.print("  cloud softness <0..1>");
+      });
+
+
 
   // --- file export ---
   m_console.registerCommand(
@@ -1892,6 +2080,7 @@ void Game::setupDevConsole()
           if (t == "goodsfill" || t == "goods_fill" || t == "fill") { out = ExportLayer::GoodsFill; return true; }
           if (t == "district" || t == "districts") { out = ExportLayer::District; return true; }
           if (t == "flood" || t == "flooddepth") { out = ExportLayer::FloodDepth; return true; }
+          if (t == "pond" || t == "ponding" || t == "pondingdepth" || t == "ponding_depth" || t == "depression") { out = ExportLayer::PondingDepth; return true; }
           return false;
         };
 
@@ -1921,12 +2110,12 @@ void Game::setupDevConsole()
           }
 
           if (t == "iso" || t == "ortho" || t == "isometric") {
-            cfg.proj = Render3DConfig::Projection::IsometricOrtho;
+            cfg.projection = Render3DConfig::Projection::IsometricOrtho;
             continue;
           }
 
           if (t == "persp" || t == "perspective") {
-            cfg.proj = Render3DConfig::Projection::Perspective;
+            cfg.projection = Render3DConfig::Projection::Perspective;
             continue;
           }
 
@@ -1963,7 +2152,7 @@ void Game::setupDevConsole()
 
         showToast(TextFormat("Queued 3D render: %s", path.c_str()), 2.0f);
         c.print(TextFormat("queued: %s (%dx%d ssaa=%d %s %s)", path.c_str(), cfg.width, cfg.height, cfg.supersample,
-                           (cfg.proj == Render3DConfig::Projection::Perspective) ? "persp" : "iso",
+                           (cfg.projection == Render3DConfig::Projection::Perspective) ? "persp" : "iso",
                            applyGrade ? "grade" : "raw"));
       });
 
@@ -2785,6 +2974,44 @@ float Game::clampWorldRenderScale(float scale) const
   }
 
   return std::clamp(scale, kWorldRenderScaleAbsMin, kWorldRenderScaleAbsMax);
+}
+
+void Game::setWorldRenderScale(float scale)
+{
+  m_worldRenderScale = clampWorldRenderScale(scale);
+  m_cfg.worldRenderScale = m_worldRenderScale;
+
+  // If manual scaling ends up effectively "1x", drop the render target to save VRAM.
+  if (!wantsWorldRenderTarget()) {
+    unloadWorldRenderTarget();
+  }
+}
+
+void Game::setWorldRenderScaleMin(float scaleMin)
+{
+  m_worldRenderScaleMin = clampWorldRenderScale(scaleMin);
+  m_cfg.worldRenderScaleMin = m_worldRenderScaleMin;
+
+  // Keep the active scale inside the new bounds (useful when auto-scaling is enabled).
+  m_worldRenderScale = clampWorldRenderScale(m_worldRenderScale);
+  m_cfg.worldRenderScale = m_worldRenderScale;
+}
+
+void Game::setWorldRenderScaleMax(float scaleMax)
+{
+  m_worldRenderScaleMax = clampWorldRenderScale(scaleMax);
+  m_cfg.worldRenderScaleMax = m_worldRenderScaleMax;
+
+  m_worldRenderScale = clampWorldRenderScale(m_worldRenderScale);
+  m_cfg.worldRenderScale = m_worldRenderScale;
+}
+
+void Game::updateWorldRenderFilter()
+{
+  if (!m_worldRenderRTValid) return;
+  SetTextureFilter(
+    m_worldRenderRT.texture,
+    m_worldRenderPixelPerfect ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
 }
 
 bool Game::wantsWorldRenderTarget() const
@@ -4057,6 +4284,41 @@ void Game::rebuildVehiclesRoutingCache()
   }
 }
 
+namespace {
+
+// Removes points that don't change direction (collinear steps), to keep vehicle polylines short.
+// This is purely visual and assumes grid-adjacent steps.
+static std::vector<Point> simplifyPath(const std::vector<Point>& path)
+{
+  if (path.size() < 3) {
+    return path;
+  }
+
+  auto sgn = [](int v) { return (v > 0) - (v < 0); };
+
+  std::vector<Point> out;
+  out.reserve(path.size());
+  out.push_back(path.front());
+
+  int prevDx = sgn(path[1].x - path[0].x);
+  int prevDy = sgn(path[1].y - path[0].y);
+
+  for (std::size_t i = 1; i + 1 < path.size(); ++i) {
+    const int dx = sgn(path[i + 1].x - path[i].x);
+    const int dy = sgn(path[i + 1].y - path[i].y);
+    if (dx != prevDx || dy != prevDy) {
+      out.push_back(path[i]);
+      prevDx = dx;
+      prevDy = dy;
+    }
+  }
+
+  out.push_back(path.back());
+  return out;
+}
+
+} // namespace
+
 void Game::updateVehicles(float dt)
 {
   if (!m_showVehicles) return;
@@ -4189,6 +4451,8 @@ void Game::updateVehicles(float dt)
     return -1;
   };
 
+  int commuteVehiclesSpawnedThisFrame = 0;
+
   auto spawnCommute = [&]() -> bool {
     if (m_commuteField.dist.empty() || m_commuteField.parent.empty()) return false;
 
@@ -4199,7 +4463,7 @@ void Game::updateVehicles(float dt)
     const int idx = PickWeightedIndex(m_vehicleRngState, m_commuteOrigins, m_commuteOriginWeightTotal, getOriginWeight);
     if (idx < 0 || static_cast<std::size_t>(idx) >= m_commuteOrigins.size()) return false;
 
-    const int startRoadIdx = m_commuteOrigins[static_cast<std::size_t>(idx)].roadIdx;
+    const int startRoadIdx = m_commuteOrigins[static_cast<std::size_t>(idx)].first;
 
     // Preferred destination: nearest job source for this origin (flow-field owner).
     int goalRoadIdx = -1;
@@ -4225,7 +4489,7 @@ void Game::updateVehicles(float dt)
 
     const float baseSpeed = 7.5f * speedMultForPath(path);
     makeVehicle(VehicleKind::Commute, std::move(path), baseSpeed, 1);
-    m_commuteVehiclesSpawnedThisFrame++;
+    ++commuteVehiclesSpawnedThisFrame;
     return true;
   };
 
@@ -4595,7 +4859,7 @@ void Game::applyToolBrush(int centerX, int centerY)
 
         if (heightChanged) {
           // Flood overlay is derived purely from the heightfield.
-          m_seaFloodDirty = true;
+          invalidateHydrology();
         }
 
         if (applied) {
@@ -4826,7 +5090,7 @@ bool Game::stampBlueprintAt(const Point& anchorTile)
   m_trafficDirty = true;
   m_goodsDirty = true;
   m_landValueDirty = true;
-  m_seaFloodDirty = true;
+  invalidateHydrology();
   m_vehiclesDirty = true;
 
   endPaintStroke();
@@ -5396,7 +5660,7 @@ void Game::doUndo()
     m_trafficDirty = true;
     m_goodsDirty = true;
     m_landValueDirty = true;
-    m_seaFloodDirty = true;
+    invalidateHydrology();
     m_vehiclesDirty = true;
     showToast(TextFormat("Undo (%d left)", static_cast<int>(m_history.undoSize())));
   } else {
@@ -5416,7 +5680,7 @@ void Game::doRedo()
     m_trafficDirty = true;
     m_goodsDirty = true;
     m_landValueDirty = true;
-    m_seaFloodDirty = true;
+    invalidateHydrology();
     m_vehiclesDirty = true;
     showToast(TextFormat("Redo (%d left)", static_cast<int>(m_history.redoSize())));
   } else {
@@ -5435,7 +5699,7 @@ void Game::resetWorld(std::uint64_t newSeed)
   m_trafficDirty = true;
   m_goodsDirty = true;
   m_landValueDirty = true;
-  m_seaFloodDirty = true;
+  invalidateHydrology();
   m_vehiclesDirty = true;
   m_vehicles.clear();
 
@@ -5762,33 +6026,34 @@ void Game::handleInput(float dt)
     const float stepPitch = shift ? 8.0f : 3.0f;
 
     if (IsKeyPressed(KEY_LEFT)) {
-      m_3dPreviewCfg.camYawDeg -= stepYaw;
+      m_3dPreviewCfg.yawDeg -= stepYaw;
       changed = true;
     }
     if (IsKeyPressed(KEY_RIGHT)) {
-      m_3dPreviewCfg.camYawDeg += stepYaw;
+      m_3dPreviewCfg.yawDeg += stepYaw;
       changed = true;
     }
     if (IsKeyPressed(KEY_UP)) {
-      m_3dPreviewCfg.camPitchDeg = std::clamp(m_3dPreviewCfg.camPitchDeg + stepPitch, 10.0f, 80.0f);
+      m_3dPreviewCfg.pitchDeg = std::clamp(m_3dPreviewCfg.pitchDeg + stepPitch, 10.0f, 80.0f);
       changed = true;
     }
     if (IsKeyPressed(KEY_DOWN)) {
-      m_3dPreviewCfg.camPitchDeg = std::clamp(m_3dPreviewCfg.camPitchDeg - stepPitch, 10.0f, 80.0f);
+      m_3dPreviewCfg.pitchDeg = std::clamp(m_3dPreviewCfg.pitchDeg - stepPitch, 10.0f, 80.0f);
       changed = true;
     }
     if (IsKeyPressed(KEY_R)) {
-      m_3dPreviewCfg.camYawDeg = 45.0f;
-      m_3dPreviewCfg.camPitchDeg = 35.264f;
-      m_3dPreviewCfg.proj = Render3DConfig::Projection::IsometricOrtho;
+      m_3dPreviewCfg.yawDeg = 45.0f;
+      m_3dPreviewCfg.pitchDeg = 35.264f;
+      m_3dPreviewCfg.projection = Render3DConfig::Projection::IsometricOrtho;
       m_3dPreviewCfg.autoFit = true;
       changed = true;
     }
     if (IsKeyPressed(KEY_P)) {
       // Toggle projection between isometric orthographic and a mild perspective.
-      m_3dPreviewCfg.proj = (m_3dPreviewCfg.proj == Render3DConfig::Projection::IsometricOrtho)
-                                ? Render3DConfig::Projection::Perspective
-                                : Render3DConfig::Projection::IsometricOrtho;
+      m_3dPreviewCfg.projection =
+        (m_3dPreviewCfg.projection == Render3DConfig::Projection::IsometricOrtho)
+          ? Render3DConfig::Projection::Perspective
+          : Render3DConfig::Projection::IsometricOrtho;
       changed = true;
     }
 
@@ -6090,7 +6355,7 @@ void Game::handleInput(float dt)
       constexpr int kPages = 5;
       m_reportPage = (m_reportPage + delta + kPages) % kPages;
     } else if (m_showPolicy) {
-      const int count = 7;
+      const int count = 8;
       m_policySelection = (m_policySelection + delta + count) % count;
     } else if (m_showTrafficModel) {
       const int count = 9;
@@ -6251,6 +6516,7 @@ void Game::handleInput(float dt)
       case HeatmapOverlay::Pollution: return "Pollution";
       case HeatmapOverlay::TrafficSpill: return "Traffic spill";
       case HeatmapOverlay::FloodDepth: return "Flood depth";
+      case HeatmapOverlay::PondingDepth: return "Ponding depth";
       default: return "Heatmap";
       }
     };
@@ -6264,6 +6530,7 @@ void Game::handleInput(float dt)
       case HeatmapOverlay::Pollution: return 4;
       case HeatmapOverlay::TrafficSpill: return 5;
       case HeatmapOverlay::FloodDepth: return 6;
+      case HeatmapOverlay::PondingDepth: return 7;
       default: return 0;
       }
     };
@@ -6277,18 +6544,19 @@ void Game::handleInput(float dt)
       case 4: return HeatmapOverlay::Pollution;
       case 5: return HeatmapOverlay::TrafficSpill;
       case 6: return HeatmapOverlay::FloodDepth;
+      case 7: return HeatmapOverlay::PondingDepth;
       default: return HeatmapOverlay::Off;
       }
     };
 
-    const int count = 7;
+    const int count = 8;
     const int delta = shift ? -1 : 1;
     int idx = toIndex(m_heatmapOverlay);
     idx = (idx + delta + count) % count;
     m_heatmapOverlay = fromIndex(idx);
 
     m_landValueDirty = true;
-    m_seaFloodDirty = true;
+    invalidateHydrology();
     showToast(TextFormat("Heatmap: %s", nameOf(m_heatmapOverlay)));
   }
 
@@ -7579,7 +7847,7 @@ void Game::draw()
   }
 
   const bool heatmapActive = (m_heatmapOverlay != HeatmapOverlay::Off);
-  const bool heatmapUsesLandValue = heatmapActive && (m_heatmapOverlay != HeatmapOverlay::FloodDepth);
+  const bool heatmapUsesLandValue = heatmapActive && (m_heatmapOverlay != HeatmapOverlay::FloodDepth) && (m_heatmapOverlay != HeatmapOverlay::PondingDepth);
   const bool districtStatsActive = m_showDistrictPanel || (m_showReport && m_reportPage == 4);
 
   // Many derived systems need the "road component touches map edge" mask.
@@ -7696,6 +7964,50 @@ void Game::draw()
     }
   }
 
+  // --- Ponding / depression-fill heatmap (derived from the heightfield) ---
+  const bool needPondingHeatmap = heatmapActive && (m_heatmapOverlay == HeatmapOverlay::PondingDepth);
+  if (needPondingHeatmap) {
+    const int w = m_world.width();
+    const int h = m_world.height();
+    const std::size_t n = static_cast<std::size_t>(std::max(0, w) * std::max(0, h));
+
+    if (m_pondingDirty || m_pondingHeatmap.size() != n) {
+      std::vector<float> heights(n, 0.0f);
+      std::vector<std::uint8_t> drainMask(n, 0);
+
+      if (w > 0 && h > 0) {
+        for (int y = 0; y < h; ++y) {
+          for (int x = 0; x < w; ++x) {
+            const Tile& t = m_world.at(x, y);
+            const std::size_t i = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+            heights[i] = t.height;
+
+            // Preserve existing water bodies (and rivers) as drains so we measure "new" ponding potential.
+            if (t.terrain == Terrain::Water && t.overlay != Overlay::Road) {
+              drainMask[i] = 1;
+            }
+          }
+        }
+      }
+
+      const DepressionFillResult r = FillDepressionsPriorityFlood(heights, w, h, &drainMask, m_pondingCfg);
+
+      m_pondingFilledCells = r.filledCells;
+      m_pondingVolume = r.volume;
+      m_pondingMaxDepth = r.maxDepth;
+
+      m_pondingHeatmap.assign(n, 0.0f);
+      const float denom = (m_pondingMaxDepth > 1e-6f) ? m_pondingMaxDepth : 0.0f;
+      if (denom > 0.0f && r.depth.size() == n) {
+        for (std::size_t i = 0; i < n; ++i) {
+          m_pondingHeatmap[i] = std::clamp(r.depth[i] / denom, 0.0f, 1.0f);
+        }
+      }
+
+      m_pondingDirty = false;
+    }
+  }
+
   // --- Heatmap overlay (land value + component fields) ---
   const std::vector<float>* heatmap = nullptr;
   Renderer::HeatmapRamp heatmapRamp = Renderer::HeatmapRamp::Good;
@@ -7731,7 +8043,12 @@ void Game::draw()
     case HeatmapOverlay::FloodDepth:
       heatmapName = "Flood depth";
       heatmap = &m_seaFloodHeatmap;
-      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      heatmapRamp = Renderer::HeatmapRamp::Water;
+      break;
+    case HeatmapOverlay::PondingDepth:
+      heatmapName = "Ponding depth";
+      heatmap = &m_pondingHeatmap;
+      heatmapRamp = Renderer::HeatmapRamp::Water;
       break;
     default: break;
     }
@@ -7885,6 +8202,10 @@ void Game::draw()
       const float depth = (m_seaFlood.maxDepth > 1e-6f) ? (hv * m_seaFlood.maxDepth) : 0.0f;
       std::snprintf(buf, sizeof(buf), "Heatmap: %s (sea %.2f)  depth %.2f", heatmapName,
                     static_cast<double>(m_seaLevel), static_cast<double>(depth));
+    } else if (m_heatmapOverlay == HeatmapOverlay::PondingDepth) {
+      const float depth = (m_pondingMaxDepth > 1e-6f) ? (hv * m_pondingMaxDepth) : 0.0f;
+      std::snprintf(buf, sizeof(buf), "Heatmap: %s  depth %.2f (max %.2f)", heatmapName,
+                    static_cast<double>(depth), static_cast<double>(m_pondingMaxDepth));
     } else {
       std::snprintf(buf, sizeof(buf), "Heatmap: %s  %.2f", heatmapName, static_cast<double>(hv));
     }
@@ -7893,6 +8214,10 @@ void Game::draw()
     if (m_heatmapOverlay == HeatmapOverlay::FloodDepth) {
       char buf[128];
       std::snprintf(buf, sizeof(buf), "Heatmap: %s (sea %.2f)", heatmapName, static_cast<double>(m_seaLevel));
+      heatmapInfo = buf;
+    } else if (m_heatmapOverlay == HeatmapOverlay::PondingDepth) {
+      char buf[128];
+      std::snprintf(buf, sizeof(buf), "Heatmap: %s (max %.2f)", heatmapName, static_cast<double>(m_pondingMaxDepth));
       heatmapInfo = buf;
     } else {
       heatmapInfo = std::string("Heatmap: ") + heatmapName;
@@ -8364,15 +8689,15 @@ void Game::draw()
     const TrafficResult* trPtr = nullptr;
     const GoodsResult* grPtr = nullptr;
 
-    const bool requireOutside = m_sim.config().requireOutsideConnection;
-    const bool needRoadToEdgeMask = requireOutside &&
+    const bool render3d_requireOutside = m_sim.config().requireOutsideConnection;
+    const bool render3d_needRoadToEdgeMask = render3d_requireOutside &&
         (layer == ExportLayer::Traffic || layer == ExportLayer::LandValue || layer == ExportLayer::GoodsTraffic ||
          layer == ExportLayer::GoodsFill);
 
-    const std::vector<std::uint8_t>* roadToEdgeMask = nullptr;
-    if (needRoadToEdgeMask) {
+    const std::vector<std::uint8_t>* render3d_roadToEdgeMask = nullptr;
+    if (render3d_needRoadToEdgeMask) {
       ComputeRoadsConnectedToEdge(m_world, m_outsideOverlayRoadToEdge);
-      roadToEdgeMask = &m_outsideOverlayRoadToEdge;
+      render3d_roadToEdgeMask = &m_outsideOverlayRoadToEdge;
     }
 
     // Traffic (commute)
@@ -8384,7 +8709,7 @@ void Game::draw()
                                 : 0.0f;
 
         TrafficConfig tc;
-        tc.requireOutsideConnection = requireOutside;
+        tc.requireOutsideConnection = render3d_requireOutside;
         {
           const TrafficModelSettings& tm = m_sim.trafficModel();
           tc.congestionAwareRouting = tm.congestionAwareRouting;
@@ -8398,7 +8723,7 @@ void Game::draw()
           tc.jobPenaltyBaseMilli = tm.jobPenaltyBaseMilli;
         }
 
-        const std::vector<std::uint8_t>* pre = (tc.requireOutsideConnection ? roadToEdgeMask : nullptr);
+        const std::vector<std::uint8_t>* pre = (tc.requireOutsideConnection ? render3d_roadToEdgeMask : nullptr);
         m_traffic = ComputeCommuteTraffic(m_world, tc, share, pre);
         m_trafficDirty = false;
       }
@@ -8409,8 +8734,8 @@ void Game::draw()
     if (layer == ExportLayer::GoodsTraffic || layer == ExportLayer::GoodsFill) {
       if (m_goodsDirty) {
         GoodsConfig gc;
-        gc.requireOutsideConnection = requireOutside;
-        const std::vector<std::uint8_t>* pre = (gc.requireOutsideConnection ? roadToEdgeMask : nullptr);
+        gc.requireOutsideConnection = render3d_requireOutside;
+        const std::vector<std::uint8_t>* pre = (gc.requireOutsideConnection ? render3d_roadToEdgeMask : nullptr);
         m_goods = ComputeGoodsFlow(m_world, gc, pre);
         m_goodsDirty = false;
       }
@@ -8422,9 +8747,9 @@ void Game::draw()
       if (m_landValueDirty ||
           m_landValue.value.size() != static_cast<std::size_t>(std::max(0, m_world.width()) * std::max(0, m_world.height()))) {
         LandValueConfig lc;
-        lc.requireOutsideConnection = requireOutside;
+        lc.requireOutsideConnection = render3d_requireOutside;
         lvPtr = nullptr;
-        m_landValue = ComputeLandValue(m_world, lc, trPtr, roadToEdgeMask);
+        m_landValue = ComputeLandValue(m_world, lc, trPtr, render3d_roadToEdgeMask);
         m_landValueDirty = false;
       }
       lvPtr = &m_landValue;

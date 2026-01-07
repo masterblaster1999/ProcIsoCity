@@ -187,7 +187,7 @@ void MakeTreeDeciduous(int variant, std::uint32_t seedv, const GfxPropsConfig& c
 
   // Canopy size.
   const float canopyR = static_cast<float>(cfg.tileH) * (0.55f + 0.22f * h01(5, 6, 0xA3u));
-  const float canopyR2 = canopyR * (0.75f + 0.20f * h01(7, 8, 0xA4u));
+  [[maybe_unused]] const float canopyR2 = canopyR * (0.75f + 0.20f * h01(7, 8, 0xA4u));
 
   const float cx = static_cast<float>(lay.pivotX) + (h01(9, 10, 0xA5u) - 0.5f) * 2.0f;
   const float cy = static_cast<float>(lay.pivotY) - trunkH - canopyR * 0.45f;
@@ -328,6 +328,9 @@ void MakeTreeConifer(int variant, std::uint32_t seedv, const GfxPropsConfig& cfg
 void MakeStreetLight(int variant, std::uint32_t seedv, const GfxPropsConfig& cfg, const GfxPalette& pal,
                      GfxPropSprite& out)
 {
+  // Fold the variant into the seed so multiple styles can co-exist deterministically.
+  seedv ^= 0x9E3779B9u * static_cast<std::uint32_t>(variant + 1);
+
   const TallSpriteLayout lay = MakeTallLayout(cfg);
 
   // Slightly shorter than trees by default.

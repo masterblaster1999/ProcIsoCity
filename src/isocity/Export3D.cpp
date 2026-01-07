@@ -344,6 +344,9 @@ PpmImage RenderWorld3D(const World& world, ExportLayer layer, const Render3DConf
   shading.bgR = cfg.bgR;
   shading.bgG = cfg.bgG;
   shading.bgB = cfg.bgB;
+  shading.fogR = cfg.fogR;
+  shading.fogG = cfg.fogG;
+  shading.fogB = cfg.fogB;
   shading.enableFog = cfg.fog;
   shading.fogStrength = cfg.fogStrength;
   shading.fogStart = cfg.fogStart;
@@ -357,6 +360,7 @@ PpmImage RenderWorld3D(const World& world, ExportLayer layer, const Render3DConf
   rc.outlineR = cfg.outlineR;
   rc.outlineG = cfg.outlineG;
   rc.outlineB = cfg.outlineB;
+  rc.outlineAlpha = cfg.outlineAlpha;
   rc.outlineDepthEps = cfg.outlineDepthEps;
 
   std::string renderErr;

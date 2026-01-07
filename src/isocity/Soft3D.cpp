@@ -218,6 +218,7 @@ inline void PutPixel(PpmImage& img, int x, int y, std::uint8_t r, std::uint8_t g
 inline void DrawLineZTest(PpmImage& img, std::vector<float>& zbuf,
                           const SVtx& a, const SVtx& b,
                           std::uint8_t r, std::uint8_t g, std::uint8_t bb,
+                          float alpha,
                           float depthEps)
 {
   const float dx = b.sx - a.sx;
@@ -226,6 +227,8 @@ inline void DrawLineZTest(PpmImage& img, std::vector<float>& zbuf,
   const float ady = std::fabs(dy);
   const int steps = static_cast<int>(std::ceil(std::max(adx, ady)));
   if (steps <= 0) return;
+
+  const float a01 = ClampF(alpha, 0.0f, 1.0f);
 
   for (int i = 0; i <= steps; ++i) {
     const float t = static_cast<float>(i) / static_cast<float>(steps);
@@ -237,7 +240,15 @@ inline void DrawLineZTest(PpmImage& img, std::vector<float>& zbuf,
     if (x < 0 || y < 0 || x >= img.width || y >= img.height) continue;
     const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(img.width) + static_cast<std::size_t>(x);
     if (zf <= zbuf[idx] + depthEps) {
-      PutPixel(img, x, y, r, g, bb);
+      if (a01 >= 0.999f) {
+        PutPixel(img, x, y, r, g, bb);
+      } else if (a01 > 0.001f) {
+        const std::size_t i3 = idx * 3u;
+        const float inv = 1.0f - a01;
+        img.rgb[i3 + 0] = ToU8(static_cast<float>(img.rgb[i3 + 0]) * inv + static_cast<float>(r) * a01);
+        img.rgb[i3 + 1] = ToU8(static_cast<float>(img.rgb[i3 + 1]) * inv + static_cast<float>(g) * a01);
+        img.rgb[i3 + 2] = ToU8(static_cast<float>(img.rgb[i3 + 2]) * inv + static_cast<float>(bb) * a01);
+      }
     }
   }
 }
@@ -483,9 +494,9 @@ PpmImage RenderQuadsSoft3D(const std::vector<MeshQuad>& quads,
     const float s1 = ClampF(std::max(s0 + 1e-6f, shade.fogEnd), 0.0f, 1.0f);
     const float t = ClampF((depth01 - s0) / (s1 - s0), 0.0f, 1.0f);
     const float a = ClampF(shade.fogStrength, 0.0f, 1.0f) * t;
-    r = ToU8(static_cast<float>(r) * (1.0f - a) + static_cast<float>(shade.bgR) * a);
-    g = ToU8(static_cast<float>(g) * (1.0f - a) + static_cast<float>(shade.bgG) * a);
-    b = ToU8(static_cast<float>(b) * (1.0f - a) + static_cast<float>(shade.bgB) * a);
+    r = ToU8(static_cast<float>(r) * (1.0f - a) + static_cast<float>(shade.fogR) * a);
+    g = ToU8(static_cast<float>(g) * (1.0f - a) + static_cast<float>(shade.fogG) * a);
+    b = ToU8(static_cast<float>(b) * (1.0f - a) + static_cast<float>(shade.fogB) * a);
   };
 
   auto project = [&](const MeshV3& p) -> Vec4 {
@@ -626,10 +637,10 @@ PpmImage RenderQuadsSoft3D(const std::vector<MeshQuad>& quads,
       const SVtx e1 = sb;
       const SVtx e2 = sc;
       const SVtx e3 = sd;
-      DrawLineZTest(imgSS, zbuf, e0, e1, cfg.outlineR, cfg.outlineG, cfg.outlineB, cfg.outlineDepthEps);
-      DrawLineZTest(imgSS, zbuf, e1, e2, cfg.outlineR, cfg.outlineG, cfg.outlineB, cfg.outlineDepthEps);
-      DrawLineZTest(imgSS, zbuf, e2, e3, cfg.outlineR, cfg.outlineG, cfg.outlineB, cfg.outlineDepthEps);
-      DrawLineZTest(imgSS, zbuf, e3, e0, cfg.outlineR, cfg.outlineG, cfg.outlineB, cfg.outlineDepthEps);
+      DrawLineZTest(imgSS, zbuf, e0, e1, cfg.outlineR, cfg.outlineG, cfg.outlineB, cfg.outlineAlpha, cfg.outlineDepthEps);
+      DrawLineZTest(imgSS, zbuf, e1, e2, cfg.outlineR, cfg.outlineG, cfg.outlineB, cfg.outlineAlpha, cfg.outlineDepthEps);
+      DrawLineZTest(imgSS, zbuf, e2, e3, cfg.outlineR, cfg.outlineG, cfg.outlineB, cfg.outlineAlpha, cfg.outlineDepthEps);
+      DrawLineZTest(imgSS, zbuf, e3, e0, cfg.outlineR, cfg.outlineG, cfg.outlineB, cfg.outlineAlpha, cfg.outlineDepthEps);
     }
   }
 

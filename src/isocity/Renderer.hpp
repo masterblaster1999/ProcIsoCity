@@ -46,6 +46,9 @@ public:
     Good = 0,
     // 0 => good (green), 1 => bad (red)
     Bad = 1,
+
+    // 0 => shallow/low (light blue), 1 => deep/high (dark blue)
+    Water = 2,
   };
 
   // Multi-layer rendering (useful for debugging, capture, and future compositing).
@@ -58,14 +61,19 @@ public:
     Overlays = 3,
   };
 
-  static constexpr std::uint32_t LayerBit(RenderLayer layer) {
-    return 1u << static_cast<std::uint32_t>(layer);
-  }
-
-  static constexpr std::uint32_t kLayerTerrain = LayerBit(RenderLayer::Terrain);
-  static constexpr std::uint32_t kLayerDecals = LayerBit(RenderLayer::Decals);
-  static constexpr std::uint32_t kLayerStructures = LayerBit(RenderLayer::Structures);
-  static constexpr std::uint32_t kLayerOverlays = LayerBit(RenderLayer::Overlays);
+  // Some compilers (notably older MSVC toolsets) can be picky about calling a
+  // constexpr helper function in a constant-expression initializer inside the
+  // same class definition. Keep the layer mask bits as plain shifts to ensure
+  // they are always usable in constant contexts (static_assert, switch labels,
+  // template params, etc.).
+  static constexpr std::uint32_t kLayerTerrain =
+      1u << static_cast<std::uint32_t>(RenderLayer::Terrain);
+  static constexpr std::uint32_t kLayerDecals =
+      1u << static_cast<std::uint32_t>(RenderLayer::Decals);
+  static constexpr std::uint32_t kLayerStructures =
+      1u << static_cast<std::uint32_t>(RenderLayer::Structures);
+  static constexpr std::uint32_t kLayerOverlays =
+      1u << static_cast<std::uint32_t>(RenderLayer::Overlays);
   static constexpr std::uint32_t kLayerAll = kLayerTerrain | kLayerDecals | kLayerStructures | kLayerOverlays;
 
   // Purely-visual day/night cycle controls.
@@ -121,11 +129,39 @@ public:
     // Apply per-tile ground effects (wet sheen / snow cover).
     bool affectGround = true;
 
+    // Apply screen-space effects (fog + precipitation particles).
+    // Note: this is separate from affectGround so capture tools can export the
+    // world without post-FX while still baking wetness/snow into tiles.
+    bool affectScreen = true;
+
     // Draw precipitation particles (rain streaks / snowflakes).
     bool drawParticles = true;
 
     // When raining at night, draw a cheap "reflection" under lights on roads.
     bool reflectLights = true;
+  };
+
+  // Soft, large-scale cloud shadow mask rendered in world space (purely procedural).
+  //
+  // This is separate from ShadowSettings (building-cast shadows) and is intended to add
+  // slow-moving atmospheric lighting variation over the whole map.
+  struct CloudShadowSettings {
+    bool enabled = true;
+
+    // 0..1 overall opacity multiplier.
+    float strength = 0.22f;
+
+    // World-space feature size multiplier (higher => larger clouds).
+    float scale = 1.75f;
+
+    // Speed multiplier applied to weather wind (higher => faster movement).
+    float speed = 0.35f;
+
+    // 0..1 approximate coverage amount (higher => more clouds).
+    float coverage = 0.58f;
+
+    // 0..1 edge softness (higher => blurrier edges).
+    float softness = 0.70f;
   };
 
   // Ground shadow casting from structures (buildings).
@@ -257,6 +293,10 @@ public:
   WeatherSettings::Mode weatherMode() const { return m_weather.mode; }
   bool weatherEnabled() const { return m_weather.mode != WeatherSettings::Mode::Clear; }
 
+  // Cloud shadow controls (procedural atmospheric shadows).
+  void setCloudShadowSettings(const CloudShadowSettings& s);
+  const CloudShadowSettings& cloudShadowSettings() const { return m_cloudShadows; }
+
   // Shadow controls (stylized building ground shadows).
   void setShadowSettings(const ShadowSettings& s) { m_shadows = s; }
   const ShadowSettings& shadowSettings() const { return m_shadows; }
@@ -346,6 +386,9 @@ private:
 
   WeatherSettings m_weather{};
 
+  CloudShadowSettings m_cloudShadows{};
+  Texture2D m_cloudShadowTex{};
+
   ShadowSettings m_shadows{};
 
   std::array<std::array<Texture2D, kTerrainVariants>, kTerrainTypes> m_terrainTex{};
@@ -366,6 +409,8 @@ private:
 
   void unloadVehicleSprites();
   void rebuildVehicleSprites();
+
+  void rebuildCloudShadowTexture();
 
 
   // 32-bit seed used for procedural render details (ties visual variety to world seed).

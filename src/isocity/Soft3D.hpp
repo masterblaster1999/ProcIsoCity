@@ -73,6 +73,11 @@ struct Soft3DShading {
   std::uint8_t bgG = 32;
   std::uint8_t bgB = 42;
 
+  // Fog blend target color (RGB). Defaults to a cool gray.
+  std::uint8_t fogR = 200;
+  std::uint8_t fogG = 210;
+  std::uint8_t fogB = 225;
+
   // Simple depth-based fog.
   bool enableFog = false;
   float fogStrength = 0.35f;
@@ -94,6 +99,8 @@ struct Soft3DRenderConfig {
   std::uint8_t outlineR = 0;
   std::uint8_t outlineG = 0;
   std::uint8_t outlineB = 0;
+  // Outline alpha blended over the filled surface.
+  float outlineAlpha = 1.0f;
   float outlineDepthEps = 0.002f;
 };
 

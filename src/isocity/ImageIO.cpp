@@ -281,7 +281,7 @@ struct HuffmanTable {
       }
     }
 
-    const std::size_t tableSize = 1u << static_cast<std::size_t>(maxLen);
+    const std::size_t tableSize = std::size_t{1} << static_cast<std::size_t>(maxLen);
     table.assign(tableSize, HuffmanEntry{});
 
     std::array<int, 16> nextCode = {};

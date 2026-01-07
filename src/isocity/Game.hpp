@@ -5,6 +5,7 @@
 #include "isocity/EditHistory.hpp"
 #include "isocity/Export.hpp"
 #include "isocity/FloodRisk.hpp"
+#include "isocity/DepressionFill.hpp"
 #include "isocity/FlowField.hpp"
 #include "isocity/Blueprint.hpp"
 #include "isocity/Iso.hpp"
@@ -76,6 +77,7 @@ public:
 
 private:
   void resetWorld(std::uint64_t newSeed);
+  void invalidateHydrology();
   void applyToolBrush(int centerX, int centerY);
   void floodFillDistrict(Point start, bool includeRoads);
   void floodFillTool(Point start, bool includeRoads);
@@ -143,6 +145,10 @@ private:
   void updateDynamicWorldRenderScale(float dt);
   bool wantsWorldRenderTarget() const;
   float clampWorldRenderScale(float scale) const;
+  void setWorldRenderScale(float scale);
+  void setWorldRenderScaleMin(float scaleMin);
+  void setWorldRenderScaleMax(float scaleMax);
+  void updateWorldRenderFilter();
   void ensureWorldRenderTarget(int screenW, int screenH);
   void unloadWorldRenderTarget();
   void drawVideoSettingsPanel(int uiW, int uiH);
@@ -364,6 +370,9 @@ private:
 
     // Sea-level coastal flooding depth (derived from the heightfield).
     FloodDepth,
+
+    // Depression-fill depth (Priority-Flood): "ponding potential" in closed basins.
+    PondingDepth,
   };
 
   HeatmapOverlay m_heatmapOverlay = HeatmapOverlay::Off;
@@ -376,6 +385,15 @@ private:
   SeaFloodConfig m_seaFloodCfg{};
   SeaFloodResult m_seaFlood;
   std::vector<float> m_seaFloodHeatmap; // normalized depth: 0 (dry) .. 1 (deepest)
+
+  // Depression-fill / ponding potential (heatmap): computed on-demand when the ponding heatmap is active.
+  bool m_pondingDirty = true;
+  DepressionFillConfig m_pondingCfg{};
+  int m_pondingFilledCells = 0;
+  double m_pondingVolume = 0.0;
+  float m_pondingMaxDepth = 0.0f;
+  std::vector<float> m_pondingHeatmap; // normalized depth: 0 (none) .. 1 (deepest)
+
 
   // Vehicles overlay: small moving agents representing commuting + goods shipments.
   bool m_showVehicles = false;

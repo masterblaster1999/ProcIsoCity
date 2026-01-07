@@ -4,6 +4,9 @@
 #include "isocity/Random.hpp"
 #include "isocity/ZoneMetrics.hpp"
 
+#include "isocity/FloodRisk.hpp"
+#include "isocity/DepressionFill.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -532,6 +535,26 @@ inline void HeatRampPurple(float v01, std::uint8_t& r, std::uint8_t& g, std::uin
   b = ToByte(90.0f + 165.0f * t);
 }
 
+// Depth-like ramp used for flood overlays.
+// 0 -> black (no flood), 1 -> deep blue.
+inline void HeatRampBlue(float v01, std::uint8_t& r, std::uint8_t& g, std::uint8_t& b)
+{
+  const float t = Clamp01(v01);
+  const float vis = SmoothStep(0.0f, 0.02f, t);
+
+  // Shallow (near sea level): light blue; Deep: dark saturated blue.
+  constexpr float shallowR = 180.0f, shallowG = 220.0f, shallowB = 255.0f;
+  constexpr float deepR = 0.0f, deepG = 30.0f, deepB = 120.0f;
+
+  const float rr = (shallowR + (deepR - shallowR) * t) * vis;
+  const float gg = (shallowG + (deepG - shallowG) * t) * vis;
+  const float bb = (shallowB + (deepB - shallowB) * t) * vis;
+
+  r = ToByte(rr);
+  g = ToByte(gg);
+  b = ToByte(bb);
+}
+
 inline void DistrictPalette(std::uint8_t id, std::uint8_t& r, std::uint8_t& g, std::uint8_t& b)
 {
   // 8 distinct-ish colors (matches kDistrictCount).
@@ -561,6 +584,104 @@ inline std::size_t FlatIdx(int x, int y, int w)
   return static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
 }
 
+inline void BuildHeightFieldAndDrainMask(const World& world, std::vector<float>& heights,
+                                       std::vector<std::uint8_t>& drainMask)
+{
+  const int w = world.width();
+  const int h = world.height();
+  const std::size_t n =
+      static_cast<std::size_t>(std::max(0, w)) * static_cast<std::size_t>(std::max(0, h));
+
+  heights.assign(n, 0.0f);
+  drainMask.assign(n, 0);
+
+  if (w <= 0 || h <= 0) return;
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const Tile& t = world.at(x, y);
+      const std::size_t i = FlatIdx(x, y, w);
+      heights[i] = t.height;
+      // Treat existing water bodies as drains/outlets for depression fill.
+      if (t.terrain == Terrain::Water) {
+        drainMask[i] = 1;
+      }
+    }
+  }
+}
+
+inline float InferCoastalSeaLevel(const World& world)
+{
+  // We infer sea level by looking at edge-connected "ocean" water tiles (Terrain::Water).
+  // This avoids inland lakes artificially raising the sea threshold.
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return 0.35f;
+
+  const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+
+  std::vector<std::uint8_t> visited(n, 0);
+  std::vector<std::size_t> stack;
+  stack.reserve(static_cast<std::size_t>(w + h) * 2u);
+
+  auto pushIfOcean = [&](int x, int y) {
+    if (x < 0 || y < 0 || x >= w || y >= h) return;
+    const std::size_t i = FlatIdx(x, y, w);
+    if (visited[i]) return;
+    const Tile& t = world.at(x, y);
+    if (t.terrain != Terrain::Water) return;
+    visited[i] = 1;
+    stack.push_back(i);
+  };
+
+  // Seed with edge water tiles.
+  for (int x = 0; x < w; ++x) {
+    pushIfOcean(x, 0);
+    pushIfOcean(x, h - 1);
+  }
+  for (int y = 0; y < h; ++y) {
+    pushIfOcean(0, y);
+    pushIfOcean(w - 1, y);
+  }
+
+  const bool anyEdgeWater = !stack.empty();
+  float seaLevel = 0.0f;
+
+  while (!stack.empty()) {
+    const std::size_t i = stack.back();
+    stack.pop_back();
+
+    const int x = static_cast<int>(i % static_cast<std::size_t>(w));
+    const int y = static_cast<int>(i / static_cast<std::size_t>(w));
+
+    seaLevel = std::max(seaLevel, world.at(x, y).height);
+
+    pushIfOcean(x - 1, y);
+    pushIfOcean(x + 1, y);
+    pushIfOcean(x, y - 1);
+    pushIfOcean(x, y + 1);
+  }
+
+  if (anyEdgeWater) return seaLevel;
+
+  // Fallback: if there is no edge-connected water at all, use max water height (inland lakes),
+  // and if there is no water, fall back to the in-game default.
+  bool anyWater = false;
+  float maxWaterH = 0.0f;
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const Tile& t = world.at(x, y);
+      if (t.terrain == Terrain::Water) {
+        anyWater = true;
+        maxWaterH = std::max(maxWaterH, t.height);
+      }
+    }
+  }
+
+  return anyWater ? maxWaterH : 0.35f;
+}
+
+
 struct TileColorContext {
   int w = 0;
   int h = 0;
@@ -571,6 +692,14 @@ struct TileColorContext {
 
   std::uint16_t maxTraffic = 0;
   std::uint16_t maxGoodsTraffic = 0;
+
+  // Optional derived fields for heightfield-driven layers.
+  const std::vector<float>* seaFloodDepth = nullptr;
+  float seaFloodMaxDepth = 0.0f;
+  float seaLevel = 0.0f;
+
+  const std::vector<float>* pondingDepth = nullptr;
+  float pondingMaxDepth = 0.0f;
 };
 
 inline TileColorContext MakeTileColorContext(const World& world, const LandValueResult* landValue, const TrafficResult* traffic,
@@ -692,6 +821,39 @@ inline void ComputeTileColor(const World& world, int x, int y, ExportLayer layer
     }
   } break;
 
+    case ExportLayer::FloodDepth: {
+    // Sea-level coastal flooding depth. We prefer a precomputed field (if the caller provided one),
+    // but keep a small fallback so exports remain robust even when derived data isn't passed in.
+    float depth = 0.0f;
+    const std::size_t i = FlatIdx(x, y, ctx.w);
+
+    if (ctx.seaFloodDepth && i < ctx.seaFloodDepth->size()) {
+      depth = (*ctx.seaFloodDepth)[i];
+    } else {
+      const float sea = (ctx.seaLevel > 1e-6f) ? ctx.seaLevel : 0.35f;
+      depth = std::max(0.0f, sea - t.height);
+    }
+
+    float denom = (ctx.seaFloodMaxDepth > 1e-6f) ? ctx.seaFloodMaxDepth : 0.0f;
+    if (denom <= 1e-6f) denom = (ctx.seaLevel > 1e-6f) ? ctx.seaLevel : 0.0f;
+
+    const float depth01 = (denom > 1e-6f) ? Clamp01(depth / denom) : 0.0f;
+    HeatRampBlue(depth01, r, g, b);
+  } break;
+
+  case ExportLayer::PondingDepth: {
+    // Priority-Flood depression-fill depth ("ponding potential").
+    float depth = 0.0f;
+    const std::size_t i = FlatIdx(x, y, ctx.w);
+    if (ctx.pondingDepth && i < ctx.pondingDepth->size()) {
+      depth = (*ctx.pondingDepth)[i];
+    }
+
+    const float denom = (ctx.pondingMaxDepth > 1e-6f) ? ctx.pondingMaxDepth : 0.0f;
+    const float depth01 = (denom > 1e-6f) ? Clamp01(depth / denom) : 0.0f;
+    HeatRampBlue(depth01, r, g, b);
+  } break;
+
   default:
     break;
   }
@@ -790,6 +952,11 @@ bool ParseExportLayer(const std::string& s, ExportLayer& outLayer)
   if (k == "goods" || k == "goods_traffic" || k == "goodstraffic") { outLayer = ExportLayer::GoodsTraffic; return true; }
   if (k == "goods_fill" || k == "goodsfill" || k == "fill") { outLayer = ExportLayer::GoodsFill; return true; }
   if (k == "district" || k == "districts") { outLayer = ExportLayer::District; return true; }
+  if (k == "flooddepth" || k == "flood_depth" || k == "flood") { outLayer = ExportLayer::FloodDepth; return true; }
+  if (k == "pondingdepth" || k == "ponding_depth" || k == "pond" || k == "ponding" || k == "depression") {
+    outLayer = ExportLayer::PondingDepth;
+    return true;
+  }
   return false;
 }
 
@@ -804,6 +971,7 @@ const char* ExportLayerName(ExportLayer layer)
   case ExportLayer::GoodsTraffic: return "goods_traffic";
   case ExportLayer::GoodsFill: return "goods_fill";
   case ExportLayer::District: return "district";
+  case ExportLayer::FloodDepth: return "flood_depth";
   default: return "unknown";
   }
 }
@@ -818,7 +986,49 @@ PpmImage RenderPpmLayer(const World& world, ExportLayer layer, const LandValueRe
 
   img.rgb.resize(static_cast<std::size_t>(img.width) * static_cast<std::size_t>(img.height) * 3u, 0);
 
-  const TileColorContext ctx = MakeTileColorContext(world, landValue, traffic, goods);
+  // Derived, heightfield-driven layers may require some precomputation.
+  std::vector<float> heights;
+  std::vector<std::uint8_t> drainMask;
+
+  SeaFloodResult seaFlood{};
+  DepressionFillResult ponding{};
+
+  bool haveSeaFlood = false;
+  bool havePonding = false;
+  float seaLevel = 0.0f;
+
+  if (layer == ExportLayer::FloodDepth || layer == ExportLayer::PondingDepth) {
+    BuildHeightFieldAndDrainMask(world, heights, drainMask);
+  }
+
+  if (layer == ExportLayer::FloodDepth) {
+    seaLevel = InferCoastalSeaLevel(world);
+    SeaFloodConfig cfg{};
+    cfg.requireEdgeConnection = true;
+    cfg.eightConnected = false;
+    seaFlood = ComputeSeaLevelFlood(heights, img.width, img.height, seaLevel, cfg);
+    haveSeaFlood = true;
+  }
+
+  if (layer == ExportLayer::PondingDepth) {
+    DepressionFillConfig cfg{};
+    cfg.includeEdges = true;
+    cfg.epsilon = 0.0f;
+    ponding = FillDepressionsPriorityFlood(heights, img.width, img.height, &drainMask, cfg);
+    havePonding = true;
+  }
+
+  TileColorContext ctx = MakeTileColorContext(world, landValue, traffic, goods);
+  if (haveSeaFlood) {
+    ctx.seaFloodDepth = &seaFlood.depth;
+    ctx.seaFloodMaxDepth = seaFlood.maxDepth;
+    ctx.seaLevel = seaLevel;
+  }
+  if (havePonding) {
+    ctx.pondingDepth = &ponding.depth;
+    ctx.pondingMaxDepth = ponding.maxDepth;
+  }
+
 
   for (int y = 0; y < img.height; ++y) {
     for (int x = 0; x < img.width; ++x) {
@@ -895,7 +1105,49 @@ IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const
     }
   }
 
-  const TileColorContext ctx = MakeTileColorContext(world, landValue, traffic, goods);
+  // Derived, heightfield-driven layers may require some precomputation.
+  std::vector<float> heights;
+  std::vector<std::uint8_t> drainMask;
+
+  SeaFloodResult seaFlood{};
+  DepressionFillResult ponding{};
+
+  bool haveSeaFlood = false;
+  bool havePonding = false;
+  float seaLevel = 0.0f;
+
+  if (layer == ExportLayer::FloodDepth || layer == ExportLayer::PondingDepth) {
+    BuildHeightFieldAndDrainMask(world, heights, drainMask);
+  }
+
+  if (layer == ExportLayer::FloodDepth) {
+    seaLevel = InferCoastalSeaLevel(world);
+    SeaFloodConfig cfg{};
+    cfg.requireEdgeConnection = true;
+    cfg.eightConnected = false;
+    seaFlood = ComputeSeaLevelFlood(heights, mapW, mapH, seaLevel, cfg);
+    haveSeaFlood = true;
+  }
+
+  if (layer == ExportLayer::PondingDepth) {
+    DepressionFillConfig cfg{};
+    cfg.includeEdges = true;
+    cfg.epsilon = 0.0f;
+    ponding = FillDepressionsPriorityFlood(heights, mapW, mapH, &drainMask, cfg);
+    havePonding = true;
+  }
+
+  TileColorContext ctx = MakeTileColorContext(world, landValue, traffic, goods);
+  if (haveSeaFlood) {
+    ctx.seaFloodDepth = &seaFlood.depth;
+    ctx.seaFloodMaxDepth = seaFlood.maxDepth;
+    ctx.seaLevel = seaLevel;
+  }
+  if (havePonding) {
+    ctx.pondingDepth = &ponding.depth;
+    ctx.pondingMaxDepth = ponding.maxDepth;
+  }
+
 
   // Atmospheric styling is only meaningful for the visual layers.
   const bool allowAtmosphere = (layer == ExportLayer::Terrain || layer == ExportLayer::Overlay);
@@ -1890,7 +2142,7 @@ IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const
     if (cfg.dayNight.enabled && cfg.dayNight.drawLights && dayNight.night > 0.02f) {
       const float nightK = std::clamp(dayNight.night * std::clamp(cfg.dayNight.lightStrength, 0.0f, 2.0f), 0.0f, 1.0f);
 
-      auto roadMaskAt = [&](int rx, int ry) -> std::uint8_t {
+      auto roadMaskAtNL = [&](int rx, int ry) -> std::uint8_t {
         if (!world.inBounds(rx, ry)) return 0;
         const Tile& rt = world.at(rx, ry);
         if (rt.overlay != Overlay::Road) return 0;
@@ -1915,7 +2167,7 @@ IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const
 
           // Roads: streetlights and intersection glows.
           if (t.overlay == Overlay::Road) {
-            const std::uint8_t mask = roadMaskAt(tx, ty);
+            const std::uint8_t mask = roadMaskAtNL(tx, ty);
             const int conn = popCount4(mask);
             const bool intersection = (conn >= 3);
             const bool major = (static_cast<int>(t.level) >= 2);
@@ -2273,7 +2525,8 @@ bool ReadPpm(const std::string& path, PpmImage& outImg, std::string& outError)
   return true;
 }
 
-bool ComparePpm(const PpmImage& a, const PpmImage& b, PpmDiffStats& outStats, int threshold, PpmImage* outDiff)
+bool ComparePpm(const PpmImage& a, const PpmImage& b, PpmDiffStats& outStats, int threshold, PpmImage* outDiff,
+                int ssimWindow)
 {
   outStats = PpmDiffStats{};
 
@@ -2340,6 +2593,203 @@ bool ComparePpm(const PpmImage& a, const PpmImage& b, PpmDiffStats& outStats, in
     const double peak = 255.0;
     outStats.psnr = 10.0 * std::log10((peak * peak) / outStats.mse);
   }
+
+  // ---------------------------------------------------------------------------
+  // SSIM (Structural Similarity Index) on luma.
+  //
+  // We use a simple uniform window SSIM (box filter) with a caller-provided
+  // window size. This is fast enough for regression tooling and provides a much
+  // better correlation with perceived differences than raw MSE/PSNR.
+  // ---------------------------------------------------------------------------
+
+  auto Luma01 = [&](const PpmImage& img, int x, int y) -> double {
+    const std::size_t i = (static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x)) * 3u;
+    const double r = static_cast<double>(img.rgb[i + 0u]) / 255.0;
+    const double g = static_cast<double>(img.rgb[i + 1u]) / 255.0;
+    const double bch = static_cast<double>(img.rgb[i + 2u]) / 255.0;
+    // ITU-R BT.601 luma coefficients.
+    return 0.299 * r + 0.587 * g + 0.114 * bch;
+  };
+
+  auto GlobalSsim = [&]() -> double {
+    const double c1 = 0.01 * 0.01;
+    const double c2 = 0.03 * 0.03;
+
+    const double n = static_cast<double>(outStats.pixelsCompared);
+    if (n <= 0.0) return 1.0;
+
+    double sumA = 0.0;
+    double sumB = 0.0;
+    double sumAA = 0.0;
+    double sumBB = 0.0;
+    double sumAB = 0.0;
+
+    for (int yy = 0; yy < h; ++yy) {
+      for (int xx = 0; xx < w; ++xx) {
+        const double la = Luma01(a, xx, yy);
+        const double lb = Luma01(b, xx, yy);
+        sumA += la;
+        sumB += lb;
+        sumAA += la * la;
+        sumBB += lb * lb;
+        sumAB += la * lb;
+      }
+    }
+
+    const double muA = sumA / n;
+    const double muB = sumB / n;
+    double varA = sumAA / n - muA * muA;
+    double varB = sumBB / n - muB * muB;
+    double cov = sumAB / n - muA * muB;
+
+    if (varA < 0.0) varA = 0.0;
+    if (varB < 0.0) varB = 0.0;
+
+    const double num = (2.0 * muA * muB + c1) * (2.0 * cov + c2);
+    const double den = (muA * muA + muB * muB + c1) * (varA + varB + c2);
+    if (den == 0.0) return 1.0;
+    const double s = num / den;
+    return std::clamp(s, -1.0, 1.0);
+  };
+
+  // Sanitize window: min 3, odd.
+  int win = ssimWindow;
+  if (win < 3) win = 3;
+  if ((win % 2) == 0) win += 1;
+
+  if (w < win || h < win) {
+    outStats.ssim = GlobalSsim();
+    return true;
+  }
+
+  const int r = win / 2;
+  const int interiorW = w - 2 * r;
+  const int interiorH = h - 2 * r;
+  const std::uint64_t count = (interiorW > 0 && interiorH > 0)
+                                 ? static_cast<std::uint64_t>(interiorW) * static_cast<std::uint64_t>(interiorH)
+                                 : 0u;
+  if (count == 0u) {
+    outStats.ssim = GlobalSsim();
+    return true;
+  }
+
+  const double c1 = 0.01 * 0.01;
+  const double c2 = 0.03 * 0.03;
+  const double area = static_cast<double>(win) * static_cast<double>(win);
+
+  // Vertical running sums (one per x) over the last `win` rows of horizontal sums.
+  std::vector<double> vA(static_cast<std::size_t>(w), 0.0);
+  std::vector<double> vB(static_cast<std::size_t>(w), 0.0);
+  std::vector<double> vAA(static_cast<std::size_t>(w), 0.0);
+  std::vector<double> vBB(static_cast<std::size_t>(w), 0.0);
+  std::vector<double> vAB(static_cast<std::size_t>(w), 0.0);
+
+  // Ring buffer storing the last `win` horizontal-sum rows so we can subtract the leaving row.
+  const std::size_t rowStride = static_cast<std::size_t>(w);
+  std::vector<double> ringA(static_cast<std::size_t>(win) * rowStride, 0.0);
+  std::vector<double> ringB(static_cast<std::size_t>(win) * rowStride, 0.0);
+  std::vector<double> ringAA(static_cast<std::size_t>(win) * rowStride, 0.0);
+  std::vector<double> ringBB(static_cast<std::size_t>(win) * rowStride, 0.0);
+  std::vector<double> ringAB(static_cast<std::size_t>(win) * rowStride, 0.0);
+
+  double sumSsim = 0.0;
+
+  for (int yy = 0; yy < h; ++yy) {
+    const int slot = yy % win;
+    const std::size_t base = static_cast<std::size_t>(slot) * rowStride;
+
+    double* hA = ringA.data() + base;
+    double* hB = ringB.data() + base;
+    double* hAA = ringAA.data() + base;
+    double* hBB = ringBB.data() + base;
+    double* hAB = ringAB.data() + base;
+
+    // Remove the leaving row from the vertical sums once the window is full.
+    if (yy >= win) {
+      for (int xx = 0; xx < w; ++xx) {
+        const std::size_t i = static_cast<std::size_t>(xx);
+        vA[i] -= hA[i];
+        vB[i] -= hB[i];
+        vAA[i] -= hAA[i];
+        vBB[i] -= hBB[i];
+        vAB[i] -= hAB[i];
+      }
+    }
+
+    // Build per-row prefix sums so we can compute horizontal box sums quickly.
+    std::vector<double> pA(static_cast<std::size_t>(w) + 1u, 0.0);
+    std::vector<double> pB(static_cast<std::size_t>(w) + 1u, 0.0);
+    std::vector<double> pAA(static_cast<std::size_t>(w) + 1u, 0.0);
+    std::vector<double> pBB(static_cast<std::size_t>(w) + 1u, 0.0);
+    std::vector<double> pAB(static_cast<std::size_t>(w) + 1u, 0.0);
+
+    for (int xx = 0; xx < w; ++xx) {
+      const double la = Luma01(a, xx, yy);
+      const double lb = Luma01(b, xx, yy);
+      const std::size_t pi = static_cast<std::size_t>(xx) + 1u;
+      pA[pi] = pA[pi - 1u] + la;
+      pB[pi] = pB[pi - 1u] + lb;
+      pAA[pi] = pAA[pi - 1u] + la * la;
+      pBB[pi] = pBB[pi - 1u] + lb * lb;
+      pAB[pi] = pAB[pi - 1u] + la * lb;
+    }
+
+    // Compute horizontal sums for interior x only; zero elsewhere.
+    for (int xx = 0; xx < w; ++xx) {
+      hA[xx] = 0.0;
+      hB[xx] = 0.0;
+      hAA[xx] = 0.0;
+      hBB[xx] = 0.0;
+      hAB[xx] = 0.0;
+    }
+
+    for (int xx = r; xx < w - r; ++xx) {
+      const int x0 = xx - r;
+      const int x1 = xx + r + 1;
+      const std::size_t s0 = static_cast<std::size_t>(x0);
+      const std::size_t s1 = static_cast<std::size_t>(x1);
+
+      hA[xx] = pA[s1] - pA[s0];
+      hB[xx] = pB[s1] - pB[s0];
+      hAA[xx] = pAA[s1] - pAA[s0];
+      hBB[xx] = pBB[s1] - pBB[s0];
+      hAB[xx] = pAB[s1] - pAB[s0];
+    }
+
+    // Add the new row into the vertical sums.
+    for (int xx = 0; xx < w; ++xx) {
+      const std::size_t i = static_cast<std::size_t>(xx);
+      vA[i] += hA[i];
+      vB[i] += hB[i];
+      vAA[i] += hAA[i];
+      vBB[i] += hBB[i];
+      vAB[i] += hAB[i];
+    }
+
+    // Once we have a full `win` rows, compute SSIM for the center row.
+    if (yy >= win - 1) {
+      for (int xx = r; xx < w - r; ++xx) {
+        const std::size_t i = static_cast<std::size_t>(xx);
+
+        const double muA = vA[i] / area;
+        const double muB = vB[i] / area;
+
+        double varA = vAA[i] / area - muA * muA;
+        double varB = vBB[i] / area - muB * muB;
+        double cov = vAB[i] / area - muA * muB;
+
+        if (varA < 0.0) varA = 0.0;
+        if (varB < 0.0) varB = 0.0;
+
+        const double num = (2.0 * muA * muB + c1) * (2.0 * cov + c2);
+        const double den = (muA * muA + muB * muB + c1) * (varA + varB + c2);
+        const double s = (den == 0.0) ? 1.0 : (num / den);
+        sumSsim += std::clamp(s, -1.0, 1.0);
+      }
+    }
+  }
+
+  outStats.ssim = sumSsim / static_cast<double>(count);
 
   return true;
 }
