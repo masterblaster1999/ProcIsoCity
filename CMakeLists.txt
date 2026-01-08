@@ -49,6 +49,7 @@ add_library(isocity_core
   src/isocity/Compression.cpp
   src/isocity/GltfExport.cpp
   src/isocity/GeoJsonExport.cpp
+  src/isocity/OsmImport.cpp
   src/isocity/Suite.cpp
   src/isocity/Blueprint.cpp
   src/isocity/MeshExport.cpp
@@ -570,6 +571,17 @@ if (PROCISOCITY_BUILD_CLI)
   target_link_libraries(proc_isocity_mapexport PRIVATE isocity_core)
 
   procisocity_set_strict_warnings(proc_isocity_mapexport)
+
+  # OSM import tool (headless): import an OpenStreetMap (OSM XML) extract into a new save.
+  add_executable(proc_isocity_osmimport
+    src/cli/osmimport.cpp
+  )
+
+  target_include_directories(proc_isocity_osmimport PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_osmimport PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_osmimport)
+
 
   # Tileset generator tool (headless): export procedural tile textures as a sprite atlas PNG (+ optional JSON metadata).
   add_executable(proc_isocity_tileset

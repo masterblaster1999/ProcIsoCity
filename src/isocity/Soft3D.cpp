@@ -1,5 +1,6 @@
 #include "isocity/Soft3D.hpp"
 
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -183,6 +184,67 @@ inline std::uint8_t ToU8(float f)
   return static_cast<std::uint8_t>(std::clamp(v, 0, 255));
 }
 
+inline float Smoothstep(float e0, float e1, float x)
+{
+  if (!(e1 > e0)) return (x >= e0) ? 1.0f : 0.0f;
+  const float t = ClampF((x - e0) / (e1 - e0), 0.0f, 1.0f);
+  return t * t * (3.0f - 2.0f * t);
+}
+
+// sRGB <-> linear helpers.
+inline float SrgbToLinear01(float cs)
+{
+  cs = ClampF(cs, 0.0f, 1.0f);
+  if (cs <= 0.04045f) return cs / 12.92f;
+  return std::pow((cs + 0.055f) / 1.055f, 2.4f);
+}
+
+inline float LinearToSrgb01(float cl)
+{
+  cl = ClampF(cl, 0.0f, 1.0f);
+  if (cl <= 0.0031308f) return cl * 12.92f;
+  return 1.055f * std::pow(cl, 1.0f / 2.4f) - 0.055f;
+}
+
+inline const std::array<float, 256>& SrgbU8ToLinearLut()
+{
+  static const std::array<float, 256> lut = []() {
+    std::array<float, 256> a{};
+    for (int i = 0; i < 256; ++i) {
+      const float cs = static_cast<float>(i) / 255.0f;
+      a[static_cast<std::size_t>(i)] = SrgbToLinear01(cs);
+    }
+    return a;
+  }();
+  return lut;
+}
+
+inline float SrgbU8ToLinear01(std::uint8_t v) { return SrgbU8ToLinearLut()[v]; }
+
+inline std::uint8_t Linear01ToSrgbU8(float v01)
+{
+  const float srgb01 = LinearToSrgb01(v01);
+  return ToU8(srgb01 * 255.0f);
+}
+
+inline std::uint32_t Hash32(std::uint32_t x)
+{
+  // A small integer hash (finalizer-inspired mix). Good enough for dithering/jitter.
+  x ^= x >> 16;
+  x *= 0x7feb352du;
+  x ^= x >> 15;
+  x *= 0x846ca68bu;
+  x ^= x >> 16;
+  return x;
+}
+
+inline std::uint32_t HashPixel(std::uint32_t seed, int x, int y)
+{
+  const std::uint32_t ux = static_cast<std::uint32_t>(x);
+  const std::uint32_t uy = static_cast<std::uint32_t>(y);
+  return Hash32(seed ^ (ux * 0x9e3779b9u) ^ (uy * 0x85ebca6bu));
+}
+
 inline void Clear(PpmImage& img, std::uint8_t r, std::uint8_t g, std::uint8_t b)
 {
   img.rgb.assign(static_cast<std::size_t>(img.width) * static_cast<std::size_t>(img.height) * 3u, 0);
@@ -281,6 +343,442 @@ inline void DownsampleBox(const PpmImage& src, int ssaa, PpmImage& dst)
   }
 }
 
+inline void DownsampleBoxGamma(const PpmImage& src, int ssaa, PpmImage& dst)
+{
+  dst.width = src.width / ssaa;
+  dst.height = src.height / ssaa;
+  dst.rgb.assign(static_cast<std::size_t>(dst.width) * static_cast<std::size_t>(dst.height) * 3u, 0);
+
+  const auto& lut = SrgbU8ToLinearLut();
+  const float invDenom = 1.0f / static_cast<float>(ssaa * ssaa);
+
+  for (int y = 0; y < dst.height; ++y) {
+    for (int x = 0; x < dst.width; ++x) {
+      float accR = 0.0f;
+      float accG = 0.0f;
+      float accB = 0.0f;
+      for (int yy = 0; yy < ssaa; ++yy) {
+        for (int xx = 0; xx < ssaa; ++xx) {
+          const int sx = x * ssaa + xx;
+          const int sy = y * ssaa + yy;
+          const std::size_t si = (static_cast<std::size_t>(sy) * static_cast<std::size_t>(src.width) + static_cast<std::size_t>(sx)) * 3u;
+          accR += lut[src.rgb[si + 0]];
+          accG += lut[src.rgb[si + 1]];
+          accB += lut[src.rgb[si + 2]];
+        }
+      }
+
+      const std::size_t di = (static_cast<std::size_t>(y) * static_cast<std::size_t>(dst.width) + static_cast<std::size_t>(x)) * 3u;
+      dst.rgb[di + 0] = Linear01ToSrgbU8(accR * invDenom);
+      dst.rgb[di + 1] = Linear01ToSrgbU8(accG * invDenom);
+      dst.rgb[di + 2] = Linear01ToSrgbU8(accB * invDenom);
+    }
+  }
+}
+
+inline void DownsampleDepthMin(const std::vector<float>& src, int srcW, int srcH, int ssaa,
+                               std::vector<float>& dst)
+{
+  const int dstW = srcW / ssaa;
+  const int dstH = srcH / ssaa;
+  dst.assign(static_cast<std::size_t>(dstW) * static_cast<std::size_t>(dstH), 1.0f);
+
+  for (int y = 0; y < dstH; ++y) {
+    for (int x = 0; x < dstW; ++x) {
+      float m = 1.0f;
+      for (int yy = 0; yy < ssaa; ++yy) {
+        for (int xx = 0; xx < ssaa; ++xx) {
+          const int sx = x * ssaa + xx;
+          const int sy = y * ssaa + yy;
+          const float d = src[static_cast<std::size_t>(sy) * static_cast<std::size_t>(srcW) + static_cast<std::size_t>(sx)];
+          m = std::min(m, d);
+        }
+      }
+      dst[static_cast<std::size_t>(y) * static_cast<std::size_t>(dstW) + static_cast<std::size_t>(x)] = m;
+    }
+  }
+}
+
+// ACES filmic curve (fitted) popularized by Krzysztof Narkowicz.
+inline float TonemapAcesFitted(float x)
+{
+  x = std::max(0.0f, x);
+  constexpr float a = 2.51f;
+  constexpr float b = 0.03f;
+  constexpr float c = 2.43f;
+  constexpr float d = 0.59f;
+  constexpr float e = 0.14f;
+  const float y = (x * (a * x + b)) / (x * (c * x + d) + e);
+  return ClampF(y, 0.0f, 1.0f);
+}
+
+inline void Blur3TapSeparable(const std::vector<float>& src, int w, int h, std::vector<float>& dst)
+{
+  // Gaussian-ish weights: [1 2 1] / 4.
+  std::vector<float> tmp(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), 0.0f);
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const int xm = std::max(0, x - 1);
+      const int xp = std::min(w - 1, x + 1);
+      const std::size_t i0 = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(xm);
+      const std::size_t i1 = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+      const std::size_t i2 = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(xp);
+      tmp[i1] = (src[i0] + 2.0f * src[i1] + src[i2]) * 0.25f;
+    }
+  }
+
+  dst.assign(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), 0.0f);
+  for (int y = 0; y < h; ++y) {
+    const int ym = std::max(0, y - 1);
+    const int yp = std::min(h - 1, y + 1);
+    for (int x = 0; x < w; ++x) {
+      const std::size_t i0 = static_cast<std::size_t>(ym) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+      const std::size_t i1 = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+      const std::size_t i2 = static_cast<std::size_t>(yp) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+      dst[i1] = (tmp[i0] + 2.0f * tmp[i1] + tmp[i2]) * 0.25f;
+    }
+  }
+}
+
+inline void DilationMaxSeparable(std::vector<float>& img, int w, int h, int radius)
+{
+  if (radius <= 0) return;
+  radius = std::min(radius, 32);
+
+  std::vector<float> tmp(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), 0.0f);
+  // Horizontal max.
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      float m = 0.0f;
+      const int x0 = std::max(0, x - radius);
+      const int x1 = std::min(w - 1, x + radius);
+      const std::size_t base = static_cast<std::size_t>(y) * static_cast<std::size_t>(w);
+      for (int xx = x0; xx <= x1; ++xx) {
+        m = std::max(m, img[base + static_cast<std::size_t>(xx)]);
+      }
+      tmp[base + static_cast<std::size_t>(x)] = m;
+    }
+  }
+
+  // Vertical max.
+  for (int y = 0; y < h; ++y) {
+    const int y0 = std::max(0, y - radius);
+    const int y1 = std::min(h - 1, y + radius);
+    for (int x = 0; x < w; ++x) {
+      float m = 0.0f;
+      for (int yy = y0; yy <= y1; ++yy) {
+        m = std::max(m, tmp[static_cast<std::size_t>(yy) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x)]);
+      }
+      img[static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x)] = m;
+    }
+  }
+}
+
+inline void ApplyPostFx(PpmImage& img, const std::vector<float>& depth, const Soft3DPostFxConfig& fx)
+{
+  const int w = img.width;
+  const int h = img.height;
+  if (w <= 0 || h <= 0) return;
+  const std::size_t nPix = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+  if (img.rgb.size() != nPix * 3u) return;
+  if (depth.size() != nPix) return;
+
+  const bool needLin = fx.enableAO || fx.enableEdge || fx.enableTonemap;
+  const bool needDither = fx.enableDither;
+  if (!needLin && !needDither) return;
+
+  // Convert to linear [0..1] if needed.
+  std::vector<float> lin;
+  if (needLin) {
+    lin.assign(nPix * 3u, 0.0f);
+    const auto& lut = SrgbU8ToLinearLut();
+    for (std::size_t i = 0; i < nPix; ++i) {
+      lin[i * 3u + 0] = lut[img.rgb[i * 3u + 0]];
+      lin[i * 3u + 1] = lut[img.rgb[i * 3u + 1]];
+      lin[i * 3u + 2] = lut[img.rgb[i * 3u + 2]];
+    }
+  }
+
+  // --- AO pass ---
+  if (fx.enableAO && needLin) {
+    const int radius = std::max(1, fx.aoRadiusPx);
+    const int samples = std::clamp(fx.aoSamples, 4, 32);
+    const float range = std::max(1e-6f, fx.aoRange);
+    const float bias = std::max(0.0f, fx.aoBias);
+    const float strength = ClampF(fx.aoStrength, 0.0f, 1.0f);
+    const float power = std::max(0.01f, fx.aoPower);
+
+    struct AOSample {
+      int dx = 0;
+      int dy = 0;
+      float dist = 1.0f;
+    };
+    std::vector<AOSample> kernel;
+    kernel.reserve(static_cast<std::size_t>(samples));
+
+    // Golden-angle spiral (precomputed per render), rounded to pixel taps.
+    constexpr float kGolden = 2.39996322972865332f;
+    for (int i = 0; i < samples; ++i) {
+      const float t = (static_cast<float>(i) + 0.5f) / static_cast<float>(samples);
+      const float ang = static_cast<float>(i) * kGolden;
+      const float r = std::sqrt(t) * static_cast<float>(radius);
+      const int dx = static_cast<int>(std::lround(std::cos(ang) * r));
+      const int dy = static_cast<int>(std::lround(std::sin(ang) * r));
+      if (dx == 0 && dy == 0) continue;
+      const float dist = std::sqrt(static_cast<float>(dx * dx + dy * dy));
+      kernel.push_back(AOSample{dx, dy, dist});
+    }
+    if (kernel.size() < 4u) {
+      kernel.clear();
+      kernel.push_back(AOSample{radius, 0, static_cast<float>(radius)});
+      kernel.push_back(AOSample{-radius, 0, static_cast<float>(radius)});
+      kernel.push_back(AOSample{0, radius, static_cast<float>(radius)});
+      kernel.push_back(AOSample{0, -radius, static_cast<float>(radius)});
+    }
+
+    std::vector<float> occ(nPix, 0.0f);
+
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) {
+        const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+        const float d0 = depth[idx];
+        if (!(d0 < 0.9999f)) {
+          occ[idx] = 0.0f;
+          continue;
+        }
+
+        const std::uint32_t hpx = HashPixel(fx.postSeed, x, y);
+        const int start = static_cast<int>(hpx % static_cast<std::uint32_t>(kernel.size()));
+
+        float sum = 0.0f;
+        int count = 0;
+        for (std::size_t s = 0; s < kernel.size(); ++s) {
+          const AOSample& k = kernel[(static_cast<std::size_t>(start) + s) % kernel.size()];
+          const int sx = x + k.dx;
+          const int sy = y + k.dy;
+          if (sx < 0 || sy < 0 || sx >= w || sy >= h) continue;
+          const std::size_t si = static_cast<std::size_t>(sy) * static_cast<std::size_t>(w) + static_cast<std::size_t>(sx);
+          const float d1 = depth[si];
+          if (!(d1 < 0.9999f)) continue;
+          const float dd = (d0 - d1) - bias;
+          if (!(dd > 0.0f)) continue;
+          if (dd >= range) continue;
+          const float wDepth = 1.0f - (dd / range);
+          const float wDist = 1.0f - ClampF(k.dist / static_cast<float>(radius), 0.0f, 1.0f);
+          sum += wDepth * wDist;
+          ++count;
+        }
+
+        float o = (count > 0) ? (sum / static_cast<float>(count)) : 0.0f;
+        o = std::pow(ClampF(o, 0.0f, 1.0f), power);
+        occ[idx] = o;
+      }
+    }
+
+    if (fx.aoBlurRadiusPx > 0) {
+      std::vector<float> blurred;
+      Blur3TapSeparable(occ, w, h, blurred);
+      occ.swap(blurred);
+    }
+
+    for (std::size_t i = 0; i < nPix; ++i) {
+      const float o = ClampF(occ[i], 0.0f, 1.0f);
+      const float mul = ClampF(1.0f - strength * o, 0.0f, 1.0f);
+      lin[i * 3u + 0] *= mul;
+      lin[i * 3u + 1] *= mul;
+      lin[i * 3u + 2] *= mul;
+    }
+  }
+
+  // --- Tonemap / grade ---
+  if (fx.enableTonemap && needLin) {
+    const float exposure = std::max(0.0f, fx.exposure);
+    const float contrast = std::max(0.0f, fx.contrast);
+    const float sat = std::max(0.0f, fx.saturation);
+    const float vignette = ClampF(fx.vignette, 0.0f, 1.0f);
+
+    for (int y = 0; y < h; ++y) {
+      const float ny = (static_cast<float>(y) + 0.5f) / static_cast<float>(h) * 2.0f - 1.0f;
+      for (int x = 0; x < w; ++x) {
+        const float nx = (static_cast<float>(x) + 0.5f) / static_cast<float>(w) * 2.0f - 1.0f;
+        const float d2 = nx * nx + ny * ny;
+        const float vig = 1.0f - vignette * Smoothstep(0.35f, 1.25f, d2);
+
+        const std::size_t i = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+        float r = lin[i * 3u + 0] * exposure;
+        float g = lin[i * 3u + 1] * exposure;
+        float b = lin[i * 3u + 2] * exposure;
+
+        // Filmic tonemap.
+        r = TonemapAcesFitted(r);
+        g = TonemapAcesFitted(g);
+        b = TonemapAcesFitted(b);
+
+        // Contrast around 0.5.
+        r = ClampF((r - 0.5f) * contrast + 0.5f, 0.0f, 1.0f);
+        g = ClampF((g - 0.5f) * contrast + 0.5f, 0.0f, 1.0f);
+        b = ClampF((b - 0.5f) * contrast + 0.5f, 0.0f, 1.0f);
+
+        // Saturation.
+        const float l = r * 0.2126f + g * 0.7152f + b * 0.0722f;
+        r = ClampF(l + (r - l) * sat, 0.0f, 1.0f);
+        g = ClampF(l + (g - l) * sat, 0.0f, 1.0f);
+        b = ClampF(l + (b - l) * sat, 0.0f, 1.0f);
+
+        r *= vig;
+        g *= vig;
+        b *= vig;
+
+        lin[i * 3u + 0] = r;
+        lin[i * 3u + 1] = g;
+        lin[i * 3u + 2] = b;
+      }
+    }
+  }
+
+  // --- Edge outlines (depth discontinuity) ---
+  if (fx.enableEdge && needLin) {
+    const float thr = ClampF(fx.edgeThreshold, 0.0f, 1.0f);
+    const float soft = std::max(1e-6f, fx.edgeSoftness);
+    const float alpha = ClampF(fx.edgeAlpha, 0.0f, 1.0f);
+
+    std::vector<float> edge(nPix, 0.0f);
+    for (int y = 0; y < h; ++y) {
+      const int ym = std::max(0, y - 1);
+      const int yp = std::min(h - 1, y + 1);
+      for (int x = 0; x < w; ++x) {
+        const int xm = std::max(0, x - 1);
+        const int xp = std::min(w - 1, x + 1);
+
+        const std::size_t i = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+        const float d = depth[i];
+        float md = 0.0f;
+
+        auto upd = [&](int xx, int yy) {
+          const std::size_t j = static_cast<std::size_t>(yy) * static_cast<std::size_t>(w) + static_cast<std::size_t>(xx);
+          md = std::max(md, std::fabs(d - depth[j]));
+        };
+
+        upd(xm, y);
+        upd(xp, y);
+        upd(x, ym);
+        upd(x, yp);
+        // Diagonals help for thin silhouettes.
+        upd(xm, ym);
+        upd(xp, ym);
+        upd(xm, yp);
+        upd(xp, yp);
+
+        edge[i] = Smoothstep(thr, thr + soft, md);
+      }
+    }
+
+    // EdgeRadiusPx is "thickness"; radius==1 means no extra dilation.
+    if (fx.edgeRadiusPx > 1) {
+      DilationMaxSeparable(edge, w, h, fx.edgeRadiusPx - 1);
+    }
+
+    const auto& lut = SrgbU8ToLinearLut();
+    const float er = lut[fx.edgeR];
+    const float eg = lut[fx.edgeG];
+    const float eb = lut[fx.edgeB];
+
+    for (std::size_t i = 0; i < nPix; ++i) {
+      const float a = alpha * ClampF(edge[i], 0.0f, 1.0f);
+      if (!(a > 1e-6f)) continue;
+      const float inv = 1.0f - a;
+      lin[i * 3u + 0] = lin[i * 3u + 0] * inv + er * a;
+      lin[i * 3u + 1] = lin[i * 3u + 1] * inv + eg * a;
+      lin[i * 3u + 2] = lin[i * 3u + 2] * inv + eb * a;
+    }
+  }
+
+  // --- Output conversion ---
+  if (needLin) {
+    // Convert linear -> sRGB and (optionally) dither/quantize.
+    const int bits = std::clamp(fx.ditherBits, 1, 8);
+    const int levels = (1 << bits) - 1;
+    const float invLevels = 1.0f / static_cast<float>(levels);
+    const float dStr = ClampF(fx.ditherStrength, 0.0f, 1.0f);
+
+    // 4x4 Bayer matrix values in [0..15].
+    static constexpr int bayer4[4][4] = {
+        {0, 8, 2, 10},
+        {12, 4, 14, 6},
+        {3, 11, 1, 9},
+        {15, 7, 13, 5},
+    };
+
+    const int ox = static_cast<int>((fx.postSeed >> 0) & 3u);
+    const int oy = static_cast<int>((fx.postSeed >> 2) & 3u);
+
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) {
+        const std::size_t i = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+        float r = lin[i * 3u + 0];
+        float g = lin[i * 3u + 1];
+        float b = lin[i * 3u + 2];
+
+        float sr = LinearToSrgb01(r);
+        float sg = LinearToSrgb01(g);
+        float sb = LinearToSrgb01(b);
+
+        if (fx.enableDither) {
+          const int bv = bayer4[(y + oy) & 3][(x + ox) & 3];
+          const float d = (static_cast<float>(bv) + 0.5f) / 16.0f - 0.5f; // [-0.5..0.5]
+          const float delta = d * dStr * invLevels;
+          sr += delta;
+          sg += delta;
+          sb += delta;
+
+          sr = ClampF(std::round(ClampF(sr, 0.0f, 1.0f) * static_cast<float>(levels)) * invLevels, 0.0f, 1.0f);
+          sg = ClampF(std::round(ClampF(sg, 0.0f, 1.0f) * static_cast<float>(levels)) * invLevels, 0.0f, 1.0f);
+          sb = ClampF(std::round(ClampF(sb, 0.0f, 1.0f) * static_cast<float>(levels)) * invLevels, 0.0f, 1.0f);
+        }
+
+        const std::size_t o = i * 3u;
+        img.rgb[o + 0] = ToU8(sr * 255.0f);
+        img.rgb[o + 1] = ToU8(sg * 255.0f);
+        img.rgb[o + 2] = ToU8(sb * 255.0f);
+      }
+    }
+    return;
+  }
+
+  // Dither-only path (no linear conversion required).
+  if (needDither) {
+    const int bits = std::clamp(fx.ditherBits, 1, 8);
+    const int levels = (1 << bits) - 1;
+    const float invLevels = 1.0f / static_cast<float>(levels);
+    const float dStr = ClampF(fx.ditherStrength, 0.0f, 1.0f);
+
+    static constexpr int bayer4[4][4] = {
+        {0, 8, 2, 10},
+        {12, 4, 14, 6},
+        {3, 11, 1, 9},
+        {15, 7, 13, 5},
+    };
+    const int ox = static_cast<int>((fx.postSeed >> 0) & 3u);
+    const int oy = static_cast<int>((fx.postSeed >> 2) & 3u);
+
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) {
+        const std::size_t i = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+        const int bv = bayer4[(y + oy) & 3][(x + ox) & 3];
+        const float d = (static_cast<float>(bv) + 0.5f) / 16.0f - 0.5f;
+        const float delta = d * dStr * invLevels;
+
+        for (int c = 0; c < 3; ++c) {
+          const float v = static_cast<float>(img.rgb[i * 3u + static_cast<std::size_t>(c)]) / 255.0f;
+          const float q = std::round(ClampF(v + delta, 0.0f, 1.0f) * static_cast<float>(levels)) * invLevels;
+          img.rgb[i * 3u + static_cast<std::size_t>(c)] = ToU8(q * 255.0f);
+        }
+      }
+    }
+  }
+}
+
 } // namespace
 
 PpmImage RenderQuadsSoft3D(const std::vector<MeshQuad>& quads,
@@ -313,12 +811,21 @@ PpmImage RenderQuadsSoft3D(const std::vector<MeshQuad>& quads,
 
   if (quads.empty()) {
     if (outError) *outError = "no geometry";
-    PpmImage out = imgSS;
+    PpmImage out;
+    std::vector<float> depthOut;
     if (ssaa > 1) {
-      PpmImage ds;
-      DownsampleBox(imgSS, ssaa, ds);
-      out = std::move(ds);
+      if (cfg.postFx.gammaCorrectDownsample) {
+        DownsampleBoxGamma(imgSS, ssaa, out);
+      } else {
+        DownsampleBox(imgSS, ssaa, out);
+      }
+      DownsampleDepthMin(zbuf, w, h, ssaa, depthOut);
+    } else {
+      out = std::move(imgSS);
+      depthOut = std::move(zbuf);
     }
+
+    ApplyPostFx(out, depthOut, cfg.postFx);
     return out;
   }
 
@@ -644,13 +1151,23 @@ PpmImage RenderQuadsSoft3D(const std::vector<MeshQuad>& quads,
     }
   }
 
+  // Resolve SSAA, build a matching depth buffer for post, then apply post-fx.
+  PpmImage out;
+  std::vector<float> depthOut;
   if (ssaa > 1) {
-    PpmImage out;
-    DownsampleBox(imgSS, ssaa, out);
-    return out;
+    if (cfg.postFx.gammaCorrectDownsample) {
+      DownsampleBoxGamma(imgSS, ssaa, out);
+    } else {
+      DownsampleBox(imgSS, ssaa, out);
+    }
+    DownsampleDepthMin(zbuf, w, h, ssaa, depthOut);
+  } else {
+    out = std::move(imgSS);
+    depthOut = std::move(zbuf);
   }
 
-  return imgSS;
+  ApplyPostFx(out, depthOut, cfg.postFx);
+  return out;
 }
 
 } // namespace isocity

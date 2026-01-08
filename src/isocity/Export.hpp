@@ -467,6 +467,48 @@ struct Render3DConfig {
   float fogStart = 0.35f; // [0..1] depth
   float fogEnd = 1.0f;
 
+  // --- Post-processing (software renderer only) ---
+  //
+  // These are optional "style" improvements that run after rasterization.
+  // They are off by default (except gamma-correct SSAA resolve) to keep
+  // backwards-compatible output.
+  bool gammaCorrectDownsample = true;
+
+  // Screen-space AO approximation (depth only).
+  bool postAO = false;
+  float aoStrength = 0.55f;
+  int aoRadiusPx = 7;
+  float aoRange = 0.02f;
+  float aoBias = 0.0015f;
+  float aoPower = 1.25f;
+  int aoSamples = 12;
+  int aoBlurRadiusPx = 1;
+
+  // Depth-edge outlines.
+  bool postEdge = false;
+  float edgeAlpha = 0.90f;
+  float edgeThreshold = 0.004f;
+  float edgeSoftness = 0.003f;
+  int edgeRadiusPx = 1;
+  std::uint8_t edgeR = 0;
+  std::uint8_t edgeG = 0;
+  std::uint8_t edgeB = 0;
+
+  // Tonemap / grade.
+  bool postTonemap = false;
+  float exposure = 1.0f;
+  float contrast = 1.0f;
+  float saturation = 1.0f;
+  float vignette = 0.0f;
+
+  // Ordered dithering + quantization.
+  bool postDither = false;
+  float ditherStrength = 0.35f;
+  int ditherBits = 6;
+
+  // Seed for deterministic post jitter/patterns (0 = derive from world seed).
+  std::uint32_t postSeed = 0;
+
   // Terrain surface mode.
   //
   // When disabled (default), top surfaces are generated as flat per-tile quads.

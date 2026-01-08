@@ -355,13 +355,51 @@ PpmImage RenderWorld3D(const World& world, ExportLayer layer, const Render3DConf
   Soft3DRenderConfig rc;
   rc.width = cfg.width;
   rc.height = cfg.height;
-  rc.supersample = cfg.supersample;
+  rc.supersample = std::max(1, cfg.supersample);
   rc.drawOutlines = cfg.drawOutlines;
   rc.outlineR = cfg.outlineR;
   rc.outlineG = cfg.outlineG;
   rc.outlineB = cfg.outlineB;
   rc.outlineAlpha = cfg.outlineAlpha;
   rc.outlineDepthEps = cfg.outlineDepthEps;
+
+  // Post-fx (optional) for "readable" isometric exports.
+  rc.postFx.gammaCorrectDownsample = cfg.gammaCorrectDownsample;
+  rc.postFx.enableAO = cfg.postAO;
+  rc.postFx.aoStrength = cfg.aoStrength;
+  rc.postFx.aoRadiusPx = cfg.aoRadiusPx;
+  rc.postFx.aoRange = cfg.aoRange;
+  rc.postFx.aoBias = cfg.aoBias;
+  rc.postFx.aoPower = cfg.aoPower;
+  rc.postFx.aoSamples = cfg.aoSamples;
+  rc.postFx.aoBlurRadiusPx = cfg.aoBlurRadiusPx;
+
+  rc.postFx.enableEdge = cfg.postEdge;
+  rc.postFx.edgeAlpha = cfg.edgeAlpha;
+  rc.postFx.edgeThreshold = cfg.edgeThreshold;
+  rc.postFx.edgeSoftness = cfg.edgeSoftness;
+  rc.postFx.edgeRadiusPx = cfg.edgeRadiusPx;
+  rc.postFx.edgeR = cfg.edgeR;
+  rc.postFx.edgeG = cfg.edgeG;
+  rc.postFx.edgeB = cfg.edgeB;
+
+  rc.postFx.enableTonemap = cfg.postTonemap;
+  rc.postFx.exposure = cfg.exposure;
+  rc.postFx.contrast = cfg.contrast;
+  rc.postFx.saturation = cfg.saturation;
+  rc.postFx.vignette = cfg.vignette;
+
+  rc.postFx.enableDither = cfg.postDither;
+  rc.postFx.ditherStrength = cfg.ditherStrength;
+  rc.postFx.ditherBits = cfg.ditherBits;
+
+  // Derive a stable default seed from the world seed unless explicitly overridden.
+  rc.postFx.postSeed = cfg.postSeed;
+  if (rc.postFx.postSeed == 0) {
+    const std::uint64_t ws = world.seed();
+    const std::uint32_t s32 = static_cast<std::uint32_t>(ws ^ (ws >> 32));
+    rc.postFx.postSeed = (s32 != 0u) ? s32 : 1u;
+  }
 
   std::string renderErr;
   PpmImage img = RenderQuadsSoft3D(quads, cam, shading, rc, nullptr, nullptr, &renderErr);

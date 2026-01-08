@@ -34,6 +34,7 @@
 #include "isocity/Script.hpp"
 #include "isocity/Suite.hpp"
 #include "isocity/AutoBuild.hpp"
+#include "isocity/OsmImport.hpp"
 #include "isocity/DistrictStats.hpp"
 #include "isocity/Districting.hpp"
 #include "isocity/Brush.hpp"
@@ -6344,6 +6345,221 @@ void TestExport3DHeightfieldAndSkirt()
   EXPECT_NE(hashImg(flat), hashImg(hf));
 }
 
+void TestExport3DPostFxPipelineDeterministic()
+{
+  using namespace isocity;
+
+  // Build a small but non-trivial scene: a plateau cliff, a road, and a couple of zone clusters
+  // to create vertical geometry for AO/edge detection.
+  World w(32, 32, 424242u);
+
+  for (int y = 0; y < w.height(); ++y) {
+    for (int x = 0; x < w.width(); ++x) {
+      // A two-level height step plus a gentle bump so the depth buffer has detail.
+      const float step = (x < w.width() / 2) ? 0.05f : 0.35f;
+      const float bump = 0.03f * std::sin(0.25f * static_cast<float>(x)) * std::cos(0.20f * static_cast<float>(y));
+      w.at(x, y).height = step + bump;
+    }
+  }
+
+  // A road spine.
+  for (int x = 2; x < w.width() - 2; ++x) {
+    w.setRoad(x, w.height() / 2);
+  }
+
+  // Zone clusters on either side of the road.
+  for (int y = w.height() / 2 - 5; y < w.height() / 2 - 1; ++y) {
+    for (int x = 6; x < 18; ++x) w.setOverlay(Overlay::Residential, x, y);
+  }
+  for (int y = w.height() / 2 + 1; y < w.height() / 2 + 4; ++y) {
+    for (int x = 8; x < 16; ++x) w.setOverlay(Overlay::Commercial, x, y);
+  }
+
+  auto hashImg = [&](const PpmImage& img) -> std::uint64_t {
+    std::uint64_t h = 1469598103934665603ull; // FNV-1a 64-bit offset basis
+
+    auto mixU32 = [&](std::uint32_t v) {
+      for (int i = 0; i < 4; ++i) {
+        const std::uint8_t b = static_cast<std::uint8_t>((v >> (i * 8)) & 0xFFu);
+        h ^= static_cast<std::uint64_t>(b);
+        h *= 1099511628211ull;
+      }
+    };
+
+    mixU32(static_cast<std::uint32_t>(img.width));
+    mixU32(static_cast<std::uint32_t>(img.height));
+    for (std::uint8_t b : img.rgb) {
+      h ^= static_cast<std::uint64_t>(b);
+      h *= 1099511628211ull; // FNV prime
+    }
+    return h;
+  };
+
+  Render3DConfig base;
+  base.width = 192;
+  base.height = 128;
+  base.supersample = 2; // exercise SSAA resolve
+  base.drawOutlines = false;
+  base.meshCfg.heightScale = 10.0f;
+  base.meshCfg.heightQuantization = 0.0f;
+  base.meshCfg.overlayOffset = 0.0f;
+  base.meshCfg.includeCliffs = true;
+  base.meshCfg.includeBuildings = true;
+
+  Render3DConfig fx = base;
+  fx.gammaCorrectDownsample = true;
+
+  fx.postAO = true;
+  fx.aoStrength = 0.70f;
+  fx.aoRadiusPx = 7;
+  fx.aoRange = 0.030f;
+  fx.aoBias = 0.002f;
+  fx.aoPower = 1.35f;
+  fx.aoSamples = 16;
+  fx.aoBlurRadiusPx = 1;
+
+  fx.postEdge = true;
+  fx.edgeAlpha = 0.90f;
+  fx.edgeThreshold = 0.0045f;
+  fx.edgeSoftness = 0.0030f;
+  fx.edgeRadiusPx = 2;
+  fx.edgeR = 0;
+  fx.edgeG = 0;
+  fx.edgeB = 0;
+
+  fx.postTonemap = true;
+  fx.exposure = 1.10f;
+  fx.contrast = 1.10f;
+  fx.saturation = 1.05f;
+  fx.vignette = 0.15f;
+
+  fx.postDither = true;
+  fx.ditherStrength = 0.45f;
+  fx.ditherBits = 6;
+
+  fx.postSeed = 123u;
+
+  const PpmImage imgBase = RenderWorld3D(w, ExportLayer::Terrain, base);
+  const PpmImage imgFx1 = RenderWorld3D(w, ExportLayer::Terrain, fx);
+  const PpmImage imgFx2 = RenderWorld3D(w, ExportLayer::Terrain, fx);
+
+  EXPECT_EQ(hashImg(imgFx1), hashImg(imgFx2));
+  EXPECT_NE(hashImg(imgBase), hashImg(imgFx1));
+
+  Render3DConfig fx2 = fx;
+  fx2.postSeed = 124u;
+  const PpmImage imgFx3 = RenderWorld3D(w, ExportLayer::Terrain, fx2);
+  EXPECT_NE(hashImg(imgFx1), hashImg(imgFx3));
+}
+
+
+
+void TestOsmImportBasic()
+{
+  // Tiny OSM XML snippet (bounds + a landuse polygon + a water polygon + a highway line).
+  // This validates that the importer can:
+  //  - parse nodes/ways
+  //  - project lat/lon into tile space
+  //  - rasterize polygons + lines
+  //  - respect the "roads overwrite zones" and "no zoning on water" rules
+
+  const char* osm = R"OSM(
+<osm version="0.6" generator="proc_isocity_tests">
+  <bounds minlat="0.0" minlon="0.0" maxlat="0.002" maxlon="0.002"/>
+
+  <!-- Landuse polygon: residential (a large square) -->
+  <node id="1" lat="0.0002" lon="0.0002"/>
+  <node id="2" lat="0.0002" lon="0.0018"/>
+  <node id="3" lat="0.0018" lon="0.0018"/>
+  <node id="4" lat="0.0018" lon="0.0002"/>
+
+  <!-- Water polygon: natural=water (a small square near the origin) -->
+  <node id="5" lat="0.0000" lon="0.0000"/>
+  <node id="6" lat="0.0000" lon="0.0006"/>
+  <node id="7" lat="0.0006" lon="0.0006"/>
+  <node id="8" lat="0.0006" lon="0.0000"/>
+
+  <way id="100">
+    <nd ref="1"/>
+    <nd ref="2"/>
+    <nd ref="3"/>
+    <nd ref="4"/>
+    <nd ref="1"/>
+    <tag k="landuse" v="residential"/>
+  </way>
+
+  <way id="200">
+    <nd ref="5"/>
+    <nd ref="6"/>
+    <nd ref="7"/>
+    <nd ref="8"/>
+    <nd ref="5"/>
+    <tag k="natural" v="water"/>
+  </way>
+
+  <!-- Highway line: primary (diagonal across the landuse polygon) -->
+  <way id="300">
+    <nd ref="1"/>
+    <nd ref="3"/>
+    <tag k="highway" v="primary"/>
+  </way>
+</osm>
+)OSM";
+
+  const fs::path tmp = fs::temp_directory_path() / "procisocity_osmimport_test.osm";
+  {
+    std::ofstream f(tmp);
+    EXPECT_TRUE(static_cast<bool>(f));
+    f << osm;
+  }
+
+  isocity::OsmImportConfig cfg;
+  cfg.width = 64;
+  cfg.height = 64;
+  cfg.importRoads = true;
+  cfg.importWater = true;
+  cfg.importLanduse = true;
+  cfg.importParks = false;
+  cfg.importBuildings = false;
+  cfg.preferBoundsTag = true;
+  cfg.padding = 1;
+
+  isocity::World world;
+  isocity::OsmImportStats stats;
+  std::string err;
+
+  const bool ok = isocity::ImportOsmXmlRoadsToNewWorld(tmp.string(), 1234u, cfg, world, &stats, err);
+  EXPECT_TRUE(ok);
+  EXPECT_TRUE(err.empty());
+
+  EXPECT_EQ(world.width(), 64);
+  EXPECT_EQ(world.height(), 64);
+
+  EXPECT_TRUE(stats.nodesParsed >= 8);
+  EXPECT_TRUE(stats.waysParsed >= 3);
+
+  EXPECT_TRUE(stats.highwayWaysImported >= 1);
+  EXPECT_TRUE(stats.landuseWaysImported >= 1);
+  EXPECT_TRUE(stats.waterWaysImported >= 1);
+
+  EXPECT_TRUE(stats.roadTilesPainted > 0);
+  EXPECT_TRUE(stats.zoneTilesPainted > 0);
+  EXPECT_TRUE(stats.waterTilesPainted > 0);
+
+  // Ensure we did not end up zoning on water (roads on water are allowed as bridges).
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      const isocity::Tile& t = world.at(x, y);
+      if (t.terrain == isocity::Terrain::Water) {
+        EXPECT_TRUE(t.overlay == isocity::Overlay::None || t.overlay == isocity::Overlay::Road);
+      }
+    }
+  }
+
+  std::error_code ec;
+  fs::remove(tmp, ec);
+}
+
 
 int main()
 {
@@ -6415,6 +6631,7 @@ int main()
   TestExportIsoOverview();
   TestExportIsoOverviewAtmosphere();
   TestExport3DHeightfieldAndSkirt();
+  TestExport3DPostFxPipelineDeterministic();
   TestPpmReadWriteAndCompare();
   TestHeightmapApplyReclassifyAndBulldoze();
   TestHeightmapApplyResampleNearest();
@@ -6432,6 +6649,7 @@ int main()
 
   TestZoneBuildingParcelsDeterministic();
   TestBrushRasterShapes();
+  TestOsmImportBasic();
   TestFloodFillRegions();
   TestCityBlocksBasic();
   TestVectorizeLabelGridWithHole();

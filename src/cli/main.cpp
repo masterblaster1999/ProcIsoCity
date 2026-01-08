@@ -147,6 +147,7 @@ void PrintHelp()
       << "                 [--3d-skirt <0|1>] [--3d-skirt-drop <N>]\n"
       << "                 [--3d-light <x,y,z>] [--3d-ambient <0..100>] [--3d-diffuse <0..100>] [--3d-bg <r,g,b>]\n"
       << "                 [--3d-fog <0|1>] [--3d-fog-strength <0..100>] [--3d-fog-start <0..100>] [--3d-fog-end <0..100>]\n"
+      << "                 [--3d-gamma <0|1>] [--3d-ao <0|1>] [--3d-edge <0|1>] [--3d-tonemap <0|1>] [--3d-dither <0|1>] [--3d-post-seed <N>]\n"
       << "                 [--3d-heightscale <N>] [--3d-quant <N>] [--3d-buildings <0|1>] [--3d-cliffs <0|1>]\n"
       << "                 [--iso-margin <N>] [--iso-grid <0|1>] [--iso-cliffs <0|1>] [--iso-fancy <0|1>]\n"
       << "                 [--iso-texture <0..100>] [--iso-shore <0|1>] [--iso-roadmarks <0|1>] [--iso-zonepatterns <0|1>]\n"
@@ -665,6 +666,256 @@ int main(int argc, char** argv)
         return 2;
       }
       render3dCfg.fogEnd = static_cast<float>(p) / 100.0f;
+    } else if (arg == "--3d-gamma") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-gamma requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--3d-gamma requires 0 or 1\n";
+        return 2;
+      }
+      render3dCfg.gammaCorrectDownsample = (b != 0);
+
+    } else if (arg == "--3d-ao") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-ao requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--3d-ao requires 0 or 1\n";
+        return 2;
+      }
+      render3dCfg.postAO = (b != 0);
+
+    } else if (arg == "--3d-ao-strength") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-ao-strength requires 0..100\n";
+        return 2;
+      }
+      int p = 0;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--3d-ao-strength requires 0..100\n";
+        return 2;
+      }
+      render3dCfg.aoStrength = static_cast<float>(p) / 100.0f;
+
+    } else if (arg == "--3d-ao-radius") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-ao-radius requires an int >= 1\n";
+        return 2;
+      }
+      int r = 0;
+      if (!ParseI32(val, &r) || r < 1) {
+        std::cerr << "--3d-ao-radius requires an int >= 1\n";
+        return 2;
+      }
+      render3dCfg.aoRadiusPx = r;
+
+    } else if (arg == "--3d-ao-range") {
+      float v = 0.0f;
+      if (!requireValue(i, val) || !ParseF32(val, &v) || !(v > 0.0f)) {
+        std::cerr << "--3d-ao-range requires a float > 0 (depth units, ~0.01..0.05 typical)\n";
+        return 2;
+      }
+      render3dCfg.aoRange = v;
+
+    } else if (arg == "--3d-ao-bias") {
+      float v = 0.0f;
+      if (!requireValue(i, val) || !ParseF32(val, &v) || !(v >= 0.0f)) {
+        std::cerr << "--3d-ao-bias requires a float >= 0\n";
+        return 2;
+      }
+      render3dCfg.aoBias = v;
+
+    } else if (arg == "--3d-ao-power") {
+      float v = 0.0f;
+      if (!requireValue(i, val) || !ParseF32(val, &v) || !(v > 0.0f)) {
+        std::cerr << "--3d-ao-power requires a float > 0\n";
+        return 2;
+      }
+      render3dCfg.aoPower = v;
+
+    } else if (arg == "--3d-ao-samples") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-ao-samples requires an int 4..32\n";
+        return 2;
+      }
+      int s = 0;
+      if (!ParseI32(val, &s) || s < 4 || s > 32) {
+        std::cerr << "--3d-ao-samples requires an int 4..32\n";
+        return 2;
+      }
+      render3dCfg.aoSamples = s;
+
+    } else if (arg == "--3d-ao-blur") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-ao-blur requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--3d-ao-blur requires 0 or 1\n";
+        return 2;
+      }
+      render3dCfg.aoBlurRadiusPx = (b != 0) ? 1 : 0;
+
+    } else if (arg == "--3d-edge") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-edge requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--3d-edge requires 0 or 1\n";
+        return 2;
+      }
+      render3dCfg.postEdge = (b != 0);
+
+    } else if (arg == "--3d-edge-alpha") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-edge-alpha requires 0..100\n";
+        return 2;
+      }
+      int p = 0;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--3d-edge-alpha requires 0..100\n";
+        return 2;
+      }
+      render3dCfg.edgeAlpha = static_cast<float>(p) / 100.0f;
+
+    } else if (arg == "--3d-edge-threshold") {
+      float v = 0.0f;
+      if (!requireValue(i, val) || !ParseF32(val, &v) || !(v >= 0.0f)) {
+        std::cerr << "--3d-edge-threshold requires a float >= 0 (depth delta)\n";
+        return 2;
+      }
+      render3dCfg.edgeThreshold = v;
+
+    } else if (arg == "--3d-edge-softness") {
+      float v = 0.0f;
+      if (!requireValue(i, val) || !ParseF32(val, &v) || !(v >= 0.0f)) {
+        std::cerr << "--3d-edge-softness requires a float >= 0 (smoothstep width)\n";
+        return 2;
+      }
+      render3dCfg.edgeSoftness = v;
+
+    } else if (arg == "--3d-edge-radius") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-edge-radius requires an int >= 1\n";
+        return 2;
+      }
+      int r = 0;
+      if (!ParseI32(val, &r) || r < 1) {
+        std::cerr << "--3d-edge-radius requires an int >= 1\n";
+        return 2;
+      }
+      render3dCfg.edgeRadiusPx = r;
+
+    } else if (arg == "--3d-edge-color") {
+      std::uint8_t r = 0, g = 0, b = 0;
+      if (!requireValue(i, val) || !ParseU8Triple(val, &r, &g, &b)) {
+        std::cerr << "--3d-edge-color requires: r,g,b (0..255)\n";
+        return 2;
+      }
+      render3dCfg.edgeR = r;
+      render3dCfg.edgeG = g;
+      render3dCfg.edgeB = b;
+
+    } else if (arg == "--3d-tonemap") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-tonemap requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--3d-tonemap requires 0 or 1\n";
+        return 2;
+      }
+      render3dCfg.postTonemap = (b != 0);
+
+    } else if (arg == "--3d-exposure") {
+      float v = 0.0f;
+      if (!requireValue(i, val) || !ParseF32(val, &v) || !(v >= 0.0f)) {
+        std::cerr << "--3d-exposure requires a float >= 0\n";
+        return 2;
+      }
+      render3dCfg.exposure = v;
+
+    } else if (arg == "--3d-contrast") {
+      float v = 0.0f;
+      if (!requireValue(i, val) || !ParseF32(val, &v) || !(v >= 0.0f)) {
+        std::cerr << "--3d-contrast requires a float >= 0\n";
+        return 2;
+      }
+      render3dCfg.contrast = v;
+
+    } else if (arg == "--3d-saturation") {
+      float v = 0.0f;
+      if (!requireValue(i, val) || !ParseF32(val, &v) || !(v >= 0.0f)) {
+        std::cerr << "--3d-saturation requires a float >= 0\n";
+        return 2;
+      }
+      render3dCfg.saturation = v;
+
+    } else if (arg == "--3d-vignette") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-vignette requires 0..100\n";
+        return 2;
+      }
+      int p = 0;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--3d-vignette requires 0..100\n";
+        return 2;
+      }
+      render3dCfg.vignette = static_cast<float>(p) / 100.0f;
+
+    } else if (arg == "--3d-dither") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-dither requires 0 or 1\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--3d-dither requires 0 or 1\n";
+        return 2;
+      }
+      render3dCfg.postDither = (b != 0);
+
+    } else if (arg == "--3d-dither-strength") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-dither-strength requires 0..100\n";
+        return 2;
+      }
+      int p = 0;
+      if (!ParseI32(val, &p) || p < 0 || p > 100) {
+        std::cerr << "--3d-dither-strength requires 0..100\n";
+        return 2;
+      }
+      render3dCfg.ditherStrength = static_cast<float>(p) / 100.0f;
+
+    } else if (arg == "--3d-dither-bits") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--3d-dither-bits requires an int 1..8\n";
+        return 2;
+      }
+      int b = 0;
+      if (!ParseI32(val, &b) || b < 1 || b > 8) {
+        std::cerr << "--3d-dither-bits requires an int 1..8\n";
+        return 2;
+      }
+      render3dCfg.ditherBits = b;
+
+    } else if (arg == "--3d-post-seed") {
+      std::uint64_t s = 0;
+      if (!requireValue(i, val) || !ParseU64(val, &s)) {
+        std::cerr << "--3d-post-seed requires a u64\n";
+        return 2;
+      }
+      render3dCfg.postSeed = static_cast<std::uint32_t>(s & 0xFFFFFFFFu);
+
     } else if (arg == "--3d-heightscale") {
       float s = 0.0f;
       if (!requireValue(i, val) || !ParseF32(val, &s) || !(s > 0.0f)) {

@@ -86,6 +86,55 @@ struct Soft3DShading {
   float fogEnd = 1.0f;
 };
 
+// Optional post-processing for Soft3D renders.
+//
+// These are intended to improve the readability / "game-art" look of the
+// exported isometric renders while staying dependency-free and deterministic.
+struct Soft3DPostFxConfig {
+  // When SSAA is enabled, downsampling in sRGB space tends to produce
+  // overly-dark results (because sRGB is non-linear). When enabled, the
+  // resolve pass converts to linear light, averages, then converts back.
+  bool gammaCorrectDownsample = true;
+
+  // --- Screen-space ambient occlusion (SSAO-ish) ---
+  // Depth-only approximation (fast, stable, no normals required).
+  bool enableAO = false;
+  float aoStrength = 0.55f; // 0..1 multiplier applied to occlusion
+  int aoRadiusPx = 7;       // sampling radius in pixels
+  float aoRange = 0.02f;    // max depth delta in [0..1] considered for occlusion
+  float aoBias = 0.0015f;   // small bias to reduce self-occlusion
+  float aoPower = 1.25f;    // contrast curve on the final occlusion
+  int aoSamples = 12;       // number of samples per pixel (4..32 typical)
+  int aoBlurRadiusPx = 1;   // 0 disables, 1 is a small 3-tap blur (separable)
+
+  // --- Depth-based edge outlines ---
+  // Finds depth discontinuities and blends an outline color on top.
+  bool enableEdge = false;
+  float edgeAlpha = 0.90f;     // 0..1 blend over the image
+  float edgeThreshold = 0.004f; // depth delta threshold in [0..1]
+  float edgeSoftness = 0.003f; // smoothstep width in [0..1]
+  int edgeRadiusPx = 1;        // dilation radius in pixels (>=1)
+  std::uint8_t edgeR = 0;
+  std::uint8_t edgeG = 0;
+  std::uint8_t edgeB = 0;
+
+  // --- Tonemap / grade ---
+  bool enableTonemap = false;
+  float exposure = 1.0f;   // linear multiplier
+  float contrast = 1.0f;   // 1=identity
+  float saturation = 1.0f; // 1=identity
+  float vignette = 0.0f;   // 0..1
+
+  // --- Ordered dithering + quantization ---
+  bool enableDither = false;
+  float ditherStrength = 0.35f; // 0..1
+  int ditherBits = 6;           // bits per channel in [1..8]
+
+  // Seed for deterministic noise/jitter in post (AO sample rotation + dithering).
+  // 0 means "derive from content" (caller may override).
+  std::uint32_t postSeed = 0;
+};
+
 struct Soft3DRenderConfig {
   int width = 1280;
   int height = 720;
@@ -102,6 +151,10 @@ struct Soft3DRenderConfig {
   // Outline alpha blended over the filled surface.
   float outlineAlpha = 1.0f;
   float outlineDepthEps = 0.002f;
+
+  // Optional post-processing. All features are off by default except
+  // gamma-correct SSAA resolve.
+  Soft3DPostFxConfig postFx{};
 };
 
 // Render a set of quads (each treated as two triangles) into a PPM image using

@@ -48,7 +48,7 @@ ctest --test-dir build-tests --output-on-failure
 
 - `PROCISOCITY_BUILD_APP` (default: ON) — build the interactive raylib app (`proc_isocity`).
 - `PROCISOCITY_BUILD_TESTS` (default: OFF) — build `proc_isocity_tests` and enable `ctest`.
-- `PROCISOCITY_BUILD_CLI` (default: ON) — build headless command-line tools (`proc_isocity_cli`, `proc_isocity_diff`, `proc_isocity_imagediff`, `proc_isocity_inspect`, `proc_isocity_config`, `proc_isocity_patch`, `proc_isocity_script`, `proc_isocity_replay`, `proc_isocity_blueprint`, `proc_isocity_suite`, `proc_isocity_transform`, `proc_isocity_roadgraph`, `proc_isocity_roadcentrality`, `proc_isocity_blocks`, `proc_isocity_mesh`, `proc_isocity_timelapse`, `proc_isocity_mapexport`, `proc_isocity_tileset`).
+- `PROCISOCITY_BUILD_CLI` (default: ON) — build headless command-line tools (`proc_isocity_cli`, `proc_isocity_diff`, `proc_isocity_imagediff`, `proc_isocity_inspect`, `proc_isocity_config`, `proc_isocity_patch`, `proc_isocity_script`, `proc_isocity_replay`, `proc_isocity_blueprint`, `proc_isocity_suite`, `proc_isocity_transform`, `proc_isocity_roadgraph`, `proc_isocity_roadcentrality`, `proc_isocity_blocks`, `proc_isocity_mesh`, `proc_isocity_timelapse`, `proc_isocity_mapexport`, `proc_isocity_osmimport`, `proc_isocity_tileset`).
 - `PROCISOCITY_USE_SYSTEM_RAYLIB` (default: OFF) — when building the app, use a system raylib instead of FetchContent.
 
 ### Headless CLI tools (optional)
@@ -69,6 +69,13 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
     - simple directional lighting (`--3d-light x,y,z`, `--3d-ambient`, `--3d-diffuse`)
     - anti-aliasing via SSAA (`--3d-ssaa 2` is a good starting point)
     - optional fog (`--3d-fog 1`, `--3d-fog-strength`, `--3d-fog-start`, `--3d-fog-end`)
+    - optional post-fx (for a more "game-art" isometric look):
+      - gamma-correct SSAA resolve (`--3d-gamma 1`)
+      - screen-space ambient occlusion (`--3d-ao 1`, `--3d-ao-strength`, `--3d-ao-radius`, ...)
+      - depth-based outline pass (`--3d-edge 1`, `--3d-edge-alpha`, `--3d-edge-threshold`, ...)
+      - filmic tonemap / grade (`--3d-tonemap 1`, `--3d-exposure`, `--3d-contrast`, `--3d-saturation`, `--3d-vignette`)
+      - ordered dithering + channel quantize (`--3d-dither 1`, `--3d-dither-bits`, `--3d-dither-strength`)
+      - deterministic seed for AO/dither jitter (`--3d-post-seed`)
     - geometry knobs: `--3d-heightscale`, `--3d-quant`, `--3d-buildings`, `--3d-cliffs`
   - batch runs across multiple seeds (`--batch N`)
 
@@ -79,7 +86,8 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
     --out out_{seed}.json --csv ticks_{seed}.csv \
     --export-ppm overlay overlay_{seed}.ppm --export-scale 4 \
     --export-iso overlay iso_{seed}.ppm --iso-tile 16x8 --iso-height 14 \
-    --export-3d overlay view3d_{seed}.png --3d-size 1280x720 --3d-proj iso --3d-ssaa 2 --batch 3
+    --export-3d overlay view3d_{seed}.png --3d-size 1280x720 --3d-proj iso --3d-ssaa 2 \
+    --3d-ao 1 --3d-edge 1 --3d-tonemap 1 --3d-dither 1 --3d-post-seed 1337 --batch 3
   ```
 
 - `proc_isocity_timelapse`: generate a deterministic **isometric frame sequence** by stepping the simulator forward.
@@ -88,6 +96,26 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
   ```bash
   ./build/proc_isocity_timelapse --seed 1 --size 128x128 --out frames \
     --days 120 --every 2 --layers overlay,landvalue --format png
+  ```
+
+- `proc_isocity_osmimport`: import an **OpenStreetMap (OSM XML)** extract into a new ProcIsoCity save.
+
+  This tool maps common OSM tags to ProcIsoCity features:
+  - `highway=*` -> roads (with tiered levels)
+  - `natural=water` / `waterway=*` -> water
+  - `landuse=*` -> zones (res/com/ind)
+  - `leisure=park` -> parks
+  - `building=*` -> zones (heuristic)
+
+  Optional: run the deterministic **AutoBuild** bot for `--autobuild-days` after import to populate additional zoning/parks.
+
+  ```bash
+  # Roads-only import into a 512x512 world
+  ./build/proc_isocity_osmimport --osm extract.osm --save osm_world.bin --seed 1 --size 512x512
+
+  # Full import (roads + water + landuse + parks + buildings) with AutoBuild growth
+  ./build/proc_isocity_osmimport --osm extract.osm --save osm_full.bin --seed 1 --size 512x512 --full \
+    --autobuild-days 120
   ```
 
 - `proc_isocity_mapexport`: export a world to a single **GeoJSON FeatureCollection** (roads + landuse polygons + optional
