@@ -1104,7 +1104,6 @@ void Game::setupDevConsole()
       });
 
   m_console.registerCommand(
-        m_console.registerCommand(
       "pond",
       "pond [eps] [edge|noedge]  - configure depression-fill ponding overlay (used by heatmap pond)",
       [this, toLower, parseF32](DevConsole& c, const DevConsole::Args& args) {
@@ -1148,7 +1147,8 @@ void Game::setupDevConsole()
                            m_pondingCfg.includeEdges ? "edge" : "noedge"));
       });
 
-"floodapply",
+  m_console.registerCommand(
+      "floodapply",
       "floodapply [level] [edge|all] [4|8]  - apply sea flooding to the world (undoable)",
       [this, toLower, parseF32](DevConsole& c, const DevConsole::Args& args) {
         if (args.size() > 3) {
@@ -1205,7 +1205,6 @@ void Game::setupDevConsole()
         if (w <= 0 || h <= 0) {
           c.print("World is empty");
           return;
-
         }
 
         const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
@@ -3011,7 +3010,7 @@ void Game::updateWorldRenderFilter()
   if (!m_worldRenderRTValid) return;
   SetTextureFilter(
     m_worldRenderRT.texture,
-    m_worldRenderPixelPerfect ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
+    m_worldRenderFilterPoint ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
 }
 
 bool Game::wantsWorldRenderTarget() const

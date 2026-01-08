@@ -46,7 +46,7 @@ inline Rgba8 Add(Rgba8 c, int dr, int dg, int db)
 
 inline void Clear(RgbaImage& img)
 {
-  std::fill(img.rgba.begin(), img.rgba.end(), 0u);
+  std::fill(img.rgba.begin(), img.rgba.end(), std::uint8_t{0});
 }
 
 inline void BlendPixel(RgbaImage& img, int x, int y, Rgba8 src)

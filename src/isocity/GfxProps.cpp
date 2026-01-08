@@ -421,11 +421,48 @@ void MakeVehicle(bool truck, int variant, std::uint32_t seedv, const GfxPropsCon
   // Orient along one of the two isometric diagonals.
   const bool diagNE = (h01(1, 2, 0xF1u) < 0.5f);
 
-  // Base colors: choose a vivid paint from overlays.
-  const Rgba8 c0 = pal.overlayCommercial;
-  const Rgba8 c1 = pal.overlayIndustrial;
-  const Rgba8 c2 = pal.overlayResidential;
-  const Rgba8 paint = Lerp(Lerp(c0, c1, h01(3, 4, 0xF2u)), c2, h01(5, 6, 0xF3u));
+  // Base colors: choose a vivid paint from a small set of variant-driven schemes.
+  //
+  // NOTE: `seedv` already incorporates `variant`, but using the explicit variant index here makes
+  // the different variants reliably look different even if the global seed changes.
+  const int scheme = (variant >= 0) ? (variant % 6) : ((-variant) % 6);
+
+  Rgba8 s0 = pal.overlayCommercial;
+  Rgba8 s1 = pal.overlayIndustrial;
+  Rgba8 s2 = pal.overlayResidential;
+
+  switch (scheme) {
+  default:
+  case 0: // "default" mix
+    break;
+  case 1: // more residential
+    s0 = pal.overlayResidential;
+    s1 = pal.overlayCommercial;
+    s2 = pal.overlayIndustrial;
+    break;
+  case 2: // more industrial
+    s0 = pal.overlayIndustrial;
+    s1 = pal.overlayResidential;
+    s2 = pal.overlayCommercial;
+    break;
+  case 3: // taxi / service vibe
+    s0 = pal.roadMarkYellow;
+    s1 = pal.overlayCommercial;
+    s2 = pal.overlayResidential;
+    break;
+  case 4: // light paint / fleet vehicles
+    s0 = pal.roadMarkWhite;
+    s1 = pal.overlayIndustrial;
+    s2 = pal.overlayCommercial;
+    break;
+  case 5: // park-ish / green-ish paint
+    s0 = pal.overlayPark;
+    s1 = pal.overlayResidential;
+    s2 = pal.overlayCommercial;
+    break;
+  }
+
+  const Rgba8 paint = Lerp(Lerp(s0, s1, h01(3, 4, 0xF2u)), s2, h01(5, 6, 0xF3u));
   const Rgba8 dark = Mul(paint, 0.72f);
   const Rgba8 light = Mul(paint, 1.15f);
   const Rgba8 glass = Mul(pal.water, 0.85f);

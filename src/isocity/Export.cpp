@@ -1122,18 +1122,18 @@ IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const
 
   if (layer == ExportLayer::FloodDepth) {
     seaLevel = InferCoastalSeaLevel(world);
-    SeaFloodConfig cfg{};
-    cfg.requireEdgeConnection = true;
-    cfg.eightConnected = false;
-    seaFlood = ComputeSeaLevelFlood(heights, mapW, mapH, seaLevel, cfg);
+    SeaFloodConfig floodCfg{};
+    floodCfg.requireEdgeConnection = true;
+    floodCfg.eightConnected = false;
+    seaFlood = ComputeSeaLevelFlood(heights, mapW, mapH, seaLevel, floodCfg);
     haveSeaFlood = true;
   }
 
   if (layer == ExportLayer::PondingDepth) {
-    DepressionFillConfig cfg{};
-    cfg.includeEdges = true;
-    cfg.epsilon = 0.0f;
-    ponding = FillDepressionsPriorityFlood(heights, mapW, mapH, &drainMask, cfg);
+    DepressionFillConfig pondCfg{};
+    pondCfg.includeEdges = true;
+    pondCfg.epsilon = 0.0f;
+    ponding = FillDepressionsPriorityFlood(heights, mapW, mapH, &drainMask, pondCfg);
     havePonding = true;
   }
 

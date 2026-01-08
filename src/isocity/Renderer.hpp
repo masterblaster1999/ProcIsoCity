@@ -76,6 +76,16 @@ public:
       1u << static_cast<std::uint32_t>(RenderLayer::Overlays);
   static constexpr std::uint32_t kLayerAll = kLayerTerrain | kLayerDecals | kLayerStructures | kLayerOverlays;
 
+  // Convert a RenderLayer enum into its bit in a layer mask.
+  //
+  // Keep this as a small constexpr utility so both the renderer and other
+  // systems (visual prefs persistence, exports, debug UI) can reason about
+  // the mask without duplicating the bit shift logic.
+  static constexpr std::uint32_t LayerBit(RenderLayer layer)
+  {
+    return 1u << static_cast<std::uint32_t>(layer);
+  }
+
   // Purely-visual day/night cycle controls.
   //
   // This is implemented as a lightweight, screen-space color grade (night darkening + optional

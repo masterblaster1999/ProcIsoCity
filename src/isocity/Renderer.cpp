@@ -103,12 +103,6 @@ inline Color Lerp(Color a, Color b, float t)
   return Color{ClampU8(r), ClampU8(g), ClampU8(bl), ClampU8(al)};
 }
 
-inline float Lerp(float a, float b, float t)
-{
-  t = std::clamp(t, 0.0f, 1.0f);
-  return a + (b - a) * t;
-}
-
 inline Vector2 LerpV(const Vector2& a, const Vector2& b, float t)
 {
   return Vector2{Lerp(a.x, b.x, t), Lerp(a.y, b.y, t)};
@@ -4136,7 +4130,7 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
         const float offX = weather.windX * worldSpeed * timeSec;
         const float offY = weather.windY * worldSpeed * timeSec;
 
-        const Rectangle src{
+        const Rectangle srcRect{
             (dstX + offX) * texPerWorld,
             (dstY + offY) * texPerWorld,
             dstW * texPerWorld,
@@ -4144,7 +4138,7 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
         const Rectangle dst{dstX, dstY, dstW, dstH};
 
         const unsigned char a = static_cast<unsigned char>(std::round(255.0f * alpha));
-        DrawTexturePro(m_cloudShadowTex, src, dst, Vector2{0.0f, 0.0f}, 0.0f, Color{0, 0, 0, a});
+        DrawTexturePro(m_cloudShadowTex, srcRect, dst, Vector2{0.0f, 0.0f}, 0.0f, Color{0, 0, 0, a});
       }
     }
   }
