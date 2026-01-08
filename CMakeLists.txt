@@ -113,6 +113,7 @@ add_library(isocity_core
   src/isocity/RoadGraphCentrality.cpp
   src/isocity/RoadGraphCentralityExport.cpp
   src/isocity/RoadUpgradePlanner.cpp
+  src/isocity/RoadUpgradePlannerExport.cpp
   src/isocity/PolicyOptimizer.cpp
   src/isocity/PolicyOptimizerExport.cpp
   src/isocity/ZoneParcels.cpp

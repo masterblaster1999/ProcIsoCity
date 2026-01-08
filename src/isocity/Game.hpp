@@ -15,10 +15,12 @@
 #include "isocity/RoadGraph.hpp"
 #include "isocity/RoadGraphRouting.hpp"
 #include "isocity/RoadGraphResilience.hpp"
+#include "isocity/RoadUpgradePlanner.hpp"
 #include "isocity/SaveLoad.hpp"
 #include "isocity/Traffic.hpp"
 #include "isocity/Goods.hpp"
 #include "isocity/LandValue.hpp"
+#include "isocity/TransitPlanner.hpp"
 #include "isocity/Sim.hpp"
 #include "isocity/World.hpp"
 
@@ -135,6 +137,23 @@ private:
   void rebuildRoadResilienceBypasses();
   void drawRoadResilienceOverlay();
   bool applyRoadResilienceBypass(std::size_t idx);
+
+  // Transit planner (auto "bus line" suggestions) + overlay.
+  void ensureTransitPlanUpToDate();
+  void ensureTransitVizUpToDate();
+  void drawTransitOverlay();
+  void drawTransitPanel(int uiW, int uiH);
+  void adjustTransitPanel(int dir, bool bigStep);
+  void exportTransitArtifacts();
+
+  // Road upgrade planner (suggests street->avenue/highway upgrades) + overlay.
+  void ensureRoadUpgradePlanUpToDate();
+  void ensureRoadUpgradeSelectedMaskUpToDate();
+  void drawRoadUpgradeOverlay();
+  void drawRoadUpgradePanel(int uiW, int uiH);
+  void adjustRoadUpgradePanel(int dir, bool bigStep);
+  bool applyRoadUpgradePlan();
+  void exportRoadUpgradeArtifacts();
 
 
   // Display helpers
@@ -358,6 +377,67 @@ private:
   bool m_showGoodsOverlay = false;
   bool m_goodsDirty = true;
   GoodsResult m_goods;
+
+  // Transit planner overlay (auto bus line suggestions).
+  // Toggle panel with Ctrl+T. Export artifacts with Ctrl+Shift+T.
+  enum class TransitDemandMode : std::uint8_t { Commute = 0, Goods = 1, Combined = 2 };
+
+  struct TransitLineViz {
+    int lineIndex = -1;
+    int id = 0;
+    std::uint64_t sumDemand = 0;
+    std::uint64_t baseCost = 0;
+
+    // Inclusive road-tile polyline for drawing.
+    std::vector<Point> tiles;
+
+    // Sampled stop tiles (endpoints always included).
+    std::vector<Point> stops;
+  };
+
+  bool m_showTransitPanel = false;
+  bool m_showTransitOverlay = false;
+  TransitDemandMode m_transitDemandMode = TransitDemandMode::Combined;
+  TransitPlannerConfig m_transitCfg{};
+  TransitPlan m_transitPlan{};
+  std::vector<std::uint64_t> m_transitEdgeDemand;
+
+  bool m_transitPlanDirty = true;
+  bool m_transitVizDirty = true;
+
+  int m_transitSelection = 0;
+  int m_transitStopSpacing = 12;
+  bool m_transitShowStops = true;
+  bool m_transitShowOnlySelectedLine = false;
+  int m_transitSelectedLine = -1; // -1 = all
+
+  std::vector<TransitLineViz> m_transitViz;
+
+  // Road upgrade planner overlay (street->avenue/highway suggestions).
+  // Toggle panel with Ctrl+U. Export artifacts with Ctrl+Shift+U.
+  enum class RoadUpgradeDemandMode : std::uint8_t { Commute = 0, Goods = 1, Combined = 2 };
+
+  bool m_showRoadUpgradePanel = false;
+  bool m_showRoadUpgradeOverlay = false;
+  RoadUpgradeDemandMode m_roadUpgradeDemandMode = RoadUpgradeDemandMode::Combined;
+
+  // Planner configuration. Note: budget is overridden when m_roadUpgradeBudgetAuto==true.
+  RoadUpgradePlannerConfig m_roadUpgradeCfg{};
+  bool m_roadUpgradeBudgetAuto = true;
+  int m_roadUpgradeBudget = -1; // used when budgetAuto==false. -1 = unlimited.
+
+  // Flow composition when demandMode includes goods.
+  double m_roadUpgradeGoodsWeight = 1.0;
+
+  RoadUpgradePlan m_roadUpgradePlan{};
+  bool m_roadUpgradePlanDirty = true;
+
+  int m_roadUpgradeSelection = 0;
+  bool m_roadUpgradeShowOnlySelectedEdge = false;
+  int m_roadUpgradeSelectedEdge = -1; // index into m_roadUpgradePlan.edges; -1 = all
+
+  bool m_roadUpgradeSelectedMaskDirty = true;
+  std::vector<std::uint8_t> m_roadUpgradeSelectedMask;
 
   // Heatmap overlay: land value / amenities / pollution / traffic spill.
   enum class HeatmapOverlay : std::uint8_t {

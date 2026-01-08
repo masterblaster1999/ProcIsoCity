@@ -4525,6 +4525,9 @@ void Renderer::drawHUD(const World& world, const Camera2D& camera, Tool tool, in
     DrawText("Right drag: pan | Wheel: zoom | R regen | G grid | H help | M minimap | E elev | O outside | L heatmap | C vehicles | P policy | F1 report | F2 cache | Shift+F2 day/night | F3 model | Shift+F3 weather | F7 districts | T graph | V traffic | B goods", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
     y += 22;
+    DrawText("Ctrl+T transit | Ctrl+Shift+T transit export", pad + 10, y + 10, 16,
+             Color{220, 220, 220, 255});
+    y += 22;
     DrawText("1 Road | 2 Res | 3 Com | 4 Ind | 5 Park | 0 Doze | 6 Raise | 7 Lower | 8 Smooth | 9 District | Q Inspect", pad + 10, y + 10, 16,
              Color{220, 220, 220, 255});
     y += 22;

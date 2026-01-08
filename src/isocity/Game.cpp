@@ -7,7 +7,10 @@
 #include "isocity/Pathfinding.hpp"
 #include "isocity/Random.hpp"
 #include "isocity/Road.hpp"
+#include "isocity/RoadGraphTraffic.hpp"
+#include "isocity/RoadUpgradePlannerExport.hpp"
 #include "isocity/SaveLoad.hpp"
+#include "isocity/TransitPlannerExport.hpp"
 #include "isocity/ZoneAccess.hpp"
 
 #include <algorithm>
@@ -346,6 +349,10 @@ bool Game::loadFromPath(const std::string& path, const char* toastLabel)
   m_trafficDirty = true;
   m_goodsDirty = true;
   m_landValueDirty = true;
+  m_transitPlanDirty = true;
+  m_transitVizDirty = true;
+  m_roadUpgradePlanDirty = true;
+  m_roadUpgradeSelectedMaskDirty = true;
   invalidateHydrology();
   m_vehiclesDirty = true;
   m_vehicles.clear();
@@ -873,6 +880,10 @@ void Game::setupDevConsole()
         m_goodsDirty = true;
         m_landValueDirty = true;
         m_vehiclesDirty = true;
+        m_transitPlanDirty = true;
+        m_transitVizDirty = true;
+        m_roadUpgradePlanDirty = true;
+        m_roadUpgradeSelectedMaskDirty = true;
         showToast("Sim step");
         c.print("stepped");
       });
@@ -4981,6 +4992,10 @@ void Game::endPaintStroke()
   // Keep HUD numbers (roads/parks/capacities) responsive even before the next sim tick.
   m_sim.refreshDerivedStats(m_world);
 
+  // Any edit stroke potentially changes travel demand and the road graph.
+  m_transitPlanDirty = true;
+  m_transitVizDirty = true;
+
   // Provide one toast per stroke for common build failures (no money, no road access, etc.).
   if (m_strokeFeedback.any()) {
     std::string msg = "Some placements failed: ";
@@ -5552,6 +5567,8 @@ bool Game::applyRoadResilienceBypass(std::size_t idx)
   m_trafficDirty = true;
   m_goodsDirty = true;
   m_landValueDirty = true;
+  m_transitPlanDirty = true;
+  m_transitVizDirty = true;
   m_vehiclesDirty = true;
 
   // Suggestions are now stale.
@@ -5646,6 +5663,1208 @@ void Game::drawRoadResilienceOverlay()
   EndMode2D();
 }
 
+// -----------------------------------------------------------------------------
+// Transit planner (auto "bus line" suggestions)
+// -----------------------------------------------------------------------------
+
+namespace {
+
+const char* TransitDemandModeName(Game::TransitDemandMode m)
+{
+  switch (m) {
+    case Game::TransitDemandMode::Commute: return "commute";
+    case Game::TransitDemandMode::Goods: return "goods";
+    case Game::TransitDemandMode::Combined: return "combined";
+  }
+  return "combined";
+}
+
+Color TransitLineColor(int idx, unsigned char alpha)
+{
+  // A small cycle of high-contrast colors for map overlays.
+  constexpr Color kColors[] = {
+      {230,  70,  70, 255},
+      { 70, 210, 120, 255},
+      { 70, 140, 230, 255},
+      {240, 190,  60, 255},
+      {190,  90, 220, 255},
+      { 60, 210, 220, 255},
+      {240, 120,  40, 255},
+      {140, 230,  70, 255},
+  };
+  constexpr int kN = static_cast<int>(sizeof(kColors) / sizeof(kColors[0]));
+  const int i = (kN > 0) ? (idx % kN) : 0;
+  Color c = kColors[i];
+  c.a = alpha;
+  return c;
+}
+
+} // namespace
+
+void Game::ensureTransitPlanUpToDate()
+{
+  if (!m_transitPlanDirty) return;
+
+  ensureRoadGraphUpToDate();
+  m_transitEdgeDemand.clear();
+
+  if (m_roadGraph.edges.empty()) {
+    m_transitPlan = TransitPlan{};
+    m_transitViz.clear();
+    m_transitVizDirty = false;
+    m_transitPlanDirty = false;
+    m_transitSelectedLine = -1;
+    return;
+  }
+
+  const int w = m_world.width();
+  const int h = m_world.height();
+  const int n = std::max(0, w) * std::max(0, h);
+  if (n <= 0) {
+    m_transitPlan = TransitPlan{};
+    m_transitViz.clear();
+    m_transitVizDirty = false;
+    m_transitPlanDirty = false;
+    m_transitSelectedLine = -1;
+    return;
+  }
+
+  // Outside-connection mask (optional, reused by traffic/goods demand computation).
+  const bool requireOutside = m_sim.config().requireOutsideConnection;
+  const std::vector<std::uint8_t>* roadToEdgeMask = nullptr;
+  if (requireOutside) {
+    // Reuse cached outside-connection mask when possible (also used by other overlays).
+    if (static_cast<int>(m_outsideOverlayRoadToEdge.size()) != n) {
+      ComputeRoadsConnectedToEdge(m_world, m_outsideOverlayRoadToEdge);
+    }
+    roadToEdgeMask = &m_outsideOverlayRoadToEdge;
+  }
+
+  const bool needTraffic = (m_transitDemandMode == TransitDemandMode::Commute ||
+                            m_transitDemandMode == TransitDemandMode::Combined);
+  const bool needGoods = (m_transitDemandMode == TransitDemandMode::Goods ||
+                          m_transitDemandMode == TransitDemandMode::Combined);
+
+  // Traffic (commute)
+  if (needTraffic) {
+    if (m_trafficDirty || static_cast<int>(m_traffic.roadTraffic.size()) != n) {
+      const float share = (m_world.stats().population > 0)
+                              ? (static_cast<float>(m_world.stats().employed) /
+                                 static_cast<float>(m_world.stats().population))
+                              : 0.0f;
+
+      TrafficConfig tc;
+      tc.requireOutsideConnection = requireOutside;
+      {
+        const TrafficModelSettings& tm = m_sim.trafficModel();
+        tc.congestionAwareRouting = tm.congestionAwareRouting;
+        tc.congestionIterations = tm.congestionIterations;
+        tc.congestionAlpha = tm.congestionAlpha;
+        tc.congestionBeta = tm.congestionBeta;
+        tc.congestionCapacityScale = tm.congestionCapacityScale;
+        tc.congestionRatioClamp = tm.congestionRatioClamp;
+        tc.capacityAwareJobs = tm.capacityAwareJobs;
+        tc.jobAssignmentIterations = tm.jobAssignmentIterations;
+        tc.jobPenaltyBaseMilli = tm.jobPenaltyBaseMilli;
+      }
+
+      const std::vector<std::uint8_t>* pre = (tc.requireOutsideConnection ? roadToEdgeMask : nullptr);
+      m_traffic = ComputeCommuteTraffic(m_world, tc, share, pre);
+      m_trafficDirty = false;
+    }
+  }
+
+  // Goods
+  if (needGoods) {
+    if (m_goodsDirty || static_cast<int>(m_goods.roadGoodsTraffic.size()) != n) {
+      GoodsConfig gc;
+      gc.requireOutsideConnection = requireOutside;
+      const std::vector<std::uint8_t>* pre = (gc.requireOutsideConnection ? roadToEdgeMask : nullptr);
+      m_goods = ComputeGoodsFlow(m_world, gc, pre);
+      m_goodsDirty = false;
+    }
+  }
+
+  // Build a per-road-tile demand signal.
+  std::vector<std::uint32_t> roadFlow(static_cast<std::size_t>(n), 0);
+  if (needTraffic && m_traffic.roadTraffic.size() == static_cast<std::size_t>(n)) {
+    for (int i = 0; i < n; ++i) {
+      roadFlow[static_cast<std::size_t>(i)] += static_cast<std::uint32_t>(m_traffic.roadTraffic[static_cast<std::size_t>(i)]);
+    }
+  }
+  if (needGoods && m_goods.roadGoodsTraffic.size() == static_cast<std::size_t>(n)) {
+    for (int i = 0; i < n; ++i) {
+      roadFlow[static_cast<std::size_t>(i)] += static_cast<std::uint32_t>(m_goods.roadGoodsTraffic[static_cast<std::size_t>(i)]);
+    }
+  }
+
+  // Aggregate road-tile demand onto the compressed RoadGraph edges.
+  const RoadGraphTrafficResult agg = AggregateFlowOnRoadGraph(m_world, m_roadGraph, roadFlow);
+  m_transitEdgeDemand.resize(m_roadGraph.edges.size(), 0);
+
+  // Prefer interior demand so endpoints don't get double-counted across adjacent edges.
+  for (std::size_t ei = 0; ei < m_roadGraph.edges.size() && ei < agg.edges.size(); ++ei) {
+    m_transitEdgeDemand[ei] = agg.edges[ei].sumTrafficInterior;
+  }
+
+  // Keep the planner deterministic per-world unless the user tweaks seedSalt explicitly.
+  TransitPlannerConfig cfg = m_transitCfg;
+  if (cfg.seedSalt == 0) cfg.seedSalt = (m_cfg.seed ^ 0xA2B3C4D5E6F70911ULL);
+
+  m_transitPlan = PlanTransitLines(m_roadGraph, m_transitEdgeDemand, cfg, &m_world);
+  m_transitPlan.cfg = cfg;
+
+  // Clamp selected line to the new plan.
+  if (m_transitSelectedLine >= static_cast<int>(m_transitPlan.lines.size())) {
+    m_transitSelectedLine = static_cast<int>(m_transitPlan.lines.size()) - 1;
+  }
+  if (m_transitPlan.lines.empty()) {
+    m_transitSelectedLine = -1;
+  }
+
+  m_transitPlanDirty = false;
+  m_transitVizDirty = true;
+}
+
+void Game::ensureTransitVizUpToDate()
+{
+  ensureTransitPlanUpToDate();
+  if (!m_transitVizDirty) return;
+
+  m_transitViz.clear();
+  m_transitViz.reserve(m_transitPlan.lines.size());
+
+  const int stopSpacing = std::max(2, m_transitStopSpacing);
+
+  for (std::size_t i = 0; i < m_transitPlan.lines.size(); ++i) {
+    const TransitLine& line = m_transitPlan.lines[i];
+
+    TransitLineViz viz;
+    viz.lineIndex = static_cast<int>(i);
+    viz.id = line.id;
+    viz.sumDemand = line.sumDemand;
+    viz.baseCost = line.baseCost;
+
+    if (!BuildTransitLineTilePolyline(m_roadGraph, line, viz.tiles)) continue;
+    (void)BuildTransitLineStopTiles(m_roadGraph, line, stopSpacing, viz.stops);
+
+    m_transitViz.push_back(std::move(viz));
+  }
+
+  m_transitVizDirty = false;
+}
+
+void Game::drawTransitOverlay()
+{
+  const bool show = (m_showTransitPanel || m_showTransitOverlay);
+  if (!show) return;
+
+  ensureTransitVizUpToDate();
+  if (m_transitViz.empty()) return;
+
+  BeginMode2D(m_camera);
+
+  const float zoom = std::max(0.25f, m_camera.zoom);
+  const float thickness = 2.8f / zoom;
+  const float stopRadius = 3.8f / zoom;
+
+  const bool solo = (m_transitShowOnlySelectedLine && m_transitSelectedLine >= 0);
+
+  for (std::size_t li = 0; li < m_transitViz.size(); ++li) {
+    const TransitLineViz& l = m_transitViz[li];
+    if (solo && l.lineIndex != m_transitSelectedLine) continue;
+
+    const bool isSelected = (m_transitSelectedLine >= 0 && l.lineIndex == m_transitSelectedLine);
+    const unsigned char alpha = (solo || isSelected || m_transitSelectedLine < 0) ? 210 : 90;
+    const Color c = TransitLineColor(static_cast<int>(li), alpha);
+
+    for (std::size_t i = 1; i < l.tiles.size(); ++i) {
+      const Point& a = l.tiles[i - 1];
+      const Point& b = l.tiles[i];
+      const Vector2 wa = TileToWorldCenterElevated(m_world, a.x, a.y, static_cast<float>(m_cfg.tileWidth),
+                                                   static_cast<float>(m_cfg.tileHeight), m_elev);
+      const Vector2 wb = TileToWorldCenterElevated(m_world, b.x, b.y, static_cast<float>(m_cfg.tileWidth),
+                                                   static_cast<float>(m_cfg.tileHeight), m_elev);
+      DrawLineEx(wa, wb, thickness, c);
+    }
+
+    if (m_transitShowStops) {
+      const Color stopC = Color{c.r, c.g, c.b, static_cast<unsigned char>(std::min(255, alpha + 40))};
+      for (const Point& s : l.stops) {
+        const Vector2 ws = TileToWorldCenterElevated(m_world, s.x, s.y, static_cast<float>(m_cfg.tileWidth),
+                                                     static_cast<float>(m_cfg.tileHeight), m_elev);
+        DrawCircleV(ws, stopRadius, stopC);
+      }
+    }
+  }
+
+  EndMode2D();
+}
+
+void Game::drawTransitPanel(int uiW, int uiH)
+{
+  if (!m_showTransitPanel) return;
+
+  ensureTransitVizUpToDate();
+
+  const int panelW = 420;
+  const int panelH = 340;
+  const int x0 = uiW - panelW - 12;
+  int y0 = 96;
+  if (m_showPolicy) y0 += 280 + 12;
+  if (m_showTrafficModel) y0 += 314 + 12;
+  if (m_showDistrictPanel) y0 += 308 + 12;
+
+  DrawRectangle(x0, y0, panelW, panelH, Color{0, 0, 0, 180});
+  DrawRectangleLines(x0, y0, panelW, panelH, Color{255, 255, 255, 70});
+
+  int x = x0 + 12;
+  int y = y0 + 10;
+  DrawText("Transit Planner", x, y, 20, RAYWHITE);
+  y += 24;
+  DrawText("Tab: select   [ / ]: adjust   Enter: replan", x, y, 16, Color{220, 220, 220, 255});
+  y += 20;
+  DrawText("Ctrl+T: toggle panel   Ctrl+Shift+T: export", x, y, 16, Color{220, 220, 220, 255});
+  y += 22;
+
+  auto row = [&](int idx, const char* label, const char* value) {
+    const bool sel = (m_transitSelection == idx);
+    if (sel) {
+      DrawRectangle(x - 6, y - 2, panelW - 24, 20, Color{255, 255, 255, 40});
+    }
+    DrawText(TextFormat("%s: %s", label, value), x, y, 18,
+             sel ? Color{255, 255, 255, 255} : Color{210, 210, 210, 255});
+    y += 22;
+  };
+
+  const bool overlayEffective = (m_showTransitPanel || m_showTransitOverlay);
+  const char* overlayLabel = m_showTransitOverlay ? "ON" : (overlayEffective ? "AUTO (panel)" : "OFF");
+
+  // Keep these indices in sync with adjustTransitPanel().
+  row(0, "Overlay", overlayLabel);
+  row(1, "Demand", TransitDemandModeName(m_transitDemandMode));
+  row(2, "Max lines", TextFormat("%d", m_transitCfg.maxLines));
+  row(3, "Endpoints", TextFormat("%d", m_transitCfg.endpointCandidates));
+  row(4, "Edge weight", TransitEdgeWeightModeName(m_transitCfg.weightMode));
+  row(5, "Demand bias", TextFormat("%.2f", static_cast<double>(m_transitCfg.demandBias)));
+  row(6, "Max detour", TextFormat("%.2f", static_cast<double>(m_transitCfg.maxDetour)));
+  row(7, "Cover frac", TextFormat("%.2f", static_cast<double>(m_transitCfg.coverFraction)));
+  row(8, "Min line", TextFormat("%llu", static_cast<unsigned long long>(m_transitCfg.minLineDemand)));
+  row(9, "Stop spacing", TextFormat("%d tiles", std::max(2, m_transitStopSpacing)));
+  row(10, "Show stops", m_transitShowStops ? "ON" : "OFF");
+
+  const int lineCount = static_cast<int>(m_transitPlan.lines.size());
+  row(11, "Highlight", (m_transitSelectedLine < 0) ? "All" : TextFormat("%d / %d", m_transitSelectedLine + 1, lineCount));
+  row(12, "Solo", m_transitShowOnlySelectedLine ? "ON" : "OFF");
+
+  y += 4;
+  DrawLine(x, y, x0 + panelW - 12, y, Color{255, 255, 255, 70});
+  y += 10;
+
+  const double cov = (m_transitPlan.totalDemand > 0)
+                         ? (100.0 * static_cast<double>(m_transitPlan.coveredDemand) /
+                            static_cast<double>(m_transitPlan.totalDemand))
+                         : 0.0;
+  DrawText(TextFormat("Lines: %d   Coverage: %.0f%%", lineCount, cov), x, y, 18, RAYWHITE);
+  y += 20;
+  DrawText(TextFormat("Demand: %llu  Covered: %llu", static_cast<unsigned long long>(m_transitPlan.totalDemand),
+                      static_cast<unsigned long long>(m_transitPlan.coveredDemand)),
+           x, y, 16, Color{220, 220, 220, 255});
+  y += 18;
+
+  if (m_transitSelectedLine >= 0 && m_transitSelectedLine < static_cast<int>(m_transitPlan.lines.size())) {
+    const TransitLine& l = m_transitPlan.lines[static_cast<std::size_t>(m_transitSelectedLine)];
+    // Find the viz cache for stop count.
+    int stopCount = 0;
+    for (const TransitLineViz& v : m_transitViz) {
+      if (v.lineIndex == m_transitSelectedLine) {
+        stopCount = static_cast<int>(v.stops.size());
+        break;
+      }
+    }
+
+    DrawText(TextFormat("Line %d: demand %llu   cost %llu   stops %d", m_transitSelectedLine + 1,
+                        static_cast<unsigned long long>(l.sumDemand),
+                        static_cast<unsigned long long>(l.baseCost),
+                        stopCount),
+             x, y, 16, Color{220, 220, 220, 255});
+  }
+}
+
+void Game::adjustTransitPanel(int dir, bool bigStep)
+{
+  const int stepI = bigStep ? 2 : 1;
+  const int stepBigI = bigStep ? 8 : 2;
+  const double stepF = bigStep ? 0.25 : 0.05;
+  const double stepBias = bigStep ? 0.50 : 0.10;
+
+  auto markPlanDirty = [&]() {
+    m_transitPlanDirty = true;
+    m_transitVizDirty = true;
+  };
+
+  switch (m_transitSelection) {
+  case 0: {
+    // Overlay persist toggle.
+    if (dir != 0) {
+      m_showTransitOverlay = !m_showTransitOverlay;
+      showToast(m_showTransitOverlay ? "Transit overlay: ON" : "Transit overlay: OFF", 2.0f);
+    }
+    break;
+  }
+  case 1: {
+    // Demand mode.
+    if (dir != 0) {
+      const int idx = static_cast<int>(m_transitDemandMode);
+      const int next = (idx + (dir > 0 ? 1 : -1) + 3) % 3;
+      m_transitDemandMode = static_cast<TransitDemandMode>(next);
+      markPlanDirty();
+      showToast(std::string("Transit demand: ") + TransitDemandModeName(m_transitDemandMode), 2.0f);
+    }
+    break;
+  }
+  case 2: {
+    m_transitCfg.maxLines = std::clamp(m_transitCfg.maxLines + dir * stepI, 1, 32);
+    markPlanDirty();
+    break;
+  }
+  case 3: {
+    m_transitCfg.endpointCandidates = std::clamp(m_transitCfg.endpointCandidates + dir * stepBigI, 4, 128);
+    markPlanDirty();
+    break;
+  }
+  case 4: {
+    if (dir != 0) {
+      m_transitCfg.weightMode = (m_transitCfg.weightMode == TransitEdgeWeightMode::Steps)
+                                    ? TransitEdgeWeightMode::TravelTime
+                                    : TransitEdgeWeightMode::Steps;
+      markPlanDirty();
+    }
+    break;
+  }
+  case 5: {
+    m_transitCfg.demandBias = std::clamp(m_transitCfg.demandBias + static_cast<double>(dir) * stepBias, 0.0, 10.0);
+    markPlanDirty();
+    break;
+  }
+  case 6: {
+    m_transitCfg.maxDetour = std::clamp(m_transitCfg.maxDetour + static_cast<double>(dir) * stepF, 1.0, 3.0);
+    markPlanDirty();
+    break;
+  }
+  case 7: {
+    m_transitCfg.coverFraction = std::clamp(m_transitCfg.coverFraction + static_cast<double>(dir) * stepF, 0.0, 1.0);
+    markPlanDirty();
+    break;
+  }
+  case 8: {
+    const std::uint64_t step = static_cast<std::uint64_t>(bigStep ? 50 : 10);
+    if (dir > 0) {
+      m_transitCfg.minLineDemand += step;
+    } else if (dir < 0) {
+      m_transitCfg.minLineDemand = (m_transitCfg.minLineDemand > step) ? (m_transitCfg.minLineDemand - step) : 0;
+    }
+    markPlanDirty();
+    break;
+  }
+  case 9: {
+    m_transitStopSpacing = std::clamp(m_transitStopSpacing + dir * (bigStep ? 4 : 1), 2, 64);
+    m_transitVizDirty = true;
+    break;
+  }
+  case 10: {
+    if (dir != 0) m_transitShowStops = !m_transitShowStops;
+    break;
+  }
+  case 11: {
+    const int count = static_cast<int>(m_transitPlan.lines.size());
+    if (count <= 0) {
+      m_transitSelectedLine = -1;
+      break;
+    }
+
+    // Cycle: All (-1) then 0..count-1.
+    int idx = m_transitSelectedLine;
+    if (idx < -1) idx = -1;
+    if (idx >= count) idx = count - 1;
+
+    if (dir > 0) {
+      idx = (idx < 0) ? 0 : (idx + 1);
+      if (idx >= count) idx = -1;
+    } else if (dir < 0) {
+      idx = (idx < 0) ? (count - 1) : (idx - 1);
+      if (idx < 0) idx = -1;
+    }
+
+    m_transitSelectedLine = idx;
+    break;
+  }
+  case 12: {
+    if (dir != 0) m_transitShowOnlySelectedLine = !m_transitShowOnlySelectedLine;
+    break;
+  }
+  default:
+    break;
+  }
+}
+
+void Game::exportTransitArtifacts()
+{
+  ensureTransitVizUpToDate();
+  if (m_transitPlan.lines.empty() || m_roadGraph.edges.empty()) {
+    showToast("Transit export: no plan", 2.5f);
+    return;
+  }
+
+  namespace fs = std::filesystem;
+  fs::create_directories("captures");
+
+  const std::string base = TextFormat("captures/transit_seed%llu_%s",
+                                     static_cast<unsigned long long>(m_world.seed()),
+                                      FileTimestamp().c_str());
+
+  TransitPlanExportConfig ec;
+  ec.includeStops = true;
+  ec.includeTiles = true;
+  ec.stopMode = TransitStopMode::Tiles;
+  ec.stopSpacingTiles = std::max(2, m_transitStopSpacing);
+
+  // GeoJSON + JSON
+  {
+    std::string err;
+    const std::string path = base + ".geojson";
+    const bool ok = ExportTransitPlanGeoJson(path, m_roadGraph, m_transitPlan, ec, &err);
+    showToast(ok ? (std::string("Transit export: ") + path) : (std::string("Transit export failed: ") + err), 3.0f);
+  }
+  {
+    std::string err;
+    const std::string path = base + ".json";
+    const bool ok = ExportTransitPlanJson(path, m_roadGraph, m_transitPlan, ec, &err);
+    if (!ok) {
+      showToast(std::string("Transit JSON failed: ") + err, 3.0f);
+    }
+  }
+
+  // Quick-look raster overlay (tile-space, scaled).
+  {
+    std::string err;
+    PpmImage img = RenderTransitOverlayTile(m_world, ExportLayer::Overlay, m_roadGraph, m_transitPlan, ec);
+    const int maxDim = std::max(1, std::max(m_world.width(), m_world.height()));
+    const int scale = std::clamp(2048 / maxDim, 1, 8);
+    if (scale > 1) {
+      img = ScaleNearest(img, scale);
+    }
+
+    const std::string path = base + ".png";
+    const bool ok = WriteImageAuto(path, img, err);
+    if (!ok) {
+      showToast(std::string("Transit PNG failed: ") + err, 3.0f);
+    }
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Road upgrade planner (street->avenue/highway suggestions)
+// -----------------------------------------------------------------------------
+
+namespace {
+
+const char* RoadUpgradeDemandModeName(Game::RoadUpgradeDemandMode m)
+{
+  switch (m) {
+    case Game::RoadUpgradeDemandMode::Commute: return "commute";
+    case Game::RoadUpgradeDemandMode::Goods: return "goods";
+    case Game::RoadUpgradeDemandMode::Combined: return "combined";
+  }
+  return "combined";
+}
+
+const char* RoadUpgradeObjectiveLabel(RoadUpgradeObjective obj)
+{
+  switch (obj) {
+    case RoadUpgradeObjective::Congestion: return "Congestion";
+    case RoadUpgradeObjective::Time: return "Time";
+    case RoadUpgradeObjective::Hybrid: return "Hybrid";
+  }
+  return "Congestion";
+}
+
+Color RoadUpgradeLevelColor(int level, unsigned char alpha)
+{
+  // Match export colors (teal for level 2, warm orange-red for level 3), but use
+  // alpha-tinted overlays for in-game readability.
+  Color c = WHITE;
+  switch (ClampRoadLevel(level)) {
+    case 2: c = Color{40, 220, 200, 255}; break;
+    case 3: c = Color{255, 110, 70, 255}; break;
+    default: c = Color{255, 255, 255, 255}; break;
+  }
+  c.a = alpha;
+  return c;
+}
+
+} // namespace
+
+void Game::ensureRoadUpgradePlanUpToDate()
+{
+  // If the plan isn't explicitly dirty, still replan if any of the upstream
+  // inputs changed (roads, traffic/goods caches, or auto-budget money).
+  const bool needCommute = (m_roadUpgradeDemandMode == RoadUpgradeDemandMode::Commute) ||
+                           (m_roadUpgradeDemandMode == RoadUpgradeDemandMode::Combined);
+  const bool needGoods = (m_roadUpgradeDemandMode == RoadUpgradeDemandMode::Goods) ||
+                         (m_roadUpgradeDemandMode == RoadUpgradeDemandMode::Combined);
+
+  const int w = m_world.width();
+  const int h = m_world.height();
+  const int n = std::max(0, w) * std::max(0, h);
+
+  if (!m_roadUpgradePlanDirty) {
+    if (m_roadGraphDirty) m_roadUpgradePlanDirty = true;
+    if (needCommute && (m_trafficDirty || static_cast<int>(m_traffic.roadTraffic.size()) != n)) m_roadUpgradePlanDirty = true;
+    if (needGoods && (m_goodsDirty || static_cast<int>(m_goods.roadGoodsTraffic.size()) != n)) m_roadUpgradePlanDirty = true;
+    if (m_roadUpgradeBudgetAuto && (m_roadUpgradePlan.cfg.budget != std::max(0, m_world.stats().money))) m_roadUpgradePlanDirty = true;
+    if ((m_roadUpgradePlan.w != w) || (m_roadUpgradePlan.h != h)) m_roadUpgradePlanDirty = true;
+  }
+
+  if (!m_roadUpgradePlanDirty) return;
+
+  ensureRoadGraphUpToDate();
+
+  if (m_roadGraph.edges.empty() || n <= 0) {
+    m_roadUpgradePlan = RoadUpgradePlan{};
+    m_roadUpgradePlanDirty = false;
+    m_roadUpgradeSelectedEdge = -1;
+    m_roadUpgradeSelectedMaskDirty = true;
+    return;
+  }
+
+  // Outside-connection rule (optionally cached so we can reuse it across planners/overlays).
+  const bool requireOutside = m_sim.config().requireOutsideConnection;
+  const std::vector<std::uint8_t>* roadToEdgeMask = nullptr;
+  if (requireOutside) {
+    if (static_cast<int>(m_outsideOverlayRoadToEdge.size()) != n) {
+      ComputeRoadsConnectedToEdge(m_world, m_outsideOverlayRoadToEdge);
+    }
+    if (static_cast<int>(m_outsideOverlayRoadToEdge.size()) == n) {
+      roadToEdgeMask = &m_outsideOverlayRoadToEdge;
+    }
+  }
+
+  // Ensure derived flows exist for the selected demand mode.
+  if (needCommute) {
+    if (m_trafficDirty || static_cast<int>(m_traffic.roadTraffic.size()) != n) {
+      const auto& cfg = m_sim.config();
+      TrafficConfig tc;
+      tc.baseRoadCapacity = cfg.trafficModel.baseRoadCapacity;
+      tc.useCongestionModel = cfg.trafficModel.useCongestionModel;
+      tc.congestionAlpha = cfg.trafficModel.congestionAlpha;
+      tc.congestionBeta = cfg.trafficModel.congestionBeta;
+      tc.roadSpeedPenaltyWeight = cfg.trafficModel.roadSpeedPenaltyWeight;
+
+      const float employedShare = (m_world.stats().population > 0)
+                                      ? (static_cast<float>(m_world.stats().employed) /
+                                         static_cast<float>(m_world.stats().population))
+                                      : 1.0f;
+      m_traffic = ComputeCommuteTraffic(m_world, tc, employedShare, roadToEdgeMask, nullptr);
+      m_trafficDirty = false;
+    }
+  }
+
+  if (needGoods) {
+    if (m_goodsDirty || static_cast<int>(m_goods.roadGoodsTraffic.size()) != n) {
+      const auto& cfg = m_sim.config();
+      GoodsConfig gc;
+      gc.baseRoadCapacity = cfg.trafficModel.baseRoadCapacity;
+      gc.useCongestionModel = cfg.trafficModel.useCongestionModel;
+      gc.congestionAlpha = cfg.trafficModel.congestionAlpha;
+      gc.congestionBeta = cfg.trafficModel.congestionBeta;
+      gc.roadSpeedPenaltyWeight = cfg.trafficModel.roadSpeedPenaltyWeight;
+      gc.goodsPerCommercialTile = cfg.goodsPerCommercialTile;
+      gc.maxDeliveryDistance = cfg.maxDeliveryDistance;
+
+      m_goods = ComputeGoodsFlow(m_world, gc, roadToEdgeMask, nullptr);
+      m_goodsDirty = false;
+    }
+  }
+
+  // Compose a per-road-tile flow map.
+  std::vector<std::uint32_t> roadFlow;
+  roadFlow.assign(static_cast<std::size_t>(n), 0u);
+
+  if (needCommute && static_cast<int>(m_traffic.roadTraffic.size()) == n) {
+    for (int i = 0; i < n; ++i) {
+      roadFlow[static_cast<std::size_t>(i)] += static_cast<std::uint32_t>(m_traffic.roadTraffic[static_cast<std::size_t>(i)]);
+    }
+  }
+  if (needGoods && static_cast<int>(m_goods.roadGoodsTraffic.size()) == n) {
+    const double wgt = std::max(0.0, m_roadUpgradeGoodsWeight);
+    for (int i = 0; i < n; ++i) {
+      const double add = wgt * static_cast<double>(m_goods.roadGoodsTraffic[static_cast<std::size_t>(i)]);
+      const std::uint32_t inc = static_cast<std::uint32_t>(std::clamp<long long>(
+          static_cast<long long>(std::llround(add)), 0ll, static_cast<long long>(std::numeric_limits<std::uint32_t>::max())));
+      roadFlow[static_cast<std::size_t>(i)] += inc;
+    }
+  }
+
+  // Apply outside-connection pruning at the tile level (extra safety in case the derived models
+  // didn't fully suppress disconnected subnets).
+  if (roadToEdgeMask && static_cast<int>(roadToEdgeMask->size()) == n) {
+    for (int i = 0; i < n; ++i) {
+      if ((*roadToEdgeMask)[static_cast<std::size_t>(i)] == 0) {
+        roadFlow[static_cast<std::size_t>(i)] = 0u;
+      }
+    }
+  }
+
+  RoadUpgradePlannerConfig cfg = m_roadUpgradeCfg;
+
+  // Keep maxTargetLevel sane for gameplay (no point planning "upgrade to street").
+  cfg.maxTargetLevel = std::clamp(cfg.maxTargetLevel, 2, 3);
+
+  // Budget: either manual (cfg.budget) or dynamic based on current money.
+  if (m_roadUpgradeBudgetAuto) {
+    cfg.budget = std::max(0, m_world.stats().money);
+  } else {
+    cfg.budget = m_roadUpgradeBudget;
+  }
+
+  m_roadUpgradePlan = PlanRoadUpgrades(m_world, m_roadGraph, roadFlow, cfg);
+  m_roadUpgradePlanDirty = false;
+  m_roadUpgradeSelectedMaskDirty = true;
+
+  // Clamp selection to valid range.
+  if (m_roadUpgradePlan.edges.empty()) {
+    m_roadUpgradeSelectedEdge = -1;
+  } else if (m_roadUpgradeSelectedEdge >= static_cast<int>(m_roadUpgradePlan.edges.size())) {
+    m_roadUpgradeSelectedEdge = -1;
+  }
+}
+
+void Game::ensureRoadUpgradeSelectedMaskUpToDate()
+{
+  if (!m_roadUpgradeSelectedMaskDirty) return;
+
+  const int w = m_world.width();
+  const int h = m_world.height();
+  const int n = std::max(0, w) * std::max(0, h);
+
+  m_roadUpgradeSelectedMask.assign(static_cast<std::size_t>(n), 0u);
+
+  ensureRoadUpgradePlanUpToDate();
+  if (m_roadUpgradeSelectedEdge < 0 || m_roadUpgradeSelectedEdge >= static_cast<int>(m_roadUpgradePlan.edges.size()) || n <= 0) {
+    m_roadUpgradeSelectedMaskDirty = false;
+    return;
+  }
+
+  const int gEdge = m_roadUpgradePlan.edges[static_cast<std::size_t>(m_roadUpgradeSelectedEdge)].edgeIndex;
+  if (gEdge < 0 || gEdge >= static_cast<int>(m_roadGraph.edges.size())) {
+    m_roadUpgradeSelectedMaskDirty = false;
+    return;
+  }
+
+  const int planW = m_roadUpgradePlan.w;
+  const int planH = m_roadUpgradePlan.h;
+  if (planW != w || planH != h) {
+    m_roadUpgradeSelectedMaskDirty = false;
+    return;
+  }
+  if (static_cast<int>(m_roadUpgradePlan.tileTargetLevel.size()) != n) {
+    m_roadUpgradeSelectedMaskDirty = false;
+    return;
+  }
+
+  const RoadGraphEdge& e = m_roadGraph.edges[static_cast<std::size_t>(gEdge)];
+  for (const Point& p : e.tiles) {
+    if (!m_world.inBounds(p.x, p.y)) continue;
+    const std::size_t idx = static_cast<std::size_t>(p.y) * static_cast<std::size_t>(w) +
+                            static_cast<std::size_t>(p.x);
+    if (idx >= m_roadUpgradeSelectedMask.size()) continue;
+    if (m_roadUpgradePlan.tileTargetLevel[idx] > 0) {
+      m_roadUpgradeSelectedMask[idx] = 1u;
+    }
+  }
+
+  m_roadUpgradeSelectedMaskDirty = false;
+}
+
+void Game::drawRoadUpgradeOverlay()
+{
+  const bool show = m_showRoadUpgradePanel || m_showRoadUpgradeOverlay;
+  if (!show) return;
+
+  ensureRoadUpgradePlanUpToDate();
+  if (m_roadUpgradePlan.tileTargetLevel.empty()) return;
+
+  const int w = m_world.width();
+  const int h = m_world.height();
+  if (w <= 0 || h <= 0) return;
+  if (m_roadUpgradePlan.w != w || m_roadUpgradePlan.h != h) return;
+  const int n = w * h;
+  if (static_cast<int>(m_roadUpgradePlan.tileTargetLevel.size()) != n) return;
+
+  ensureRoadUpgradeSelectedMaskUpToDate();
+
+  BeginMode2D(m_camera);
+
+  const float zoom = std::max(0.25f, m_camera.zoom);
+  const float outline = 1.25f / zoom;
+
+  const bool haveSelectionMask = (m_roadUpgradeSelectedEdge >= 0) &&
+                                 (static_cast<int>(m_roadUpgradeSelectedMask.size()) == n);
+
+  Vector2 corners[4];
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
+                              static_cast<std::size_t>(x);
+      const int lvl = static_cast<int>(m_roadUpgradePlan.tileTargetLevel[idx]);
+      if (lvl <= 0) continue;
+
+      const bool isSelectedTile = haveSelectionMask && (m_roadUpgradeSelectedMask[idx] != 0u);
+      if (m_roadUpgradeShowOnlySelectedEdge && haveSelectionMask && !isSelectedTile) continue;
+
+      const unsigned char alpha = isSelectedTile ? 170u : (haveSelectionMask ? 70u : 130u);
+      const Color fill = RoadUpgradeLevelColor(lvl, alpha);
+
+      const Vector2 c = TileToWorldCenterElevated(m_world, x, y, static_cast<float>(m_cfg.tileWidth),
+                                                  static_cast<float>(m_cfg.tileHeight), m_elev);
+      TileDiamondCorners(c, static_cast<float>(m_cfg.tileWidth), static_cast<float>(m_cfg.tileHeight), corners);
+
+      // Filled diamond (two triangles).
+      DrawTriangle(corners[0], corners[1], corners[3], fill);
+      DrawTriangle(corners[1], corners[2], corners[3], fill);
+
+      if (isSelectedTile) {
+        const Color oc = Color{255, 255, 255, 200};
+        DrawLineEx(corners[0], corners[1], outline, oc);
+        DrawLineEx(corners[1], corners[2], outline, oc);
+        DrawLineEx(corners[2], corners[3], outline, oc);
+        DrawLineEx(corners[3], corners[0], outline, oc);
+      }
+    }
+  }
+
+  EndMode2D();
+}
+
+void Game::drawRoadUpgradePanel(int uiW, int uiH)
+{
+  if (!m_showRoadUpgradePanel) return;
+
+  ensureRoadUpgradePlanUpToDate();
+
+  const int panelW = 460;
+  const int panelH = 360;
+
+  const int x0 = uiW - panelW - 12;
+  int y0 = 96;
+  if (m_showPolicy) y0 += 280 + 12;
+  if (m_showTrafficModel) y0 += 314 + 12;
+  if (m_showDistrictPanel) y0 += 308 + 12;
+  if (m_showTransitPanel) y0 += 340 + 12;
+
+  DrawRectangle(x0, y0, panelW, panelH, Color{20, 20, 20, 200});
+  DrawRectangleLines(x0, y0, panelW, panelH, Color{255, 255, 255, 90});
+
+  int x = x0 + 12;
+  int y = y0 + 10;
+
+  DrawText("Road Upgrade Planner", x, y, 20, Color{255, 255, 255, 255});
+  y += 22;
+  DrawText("Tab: select  [ / ]: adjust  Enter: replan  Ctrl+Enter: apply", x, y, 16, Color{220, 220, 220, 255});
+  y += 18;
+  DrawText("Ctrl+U toggle.  Ctrl+Shift+U export (json/geojson/png).", x, y, 16, Color{200, 200, 200, 255});
+  y += 18;
+
+  const int planEdges = static_cast<int>(m_roadUpgradePlan.edges.size());
+
+  int tileUpgrades = 0;
+  if (static_cast<int>(m_roadUpgradePlan.tileTargetLevel.size()) == m_roadUpgradePlan.w * m_roadUpgradePlan.h) {
+    for (std::uint8_t lvl : m_roadUpgradePlan.tileTargetLevel) {
+      if (lvl > 0) ++tileUpgrades;
+    }
+  }
+
+  const int budgetEff = m_roadUpgradeBudgetAuto ? std::max(0, m_world.stats().money) : m_roadUpgradeBudget;
+  const char* budgetLabel = m_roadUpgradeBudgetAuto ? "AUTO" : ((budgetEff < 0) ? "UNLIM" : "LIMIT");
+
+  DrawText(TextFormat("Plan: %d edges  %d tiles  Cost $%d  Budget %s (%d)",
+                      planEdges, tileUpgrades, m_roadUpgradePlan.totalCost, budgetLabel, budgetEff),
+           x, y, 16, Color{220, 220, 220, 255});
+  y += 20;
+  DrawLine(x, y, x0 + panelW - 12, y, Color{255, 255, 255, 70});
+  y += 8;
+
+  auto row = [&](int idx, const char* label, const char* value, bool enabled = true) {
+    const bool sel = (m_roadUpgradeSelection == idx);
+    if (sel) {
+      DrawRectangle(x - 6, y - 2, panelW - 24, 20, Color{255, 255, 255, 40});
+    }
+    Color c = sel ? Color{255, 255, 255, 255} : Color{210, 210, 210, 255};
+    if (!enabled) c = sel ? Color{200, 200, 200, 220} : Color{140, 140, 140, 220};
+    DrawText(TextFormat("%s: %s", label, value), x, y, 18, c);
+    y += 22;
+  };
+
+  row(0, "Overlay", m_showRoadUpgradeOverlay ? "ON" : "AUTO (panel)");
+  row(1, "Demand", RoadUpgradeDemandModeName(m_roadUpgradeDemandMode));
+  row(2, "Objective", RoadUpgradeObjectiveLabel(m_roadUpgradeCfg.objective));
+
+  // Budget row: Shift+[ / ] toggles AUTO vs MANUAL. In MANUAL, [ / ] adjusts limit.
+  {
+    const char* mode = m_roadUpgradeBudgetAuto ? "AUTO" : "MANUAL";
+    const char* val = "";
+    char buf[64];
+    if (m_roadUpgradeBudgetAuto) {
+      std::snprintf(buf, sizeof(buf), "money (%d)", std::max(0, m_world.stats().money));
+      val = buf;
+    } else {
+      if (m_roadUpgradeBudget < 0) {
+        val = "unlimited";
+      } else {
+        std::snprintf(buf, sizeof(buf), "%d", m_roadUpgradeBudget);
+        val = buf;
+      }
+    }
+    row(3, "Budget", TextFormat("%s (%s)", mode, val));
+  }
+
+  row(4, "Max level", TextFormat("%d", m_roadUpgradeCfg.maxTargetLevel));
+  row(5, "Min util", TextFormat("%.2f", static_cast<double>(m_roadUpgradeCfg.minUtilConsider)));
+  row(6, "Endpoints", m_roadUpgradeCfg.upgradeEndpoints ? "ON" : "OFF");
+  row(7, "Base cap", TextFormat("%d", m_roadUpgradeCfg.baseTileCapacity));
+
+  const bool hybrid = (m_roadUpgradeCfg.objective == RoadUpgradeObjective::Hybrid);
+  row(8, "Hybrid excess", TextFormat("%.2f", static_cast<double>(m_roadUpgradeCfg.hybridExcessWeight)), hybrid);
+  row(9, "Hybrid time", TextFormat("%.2f", static_cast<double>(m_roadUpgradeCfg.hybridTimeWeight)), hybrid);
+
+  const bool goodsMode = (m_roadUpgradeDemandMode == RoadUpgradeDemandMode::Goods) ||
+                         (m_roadUpgradeDemandMode == RoadUpgradeDemandMode::Combined);
+  row(10, "Goods weight", TextFormat("%.2f", static_cast<double>(m_roadUpgradeGoodsWeight)), goodsMode);
+
+  // Selected edge highlight.
+  {
+    if (planEdges <= 0) {
+      row(11, "Highlight", "(none)", false);
+    } else if (m_roadUpgradeSelectedEdge < 0 || m_roadUpgradeSelectedEdge >= planEdges) {
+      row(11, "Highlight", TextFormat("All (%d)", planEdges));
+    } else {
+      const RoadUpgradeEdge& e = m_roadUpgradePlan.edges[static_cast<std::size_t>(m_roadUpgradeSelectedEdge)];
+      row(11, "Highlight", TextFormat("%d/%d  edge %d  -> L%d  $%d", m_roadUpgradeSelectedEdge + 1, planEdges,
+                                     e.edgeIndex, e.targetLevel, e.cost));
+    }
+  }
+
+  row(12, "Solo", m_roadUpgradeShowOnlySelectedEdge ? "ON" : "OFF",
+      (m_roadUpgradeSelectedEdge >= 0 && m_roadUpgradeSelectedEdge < planEdges));
+
+  y += 2;
+  DrawLine(x, y, x0 + panelW - 12, y, Color{255, 255, 255, 70});
+  y += 8;
+
+  if (m_roadUpgradePlan.edges.empty()) {
+    DrawText("No upgrades selected (try lowering Min util, raising budget, or switching objective).", x, y, 16,
+             Color{200, 200, 200, 255});
+  } else {
+    const double tK = static_cast<double>(m_roadUpgradePlan.totalTimeSaved) / 1000.0;
+    DrawText(TextFormat("Benefit: excess -%llu  timeSaved ~%.0fk", (unsigned long long)m_roadUpgradePlan.totalExcessReduced, tK),
+             x, y, 16, Color{200, 200, 200, 255});
+  }
+}
+
+void Game::adjustRoadUpgradePanel(int dir, bool bigStep)
+{
+  if (dir == 0) return;
+  ensureRoadUpgradePlanUpToDate();
+
+  bool planChanged = false;
+
+  const int stepMoney = bigStep ? 500 : 100;
+  const int stepCap = bigStep ? 8 : 2;
+  const double stepF = bigStep ? 0.25 : 0.05;
+
+  switch (m_roadUpgradeSelection) {
+    case 0: {
+      m_showRoadUpgradeOverlay = !m_showRoadUpgradeOverlay;
+      showToast(m_showRoadUpgradeOverlay ? "Road upgrades overlay: ON" : "Road upgrades overlay: OFF", 2.0f);
+    } break;
+
+    case 1: {
+      int m = static_cast<int>(m_roadUpgradeDemandMode);
+      m += (dir > 0) ? 1 : -1;
+      if (m < 0) m = 2;
+      if (m > 2) m = 0;
+      m_roadUpgradeDemandMode = static_cast<RoadUpgradeDemandMode>(m);
+      showToast(std::string("Upgrade demand: ") + RoadUpgradeDemandModeName(m_roadUpgradeDemandMode), 2.0f);
+      planChanged = true;
+    } break;
+
+    case 2: {
+      int o = static_cast<int>(m_roadUpgradeCfg.objective);
+      o += (dir > 0) ? 1 : -1;
+      if (o < 0) o = 2;
+      if (o > 2) o = 0;
+      m_roadUpgradeCfg.objective = static_cast<RoadUpgradeObjective>(o);
+      showToast(std::string("Upgrade objective: ") + RoadUpgradeObjectiveLabel(m_roadUpgradeCfg.objective), 2.0f);
+      planChanged = true;
+    } break;
+
+    case 3: {
+      if (bigStep) {
+        m_roadUpgradeBudgetAuto = !m_roadUpgradeBudgetAuto;
+        if (!m_roadUpgradeBudgetAuto && m_roadUpgradeBudget < 0) {
+          m_roadUpgradeBudget = std::max(0, m_world.stats().money);
+        }
+        showToast(m_roadUpgradeBudgetAuto ? "Upgrade budget: AUTO" : "Upgrade budget: MANUAL", 2.0f);
+        planChanged = true;
+      } else {
+        if (!m_roadUpgradeBudgetAuto) {
+          // If budget currently unlimited, snap to current money first so adjustments are intuitive.
+          if (m_roadUpgradeBudget < 0) {
+            m_roadUpgradeBudget = std::max(0, m_world.stats().money);
+          }
+          m_roadUpgradeBudget += dir * stepMoney;
+          if (m_roadUpgradeBudget < 0) m_roadUpgradeBudget = -1; // allow going back to unlimited
+          planChanged = true;
+        }
+      }
+    } break;
+
+    case 4: {
+      m_roadUpgradeCfg.maxTargetLevel = std::clamp(m_roadUpgradeCfg.maxTargetLevel + dir, 2, 3);
+      planChanged = true;
+    } break;
+
+    case 5: {
+      m_roadUpgradeCfg.minUtilConsider = std::clamp(m_roadUpgradeCfg.minUtilConsider + static_cast<double>(dir) * stepF, 0.0, 5.0);
+      planChanged = true;
+    } break;
+
+    case 6: {
+      m_roadUpgradeCfg.upgradeEndpoints = !m_roadUpgradeCfg.upgradeEndpoints;
+      planChanged = true;
+    } break;
+
+    case 7: {
+      m_roadUpgradeCfg.baseTileCapacity = std::clamp(m_roadUpgradeCfg.baseTileCapacity + dir * stepCap, 4, 200);
+      planChanged = true;
+    } break;
+
+    case 8: {
+      m_roadUpgradeCfg.hybridExcessWeight = std::clamp(m_roadUpgradeCfg.hybridExcessWeight + static_cast<double>(dir) * stepF, 0.0, 10.0);
+      planChanged = true;
+    } break;
+
+    case 9: {
+      m_roadUpgradeCfg.hybridTimeWeight = std::clamp(m_roadUpgradeCfg.hybridTimeWeight + static_cast<double>(dir) * stepF, 0.0, 10.0);
+      planChanged = true;
+    } break;
+
+    case 10: {
+      m_roadUpgradeGoodsWeight = std::clamp(m_roadUpgradeGoodsWeight + static_cast<double>(dir) * stepF, 0.0, 10.0);
+      planChanged = true;
+    } break;
+
+    case 11: {
+      const int count = static_cast<int>(m_roadUpgradePlan.edges.size());
+      if (count <= 0) {
+        m_roadUpgradeSelectedEdge = -1;
+      } else {
+        int cur = m_roadUpgradeSelectedEdge;
+        if (cur < 0) {
+          cur = (dir > 0) ? 0 : (count - 1);
+        } else {
+          cur += (dir > 0) ? 1 : -1;
+          if (cur >= count) cur = -1;
+          if (cur < -1) cur = count - 1;
+        }
+        m_roadUpgradeSelectedEdge = cur;
+      }
+      m_roadUpgradeSelectedMaskDirty = true;
+    } break;
+
+    case 12: {
+      m_roadUpgradeShowOnlySelectedEdge = !m_roadUpgradeShowOnlySelectedEdge;
+    } break;
+
+    default:
+      break;
+  }
+
+  if (planChanged) {
+    m_roadUpgradePlanDirty = true;
+    m_roadUpgradeSelectedMaskDirty = true;
+  }
+}
+
+bool Game::applyRoadUpgradePlan()
+{
+  ensureRoadUpgradePlanUpToDate();
+  if (m_roadUpgradePlan.tileTargetLevel.empty() || m_roadUpgradePlan.w <= 0 || m_roadUpgradePlan.h <= 0) {
+    showToast("No upgrade plan", 2.0f);
+    return false;
+  }
+
+  const int w = m_world.width();
+  const int h = m_world.height();
+  if (w != m_roadUpgradePlan.w || h != m_roadUpgradePlan.h) {
+    showToast("Upgrade plan mismatch (replan)", 2.5f);
+    return false;
+  }
+
+  const int n = w * h;
+  if (static_cast<int>(m_roadUpgradePlan.tileTargetLevel.size()) != n) {
+    showToast("Upgrade plan invalid (replan)", 2.5f);
+    return false;
+  }
+
+  // Compute the current money cost (world may have changed since planning).
+  int moneyCost = 0;
+  int upgradeTiles = 0;
+  bool anyChange = false;
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
+                              static_cast<std::size_t>(x);
+      const int tgt = ClampRoadLevel(static_cast<int>(m_roadUpgradePlan.tileTargetLevel[idx]));
+      if (tgt <= 0) continue;
+      const Tile& t = m_world.at(x, y);
+      if (t.overlay != Overlay::Road) continue;
+      const int cur = ClampRoadLevel(static_cast<int>(t.level));
+      if (tgt <= cur) continue;
+      const bool isBridge = (t.terrain == Terrain::Water);
+      const int c = RoadPlacementCost(cur, tgt, /*alreadyRoad=*/true, isBridge);
+      moneyCost += c;
+      if (c > 0) {
+        anyChange = true;
+        ++upgradeTiles;
+      }
+    }
+  }
+
+  if (!anyChange) {
+    showToast("Upgrade plan already applied (no changes)", 2.5f);
+    return false;
+  }
+
+  if (moneyCost > m_world.stats().money) {
+    showToast(TextFormat("Insufficient funds (%d needed)", moneyCost), 3.0f);
+    return false;
+  }
+
+  endPaintStroke();
+
+  const int moneyBefore = m_world.stats().money;
+  m_history.beginStroke(m_world);
+
+  std::vector<Point> changed;
+  changed.reserve(static_cast<std::size_t>(upgradeTiles));
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
+                              static_cast<std::size_t>(x);
+      const int tgt = ClampRoadLevel(static_cast<int>(m_roadUpgradePlan.tileTargetLevel[idx]));
+      if (tgt <= 0) continue;
+      Tile& t = m_world.at(x, y);
+      if (t.overlay != Overlay::Road) continue;
+      const int cur = ClampRoadLevel(static_cast<int>(t.level));
+      if (tgt <= cur) continue;
+
+      m_history.noteTilePreEdit(m_world, x, y);
+      t.level = static_cast<std::uint8_t>(tgt);
+      changed.push_back(Point{x, y});
+    }
+  }
+
+  // Spend money once, atomically.
+  m_world.stats().money = moneyBefore - moneyCost;
+
+  m_history.endStroke(m_world);
+
+  // Invalidate render caches and derived stats.
+  m_sim.refreshDerivedStats(m_world);
+  m_renderer.markMinimapDirty();
+  m_renderer.markBaseCacheDirtyForTiles(changed, m_world.width(), m_world.height());
+
+  m_trafficDirty = true;
+  m_goodsDirty = true;
+  m_landValueDirty = true;
+  m_transitPlanDirty = true;
+  m_transitVizDirty = true;
+  m_vehiclesDirty = true;
+
+  // Our plan is now stale.
+  m_roadUpgradePlanDirty = true;
+  m_roadUpgradeSelectedMaskDirty = true;
+
+  // Resilience suggestions depend on road class (bridge travel-time/maintenance), so invalidate.
+  m_resilienceDirty = true;
+  m_resilienceBypassesDirty = true;
+  m_resilienceBypasses.clear();
+
+  const int spent = moneyBefore - m_world.stats().money;
+  showToast(TextFormat("Road upgrades applied: %d tiles, spent %d", static_cast<int>(changed.size()), spent));
+  return true;
+}
+
+void Game::exportRoadUpgradeArtifacts()
+{
+  ensureRoadUpgradePlanUpToDate();
+  if (m_roadUpgradePlan.edges.empty()) {
+    showToast("Road upgrade export: no plan", 2.5f);
+    return;
+  }
+
+  namespace fs = std::filesystem;
+  fs::create_directories("captures");
+
+  const std::string base = TextFormat("captures/roadup_seed%llu_%s",
+                                      static_cast<unsigned long long>(m_world.seed()),
+                                      FileTimestamp().c_str());
+
+  RoadUpgradePlanExportConfig ec;
+  ec.includeEdgeTiles = true;
+  ec.includeTileUpgrades = true;
+
+  // GeoJSON + JSON
+  {
+    std::string err;
+    const std::string path = base + ".geojson";
+    const bool ok = ExportRoadUpgradePlanGeoJson(path, m_roadGraph, m_roadUpgradePlan, ec, &err);
+    showToast(ok ? (std::string("Road upgrades export: ") + path)
+                 : (std::string("Road upgrades export failed: ") + err),
+              3.0f);
+  }
+  {
+    std::string err;
+    const std::string path = base + ".json";
+    const bool ok = ExportRoadUpgradePlanJson(path, m_roadGraph, m_roadUpgradePlan, ec, &err);
+    if (!ok) {
+      showToast(std::string("Road upgrades JSON failed: ") + err, 3.0f);
+    }
+  }
+
+  // Quick-look raster overlay (tile-space, scaled).
+  {
+    std::string err;
+    PpmImage img = RenderRoadUpgradeOverlayTile(m_world, ExportLayer::Overlay, m_roadUpgradePlan);
+    const int maxDim = std::max(1, std::max(m_world.width(), m_world.height()));
+    const int scale = std::clamp(2048 / maxDim, 1, 8);
+    if (scale > 1) {
+      img = ScaleNearest(img, scale);
+    }
+
+    const std::string path = base + ".png";
+    const bool ok = WriteImageAuto(path, img, err);
+    if (!ok) {
+      showToast(std::string("Road upgrades PNG failed: ") + err, 3.0f);
+    }
+  }
+}
+
 void Game::doUndo()
 {
   // Commit any in-progress stroke before undoing.
@@ -5659,6 +6878,10 @@ void Game::doUndo()
     m_trafficDirty = true;
     m_goodsDirty = true;
     m_landValueDirty = true;
+    m_transitPlanDirty = true;
+    m_transitVizDirty = true;
+    m_roadUpgradePlanDirty = true;
+    m_roadUpgradeSelectedMaskDirty = true;
     invalidateHydrology();
     m_vehiclesDirty = true;
     showToast(TextFormat("Undo (%d left)", static_cast<int>(m_history.undoSize())));
@@ -5679,6 +6902,10 @@ void Game::doRedo()
     m_trafficDirty = true;
     m_goodsDirty = true;
     m_landValueDirty = true;
+    m_transitPlanDirty = true;
+    m_transitVizDirty = true;
+    m_roadUpgradePlanDirty = true;
+    m_roadUpgradeSelectedMaskDirty = true;
     invalidateHydrology();
     m_vehiclesDirty = true;
     showToast(TextFormat("Redo (%d left)", static_cast<int>(m_history.redoSize())));
@@ -5698,6 +6925,8 @@ void Game::resetWorld(std::uint64_t newSeed)
   m_trafficDirty = true;
   m_goodsDirty = true;
   m_landValueDirty = true;
+  m_transitPlanDirty = true;
+  m_transitVizDirty = true;
   invalidateHydrology();
   m_vehiclesDirty = true;
   m_vehicles.clear();
@@ -6232,6 +7461,10 @@ void Game::handleInput(float dt)
     m_goodsDirty = true;
     m_landValueDirty = true;
     m_vehiclesDirty = true;
+    m_transitPlanDirty = true;
+    m_transitVizDirty = true;
+    m_roadUpgradePlanDirty = true;
+    m_roadUpgradeSelectedMaskDirty = true;
     showToast("Sim step");
   }
 
@@ -6362,11 +7595,46 @@ void Game::handleInput(float dt)
     } else if (m_showDistrictPanel) {
       const int count = 9;
       m_districtSelection = (m_districtSelection + delta + count) % count;
+    } else if (m_showTransitPanel) {
+      const int count = 13;
+      m_transitSelection = (m_transitSelection + delta + count) % count;
+    } else if (m_showRoadUpgradePanel) {
+      const int count = 13;
+      m_roadUpgradeSelection = (m_roadUpgradeSelection + delta + count) % count;
     } else if (m_showVideoSettings) {
       const int count = (m_videoPage == 0) ? 11 : 26;
       m_videoSelection = (m_videoSelection + delta + count) % count;
       if (m_videoPage == 0) m_videoSelectionDisplay = m_videoSelection;
       else m_videoSelectionVisual = m_videoSelection;
+    }
+  }
+
+  // Transit panel: Enter replans with the current settings.
+  if (m_showTransitPanel && m_blueprintMode == BlueprintMode::Off &&
+      (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER))) {
+    m_transitPlanDirty = true;
+    m_transitVizDirty = true;
+    ensureTransitVizUpToDate();
+
+    const int lineCount = static_cast<int>(m_transitPlan.lines.size());
+    const double cov = (m_transitPlan.totalDemand > 0)
+                           ? (100.0 * static_cast<double>(m_transitPlan.coveredDemand) /
+                              static_cast<double>(m_transitPlan.totalDemand))
+                           : 0.0;
+    showToast(TextFormat("Transit replanned (%d lines, %.0f%% coverage)", lineCount, cov));
+  }
+
+  // Road upgrade panel: Enter replans, Ctrl+Enter applies the upgrades.
+  if (m_showRoadUpgradePanel && m_blueprintMode == BlueprintMode::Off &&
+      (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER))) {
+    if (ctrl) {
+      applyRoadUpgradePlan();
+    } else {
+      m_roadUpgradePlanDirty = true;
+      ensureRoadUpgradePlanUpToDate();
+
+      const int edgeCount = static_cast<int>(m_roadUpgradePlan.edges.size());
+      showToast(TextFormat("Upgrades replanned (%d edges)", edgeCount));
     }
   }
 
@@ -6401,8 +7669,27 @@ void Game::handleInput(float dt)
   }
 
   if (IsKeyPressed(KEY_T)) {
+    // Ctrl+T toggles transit panel; Ctrl+Shift+T exports transit artifacts.
     // Shift+T toggles road resilience; plain T toggles road graph.
-    if (shift) {
+    if (ctrl) {
+      endPaintStroke();
+      if (shift) {
+        exportTransitArtifacts();
+      } else {
+        m_showTransitPanel = !m_showTransitPanel;
+        if (m_showTransitPanel) {
+          ensureTransitVizUpToDate();
+          const int lineCount = static_cast<int>(m_transitPlan.lines.size());
+          const double cov = (m_transitPlan.totalDemand > 0)
+                                 ? (100.0 * static_cast<double>(m_transitPlan.coveredDemand) /
+                                    static_cast<double>(m_transitPlan.totalDemand))
+                                 : 0.0;
+          showToast(TextFormat("Transit: ON (%d lines, %.0f%% coverage)", lineCount, cov));
+        } else {
+          showToast("Transit: OFF");
+        }
+      }
+    } else if (shift) {
       m_showResilienceOverlay = !m_showResilienceOverlay;
       if (m_showResilienceOverlay) {
         ensureRoadResilienceUpToDate();
@@ -6423,6 +7710,22 @@ void Game::handleInput(float dt)
                              static_cast<int>(m_roadGraph.edges.size())));
       } else {
         showToast("Road graph: OFF");
+      }
+    }
+  }
+
+  if (IsKeyPressed(KEY_U) && ctrl) {
+    endPaintStroke();
+    if (shift) {
+      exportRoadUpgradeArtifacts();
+    } else {
+      m_showRoadUpgradePanel = !m_showRoadUpgradePanel;
+      if (m_showRoadUpgradePanel) {
+        ensureRoadUpgradePlanUpToDate();
+        const int edgeCount = static_cast<int>(m_roadUpgradePlan.edges.size());
+        showToast(TextFormat("Road upgrades: ON (%d edges)", edgeCount));
+      } else {
+        showToast("Road upgrades: OFF");
       }
     }
   }
@@ -6585,6 +7888,8 @@ void Game::handleInput(float dt)
       m_goodsDirty = true;
       m_landValueDirty = true;
       m_vehiclesDirty = true;
+      m_transitPlanDirty = true;
+      m_transitVizDirty = true;
       m_outsideOverlayRoadToEdge.clear();
     } else if (m_showTrafficModel) {
       // Traffic model adjustments
@@ -6614,6 +7919,8 @@ void Game::handleInput(float dt)
       m_goodsDirty = true;
       m_landValueDirty = true;
       m_vehiclesDirty = true;
+      m_transitPlanDirty = true;
+      m_transitVizDirty = true;
     } else if (m_showDistrictPanel) {
       const int deltaI = shift ? -2 : -1;
       const float deltaF = shift ? -0.25f : -0.05f;
@@ -6666,6 +7973,12 @@ void Game::handleInput(float dt)
 
       // Policies affect derived stats and budget.
       m_sim.refreshDerivedStats(m_world);
+      m_transitPlanDirty = true;
+      m_transitVizDirty = true;
+    } else if (m_showTransitPanel) {
+      adjustTransitPanel(-1, shift);
+    } else if (m_showRoadUpgradePanel) {
+      adjustRoadUpgradePanel(-1, shift);
     } else if (m_showVideoSettings) {
       adjustVideoSettings(-1);
     } else {
@@ -6696,6 +8009,8 @@ void Game::handleInput(float dt)
       m_goodsDirty = true;
       m_landValueDirty = true;
       m_vehiclesDirty = true;
+      m_transitPlanDirty = true;
+      m_transitVizDirty = true;
       m_outsideOverlayRoadToEdge.clear();
     } else if (m_showTrafficModel) {
       // Traffic model adjustments
@@ -6725,6 +8040,8 @@ void Game::handleInput(float dt)
       m_goodsDirty = true;
       m_landValueDirty = true;
       m_vehiclesDirty = true;
+      m_transitPlanDirty = true;
+      m_transitVizDirty = true;
     } else if (m_showDistrictPanel) {
       const int deltaI = shift ? 2 : 1;
       const float deltaF = shift ? 0.25f : 0.05f;
@@ -6775,6 +8092,12 @@ void Game::handleInput(float dt)
       }
 
       m_sim.refreshDerivedStats(m_world);
+      m_transitPlanDirty = true;
+      m_transitVizDirty = true;
+    } else if (m_showTransitPanel) {
+      adjustTransitPanel(+1, shift);
+    } else if (m_showRoadUpgradePanel) {
+      adjustRoadUpgradePanel(+1, shift);
     } else if (m_showVideoSettings) {
       adjustVideoSettings(+1);
     } else {
@@ -6841,7 +8164,7 @@ void Game::handleInput(float dt)
   if (IsKeyPressed(KEY_ZERO)) setTool(Tool::Bulldoze);
 
   // Road tool: cycle the road class used for placement/upgrade (Street/Avenue/Highway).
-  if (IsKeyPressed(KEY_U)) {
+  if (IsKeyPressed(KEY_U) && !ctrl) {
     const int delta = shift ? -1 : 1;
     m_roadBuildLevel += delta;
     if (m_roadBuildLevel < 1) m_roadBuildLevel = 3;
@@ -7387,6 +8710,8 @@ void Game::update(float dt)
       m_goodsDirty = true;
       m_landValueDirty = true;
       m_vehiclesDirty = true;
+      m_transitPlanDirty = true;
+      m_transitVizDirty = true;
 
       // Keep the software 3D preview in sync with sim-driven changes.
       m_3dPreviewDirty = true;
@@ -8187,6 +9512,12 @@ void Game::draw()
   // Road resilience overlay (debug): bridge edges, articulation nodes, and optional bypass suggestions.
   drawRoadResilienceOverlay();
 
+  // Transit planner overlay (Ctrl+T).
+  drawTransitOverlay();
+
+  // Road upgrade overlay (Ctrl+U).
+  drawRoadUpgradeOverlay();
+
   const float simSpeed = kSimSpeeds[static_cast<std::size_t>(std::clamp(m_simSpeedIndex, 0, kSimSpeedCount - 1))];
   const char* inspectInfo = (m_tool == Tool::Inspect && !m_inspectInfo.empty()) ? m_inspectInfo.c_str() : nullptr;
 
@@ -8419,6 +9750,10 @@ void Game::draw()
                Color{220, 220, 220, 255});
     }
   }
+
+  drawTransitPanel(uiW, uiH);
+
+  drawRoadUpgradePanel(uiW, uiH);
 
   drawVideoSettingsPanel(uiW, uiH);
 
