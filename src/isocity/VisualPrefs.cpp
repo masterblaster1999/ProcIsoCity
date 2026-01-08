@@ -85,17 +85,6 @@ static bool ApplyF32(const JsonValue& root, const char* key, float& io, std::str
   return true;
 }
 
-static bool ApplyString(const JsonValue& root, const char* key, std::string& io, std::string& err)
-{
-  const JsonValue* v = FindJsonMember(root, key);
-  if (!v) return true;
-  if (!v->isString()) {
-    err = std::string("expected string for key '") + key + "'";
-    return false;
-  }
-  io = v->stringValue;
-  return true;
-}
 
 static void Indent(std::ostringstream& oss, int n)
 {

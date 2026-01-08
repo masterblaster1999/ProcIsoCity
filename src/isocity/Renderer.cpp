@@ -93,19 +93,11 @@ inline Color Mul(Color c, float b)
   return Color{ClampU8(r), ClampU8(g), ClampU8(bl), c.a};
 }
 
-inline Color Lerp(Color a, Color b, float t)
-{
-  t = std::clamp(t, 0.0f, 1.0f);
-  const int r = static_cast<int>(std::round((1.0f - t) * static_cast<float>(a.r) + t * static_cast<float>(b.r)));
-  const int g = static_cast<int>(std::round((1.0f - t) * static_cast<float>(a.g) + t * static_cast<float>(b.g)));
-  const int bl = static_cast<int>(std::round((1.0f - t) * static_cast<float>(a.b) + t * static_cast<float>(b.b)));
-  const int al = static_cast<int>(std::round((1.0f - t) * static_cast<float>(a.a) + t * static_cast<float>(b.a)));
-  return Color{ClampU8(r), ClampU8(g), ClampU8(bl), ClampU8(al)};
-}
+inline Color LerpColor(Color a, Color b, float t);
 
 inline Vector2 LerpV(const Vector2& a, const Vector2& b, float t)
 {
-  return Vector2{Lerp(a.x, b.x, t), Lerp(a.y, b.y, t)};
+  return Vector2{::isocity::Lerp(a.x, b.x, t), ::isocity::Lerp(a.y, b.y, t)};
 }
 
 inline Color DistrictBaseColor(std::uint8_t d)
@@ -1130,17 +1122,17 @@ Color MinimapColorForTile(const isocity::Tile& t)
                           : (lvl == 2) ? Color{180, 160, 118, 255}
                                        : Color{170, 152, 110, 255};
       const float k = (lvl == 1) ? 0.82f : (lvl == 2) ? 0.84f : 0.86f;
-      return Lerp(base, bridge, k);
+      return LerpColor(base, bridge, k);
     }
 
     const Color road = (lvl == 1) ? Color{28, 28, 30, 255} : (lvl == 2) ? Color{24, 24, 28, 255} : Color{20, 20, 25, 255};
     const float k = (lvl == 1) ? 0.85f : (lvl == 2) ? 0.88f : 0.90f;
-    return Lerp(base, road, k);
+    return LerpColor(base, road, k);
   }
-  case Overlay::Park: return Lerp(base, Color{70, 200, 95, 255}, 0.70f);
-  case Overlay::Residential: return Lerp(base, Color{80, 160, 235, 255}, 0.80f);
-  case Overlay::Commercial: return Lerp(base, Color{240, 170, 60, 255}, 0.80f);
-  case Overlay::Industrial: return Lerp(base, Color{200, 90, 220, 255}, 0.80f);
+  case Overlay::Park: return LerpColor(base, Color{70, 200, 95, 255}, 0.70f);
+  case Overlay::Residential: return LerpColor(base, Color{80, 160, 235, 255}, 0.80f);
+  case Overlay::Commercial: return LerpColor(base, Color{240, 170, 60, 255}, 0.80f);
+  case Overlay::Industrial: return LerpColor(base, Color{200, 90, 220, 255}, 0.80f);
   default: break;
   }
   return base;
@@ -2848,7 +2840,7 @@ void Renderer::rebuildTextures(std::uint64_t seed)
             const int stripe = static_cast<int>(std::floor((signedPerp + st.roadW) / stripeW +
                                                           static_cast<float>(mask) * 0.10f));
             if ((stripe & 1) == 0) {
-              base = Lerp(base, Color{250, 250, 250, 255}, 0.85f);
+              base = LerpColor(base, Color{250, 250, 250, 255}, 0.85f);
             }
           }
 
