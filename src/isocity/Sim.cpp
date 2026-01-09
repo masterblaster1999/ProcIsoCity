@@ -8,7 +8,12 @@
 
 #include "isocity/Goods.hpp"
 
+#include "isocity/RoadGraph.hpp"
+#include "isocity/RoadGraphTraffic.hpp"
+
 #include "isocity/LandValue.hpp"
+
+#include "isocity/Isochrone.hpp"
 
 #include "isocity/Random.hpp"
 
@@ -132,13 +137,15 @@ bool HasAdjacentEdgeConnectedRoad(const World& world, const std::vector<std::uin
 }
 
 // Parks are modeled as an *area of influence* rather than a global ratio.
-// We compute a simple "coverage" ratio: what fraction of zone tiles are within
-// a Manhattan distance <= radius of any park that is connected to a road.
+// We compute a simple "coverage" ratio: what fraction of zone tiles can reach
+// any park (via their access road) within a travel-time threshold.
 //
 // Notes:
 // - We treat Water as a barrier so disconnected islands don't share park benefits.
-// - This is intentionally lightweight: a multi-source BFS on a 96x96 grid is cheap.
-float ParkCoverageRatio(const World& world, int radius, const std::vector<std::uint8_t>* roadToEdge)
+// - This is intentionally lightweight: a multi-source road isochrone + mapping
+//   (still cheap on a 96x96 grid).
+float ParkCoverageRatio(const World& world, int radius, const std::vector<std::uint8_t>* roadToEdge,
+                        const ZoneAccessMap* zoneAccess)
 {
   // Compatibility mode: treat parks as a global ratio (old behavior).
   if (radius <= 0) {
@@ -167,57 +174,67 @@ float ParkCoverageRatio(const World& world, int radius, const std::vector<std::u
   const int h = world.height();
   if (w <= 0 || h <= 0) return 0.0f;
 
-  constexpr int kInf = 1'000'000;
-  std::vector<int> dist(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), kInf);
-  std::vector<int> queue;
-  queue.reserve(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) / 8);
+  const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+  const bool edgeOk = (roadToEdge && roadToEdge->size() == n);
 
-  auto idxOf = [&](int x, int y) -> int { return y * w + x; };
+  // Sources are the road tiles adjacent to parks (optionally requiring outside connection).
+  std::vector<std::uint8_t> srcMask(n, 0);
+  constexpr int kDirs[4][2] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}};
 
-  // Initialize BFS sources: parks that have a road neighbor.
   for (int y = 0; y < h; ++y) {
     for (int x = 0; x < w; ++x) {
       const Tile& t = world.at(x, y);
       if (t.overlay != Overlay::Park) continue;
       if (t.terrain == Terrain::Water) continue;
-      bool connected = world.hasAdjacentRoad(x, y);
-      if (roadToEdge) connected = HasAdjacentEdgeConnectedRoad(world, *roadToEdge, x, y);
-      if (!connected) continue;
-      const int idx = idxOf(x, y);
-      dist[static_cast<std::size_t>(idx)] = 0;
-      queue.push_back(idx);
+
+      for (const auto& d : kDirs) {
+        const int nx = x + d[0];
+        const int ny = y + d[1];
+        if (!world.inBounds(nx, ny)) continue;
+        const Tile& nt = world.at(nx, ny);
+        if (nt.overlay != Overlay::Road) continue;
+        const std::size_t ridx = static_cast<std::size_t>(ny) * static_cast<std::size_t>(w) +
+                                 static_cast<std::size_t>(nx);
+        if (ridx >= n) continue;
+        if (edgeOk && (*roadToEdge)[ridx] == 0) continue;
+        srcMask[ridx] = 1;
+      }
     }
   }
 
-  // No connected parks => no coverage.
-  if (queue.empty()) return 0.0f;
-
-  // Multi-source BFS (4-neighborhood) limited to the configured radius.
-  std::size_t qHead = 0;
-  while (qHead < queue.size()) {
-    const int idx = queue[qHead++];
-    const int d = dist[static_cast<std::size_t>(idx)];
-    if (d >= radius) continue;
-
-    const int x = idx % w;
-    const int y = idx / w;
-
-    constexpr int dirs[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
-    for (const auto& dir : dirs) {
-      const int nx = x + dir[0];
-      const int ny = y + dir[1];
-      if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
-      const Tile& nt = world.at(nx, ny);
-      if (nt.terrain == Terrain::Water && nt.overlay != Overlay::Road) continue;
-
-      const int nidx = idxOf(nx, ny);
-      int& nd = dist[static_cast<std::size_t>(nidx)];
-      if (nd <= d + 1) continue;
-      nd = d + 1;
-      queue.push_back(nidx);
-    }
+  std::vector<int> sources;
+  sources.reserve(n / 64);
+  for (std::size_t i = 0; i < n; ++i) {
+    if (srcMask[i] != 0) sources.push_back(static_cast<int>(i));
   }
 
+  if (sources.empty()) return 0.0f;
+
+  RoadIsochroneConfig icfg;
+  icfg.requireOutsideConnection = edgeOk;
+  icfg.weightMode = IsochroneWeightMode::TravelTime;
+  icfg.computeOwner = false;
+
+  const RoadIsochroneField roadField = BuildRoadIsochroneField(world, sources, icfg, edgeOk ? roadToEdge : nullptr);
+
+  TileAccessCostConfig tcfg;
+  tcfg.includeRoadTiles = false;
+  tcfg.includeZones = true;
+  tcfg.includeNonZonesAdjacentToRoad = true;
+  tcfg.includeWater = false;
+  // Walk from zone parcel to its access road.
+  tcfg.accessStepCostMilli = 1000;
+  tcfg.useZoneAccessMap = true;
+
+  const ZoneAccessMap* zam = nullptr;
+  if (zoneAccess && zoneAccess->w == w && zoneAccess->h == h && zoneAccess->roadIdx.size() == n) {
+    zam = zoneAccess;
+  }
+
+  const std::vector<int> tileCost =
+      BuildTileAccessCostField(world, roadField, tcfg, edgeOk ? roadToEdge : nullptr, zam);
+
+  const int thresholdMilli = std::max(0, radius) * 1000;
   int zones = 0;
   int covered = 0;
 
@@ -227,10 +244,12 @@ float ParkCoverageRatio(const World& world, int radius, const std::vector<std::u
       const bool isZone = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
                            t.overlay == Overlay::Industrial);
       if (!isZone) continue;
-
       zones++;
-      const int idx = idxOf(x, y);
-      if (dist[static_cast<std::size_t>(idx)] <= radius) covered++;
+      const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
+                              static_cast<std::size_t>(x);
+      if (idx >= tileCost.size()) continue;
+      const int c = tileCost[idx];
+      if (c >= 0 && c <= thresholdMilli) covered++;
     }
   }
 
@@ -327,6 +346,15 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
   // Employment: fill accessible jobs up to population.
   const int employed = std::min(scan.population, jobsCapAccessible);
 
+  // --- Derived transit stats ---
+  // These are always recomputed here (not persisted).
+  s.transitLines = 0;
+  s.transitStops = 0;
+  s.transitRiders = 0;
+  s.transitModeShare = 0.0f;
+  s.transitCommuteCoverage = 0.0f;
+  s.transitCost = 0;
+
   // Traffic/commute model: estimate how far (and how congested) the average commute is.
   // This is a derived system (no agents yet): we run a multi-source road search from job access points
   // over the road network and route commuters along parent pointers back to the jobs.
@@ -346,17 +374,16 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
   tc.capacityAwareJobs = m_trafficModel.capacityAwareJobs;
   tc.jobAssignmentIterations = m_trafficModel.jobAssignmentIterations;
   tc.jobPenaltyBaseMilli = m_trafficModel.jobPenaltyBaseMilli;
-  const TrafficResult traffic = ComputeCommuteTraffic(world, tc, employedShare, roadToEdge, zoneAccess);
+  const TrafficResult trafficBase = ComputeCommuteTraffic(world, tc, employedShare, roadToEdge, zoneAccess);
 
-  s.commuters = traffic.totalCommuters;
-  s.commutersUnreachable = traffic.unreachableCommuters;
-  s.avgCommute = traffic.avgCommute;
-  s.p95Commute = traffic.p95Commute;
-  s.avgCommuteTime = traffic.avgCommuteTime;
-  s.p95CommuteTime = traffic.p95CommuteTime;
-  s.trafficCongestion = traffic.congestion;
-  s.congestedRoadTiles = traffic.congestedRoadTiles;
-  s.maxRoadTraffic = traffic.maxTraffic;
+  // Road traffic is car-only. When transit is disabled, this is simply the full commute traffic.
+  TrafficResult trafficRoad = trafficBase;
+
+  // Commute stats presented to the player represent *all* reachable commuters (car + transit).
+  float avgCommuteAll = trafficBase.avgCommute;
+  float p95CommuteAll = trafficBase.p95Commute;
+  float avgCommuteTimeAll = trafficBase.avgCommuteTime;
+  float p95CommuteTimeAll = trafficBase.p95CommuteTime;
 
   // Goods/logistics model: route industrial output to commercial demand along roads.
   GoodsConfig gc;
@@ -371,11 +398,193 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
   s.goodsSatisfaction = goods.satisfaction;
   s.maxRoadGoodsTraffic = goods.maxRoadGoodsTraffic;
 
+
+  // ---------------------------------------------------------------------------
+  // Transit mode shift model (optional)
+  // ---------------------------------------------------------------------------
+  // This is a lightweight "first layer": we plan a set of bus lines on the RoadGraph
+  // using an aggregated demand signal, then estimate (a) how much commute demand those
+  // corridors cover and (b) what fraction of commuters would shift away from cars.
+  //
+  // The resulting effect is:
+  //   - reduced road traffic + congestion (car commuters only)
+  //   - improved average commute time (blended car + transit)
+  //   - an operating cost line item in the budget
+  if (m_transitModel.enabled && trafficBase.reachableCommuters > 0) {
+    RoadGraph g = BuildRoadGraph(world);
+
+    if (!g.edges.empty()) {
+      const std::size_t nTiles = n;
+
+      // Build a per-road-tile demand signal.
+      std::vector<std::uint32_t> roadFlow(nTiles, 0u);
+      const TransitDemandMode dm = m_transitModel.demandMode;
+
+      const bool needCommute = (dm == TransitDemandMode::Commute || dm == TransitDemandMode::Combined);
+      const bool needGoods = (dm == TransitDemandMode::Goods || dm == TransitDemandMode::Combined);
+
+      if (needCommute && trafficBase.roadTraffic.size() == nTiles) {
+        for (std::size_t i = 0; i < nTiles; ++i) {
+          roadFlow[i] += static_cast<std::uint32_t>(trafficBase.roadTraffic[i]);
+        }
+      }
+      if (needGoods && goods.roadGoodsTraffic.size() == nTiles) {
+        for (std::size_t i = 0; i < nTiles; ++i) {
+          roadFlow[i] += static_cast<std::uint32_t>(goods.roadGoodsTraffic[i]);
+        }
+      }
+
+      // Aggregate road-tile demand onto the compressed RoadGraph edges.
+      const RoadGraphTrafficResult agg = AggregateFlowOnRoadGraph(world, g, roadFlow);
+      std::vector<std::uint64_t> edgeDemand(g.edges.size(), 0ull);
+      for (std::size_t ei = 0; ei < g.edges.size() && ei < agg.edges.size(); ++ei) {
+        // Prefer interior demand to avoid double-counting nodes across adjacent edges.
+        edgeDemand[ei] = agg.edges[ei].sumTrafficInterior;
+      }
+
+      // Commute-only edge demand, used for coverage + mode share estimation.
+      std::vector<std::uint64_t> commuteEdgeDemand(g.edges.size(), 0ull);
+      if (trafficBase.roadTraffic.size() == nTiles) {
+        std::vector<std::uint32_t> commuteFlow(nTiles, 0u);
+        for (std::size_t i = 0; i < nTiles; ++i) {
+          commuteFlow[i] = static_cast<std::uint32_t>(trafficBase.roadTraffic[i]);
+        }
+        const RoadGraphTrafficResult aggC = AggregateFlowOnRoadGraph(world, g, commuteFlow);
+        for (std::size_t ei = 0; ei < g.edges.size() && ei < aggC.edges.size(); ++ei) {
+          commuteEdgeDemand[ei] = aggC.edges[ei].sumTrafficInterior;
+        }
+      }
+
+      // Planner config: keep the default deterministic per-world unless the user overrides seedSalt.
+      TransitPlannerConfig pcfg = m_transitModel.plannerCfg;
+      if (pcfg.seedSalt == 0) {
+        pcfg.seedSalt = (world.seed() ^ 0xA2B3C4D5E6F70911ULL) ^ (static_cast<std::uint64_t>(dm) * 0x9E3779B97F4A7C15ULL);
+      }
+
+      TransitPlan plan = PlanTransitLines(g, edgeDemand, pcfg, &world);
+      plan.cfg = pcfg;
+
+      // Track which edges are served by at least one line.
+      std::vector<std::uint8_t> served(g.edges.size(), 0u);
+      for (const TransitLine& line : plan.lines) {
+        for (int ei : line.edges) {
+          if (ei >= 0 && static_cast<std::size_t>(ei) < served.size()) {
+            served[static_cast<std::size_t>(ei)] = 1u;
+          }
+        }
+      }
+
+      // Coverage of commute demand.
+      std::uint64_t commuteTotal = 0ull;
+      std::uint64_t commuteCovered = 0ull;
+      for (std::size_t ei = 0; ei < commuteEdgeDemand.size(); ++ei) {
+        commuteTotal += commuteEdgeDemand[ei];
+        if (served[ei]) commuteCovered += commuteEdgeDemand[ei];
+      }
+
+      const float coverage = (commuteTotal > 0)
+                               ? std::clamp(static_cast<float>(static_cast<double>(commuteCovered) / static_cast<double>(commuteTotal)), 0.0f, 1.0f)
+                               : 0.0f;
+
+      // Unique served road tiles (for cost accounting).
+      std::vector<std::uint8_t> servedTileMask(nTiles, 0u);
+      for (std::size_t ei = 0; ei < served.size() && ei < g.edges.size(); ++ei) {
+        if (!served[ei]) continue;
+        for (const Point& p : g.edges[ei].tiles) {
+          if (!world.inBounds(p.x, p.y)) continue;
+          const std::size_t idx = static_cast<std::size_t>(p.y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(p.x);
+          if (idx < servedTileMask.size()) servedTileMask[idx] = 1u;
+        }
+      }
+      int servedTileCount = 0;
+      for (std::uint8_t b : servedTileMask) servedTileCount += (b != 0);
+
+      // Stops: deterministically sample each line and count unique stop tiles.
+      const int stopSpacing = std::max(2, m_transitModel.stopSpacingTiles);
+      std::vector<std::uint8_t> stopMask(nTiles, 0u);
+      std::vector<Point> tmpStops;
+      tmpStops.reserve(256);
+      for (const TransitLine& line : plan.lines) {
+        tmpStops.clear();
+        if (!BuildTransitLineStopTiles(g, line, stopSpacing, tmpStops)) continue;
+        for (const Point& p : tmpStops) {
+          if (!world.inBounds(p.x, p.y)) continue;
+          const std::size_t idx = static_cast<std::size_t>(p.y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(p.x);
+          if (idx < stopMask.size()) stopMask[idx] = 1u;
+        }
+      }
+      int stopCount = 0;
+      for (std::uint8_t b : stopMask) stopCount += (b != 0);
+
+      // Ridership model.
+      const float service = std::max(0.0f, m_transitModel.serviceLevel);
+      const float maxShare = std::clamp(m_transitModel.maxModeShare, 0.0f, 1.0f);
+      const float tMult = std::clamp(m_transitModel.travelTimeMultiplier, 0.25f, 2.5f);
+
+      // A smooth saturating function: higher coverage + higher service + faster travel => more shift.
+      const float attractiveness = (tMult > 1.0e-3f) ? (service / tMult) : service;
+      const float base = std::max(0.0f, coverage) * std::max(0.0f, attractiveness);
+      const float modeShare = maxShare * (1.0f - static_cast<float>(std::exp(-1.2 * static_cast<double>(base))));
+      const int riders = std::clamp(static_cast<int>(std::lround(static_cast<double>(trafficBase.reachableCommuters) * static_cast<double>(modeShare))),
+                                    0, trafficBase.reachableCommuters);
+
+      s.transitLines = static_cast<int>(plan.lines.size());
+      s.transitStops = stopCount;
+      s.transitRiders = riders;
+      s.transitModeShare = (trafficBase.totalCommuters > 0)
+                             ? std::clamp(static_cast<float>(riders) / static_cast<float>(trafficBase.totalCommuters), 0.0f, 1.0f)
+                             : 0.0f;
+      s.transitCommuteCoverage = coverage;
+
+      // Operating cost: proportional to network footprint + stop count, scaled by service.
+      const int costPerTile = std::max(0, m_transitModel.costPerTile);
+      const int costPerStop = std::max(0, m_transitModel.costPerStop);
+      const double rawCost = static_cast<double>(service) *
+                             (static_cast<double>(servedTileCount) * static_cast<double>(costPerTile) +
+                              static_cast<double>(stopCount) * static_cast<double>(costPerStop));
+      s.transitCost = std::max(0, static_cast<int>(std::lround(rawCost)));
+
+      // Recompute road traffic using the reduced car commuter share.
+      const float employedShareCar = std::max(0.0f, employedShare * (1.0f - s.transitModeShare));
+      trafficRoad = ComputeCommuteTraffic(world, tc, employedShareCar, roadToEdge, zoneAccess);
+
+      // Blend commute times for happiness/UI.
+      const int reachableAll = trafficBase.reachableCommuters;
+      const int carReachable = std::max(0, reachableAll - riders);
+      if (reachableAll > 0) {
+        const float wCar = static_cast<float>(carReachable) / static_cast<float>(reachableAll);
+        const float wT = static_cast<float>(riders) / static_cast<float>(reachableAll);
+
+        // Transit adds a small wait/dwell penalty that decreases with service.
+        const float waitPenalty = 3.0f / std::max(0.25f, service);
+        const float transitAvgTime = trafficBase.avgCommuteTime * tMult + waitPenalty;
+        const float transitP95Time = trafficBase.p95CommuteTime * tMult + waitPenalty * 1.5f;
+
+        avgCommuteAll = trafficRoad.avgCommute * wCar + trafficBase.avgCommute * wT;
+        avgCommuteTimeAll = trafficRoad.avgCommuteTime * wCar + transitAvgTime * wT;
+
+        p95CommuteAll = std::max(trafficRoad.p95Commute, trafficBase.p95Commute);
+        p95CommuteTimeAll = std::max(trafficRoad.p95CommuteTime, transitP95Time);
+      }
+    }
+  }
+
+  // Commit the traffic-derived stats.
+  s.commuters = trafficBase.totalCommuters;
+  s.commutersUnreachable = trafficBase.unreachableCommuters;
+  s.avgCommute = avgCommuteAll;
+  s.p95Commute = p95CommuteAll;
+  s.avgCommuteTime = avgCommuteTimeAll;
+  s.p95CommuteTime = p95CommuteTimeAll;
+  s.trafficCongestion = trafficRoad.congestion;
+  s.congestedRoadTiles = trafficRoad.congestedRoadTiles;
+  s.maxRoadTraffic = trafficRoad.maxTraffic;
+
   // Land value (amenities + pollution + optional traffic spill). Used both for
   // display and for the simple tax model.
   LandValueConfig lvc;
   lvc.requireOutsideConnection = m_cfg.requireOutsideConnection;
-  const LandValueResult lv = ComputeLandValue(world, lvc, &traffic, roadToEdge);
+  const LandValueResult lv = ComputeLandValue(world, lvc, &trafficRoad, roadToEdge);
   s.avgLandValue = AvgLandValueNonWater(world, lv);
 
   // Economy snapshot (does NOT mutate money here; that's handled in step()).
@@ -470,23 +679,24 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
   s.importCost = importCost;
   s.exportRevenue = exportRevenue;
   s.income = taxRevenue + exportRevenue;
-  s.expenses = maintenance + importCost;
+  // Note: transitCost is computed earlier in this function (and is 0 when transit is disabled).
+  s.expenses = maintenance + importCost + s.transitCost;
   s.avgTaxPerCapita =
     (scan.population > 0) ? (static_cast<float>(taxRevenue) / static_cast<float>(scan.population)) : 0.0f;
 
   // Happiness: parks help (locally), unemployment hurts, and commutes/congestion add friction.
-  const float parkCoverage = ParkCoverageRatio(world, m_cfg.parkInfluenceRadius, roadToEdge);
+  const float parkCoverage = ParkCoverageRatio(world, m_cfg.parkInfluenceRadius, roadToEdge, zoneAccess);
   const float parkBonus = std::min(0.25f, parkCoverage * 0.35f);
 
   const float unemployment = (scan.population > 0)
                                  ? (1.0f - (static_cast<float>(employed) / static_cast<float>(scan.population)))
                                  : 0.0f;
 
-  const float commuteNorm = (traffic.reachableCommuters > 0)
-                                ? std::clamp(traffic.avgCommuteTime / kCommuteTarget, 0.0f, 2.0f)
+  const float commuteNorm = (trafficBase.reachableCommuters > 0)
+                                ? std::clamp(s.avgCommuteTime / kCommuteTarget, 0.0f, 2.0f)
                                 : 0.0f;
   const float commutePenalty = std::min(kCommutePenaltyCap, commuteNorm * kCommutePenaltyCap);
-  const float congestionPenalty = std::min(kCongestionPenaltyCap, traffic.congestion * (kCongestionPenaltyCap * 1.35f));
+  const float congestionPenalty = std::min(kCongestionPenaltyCap, trafficRoad.congestion * (kCongestionPenaltyCap * 1.35f));
 
   const float goodsPenalty = std::min(kGoodsPenaltyCap, (1.0f - goods.satisfaction) * kGoodsPenaltyCap);
 

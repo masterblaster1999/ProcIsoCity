@@ -103,6 +103,13 @@ std::uint64_t HashStats(const Stats& s)
   HashI32(h, s.congestedRoadTiles);
   HashI32(h, s.maxRoadTraffic);
 
+  // Transit.
+  HashI32(h, s.transitLines);
+  HashI32(h, s.transitStops);
+  HashI32(h, s.transitRiders);
+  HashF32(h, s.transitModeShare);
+  HashF32(h, s.transitCommuteCoverage);
+
   // Goods/logistics.
   HashI32(h, s.goodsProduced);
   HashI32(h, s.goodsDemand);
@@ -121,6 +128,7 @@ std::uint64_t HashStats(const Stats& s)
   HashI32(h, s.upgradeCost);
   HashI32(h, s.importCost);
   HashI32(h, s.exportRevenue);
+  HashI32(h, s.transitCost);
   HashF32(h, s.avgTaxPerCapita);
 
   // Demand/valuation.

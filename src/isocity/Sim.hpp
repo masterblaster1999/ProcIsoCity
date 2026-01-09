@@ -1,6 +1,7 @@
 #pragma once
 
 #include "isocity/World.hpp"
+#include "isocity/TransitPlanner.hpp"
 
 #include <array>
 #include <vector>
@@ -26,7 +27,12 @@ struct SimConfig {
   float tickSeconds = 0.5f; // how often the sim advances (in real seconds)
 
   // Parks boost happiness for *nearby* zone tiles (a simple "coverage" model).
-  // Manhattan distance in tile space.
+  //
+  // Local park influence radius.
+  //
+  // When >0, park coverage is computed via a road-network isochrone seeded from
+  // parks' adjacent road tiles, and evaluated on zone parcels using ZoneAccessMap.
+  // The unit is "street-step equivalents" (1 street road step ~= 1000 milli).
   //
   // Set to 0 to disable locality (parks behave like a global ratio again).
   int parkInfluenceRadius = 6;
@@ -100,6 +106,55 @@ struct TrafficModelSettings {
   int jobPenaltyBaseMilli = 8000;
 };
 
+// Demand signal used by the transit planner and the transit mode-shift model.
+enum class TransitDemandMode : std::uint8_t { Commute = 0, Goods = 1, Combined = 2 };
+
+inline const char* TransitDemandModeName(TransitDemandMode m)
+{
+  switch (m) {
+    case TransitDemandMode::Commute: return "commute";
+    case TransitDemandMode::Goods: return "goods";
+    case TransitDemandMode::Combined: return "combined";
+  }
+  return "combined";
+}
+
+// Non-persistent runtime tuning for the transit system.
+//
+// This is intentionally not part of SimConfig (and therefore not saved) so the
+// transit model can iterate quickly without save-version churn.
+struct TransitModelSettings {
+  // Master enable for simulation impacts (mode shift, cost, stats). The planner
+  // overlay can still be used even when this is disabled.
+  bool enabled = false;
+
+  // How heavily the city funds/operates the system. Used as a multiplier for
+  // ridership potential and operating cost.
+  float serviceLevel = 1.0f;
+
+  // Maximum share of commuters that can plausibly shift to transit.
+  float maxModeShare = 0.35f;
+
+  // Transit travel time relative to car travel time, using the same underlying
+  // road network path lengths as a proxy.
+  //
+  // < 1.0 => faster (more attractive), > 1.0 => slower.
+  float travelTimeMultiplier = 0.75f;
+
+  // Sampling spacing for stop generation (used for stop count and cost).
+  int stopSpacingTiles = 12;
+
+  // Per-tick operating costs.
+  int costPerTile = 1;
+  int costPerStop = 2;
+
+  // Planner input mode (what flow signal lines are optimized for).
+  TransitDemandMode demandMode = TransitDemandMode::Combined;
+
+  // Planner parameters (line count, weight mode, demand bias, etc.).
+  TransitPlannerConfig plannerCfg{};
+};
+
 class Simulator {
 public:
   explicit Simulator(SimConfig cfg = {}) : m_cfg(cfg) {}
@@ -125,6 +180,9 @@ public:
   const TrafficModelSettings& trafficModel() const { return m_trafficModel; }
   TrafficModelSettings& trafficModel() { return m_trafficModel; }
 
+  const TransitModelSettings& transitModel() const { return m_transitModel; }
+  TransitModelSettings& transitModel() { return m_transitModel; }
+
   // Recompute derived HUD stats (population/capacities/roads/parks/employment/happiness)
   // without advancing time or modifying tiles.
   void refreshDerivedStats(World& world) const;
@@ -139,6 +197,7 @@ private:
 
   SimConfig m_cfg;
   TrafficModelSettings m_trafficModel{};
+  TransitModelSettings m_transitModel{};
   float m_accum = 0.0f;
 };
 

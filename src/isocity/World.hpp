@@ -110,6 +110,13 @@ struct Stats {
   int congestedRoadTiles = 0;
   int maxRoadTraffic = 0; // max commuters on any road tile (for heatmap scaling)
 
+  // --- Derived transit stats (recomputed by the simulator; not persisted in saves) ---
+  int transitLines = 0;
+  int transitStops = 0;
+  int transitRiders = 0;
+  float transitModeShare = 0.0f;        // 0..1 share of commuters using transit
+  float transitCommuteCoverage = 0.0f;  // 0..1 share of commute demand on served corridors
+
   // --- Derived goods/logistics stats (recomputed by the simulator; not persisted in saves) ---
   int goodsProduced = 0;
   int goodsDemand = 0;
@@ -130,6 +137,9 @@ struct Stats {
   int importCost = 0;      // component of expenses
   int exportRevenue = 0;   // component of income
   float avgTaxPerCapita = 0.0f;
+
+  // Transit operating cost paid this tick (component of expenses).
+  int transitCost = 0;
 
   // --- Derived demand / valuation metrics (not persisted in saves) ---
   float demandResidential = 0.0f; // 0..1 (global)

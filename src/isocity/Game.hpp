@@ -6,6 +6,7 @@
 #include "isocity/Export.hpp"
 #include "isocity/FloodRisk.hpp"
 #include "isocity/DepressionFill.hpp"
+#include "isocity/EvacuationScenario.hpp"
 #include "isocity/FlowField.hpp"
 #include "isocity/Blueprint.hpp"
 #include "isocity/Iso.hpp"
@@ -154,6 +155,10 @@ private:
   void adjustRoadUpgradePanel(int dir, bool bigStep);
   bool applyRoadUpgradePlan();
   void exportRoadUpgradeArtifacts();
+  // Evacuation / disaster scenario analysis (hazards + evacuation-to-edge).
+  void ensureEvacuationScenarioUpToDate();
+  void exportEvacuationArtifacts();
+
 
 
   // Display helpers
@@ -380,7 +385,7 @@ private:
 
   // Transit planner overlay (auto bus line suggestions).
   // Toggle panel with Ctrl+T. Export artifacts with Ctrl+Shift+T.
-  enum class TransitDemandMode : std::uint8_t { Commute = 0, Goods = 1, Combined = 2 };
+  // Planner + simulation tuning lives in Simulator::transitModel().
 
   struct TransitLineViz {
     int lineIndex = -1;
@@ -397,8 +402,6 @@ private:
 
   bool m_showTransitPanel = false;
   bool m_showTransitOverlay = false;
-  TransitDemandMode m_transitDemandMode = TransitDemandMode::Combined;
-  TransitPlannerConfig m_transitCfg{};
   TransitPlan m_transitPlan{};
   std::vector<std::uint64_t> m_transitEdgeDemand;
 
@@ -406,7 +409,6 @@ private:
   bool m_transitVizDirty = true;
 
   int m_transitSelection = 0;
-  int m_transitStopSpacing = 12;
   bool m_transitShowStops = true;
   bool m_transitShowOnlySelectedLine = false;
   int m_transitSelectedLine = -1; // -1 = all
@@ -453,6 +455,11 @@ private:
 
     // Depression-fill depth (Priority-Flood): "ponding potential" in closed basins.
     PondingDepth,
+
+    // Evacuation scenario analysis (time/unreachable/flow).
+    EvacuationTime,
+    EvacuationUnreachable,
+    EvacuationFlow,
   };
 
   HeatmapOverlay m_heatmapOverlay = HeatmapOverlay::Off;
@@ -473,6 +480,14 @@ private:
   double m_pondingVolume = 0.0;
   float m_pondingMaxDepth = 0.0f;
   std::vector<float> m_pondingHeatmap; // normalized depth: 0 (none) .. 1 (deepest)
+
+  // Evacuation scenario analysis (hazards + evacuation-to-edge): computed on-demand when any
+  // evacuation heatmap is active or when explicitly requested via the console.
+  bool m_evacDirty = true;
+  EvacuationScenarioConfig m_evacCfg{};
+  EvacuationScenarioResult m_evacScenario;
+  EvacuationScenarioHeatmaps m_evacHeatmaps;
+
 
 
   // Vehicles overlay: small moving agents representing commuting + goods shipments.

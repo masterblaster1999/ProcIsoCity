@@ -19,8 +19,15 @@ namespace isocity {
 // future simulation hooks (e.g. desirability-driven growth).
 
 struct LandValueConfig {
-  // Manhattan distance influence radii.
-  int parkRadius = 8;      // positive amenity around parks
+  // Park influence radius in "street-step equivalents".
+  //
+  // The park amenity field is computed via a road-network isochrone seeded from
+  // park access roads (adjacent road tiles), using travel-time weights.
+  // A value of 1000 milli corresponds to 1 Street step, so parkRadius~=8 means
+  // "about 8 street steps" of accessibility.
+  int parkRadius = 8; // positive amenity around parks
+
+  // Manhattan distance influence radii for purely geometric fields.
   int waterRadius = 6;     // positive amenity near coasts
   int pollutionRadius = 7; // negative influence around industrial zones
 
@@ -61,6 +68,10 @@ struct LandValueResult {
 // If cfg.requireOutsideConnection is true and roadToEdgeMask is non-null, it is
 // used to decide whether parks are considered connected (and to apply the
 // disconnectedPenalty).
+//
+// If cfg.requireOutsideConnection is true but roadToEdgeMask is null (or wrong size),
+// ComputeLandValue will compute an internal road-to-edge mask so results remain
+// consistent across callers.
 LandValueResult ComputeLandValue(const World& world, const LandValueConfig& cfg,
                                  const TrafficResult* traffic = nullptr,
                                  const std::vector<std::uint8_t>* roadToEdgeMask = nullptr);

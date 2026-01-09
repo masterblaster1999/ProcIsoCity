@@ -351,6 +351,7 @@ bool Game::loadFromPath(const std::string& path, const char* toastLabel)
   m_landValueDirty = true;
   m_transitPlanDirty = true;
   m_transitVizDirty = true;
+  m_evacDirty = true;
   m_roadUpgradePlanDirty = true;
   m_roadUpgradeSelectedMaskDirty = true;
   invalidateHydrology();
@@ -465,6 +466,7 @@ void Game::invalidateHydrology()
 {
   m_seaFloodDirty = true;
   m_pondingDirty = true;
+  m_evacDirty = true;
 }
 
 
@@ -642,6 +644,9 @@ void Game::setupDevConsole()
     case HeatmapOverlay::TrafficSpill: return "traffic";
     case HeatmapOverlay::FloodDepth: return "flood";
     case HeatmapOverlay::PondingDepth: return "pond";
+    case HeatmapOverlay::EvacuationTime: return "evac";
+    case HeatmapOverlay::EvacuationUnreachable: return "evac_unreach";
+    case HeatmapOverlay::EvacuationFlow: return "evac_flow";
     default: return "?";
     }
   };
@@ -882,6 +887,7 @@ void Game::setupDevConsole()
         m_vehiclesDirty = true;
         m_transitPlanDirty = true;
         m_transitVizDirty = true;
+  m_evacDirty = true;
         m_roadUpgradePlanDirty = true;
         m_roadUpgradeSelectedMaskDirty = true;
         showToast("Sim step");
@@ -1027,10 +1033,10 @@ void Game::setupDevConsole()
       });
 
   m_console.registerCommand(
-      "heatmap", "heatmap <off|land|park|water|pollution|traffic|flood|pond> - set heatmap overlay",
+      "heatmap", "heatmap <off|land|park|water|pollution|traffic|flood|pond|evac|evac_unreach|evac_flow> - set heatmap overlay",
       [this, toLower, heatmapName](DevConsole& c, const DevConsole::Args& args) {
         if (args.size() != 1) {
-          c.print("Usage: heatmap <off|land|park|water|pollution|traffic|flood|pond>");
+          c.print("Usage: heatmap <off|land|park|water|pollution|traffic|flood|pond|evac|evac_unreach|evac_flow>");
           return;
         }
         const std::string h = toLower(args[0]);
@@ -1042,6 +1048,9 @@ void Game::setupDevConsole()
         else if (h == "traffic") m_heatmapOverlay = HeatmapOverlay::TrafficSpill;
         else if (h == "flood") m_heatmapOverlay = HeatmapOverlay::FloodDepth;
         else if (h == "pond" || h == "ponding") m_heatmapOverlay = HeatmapOverlay::PondingDepth;
+        else if (h == "evac" || h == "evactime" || h == "evac_time") m_heatmapOverlay = HeatmapOverlay::EvacuationTime;
+        else if (h == "evac_unreach" || h == "evacunreach" || h == "evac_unreachable" || h == "unreach") m_heatmapOverlay = HeatmapOverlay::EvacuationUnreachable;
+        else if (h == "evac_flow" || h == "evacflow" || h == "flow" || h == "evacuationflow") m_heatmapOverlay = HeatmapOverlay::EvacuationFlow;
         else {
           c.print("Unknown heatmap: " + args[0]);
           return;
@@ -1150,6 +1159,7 @@ void Game::setupDevConsole()
 
         if (changed) {
           m_pondingDirty = true;
+  m_evacDirty = true;
           showToast(TextFormat("Ponding: eps %.4f (%s)", static_cast<double>(m_pondingCfg.epsilon),
                                m_pondingCfg.includeEdges ? "edge" : "noedge"));
         }
@@ -1158,6 +1168,197 @@ void Game::setupDevConsole()
                            m_pondingCfg.includeEdges ? "edge" : "noedge"));
       });
 
+
+
+  m_console.registerCommand(
+      "evac",
+      "evac [status|mode <none|sea|pond|both>|pondmin <depth>|bridges <0|1>|walk <milli>|cap <n>|weight <time|steps>|run|export]  - evacuation scenario analysis",
+      [this, toLower, parseI64, parseF32](DevConsole& c, const DevConsole::Args& args) {
+        auto printCfg = [&]() {
+          c.print(TextFormat("evac = mode=%s  bridges=%s  pondMin=%.3f  weight=%s  walk=%d  cap=%d",
+                             EvacuationHazardModeName(m_evacCfg.hazardMode),
+                             m_evacCfg.bridgesPassable ? "on" : "off",
+                             static_cast<double>(m_evacCfg.pondMinDepth),
+                             m_evacCfg.evac.useTravelTime ? "time" : "steps",
+                             m_evacCfg.evac.walkCostMilli,
+                             m_evacCfg.evac.roadTileCapacity));
+          c.print(TextFormat("  sea = %.3f (%s,%s)  pond = eps %.6f (%s)",
+                             static_cast<double>(m_seaLevel),
+                             m_seaFloodCfg.requireEdgeConnection ? "edge" : "all",
+                             m_seaFloodCfg.eightConnected ? "8c" : "4c",
+                             static_cast<double>(m_pondingCfg.epsilon),
+                             m_pondingCfg.includeEdges ? "edge" : "noedge"));
+        };
+
+        auto printStatsIfReady = [&]() {
+          if (m_evacDirty || m_evacScenario.w != m_world.width() || m_evacScenario.h != m_world.height() ||
+              m_evacScenario.evac.residentialTiles == 0) {
+            c.print("  (run: evac run)  (export: evac export)");
+            return;
+          }
+          const EvacuationResult& r = m_evacScenario.evac;
+          const double reach = (r.totalResidentialPopulation > 0)
+                                   ? (100.0 * static_cast<double>(r.reachableResidentialPopulation) /
+                                      static_cast<double>(r.totalResidentialPopulation))
+                                   : 0.0;
+          c.print(TextFormat(
+              "  exits=%d  resTiles=%d  pop=%d  reach=%.1f%%  floodedPop=%d  unreachablePop=%d  avg=%.1f  p95=%.1f  maxFlow=%u",
+              r.exitSources, r.residentialTiles, r.totalResidentialPopulation, reach, r.floodedResidentialPopulation,
+              r.unreachableResidentialPopulation, r.avgEvacTime, r.p95EvacTime, r.maxEvacRoadFlow));
+        };
+
+        if (args.empty() || toLower(args[0]) == "status" || toLower(args[0]) == "show") {
+          printCfg();
+          printStatsIfReady();
+          return;
+        }
+
+        const std::string sub = toLower(args[0]);
+
+        auto setMode = [&](EvacuationHazardMode m) {
+          m_evacCfg.hazardMode = m;
+          m_evacDirty = true;
+          showToast(TextFormat("Evac mode: %s", EvacuationHazardModeName(m)), 2.0f);
+        };
+
+        if (sub == "mode" || sub == "hazard") {
+          if (args.size() != 2) {
+            c.print("Usage: evac mode <none|sea|pond|both>");
+            return;
+          }
+          const std::string m = toLower(args[1]);
+          if (m == "none") setMode(EvacuationHazardMode::None);
+          else if (m == "sea") setMode(EvacuationHazardMode::Sea);
+          else if (m == "pond" || m == "ponding") setMode(EvacuationHazardMode::Ponding);
+          else if (m == "both") setMode(EvacuationHazardMode::Both);
+          else {
+            c.print("Unknown mode: " + args[1]);
+            return;
+          }
+          printCfg();
+          return;
+        }
+
+        if (sub == "none" || sub == "sea" || sub == "pond" || sub == "ponding" || sub == "both") {
+          if (sub == "none") setMode(EvacuationHazardMode::None);
+          else if (sub == "sea") setMode(EvacuationHazardMode::Sea);
+          else if (sub == "pond" || sub == "ponding") setMode(EvacuationHazardMode::Ponding);
+          else setMode(EvacuationHazardMode::Both);
+          printCfg();
+          return;
+        }
+
+        if (sub == "pondmin") {
+          if (args.size() != 2) {
+            c.print("Usage: evac pondmin <depth>");
+            return;
+          }
+          float d = 0.0f;
+          if (!parseF32(args[1], d)) {
+            c.print("Invalid depth: " + args[1]);
+            return;
+          }
+          m_evacCfg.pondMinDepth = std::max(0.0f, d);
+          m_evacDirty = true;
+          showToast(TextFormat("Evac pond depth >= %.3f", static_cast<double>(m_evacCfg.pondMinDepth)), 2.0f);
+          printCfg();
+          return;
+        }
+
+        if (sub == "bridges") {
+          if (args.size() != 2) {
+            c.print("Usage: evac bridges <0|1>");
+            return;
+          }
+          long long v = 0;
+          if (!parseI64(args[1], v)) {
+            c.print("Invalid value: " + args[1]);
+            return;
+          }
+          m_evacCfg.bridgesPassable = (v != 0);
+          m_evacDirty = true;
+          showToast(std::string("Evac bridges: ") + (m_evacCfg.bridgesPassable ? "passable" : "blocked"), 2.0f);
+          printCfg();
+          return;
+        }
+
+        if (sub == "walk") {
+          if (args.size() != 2) {
+            c.print("Usage: evac walk <milli>");
+            return;
+          }
+          long long v = 0;
+          if (!parseI64(args[1], v)) {
+            c.print("Invalid millis: " + args[1]);
+            return;
+          }
+          m_evacCfg.evac.walkCostMilli = std::clamp(static_cast<int>(v), 0, 600000);
+          m_evacDirty = true;
+          showToast(TextFormat("Evac walk cost: %d", m_evacCfg.evac.walkCostMilli), 2.0f);
+          printCfg();
+          return;
+        }
+
+        if (sub == "cap" || sub == "capacity") {
+          if (args.size() != 2) {
+            c.print("Usage: evac cap <vehiclesPerRoadTile>");
+            return;
+          }
+          long long v = 0;
+          if (!parseI64(args[1], v)) {
+            c.print("Invalid cap: " + args[1]);
+            return;
+          }
+          m_evacCfg.evac.roadTileCapacity = std::clamp(static_cast<int>(v), 1, 100000);
+          m_evacDirty = true;
+          showToast(TextFormat("Evac road capacity: %d", m_evacCfg.evac.roadTileCapacity), 2.0f);
+          printCfg();
+          return;
+        }
+
+        if (sub == "weight") {
+          if (args.size() != 2) {
+            c.print("Usage: evac weight <time|steps>");
+            return;
+          }
+          const std::string w = toLower(args[1]);
+          if (w == "time" || w == "traveltime" || w == "t") {
+            m_evacCfg.evac.useTravelTime = true;
+          } else if (w == "steps" || w == "tiles" || w == "s") {
+            m_evacCfg.evac.useTravelTime = false;
+          } else {
+            c.print("Unknown weight: " + args[1]);
+            return;
+          }
+          m_evacDirty = true;
+          showToast(std::string("Evac weighting: ") + (m_evacCfg.evac.useTravelTime ? "time" : "steps"), 2.0f);
+          printCfg();
+          return;
+        }
+
+        if (sub == "run" || sub == "refresh") {
+          ensureEvacuationScenarioUpToDate();
+          printCfg();
+          printStatsIfReady();
+          if (!m_evacDirty) {
+            const EvacuationResult& r = m_evacScenario.evac;
+            const double reach = (r.totalResidentialPopulation > 0)
+                                     ? (100.0 * static_cast<double>(r.reachableResidentialPopulation) /
+                                        static_cast<double>(r.totalResidentialPopulation))
+                                     : 0.0;
+            showToast(TextFormat("Evac: %.0f%% reachable (p95 %.1f)", reach, r.p95EvacTime), 2.5f);
+          }
+          return;
+        }
+
+        if (sub == "export") {
+          exportEvacuationArtifacts();
+          return;
+        }
+
+        c.print(
+            "Usage: evac [status|mode <none|sea|pond|both>|pondmin <depth>|bridges <0|1>|walk <milli>|cap <n>|weight <time|steps>|run|export]");
+      });
   m_console.registerCommand(
       "floodapply",
       "floodapply [level] [edge|all] [4|8]  - apply sea flooding to the world (undoable)",
@@ -4995,6 +5196,7 @@ void Game::endPaintStroke()
   // Any edit stroke potentially changes travel demand and the road graph.
   m_transitPlanDirty = true;
   m_transitVizDirty = true;
+  m_evacDirty = true;
 
   // Provide one toast per stroke for common build failures (no money, no road access, etc.).
   if (m_strokeFeedback.any()) {
@@ -5569,6 +5771,7 @@ bool Game::applyRoadResilienceBypass(std::size_t idx)
   m_landValueDirty = true;
   m_transitPlanDirty = true;
   m_transitVizDirty = true;
+  m_evacDirty = true;
   m_vehiclesDirty = true;
 
   // Suggestions are now stale.
@@ -5669,12 +5872,12 @@ void Game::drawRoadResilienceOverlay()
 
 namespace {
 
-const char* TransitDemandModeName(Game::TransitDemandMode m)
+const char* TransitDemandModeName(TransitDemandMode m)
 {
   switch (m) {
-    case Game::TransitDemandMode::Commute: return "commute";
-    case Game::TransitDemandMode::Goods: return "goods";
-    case Game::TransitDemandMode::Combined: return "combined";
+    case TransitDemandMode::Commute: return "commute";
+    case TransitDemandMode::Goods: return "goods";
+    case TransitDemandMode::Combined: return "combined";
   }
   return "combined";
 }
@@ -5740,10 +5943,11 @@ void Game::ensureTransitPlanUpToDate()
     roadToEdgeMask = &m_outsideOverlayRoadToEdge;
   }
 
-  const bool needTraffic = (m_transitDemandMode == TransitDemandMode::Commute ||
-                            m_transitDemandMode == TransitDemandMode::Combined);
-  const bool needGoods = (m_transitDemandMode == TransitDemandMode::Goods ||
-                          m_transitDemandMode == TransitDemandMode::Combined);
+  const TransitModelSettings& tm = m_sim.transitModel();
+  const TransitDemandMode dm = tm.demandMode;
+
+  const bool needTraffic = (dm == TransitDemandMode::Commute || dm == TransitDemandMode::Combined);
+  const bool needGoods = (dm == TransitDemandMode::Goods || dm == TransitDemandMode::Combined);
 
   // Traffic (commute)
   if (needTraffic) {
@@ -5808,8 +6012,10 @@ void Game::ensureTransitPlanUpToDate()
   }
 
   // Keep the planner deterministic per-world unless the user tweaks seedSalt explicitly.
-  TransitPlannerConfig cfg = m_transitCfg;
-  if (cfg.seedSalt == 0) cfg.seedSalt = (m_cfg.seed ^ 0xA2B3C4D5E6F70911ULL);
+  TransitPlannerConfig cfg = tm.plannerCfg;
+  if (cfg.seedSalt == 0) {
+    cfg.seedSalt = (m_world.seed() ^ 0xA2B3C4D5E6F70911ULL) ^ (static_cast<std::uint64_t>(dm) * 0x9E3779B97F4A7C15ULL);
+  }
 
   m_transitPlan = PlanTransitLines(m_roadGraph, m_transitEdgeDemand, cfg, &m_world);
   m_transitPlan.cfg = cfg;
@@ -5824,6 +6030,7 @@ void Game::ensureTransitPlanUpToDate()
 
   m_transitPlanDirty = false;
   m_transitVizDirty = true;
+  m_evacDirty = true;
 }
 
 void Game::ensureTransitVizUpToDate()
@@ -5834,7 +6041,7 @@ void Game::ensureTransitVizUpToDate()
   m_transitViz.clear();
   m_transitViz.reserve(m_transitPlan.lines.size());
 
-  const int stopSpacing = std::max(2, m_transitStopSpacing);
+  const int stopSpacing = std::max(2, m_sim.transitModel().stopSpacingTiles);
 
   for (std::size_t i = 0; i < m_transitPlan.lines.size(); ++i) {
     const TransitLine& line = m_transitPlan.lines[i];
@@ -5908,7 +6115,7 @@ void Game::drawTransitPanel(int uiW, int uiH)
   ensureTransitVizUpToDate();
 
   const int panelW = 420;
-  const int panelH = 340;
+  const int panelH = 480;
   const int x0 = uiW - panelW - 12;
   int y0 = 96;
   if (m_showPolicy) y0 += 280 + 12;
@@ -5940,22 +6147,32 @@ void Game::drawTransitPanel(int uiW, int uiH)
   const bool overlayEffective = (m_showTransitPanel || m_showTransitOverlay);
   const char* overlayLabel = m_showTransitOverlay ? "ON" : (overlayEffective ? "AUTO (panel)" : "OFF");
 
+  const TransitModelSettings& tm = m_sim.transitModel();
+  const TransitPlannerConfig& cfg = tm.plannerCfg;
+
   // Keep these indices in sync with adjustTransitPanel().
   row(0, "Overlay", overlayLabel);
-  row(1, "Demand", TransitDemandModeName(m_transitDemandMode));
-  row(2, "Max lines", TextFormat("%d", m_transitCfg.maxLines));
-  row(3, "Endpoints", TextFormat("%d", m_transitCfg.endpointCandidates));
-  row(4, "Edge weight", TransitEdgeWeightModeName(m_transitCfg.weightMode));
-  row(5, "Demand bias", TextFormat("%.2f", static_cast<double>(m_transitCfg.demandBias)));
-  row(6, "Max detour", TextFormat("%.2f", static_cast<double>(m_transitCfg.maxDetour)));
-  row(7, "Cover frac", TextFormat("%.2f", static_cast<double>(m_transitCfg.coverFraction)));
-  row(8, "Min line", TextFormat("%llu", static_cast<unsigned long long>(m_transitCfg.minLineDemand)));
-  row(9, "Stop spacing", TextFormat("%d tiles", std::max(2, m_transitStopSpacing)));
-  row(10, "Show stops", m_transitShowStops ? "ON" : "OFF");
+  row(1, "System", tm.enabled ? "ON" : "OFF");
+  row(2, "Service", TextFormat("%.2f", static_cast<double>(tm.serviceLevel)));
+  row(3, "Max shift", TextFormat("%.0f%%", static_cast<double>(tm.maxModeShare * 100.0f)));
+  row(4, "Time mult", TextFormat("%.2f", static_cast<double>(tm.travelTimeMultiplier)));
+  row(5, "Cost/tile", TextFormat("%d", tm.costPerTile));
+  row(6, "Cost/stop", TextFormat("%d", tm.costPerStop));
+
+  row(7, "Demand", TransitDemandModeName(tm.demandMode));
+  row(8, "Max lines", TextFormat("%d", cfg.maxLines));
+  row(9, "Endpoints", TextFormat("%d", cfg.endpointCandidates));
+  row(10, "Edge weight", TransitEdgeWeightModeName(cfg.weightMode));
+  row(11, "Demand bias", TextFormat("%.2f", static_cast<double>(cfg.demandBias)));
+  row(12, "Max detour", TextFormat("%.2f", static_cast<double>(cfg.maxDetour)));
+  row(13, "Cover frac", TextFormat("%.2f", static_cast<double>(cfg.coverFraction)));
+  row(14, "Min line", TextFormat("%llu", static_cast<unsigned long long>(cfg.minLineDemand)));
+  row(15, "Stop spacing", TextFormat("%d tiles", std::max(2, tm.stopSpacingTiles)));
+  row(16, "Show stops", m_transitShowStops ? "ON" : "OFF");
 
   const int lineCount = static_cast<int>(m_transitPlan.lines.size());
-  row(11, "Highlight", (m_transitSelectedLine < 0) ? "All" : TextFormat("%d / %d", m_transitSelectedLine + 1, lineCount));
-  row(12, "Solo", m_transitShowOnlySelectedLine ? "ON" : "OFF");
+  row(17, "Highlight", (m_transitSelectedLine < 0) ? "All" : TextFormat("%d / %d", m_transitSelectedLine + 1, lineCount));
+  row(18, "Solo", m_transitShowOnlySelectedLine ? "ON" : "OFF");
 
   y += 4;
   DrawLine(x, y, x0 + panelW - 12, y, Color{255, 255, 255, 70});
@@ -5971,6 +6188,19 @@ void Game::drawTransitPanel(int uiW, int uiH)
                       static_cast<unsigned long long>(m_transitPlan.coveredDemand)),
            x, y, 16, Color{220, 220, 220, 255});
   y += 18;
+
+  // Simulation feedback (driven by the simulator's internal transit mode-shift model).
+  {
+    const Stats& st = m_world.stats();
+    DrawText(TextFormat("Sim riders: %d   Share: %.0f%%   Cost: $%d", st.transitRiders,
+                        static_cast<double>(st.transitModeShare * 100.0f),
+                        st.transitCost),
+             x, y, 16, Color{220, 220, 220, 255});
+    y += 18;
+    DrawText(TextFormat("Commute coverage: %.0f%%", static_cast<double>(st.transitCommuteCoverage * 100.0f)),
+             x, y, 16, Color{220, 220, 220, 255});
+    y += 18;
+  }
 
   if (m_transitSelectedLine >= 0 && m_transitSelectedLine < static_cast<int>(m_transitPlan.lines.size())) {
     const TransitLine& l = m_transitPlan.lines[static_cast<std::size_t>(m_transitSelectedLine)];
@@ -5998,9 +6228,23 @@ void Game::adjustTransitPanel(int dir, bool bigStep)
   const double stepF = bigStep ? 0.25 : 0.05;
   const double stepBias = bigStep ? 0.50 : 0.10;
 
+  const int stepCost = bigStep ? 5 : 1;
+  const float stepService = bigStep ? 0.25f : 0.05f;
+  const float stepShare = bigStep ? 0.10f : 0.02f;
+  const float stepTime = bigStep ? 0.10f : 0.02f;
+
+  TransitModelSettings& tm = m_sim.transitModel();
+  TransitPlannerConfig& cfg = tm.plannerCfg;
+
   auto markPlanDirty = [&]() {
     m_transitPlanDirty = true;
     m_transitVizDirty = true;
+  m_evacDirty = true;
+  };
+
+  auto refreshSim = [&]() {
+    // Update the derived stats immediately so the panel reflects the new setting without requiring a sim tick.
+    m_sim.refreshDerivedStats(m_world);
   };
 
   switch (m_transitSelection) {
@@ -6013,70 +6257,116 @@ void Game::adjustTransitPanel(int dir, bool bigStep)
     break;
   }
   case 1: {
-    // Demand mode.
+    // Simulation on/off.
     if (dir != 0) {
-      const int idx = static_cast<int>(m_transitDemandMode);
-      const int next = (idx + (dir > 0 ? 1 : -1) + 3) % 3;
-      m_transitDemandMode = static_cast<TransitDemandMode>(next);
-      markPlanDirty();
-      showToast(std::string("Transit demand: ") + TransitDemandModeName(m_transitDemandMode), 2.0f);
+      tm.enabled = !tm.enabled;
+      refreshSim();
+      showToast(tm.enabled ? "Transit system: ON" : "Transit system: OFF", 2.0f);
     }
     break;
   }
   case 2: {
-    m_transitCfg.maxLines = std::clamp(m_transitCfg.maxLines + dir * stepI, 1, 32);
-    markPlanDirty();
+    // Service intensity.
+    tm.serviceLevel = std::clamp(tm.serviceLevel + static_cast<float>(dir) * stepService, 0.0f, 3.0f);
+    refreshSim();
     break;
   }
   case 3: {
-    m_transitCfg.endpointCandidates = std::clamp(m_transitCfg.endpointCandidates + dir * stepBigI, 4, 128);
-    markPlanDirty();
+    // Maximum mode-shift cap.
+    tm.maxModeShare = std::clamp(tm.maxModeShare + static_cast<float>(dir) * stepShare, 0.0f, 1.0f);
+    refreshSim();
     break;
   }
   case 4: {
-    if (dir != 0) {
-      m_transitCfg.weightMode = (m_transitCfg.weightMode == TransitEdgeWeightMode::Steps)
-                                    ? TransitEdgeWeightMode::TravelTime
-                                    : TransitEdgeWeightMode::Steps;
-      markPlanDirty();
-    }
+    // Transit travel time multiplier.
+    tm.travelTimeMultiplier = std::clamp(tm.travelTimeMultiplier + static_cast<float>(dir) * stepTime, 0.25f, 2.5f);
+    refreshSim();
     break;
   }
   case 5: {
-    m_transitCfg.demandBias = std::clamp(m_transitCfg.demandBias + static_cast<double>(dir) * stepBias, 0.0, 10.0);
-    markPlanDirty();
+    tm.costPerTile = std::clamp(tm.costPerTile + dir * stepCost, 0, 200);
+    refreshSim();
     break;
   }
   case 6: {
-    m_transitCfg.maxDetour = std::clamp(m_transitCfg.maxDetour + static_cast<double>(dir) * stepF, 1.0, 3.0);
-    markPlanDirty();
+    tm.costPerStop = std::clamp(tm.costPerStop + dir * stepCost, 0, 500);
+    refreshSim();
     break;
   }
   case 7: {
-    m_transitCfg.coverFraction = std::clamp(m_transitCfg.coverFraction + static_cast<double>(dir) * stepF, 0.0, 1.0);
-    markPlanDirty();
+    // Planner demand mode.
+    if (dir != 0) {
+      const int idx = static_cast<int>(tm.demandMode);
+      const int next = (idx + (dir > 0 ? 1 : -1) + 3) % 3;
+      tm.demandMode = static_cast<TransitDemandMode>(next);
+      markPlanDirty();
+      refreshSim();
+      showToast(std::string("Transit demand: ") + TransitDemandModeName(tm.demandMode), 2.0f);
+    }
     break;
   }
   case 8: {
-    const std::uint64_t step = static_cast<std::uint64_t>(bigStep ? 50 : 10);
-    if (dir > 0) {
-      m_transitCfg.minLineDemand += step;
-    } else if (dir < 0) {
-      m_transitCfg.minLineDemand = (m_transitCfg.minLineDemand > step) ? (m_transitCfg.minLineDemand - step) : 0;
-    }
+    cfg.maxLines = std::clamp(cfg.maxLines + dir * stepI, 1, 32);
     markPlanDirty();
+    refreshSim();
     break;
   }
   case 9: {
-    m_transitStopSpacing = std::clamp(m_transitStopSpacing + dir * (bigStep ? 4 : 1), 2, 64);
-    m_transitVizDirty = true;
+    cfg.endpointCandidates = std::clamp(cfg.endpointCandidates + dir * stepBigI, 4, 128);
+    markPlanDirty();
+    refreshSim();
     break;
   }
   case 10: {
-    if (dir != 0) m_transitShowStops = !m_transitShowStops;
+    if (dir != 0) {
+      cfg.weightMode = (cfg.weightMode == TransitEdgeWeightMode::Steps) ? TransitEdgeWeightMode::TravelTime
+                                                                        : TransitEdgeWeightMode::Steps;
+      markPlanDirty();
+      refreshSim();
+    }
     break;
   }
   case 11: {
+    cfg.demandBias = std::clamp(cfg.demandBias + static_cast<double>(dir) * stepBias, 0.0, 10.0);
+    markPlanDirty();
+    refreshSim();
+    break;
+  }
+  case 12: {
+    cfg.maxDetour = std::clamp(cfg.maxDetour + static_cast<double>(dir) * stepF, 1.0, 3.0);
+    markPlanDirty();
+    refreshSim();
+    break;
+  }
+  case 13: {
+    cfg.coverFraction = std::clamp(cfg.coverFraction + static_cast<double>(dir) * stepF, 0.0, 1.0);
+    markPlanDirty();
+    refreshSim();
+    break;
+  }
+  case 14: {
+    const std::uint64_t step = static_cast<std::uint64_t>(bigStep ? 50 : 10);
+    if (dir > 0) {
+      cfg.minLineDemand += step;
+    } else if (dir < 0) {
+      cfg.minLineDemand = (cfg.minLineDemand > step) ? (cfg.minLineDemand - step) : 0;
+    }
+    markPlanDirty();
+    refreshSim();
+    break;
+  }
+  case 15: {
+    tm.stopSpacingTiles = std::clamp(tm.stopSpacingTiles + dir * (bigStep ? 4 : 1), 2, 64);
+    m_transitVizDirty = true;
+  m_evacDirty = true;
+    refreshSim();
+    break;
+  }
+  case 16: {
+    if (dir != 0) m_transitShowStops = !m_transitShowStops;
+    break;
+  }
+  case 17: {
     const int count = static_cast<int>(m_transitPlan.lines.size());
     if (count <= 0) {
       m_transitSelectedLine = -1;
@@ -6099,7 +6389,7 @@ void Game::adjustTransitPanel(int dir, bool bigStep)
     m_transitSelectedLine = idx;
     break;
   }
-  case 12: {
+  case 18: {
     if (dir != 0) m_transitShowOnlySelectedLine = !m_transitShowOnlySelectedLine;
     break;
   }
@@ -6127,7 +6417,7 @@ void Game::exportTransitArtifacts()
   ec.includeStops = true;
   ec.includeTiles = true;
   ec.stopMode = TransitStopMode::Tiles;
-  ec.stopSpacingTiles = std::max(2, m_transitStopSpacing);
+  ec.stopSpacingTiles = std::max(2, m_sim.transitModel().stopSpacingTiles);
 
   // GeoJSON + JSON
   {
@@ -6253,36 +6543,37 @@ void Game::ensureRoadUpgradePlanUpToDate()
   // Ensure derived flows exist for the selected demand mode.
   if (needCommute) {
     if (m_trafficDirty || static_cast<int>(m_traffic.roadTraffic.size()) != n) {
-      const auto& cfg = m_sim.config();
       TrafficConfig tc;
-      tc.baseRoadCapacity = cfg.trafficModel.baseRoadCapacity;
-      tc.useCongestionModel = cfg.trafficModel.useCongestionModel;
-      tc.congestionAlpha = cfg.trafficModel.congestionAlpha;
-      tc.congestionBeta = cfg.trafficModel.congestionBeta;
-      tc.roadSpeedPenaltyWeight = cfg.trafficModel.roadSpeedPenaltyWeight;
+      tc.requireOutsideConnection = requireOutside;
+      {
+        const TrafficModelSettings& tms = m_sim.trafficModel();
+        tc.congestionAwareRouting = tms.congestionAwareRouting;
+        tc.congestionIterations = tms.congestionIterations;
+        tc.congestionAlpha = tms.congestionAlpha;
+        tc.congestionBeta = tms.congestionBeta;
+        tc.congestionCapacityScale = tms.congestionCapacityScale;
+        tc.congestionRatioClamp = tms.congestionRatioClamp;
+        tc.capacityAwareJobs = tms.capacityAwareJobs;
+        tc.jobAssignmentIterations = tms.jobAssignmentIterations;
+        tc.jobPenaltyBaseMilli = tms.jobPenaltyBaseMilli;
+      }
 
       const float employedShare = (m_world.stats().population > 0)
                                       ? (static_cast<float>(m_world.stats().employed) /
                                          static_cast<float>(m_world.stats().population))
                                       : 1.0f;
-      m_traffic = ComputeCommuteTraffic(m_world, tc, employedShare, roadToEdgeMask, nullptr);
+      const std::vector<std::uint8_t>* pre = (tc.requireOutsideConnection ? roadToEdgeMask : nullptr);
+      m_traffic = ComputeCommuteTraffic(m_world, tc, employedShare, pre);
       m_trafficDirty = false;
     }
   }
 
   if (needGoods) {
     if (m_goodsDirty || static_cast<int>(m_goods.roadGoodsTraffic.size()) != n) {
-      const auto& cfg = m_sim.config();
       GoodsConfig gc;
-      gc.baseRoadCapacity = cfg.trafficModel.baseRoadCapacity;
-      gc.useCongestionModel = cfg.trafficModel.useCongestionModel;
-      gc.congestionAlpha = cfg.trafficModel.congestionAlpha;
-      gc.congestionBeta = cfg.trafficModel.congestionBeta;
-      gc.roadSpeedPenaltyWeight = cfg.trafficModel.roadSpeedPenaltyWeight;
-      gc.goodsPerCommercialTile = cfg.goodsPerCommercialTile;
-      gc.maxDeliveryDistance = cfg.maxDeliveryDistance;
-
-      m_goods = ComputeGoodsFlow(m_world, gc, roadToEdgeMask, nullptr);
+      gc.requireOutsideConnection = requireOutside;
+      const std::vector<std::uint8_t>* pre = (gc.requireOutsideConnection ? roadToEdgeMask : nullptr);
+      m_goods = ComputeGoodsFlow(m_world, gc, pre);
       m_goodsDirty = false;
     }
   }
@@ -6794,6 +7085,7 @@ bool Game::applyRoadUpgradePlan()
   m_landValueDirty = true;
   m_transitPlanDirty = true;
   m_transitVizDirty = true;
+  m_evacDirty = true;
   m_vehiclesDirty = true;
 
   // Our plan is now stale.
@@ -6865,6 +7157,209 @@ void Game::exportRoadUpgradeArtifacts()
   }
 }
 
+
+void Game::ensureEvacuationScenarioUpToDate()
+{
+  const int w = m_world.width();
+  const int h = m_world.height();
+  if (w <= 0 || h <= 0) {
+    m_evacScenario = EvacuationScenarioResult{};
+    m_evacHeatmaps = EvacuationScenarioHeatmaps{};
+    m_evacDirty = false;
+    return;
+  }
+
+  // Keep hazard settings synced with the flood/ponding overlay configs.
+  m_evacCfg.seaLevel = m_seaLevel;
+  m_evacCfg.seaCfg = m_seaFloodCfg;
+  m_evacCfg.pondCfg = m_pondingCfg;
+  m_evacCfg.pondMinDepth = std::clamp(m_evacCfg.pondMinDepth, 0.0f, 1.0f);
+
+  if (!m_evacDirty && (m_evacScenario.w == w) && (m_evacScenario.h == h)) return;
+
+  m_evacScenario = ComputeEvacuationScenario(m_world, m_evacCfg);
+  m_evacHeatmaps = BuildEvacuationScenarioHeatmaps(m_world, m_evacScenario);
+  m_evacDirty = false;
+}
+
+void Game::exportEvacuationArtifacts()
+{
+  ensureEvacuationScenarioUpToDate();
+
+  if (m_evacScenario.w <= 0 || m_evacScenario.h <= 0) {
+    showToast("Evac export: nothing to export", 2.0f);
+    return;
+  }
+
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  fs::create_directories("captures", ec);
+
+  const std::string base = TextFormat("captures/evac_seed%llu_day%d_%s",
+                                      static_cast<unsigned long long>(m_world.seed()),
+                                      m_world.stats().day,
+                                      FileTimestamp().c_str());
+
+  // Write JSON summary.
+  {
+    const std::string path = base + ".json";
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+      showToast("Evac export failed: can't write json", 3.0f);
+    } else {
+      const EvacuationScenarioConfig& cfg = m_evacCfg;
+      const EvacuationResult& r = m_evacScenario.evac;
+
+      auto b = [](bool v) -> const char* { return v ? "true" : "false"; };
+
+      out << "{\n";
+      out << "  \"seed\": " << static_cast<unsigned long long>(m_world.seed()) << ",\n";
+      out << "  \"day\": " << m_world.stats().day << ",\n";
+      out << "  \"hazardMode\": \"" << EvacuationHazardModeName(cfg.hazardMode) << "\",\n";
+      out << "  \"bridgesPassable\": " << b(cfg.bridgesPassable) << ",\n";
+      out << "  \"pondMinDepth\": " << cfg.pondMinDepth << ",\n";
+      out << "  \"seaLevel\": " << cfg.seaLevel << ",\n";
+      out << "  \"seaRequireEdge\": " << b(cfg.seaCfg.requireEdgeConnection) << ",\n";
+      out << "  \"seaEightConnected\": " << b(cfg.seaCfg.eightConnected) << ",\n";
+      out << "  \"pondEpsilon\": " << cfg.pondCfg.epsilon << ",\n";
+      out << "  \"pondIncludeEdges\": " << b(cfg.pondCfg.includeEdges) << ",\n";
+      out << "  \"evacConfig\": {\n";
+      out << "    \"useTravelTime\": " << b(cfg.evac.useTravelTime) << ",\n";
+      out << "    \"walkCostMilli\": " << cfg.evac.walkCostMilli << ",\n";
+      out << "    \"roadTileCapacity\": " << cfg.evac.roadTileCapacity << "\n";
+      out << "  },\n";
+      out << "  \"hazards\": {\n";
+      out << "    \"seaFloodedCells\": " << m_evacScenario.sea.floodedCells << ",\n";
+      out << "    \"seaMaxDepth\": " << m_evacScenario.sea.maxDepth << ",\n";
+      out << "    \"pondFilledCells\": " << m_evacScenario.pond.filledCells << ",\n";
+      out << "    \"pondMaxDepth\": " << m_evacScenario.pond.maxDepth << ",\n";
+      out << "    \"pondVolume\": " << m_evacScenario.pond.volume << "\n";
+      out << "  },\n";
+      out << "  \"evacSummary\": {\n";
+      out << "    \"exitSources\": " << r.exitSources << ",\n";
+      out << "    \"residentialTiles\": " << r.residentialTiles << ",\n";
+      out << "    \"totalResidentialPopulation\": " << r.totalResidentialPopulation << ",\n";
+      out << "    \"reachableResidentialPopulation\": " << r.reachableResidentialPopulation << ",\n";
+      out << "    \"floodedResidentialPopulation\": " << r.floodedResidentialPopulation << ",\n";
+      out << "    \"unreachableResidentialPopulation\": " << r.unreachableResidentialPopulation << ",\n";
+      out << "    \"avgEvacTime\": " << r.avgEvacTime << ",\n";
+      out << "    \"p95EvacTime\": " << r.p95EvacTime << ",\n";
+      out << "    \"maxEvacRoadFlow\": " << r.maxEvacRoadFlow << "\n";
+      out << "  }\n";
+      out << "}\n";
+    }
+  }
+
+  // Helper: overlay a per-tile value onto a base layer.
+  auto blendOver = [](std::uint8_t base, std::uint8_t over, std::uint8_t a) -> std::uint8_t {
+    const unsigned int ib = base;
+    const unsigned int io = over;
+    const unsigned int ia = a;
+    return static_cast<std::uint8_t>((ib * (255u - ia) + io * ia) / 255u);
+  };
+
+  auto overlayPixel = [&](PpmImage& img, int x, int y, std::uint8_t r, std::uint8_t g, std::uint8_t b,
+                          std::uint8_t a) {
+    const int w = img.w;
+    const std::size_t idx = static_cast<std::size_t>(y * w + x) * 3u;
+    if (idx + 2u >= img.rgb.size()) return;
+    img.rgb[idx + 0u] = blendOver(img.rgb[idx + 0u], r, a);
+    img.rgb[idx + 1u] = blendOver(img.rgb[idx + 1u], g, a);
+    img.rgb[idx + 2u] = blendOver(img.rgb[idx + 2u], b, a);
+  };
+
+  const int w = m_evacScenario.w;
+  const int h = m_evacScenario.h;
+  const int maxDim = std::max(w, h);
+  const int scale = std::clamp(2048 / std::max(1, maxDim), 1, 8);
+
+  auto write = [&](const std::string& suffix, const PpmImage& imgIn) {
+    std::string err;
+    PpmImage outImg = imgIn;
+    if (scale > 1) outImg = ScaleNearest(outImg, scale);
+    const std::string path = base + suffix;
+    if (!WriteImageAuto(path, outImg, err)) {
+      showToast(std::string("Export failed: ") + err, 4.0f);
+    }
+  };
+
+  // Hazard mask overlay (blue)
+  {
+    PpmImage img = RenderPpmLayer(m_world, ExportLayer::Overlay);
+    const std::vector<std::uint8_t>& mask = m_evacScenario.hazardMask;
+    if (static_cast<int>(mask.size()) == w * h) {
+      for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+          const std::size_t i = static_cast<std::size_t>(y * w + x);
+          if (mask[i]) overlayPixel(img, x, y, 0u, 160u, 255u, 180u);
+        }
+      }
+    }
+    write("_hazard.png", img);
+  }
+
+  auto rampColor = [](float v, std::uint8_t& outR, std::uint8_t& outG, std::uint8_t& outB) {
+    v = std::clamp(v, 0.0f, 1.0f);
+    outR = static_cast<std::uint8_t>(std::lround(255.0f * v));
+    outG = static_cast<std::uint8_t>(std::lround(255.0f * (1.0f - v)));
+    outB = 0u;
+  };
+
+  // Evacuation time overlay (residential tiles)
+  {
+    PpmImage img = RenderPpmLayer(m_world, ExportLayer::Overlay);
+    const auto& hm = m_evacHeatmaps.evacTime;
+    if (static_cast<int>(hm.size()) == w * h) {
+      for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+          const float v = hm[static_cast<std::size_t>(y * w + x)];
+          if (v <= 0.0f) continue;
+          std::uint8_t r, g, b;
+          rampColor(v, r, g, b);
+          overlayPixel(img, x, y, r, g, b, 210u);
+        }
+      }
+    }
+    write("_time.png", img);
+  }
+
+  // Evac unreachable overlay (red)
+  {
+    PpmImage img = RenderPpmLayer(m_world, ExportLayer::Overlay);
+    const auto& hm = m_evacHeatmaps.evacUnreachable;
+    if (static_cast<int>(hm.size()) == w * h) {
+      for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+          const float v = hm[static_cast<std::size_t>(y * w + x)];
+          if (v <= 0.0f) continue;
+          overlayPixel(img, x, y, 255u, 30u, 30u, 220u);
+        }
+      }
+    }
+    write("_unreachable.png", img);
+  }
+
+  // Evac road flow overlay (roads)
+  {
+    PpmImage img = RenderPpmLayer(m_world, ExportLayer::Overlay);
+    const auto& hm = m_evacHeatmaps.evacFlow;
+    if (static_cast<int>(hm.size()) == w * h) {
+      for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+          const float v = hm[static_cast<std::size_t>(y * w + x)];
+          if (v <= 0.0f) continue;
+          std::uint8_t r, g, b;
+          rampColor(v, r, g, b);
+          overlayPixel(img, x, y, r, g, b, 200u);
+        }
+      }
+    }
+    write("_flow.png", img);
+  }
+
+  showToast(std::string("Exported evac artifacts to: ") + base + "*", 3.0f);
+}
+
 void Game::doUndo()
 {
   // Commit any in-progress stroke before undoing.
@@ -6880,6 +7375,7 @@ void Game::doUndo()
     m_landValueDirty = true;
     m_transitPlanDirty = true;
     m_transitVizDirty = true;
+  m_evacDirty = true;
     m_roadUpgradePlanDirty = true;
     m_roadUpgradeSelectedMaskDirty = true;
     invalidateHydrology();
@@ -6904,6 +7400,7 @@ void Game::doRedo()
     m_landValueDirty = true;
     m_transitPlanDirty = true;
     m_transitVizDirty = true;
+  m_evacDirty = true;
     m_roadUpgradePlanDirty = true;
     m_roadUpgradeSelectedMaskDirty = true;
     invalidateHydrology();
@@ -6927,6 +7424,7 @@ void Game::resetWorld(std::uint64_t newSeed)
   m_landValueDirty = true;
   m_transitPlanDirty = true;
   m_transitVizDirty = true;
+  m_evacDirty = true;
   invalidateHydrology();
   m_vehiclesDirty = true;
   m_vehicles.clear();
@@ -7463,6 +7961,7 @@ void Game::handleInput(float dt)
     m_vehiclesDirty = true;
     m_transitPlanDirty = true;
     m_transitVizDirty = true;
+  m_evacDirty = true;
     m_roadUpgradePlanDirty = true;
     m_roadUpgradeSelectedMaskDirty = true;
     showToast("Sim step");
@@ -7587,7 +8086,7 @@ void Game::handleInput(float dt)
       constexpr int kPages = 5;
       m_reportPage = (m_reportPage + delta + kPages) % kPages;
     } else if (m_showPolicy) {
-      const int count = 8;
+      const int count = 11;
       m_policySelection = (m_policySelection + delta + count) % count;
     } else if (m_showTrafficModel) {
       const int count = 9;
@@ -7596,7 +8095,7 @@ void Game::handleInput(float dt)
       const int count = 9;
       m_districtSelection = (m_districtSelection + delta + count) % count;
     } else if (m_showTransitPanel) {
-      const int count = 13;
+      const int count = 19;
       m_transitSelection = (m_transitSelection + delta + count) % count;
     } else if (m_showRoadUpgradePanel) {
       const int count = 13;
@@ -7614,6 +8113,7 @@ void Game::handleInput(float dt)
       (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER))) {
     m_transitPlanDirty = true;
     m_transitVizDirty = true;
+  m_evacDirty = true;
     ensureTransitVizUpToDate();
 
     const int lineCount = static_cast<int>(m_transitPlan.lines.size());
@@ -7819,6 +8319,9 @@ void Game::handleInput(float dt)
       case HeatmapOverlay::TrafficSpill: return "Traffic spill";
       case HeatmapOverlay::FloodDepth: return "Flood depth";
       case HeatmapOverlay::PondingDepth: return "Ponding depth";
+      case HeatmapOverlay::EvacuationTime: return "Evac time";
+      case HeatmapOverlay::EvacuationUnreachable: return "Evac unreachable";
+      case HeatmapOverlay::EvacuationFlow: return "Evac flow";
       default: return "Heatmap";
       }
     };
@@ -7833,6 +8336,9 @@ void Game::handleInput(float dt)
       case HeatmapOverlay::TrafficSpill: return 5;
       case HeatmapOverlay::FloodDepth: return 6;
       case HeatmapOverlay::PondingDepth: return 7;
+      case HeatmapOverlay::EvacuationTime: return 8;
+      case HeatmapOverlay::EvacuationUnreachable: return 9;
+      case HeatmapOverlay::EvacuationFlow: return 10;
       default: return 0;
       }
     };
@@ -7847,11 +8353,14 @@ void Game::handleInput(float dt)
       case 5: return HeatmapOverlay::TrafficSpill;
       case 6: return HeatmapOverlay::FloodDepth;
       case 7: return HeatmapOverlay::PondingDepth;
+      case 8: return HeatmapOverlay::EvacuationTime;
+      case 9: return HeatmapOverlay::EvacuationUnreachable;
+      case 10: return HeatmapOverlay::EvacuationFlow;
       default: return HeatmapOverlay::Off;
       }
     };
 
-    const int count = 8;
+    const int count = 11;
     const int delta = shift ? -1 : 1;
     int idx = toIndex(m_heatmapOverlay);
     idx = (idx + delta + count) % count;
@@ -7890,6 +8399,7 @@ void Game::handleInput(float dt)
       m_vehiclesDirty = true;
       m_transitPlanDirty = true;
       m_transitVizDirty = true;
+  m_evacDirty = true;
       m_outsideOverlayRoadToEdge.clear();
     } else if (m_showTrafficModel) {
       // Traffic model adjustments
@@ -7921,6 +8431,7 @@ void Game::handleInput(float dt)
       m_vehiclesDirty = true;
       m_transitPlanDirty = true;
       m_transitVizDirty = true;
+  m_evacDirty = true;
     } else if (m_showDistrictPanel) {
       const int deltaI = shift ? -2 : -1;
       const float deltaF = shift ? -0.25f : -0.05f;
@@ -7975,6 +8486,7 @@ void Game::handleInput(float dt)
       m_sim.refreshDerivedStats(m_world);
       m_transitPlanDirty = true;
       m_transitVizDirty = true;
+  m_evacDirty = true;
     } else if (m_showTransitPanel) {
       adjustTransitPanel(-1, shift);
     } else if (m_showRoadUpgradePanel) {
@@ -8011,6 +8523,7 @@ void Game::handleInput(float dt)
       m_vehiclesDirty = true;
       m_transitPlanDirty = true;
       m_transitVizDirty = true;
+  m_evacDirty = true;
       m_outsideOverlayRoadToEdge.clear();
     } else if (m_showTrafficModel) {
       // Traffic model adjustments
@@ -8042,6 +8555,7 @@ void Game::handleInput(float dt)
       m_vehiclesDirty = true;
       m_transitPlanDirty = true;
       m_transitVizDirty = true;
+  m_evacDirty = true;
     } else if (m_showDistrictPanel) {
       const int deltaI = shift ? 2 : 1;
       const float deltaF = shift ? 0.25f : 0.05f;
@@ -8094,6 +8608,7 @@ void Game::handleInput(float dt)
       m_sim.refreshDerivedStats(m_world);
       m_transitPlanDirty = true;
       m_transitVizDirty = true;
+  m_evacDirty = true;
     } else if (m_showTransitPanel) {
       adjustTransitPanel(+1, shift);
     } else if (m_showRoadUpgradePanel) {
@@ -8712,6 +9227,7 @@ void Game::update(float dt)
       m_vehiclesDirty = true;
       m_transitPlanDirty = true;
       m_transitVizDirty = true;
+  m_evacDirty = true;
 
       // Keep the software 3D preview in sync with sim-driven changes.
       m_3dPreviewDirty = true;
@@ -9171,7 +9687,7 @@ void Game::draw()
   }
 
   const bool heatmapActive = (m_heatmapOverlay != HeatmapOverlay::Off);
-  const bool heatmapUsesLandValue = heatmapActive && (m_heatmapOverlay != HeatmapOverlay::FloodDepth) && (m_heatmapOverlay != HeatmapOverlay::PondingDepth);
+  const bool heatmapUsesLandValue = heatmapActive && (m_heatmapOverlay != HeatmapOverlay::FloodDepth) && (m_heatmapOverlay != HeatmapOverlay::PondingDepth) && (m_heatmapOverlay != HeatmapOverlay::EvacuationTime) && (m_heatmapOverlay != HeatmapOverlay::EvacuationUnreachable) && (m_heatmapOverlay != HeatmapOverlay::EvacuationFlow);
   const bool districtStatsActive = m_showDistrictPanel || (m_showReport && m_reportPage == 4);
 
   // Many derived systems need the "road component touches map edge" mask.
@@ -9374,6 +9890,24 @@ void Game::draw()
       heatmap = &m_pondingHeatmap;
       heatmapRamp = Renderer::HeatmapRamp::Water;
       break;
+    case HeatmapOverlay::EvacuationTime:
+      ensureEvacuationScenarioUpToDate();
+      heatmapName = "Evac time";
+      heatmap = &m_evacHeatmaps.evacTime;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
+    case HeatmapOverlay::EvacuationUnreachable:
+      ensureEvacuationScenarioUpToDate();
+      heatmapName = "Evac unreachable";
+      heatmap = &m_evacHeatmaps.evacUnreachable;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
+    case HeatmapOverlay::EvacuationFlow:
+      ensureEvacuationScenarioUpToDate();
+      heatmapName = "Evac flow";
+      heatmap = &m_evacHeatmaps.evacFlow;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
     default: break;
     }
   }
@@ -9527,7 +10061,7 @@ void Game::draw()
     const std::size_t idx = static_cast<std::size_t>(m_hovered->y) * static_cast<std::size_t>(m_world.width()) +
                             static_cast<std::size_t>(m_hovered->x);
     const float hv = (*heatmap)[idx];
-    char buf[128];
+    char buf[256];
     if (m_heatmapOverlay == HeatmapOverlay::FloodDepth) {
       const float depth = (m_seaFlood.maxDepth > 1e-6f) ? (hv * m_seaFlood.maxDepth) : 0.0f;
       std::snprintf(buf, sizeof(buf), "Heatmap: %s (sea %.2f)  depth %.2f", heatmapName,
@@ -9536,6 +10070,38 @@ void Game::draw()
       const float depth = (m_pondingMaxDepth > 1e-6f) ? (hv * m_pondingMaxDepth) : 0.0f;
       std::snprintf(buf, sizeof(buf), "Heatmap: %s  depth %.2f (max %.2f)", heatmapName,
                     static_cast<double>(depth), static_cast<double>(m_pondingMaxDepth));
+    } else if (m_heatmapOverlay == HeatmapOverlay::EvacuationTime) {
+      ensureEvacuationScenarioUpToDate();
+      const EvacuationResult& r = m_evacScenario.evac;
+      const int costMilli = (idx < r.resCostMilli.size()) ? r.resCostMilli[idx] : -1;
+      const bool hazard = (idx < m_evacScenario.hazardMask.size()) ? (m_evacScenario.hazardMask[idx] != 0) : false;
+      const char* unit = m_evacCfg.evac.useTravelTime ? "s" : "steps";
+      if (costMilli >= 0) {
+        const double t = static_cast<double>(costMilli) / 1000.0;
+        std::snprintf(buf, sizeof(buf), "Heatmap: %s (%s)  tile %.1f%s  p95 %.1f%s  unreachPop %d%s", heatmapName,
+                      EvacuationHazardModeName(m_evacCfg.hazardMode), t, unit,
+                      static_cast<double>(r.p95EvacTime), unit, r.unreachableResidentialPopulation,
+                      hazard ? "  (hazard)" : "");
+      } else {
+        std::snprintf(buf, sizeof(buf), "Heatmap: %s (%s)  tile UNREACHABLE  unreachPop %d%s", heatmapName,
+                      EvacuationHazardModeName(m_evacCfg.hazardMode), r.unreachableResidentialPopulation,
+                      hazard ? "  (hazard)" : "");
+      }
+    } else if (m_heatmapOverlay == HeatmapOverlay::EvacuationUnreachable) {
+      ensureEvacuationScenarioUpToDate();
+      const EvacuationResult& r = m_evacScenario.evac;
+      const bool unreach = (idx < r.resCostMilli.size()) ? (r.resCostMilli[idx] < 0) : false;
+      const bool hazard = (idx < m_evacScenario.hazardMask.size()) ? (m_evacScenario.hazardMask[idx] != 0) : false;
+      std::snprintf(buf, sizeof(buf), "Heatmap: %s (%s)  tile %s%s  unreachPop %d", heatmapName,
+                    EvacuationHazardModeName(m_evacCfg.hazardMode),
+                    unreach ? "UNREACHABLE" : "ok", hazard ? " (hazard)" : "",
+                    r.unreachableResidentialPopulation);
+    } else if (m_heatmapOverlay == HeatmapOverlay::EvacuationFlow) {
+      ensureEvacuationScenarioUpToDate();
+      const EvacuationResult& r = m_evacScenario.evac;
+      const unsigned int f = (idx < r.evacRoadFlow.size()) ? r.evacRoadFlow[idx] : 0u;
+      std::snprintf(buf, sizeof(buf), "Heatmap: %s (%s)  tile %u  max %u  cap %d", heatmapName,
+                    EvacuationHazardModeName(m_evacCfg.hazardMode), f, r.maxEvacRoadFlow, m_evacCfg.evac.roadTileCapacity);
     } else {
       std::snprintf(buf, sizeof(buf), "Heatmap: %s  %.2f", heatmapName, static_cast<double>(hv));
     }
@@ -9548,6 +10114,30 @@ void Game::draw()
     } else if (m_heatmapOverlay == HeatmapOverlay::PondingDepth) {
       char buf[128];
       std::snprintf(buf, sizeof(buf), "Heatmap: %s (max %.2f)", heatmapName, static_cast<double>(m_pondingMaxDepth));
+      heatmapInfo = buf;
+    } else if (m_heatmapOverlay == HeatmapOverlay::EvacuationTime ||
+               m_heatmapOverlay == HeatmapOverlay::EvacuationUnreachable ||
+               m_heatmapOverlay == HeatmapOverlay::EvacuationFlow) {
+      ensureEvacuationScenarioUpToDate();
+      const EvacuationResult& r = m_evacScenario.evac;
+      const char* unit = m_evacCfg.evac.useTravelTime ? "s" : "steps";
+      const double reachPct = (r.totalResidentialPopulation > 0)
+                                  ? (100.0 * static_cast<double>(r.reachableResidentialPopulation) /
+                                     static_cast<double>(r.totalResidentialPopulation))
+                                  : 0.0;
+      char buf[256];
+      if (m_heatmapOverlay == HeatmapOverlay::EvacuationTime) {
+        std::snprintf(buf, sizeof(buf), "Heatmap: %s (%s)  reach %.0f%%  p95 %.1f%s", heatmapName,
+                      EvacuationHazardModeName(m_evacCfg.hazardMode), reachPct,
+                      static_cast<double>(r.p95EvacTime), unit);
+      } else if (m_heatmapOverlay == HeatmapOverlay::EvacuationUnreachable) {
+        std::snprintf(buf, sizeof(buf), "Heatmap: %s (%s)  unreachPop %d  floodedPop %d", heatmapName,
+                      EvacuationHazardModeName(m_evacCfg.hazardMode), r.unreachableResidentialPopulation,
+                      r.floodedResidentialPopulation);
+      } else {
+        std::snprintf(buf, sizeof(buf), "Heatmap: %s (%s)  maxFlow %u", heatmapName,
+                      EvacuationHazardModeName(m_evacCfg.hazardMode), r.maxEvacRoadFlow);
+      }
       heatmapInfo = buf;
     } else {
       heatmapInfo = std::string("Heatmap: ") + heatmapName;

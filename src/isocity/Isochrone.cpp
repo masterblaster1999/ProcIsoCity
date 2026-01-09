@@ -73,7 +73,8 @@ RoadIsochroneField BuildRoadIsochroneField(const World& world,
 std::vector<int> BuildTileAccessCostField(const World& world,
                                          const RoadIsochroneField& roadField,
                                          const TileAccessCostConfig& cfg,
-                                         const std::vector<std::uint8_t>* roadToEdgeMask)
+                                         const std::vector<std::uint8_t>* roadToEdgeMask,
+                                         const ZoneAccessMap* precomputedZoneAccess)
 {
   const int w = world.width();
   const int h = world.height();
@@ -85,11 +86,19 @@ std::vector<int> BuildTileAccessCostField(const World& world,
   if (roadField.costMilli.size() != n) return out;
 
   // Optional zone access map (supports interior zoning tiles).
-  ZoneAccessMap zam;
-  bool haveZam = false;
+  // If a usable precomputedZoneAccess is provided, we reuse it to avoid rebuilding.
+  ZoneAccessMap zamLocal;
+  const ZoneAccessMap* zam = nullptr;
   if (cfg.includeZones && cfg.useZoneAccessMap) {
-    zam = BuildZoneAccessMap(world, MaskUsable(roadToEdgeMask, w, h) ? roadToEdgeMask : nullptr);
-    haveZam = (zam.w == w && zam.h == h && zam.roadIdx.size() == n);
+    if (precomputedZoneAccess && precomputedZoneAccess->w == w && precomputedZoneAccess->h == h &&
+        precomputedZoneAccess->roadIdx.size() == n) {
+      zam = precomputedZoneAccess;
+    } else {
+      zamLocal = BuildZoneAccessMap(world, MaskUsable(roadToEdgeMask, w, h) ? roadToEdgeMask : nullptr);
+      if (zamLocal.w == w && zamLocal.h == h && zamLocal.roadIdx.size() == n) {
+        zam = &zamLocal;
+      }
+    }
   }
 
   const int walkCost = std::max(0, cfg.accessStepCostMilli);
@@ -133,8 +142,8 @@ std::vector<int> BuildTileAccessCostField(const World& world,
 
       // Zones can use ZoneAccessMap for interior parcels.
       if (cfg.includeZones && IsZoneOverlay(t.overlay)) {
-        if (haveZam) {
-          const int ridx = zam.roadIdx[idx];
+        if (zam) {
+          const int ridx = zam->roadIdx[idx];
           if (ridx >= 0 && static_cast<std::size_t>(ridx) < n) {
             mappedRoadCost = roadField.costMilli[static_cast<std::size_t>(ridx)];
           }

@@ -7,6 +7,8 @@
 
 namespace isocity {
 
+struct ZoneAccessMap;
+
 // Accessibility / isochrone helpers.
 //
 // An "isochrone" is a region reachable within a given travel-time threshold.
@@ -92,6 +94,7 @@ struct TileAccessCostConfig {
 std::vector<int> BuildTileAccessCostField(const World& world,
                                          const RoadIsochroneField& roadField,
                                          const TileAccessCostConfig& cfg,
-                                         const std::vector<std::uint8_t>* roadToEdgeMask = nullptr);
+                                         const std::vector<std::uint8_t>* roadToEdgeMask = nullptr,
+                                         const ZoneAccessMap* precomputedZoneAccess = nullptr);
 
 } // namespace isocity
