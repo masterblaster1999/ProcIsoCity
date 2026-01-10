@@ -39,6 +39,79 @@ constexpr int kAutosaveSlotMin = 1;
 constexpr int kAutosaveSlotMax = 3;
 constexpr float kAutosaveIntervalSec = 60.0f;
 
+// --- UI layout ---
+// Panels are drawn in a virtual UI coordinate system (see Game::draw). These constants are in that
+// same coordinate space.
+constexpr int kUiPanelMargin = 12;
+constexpr int kUiPanelSpacing = 12;
+constexpr int kUiPanelTopY = 96;
+
+// Standard right-docked panel sizes.
+constexpr int kPolicyPanelW = 420;
+constexpr int kPolicyPanelH = 280;
+constexpr int kTrafficPanelW = 420;
+constexpr int kTrafficPanelH = 314;
+constexpr int kDistrictPanelW = 420;
+constexpr int kDistrictPanelH = 308;
+constexpr int kTransitPanelW = 420;
+constexpr int kTransitPanelH = 480;
+constexpr int kRoadUpgradePanelW = 460;
+constexpr int kRoadUpgradePanelH = 360;
+
+// Simple flow-dock for stacking panels on the right. When vertical space runs out it wraps to a new
+// column to the left, keeping panels on-screen without overlap.
+struct RightPanelDock {
+  int uiW = 0;
+  int uiH = 0;
+
+  int rightEdgeX = 0; // right edge of current column
+  int cursorY = kUiPanelTopY;
+  int colWidth = 0;
+
+  explicit RightPanelDock(int w, int h)
+    : uiW(w)
+    , uiH(h)
+    , rightEdgeX(w - kUiPanelMargin)
+    , cursorY(kUiPanelTopY)
+    , colWidth(0)
+  {
+  }
+
+  void wrapColumn()
+  {
+    rightEdgeX -= (colWidth + kUiPanelSpacing);
+    cursorY = kUiPanelTopY;
+    colWidth = 0;
+  }
+
+  Rectangle alloc(int panelW, int panelH)
+  {
+    if (uiH > 0) {
+      const int maxY = uiH - kUiPanelMargin;
+      // If this panel doesn't fit in the current column and the column already contains something,
+      // wrap to the next column.
+      if (cursorY != kUiPanelTopY && (cursorY + panelH) > maxY) {
+        wrapColumn();
+      }
+    }
+
+    // If the panel is still too tall to fit (e.g. tiny window), pin it as best as we can.
+    int y0 = cursorY;
+    if (uiH > 0) {
+      const int maxY0 = uiH - panelH - kUiPanelMargin;
+      if (y0 > maxY0) {
+        y0 = std::max(kUiPanelMargin, maxY0);
+      }
+    }
+
+    const int x0 = rightEdgeX - panelW;
+    cursorY = y0 + panelH + kUiPanelSpacing;
+    colWidth = std::max(colWidth, panelW);
+    return Rectangle{static_cast<float>(x0), static_cast<float>(y0), static_cast<float>(panelW),
+                     static_cast<float>(panelH)};
+  }
+};
+
 // --- Vehicle micro-sim tuning ---
 constexpr int kMaxCommuteVehicles = 160;
 constexpr int kMaxGoodsVehicles = 120;
@@ -5409,6 +5482,10 @@ void Game::drawBlueprintPanel(int uiW, int uiH)
 {
   if (m_blueprintMode == BlueprintMode::Off) return;
 
+  // Future: make the blueprint tool panel responsive to UI dimensions.
+  static_cast<void>(uiW);
+  static_cast<void>(uiH);
+
   const int x = 12;
   const int y = 96;
   const int w = 420;
@@ -6098,19 +6175,14 @@ void Game::drawTransitOverlay()
   EndMode2D();
 }
 
-void Game::drawTransitPanel(int uiW, int uiH)
+void Game::drawTransitPanel(int x0, int y0)
 {
   if (!m_showTransitPanel) return;
 
   ensureTransitVizUpToDate();
 
-  const int panelW = 420;
-  const int panelH = 480;
-  const int x0 = uiW - panelW - 12;
-  int y0 = 96;
-  if (m_showPolicy) y0 += 280 + 12;
-  if (m_showTrafficModel) y0 += 314 + 12;
-  if (m_showDistrictPanel) y0 += 308 + 12;
+  const int panelW = kTransitPanelW;
+  const int panelH = kTransitPanelH;
 
   DrawRectangle(x0, y0, panelW, panelH, Color{0, 0, 0, 180});
   DrawRectangleLines(x0, y0, panelW, panelH, Color{255, 255, 255, 70});
@@ -6719,21 +6791,14 @@ void Game::drawRoadUpgradeOverlay()
   EndMode2D();
 }
 
-void Game::drawRoadUpgradePanel(int uiW, int uiH)
+void Game::drawRoadUpgradePanel(int x0, int y0)
 {
   if (!m_showRoadUpgradePanel) return;
 
   ensureRoadUpgradePlanUpToDate();
 
-  const int panelW = 460;
-  const int panelH = 360;
-
-  const int x0 = uiW - panelW - 12;
-  int y0 = 96;
-  if (m_showPolicy) y0 += 280 + 12;
-  if (m_showTrafficModel) y0 += 314 + 12;
-  if (m_showDistrictPanel) y0 += 308 + 12;
-  if (m_showTransitPanel) y0 += 340 + 12;
+  const int panelW = kRoadUpgradePanelW;
+  const int panelH = kRoadUpgradePanelH;
 
   DrawRectangle(x0, y0, panelW, panelH, Color{20, 20, 20, 200});
   DrawRectangleLines(x0, y0, panelW, panelH, Color{255, 255, 255, 90});
@@ -10142,15 +10207,20 @@ void Game::draw()
 
   drawBlueprintPanel(uiW, uiH);
 
+  // Right-side panels share a simple docking layout that wraps to additional columns if vertical
+  // space runs out. This prevents panels from falling off-screen when multiple tools are enabled.
+  RightPanelDock rightDock(uiW, uiH);
+
   // Policy / budget panel (simple keyboard-driven UI).
   if (m_showPolicy) {
     const SimConfig& cfg = m_sim.config();
     const Stats& st = m_world.stats();
 
-    const int panelW = 420;
-    const int panelH = 280;
-    const int x0 = uiW - panelW - 12;
-    const int y0 = 96;
+    const int panelW = kPolicyPanelW;
+    const int panelH = kPolicyPanelH;
+    const Rectangle rect = rightDock.alloc(panelW, panelH);
+    const int x0 = static_cast<int>(rect.x);
+    const int y0 = static_cast<int>(rect.y);
 
     DrawRectangle(x0, y0, panelW, panelH, Color{0, 0, 0, 180});
     DrawRectangleLines(x0, y0, panelW, panelH, Color{255, 255, 255, 70});
@@ -10201,11 +10271,11 @@ void Game::draw()
     const TrafficModelSettings& tm = m_sim.trafficModel();
     const Stats& st = m_world.stats();
 
-    const int panelW = 420;
-    const int panelH = 314;
-    const int x0 = uiW - panelW - 12;
-    // Stack below policy if both are visible.
-    const int y0 = m_showPolicy ? (96 + 280 + 12) : 96;
+    const int panelW = kTrafficPanelW;
+    const int panelH = kTrafficPanelH;
+    const Rectangle rect = rightDock.alloc(panelW, panelH);
+    const int x0 = static_cast<int>(rect.x);
+    const int y0 = static_cast<int>(rect.y);
 
     DrawRectangle(x0, y0, panelW, panelH, Color{0, 0, 0, 180});
     DrawRectangleLines(x0, y0, panelW, panelH, Color{255, 255, 255, 70});
@@ -10252,12 +10322,11 @@ void Game::draw()
     const int district = std::clamp(m_activeDistrict, 0, kDistrictCount - 1);
     const DistrictPolicy& dp = cfg.districtPolicies[static_cast<std::size_t>(district)];
 
-    const int panelW = 420;
-    const int panelH = 308;
-    const int x0 = uiW - panelW - 12;
-    int y0 = 96;
-    if (m_showPolicy) y0 += 280 + 12;
-    if (m_showTrafficModel) y0 += 314 + 12;
+    const int panelW = kDistrictPanelW;
+    const int panelH = kDistrictPanelH;
+    const Rectangle rect = rightDock.alloc(panelW, panelH);
+    const int x0 = static_cast<int>(rect.x);
+    const int y0 = static_cast<int>(rect.y);
 
     DrawRectangle(x0, y0, panelW, panelH, Color{0, 0, 0, 180});
     DrawRectangleLines(x0, y0, panelW, panelH, Color{255, 255, 255, 70});
@@ -10321,9 +10390,15 @@ void Game::draw()
     }
   }
 
-  drawTransitPanel(uiW, uiH);
+  if (m_showTransitPanel) {
+    const Rectangle rect = rightDock.alloc(kTransitPanelW, kTransitPanelH);
+    drawTransitPanel(static_cast<int>(rect.x), static_cast<int>(rect.y));
+  }
 
-  drawRoadUpgradePanel(uiW, uiH);
+  if (m_showRoadUpgradePanel) {
+    const Rectangle rect = rightDock.alloc(kRoadUpgradePanelW, kRoadUpgradePanelH);
+    drawRoadUpgradePanel(static_cast<int>(rect.x), static_cast<int>(rect.y));
+  }
 
   drawVideoSettingsPanel(uiW, uiH);
 

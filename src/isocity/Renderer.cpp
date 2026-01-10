@@ -4156,8 +4156,10 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
 
       const Rectangle dst = Rectangle{center.x - tileWf * 0.5f, center.y - tileHf * 0.5f, tileWf, tileHf};
 
-      const TileLighting light = ComputeTileLighting(world, x, y, tileWf, tileHf, m_elev, timeSec, animatedLighting);
-      const float brightness = animatedLighting ? light.animated : light.base;
+      const TileLighting light =
+        ComputeTileLighting(world, x, y, tileWf, tileHf, m_elev, timeSec, animatedLighting);
+      const float baseBrightness = light.base;
+      const float brightness = animatedLighting ? light.animated : baseBrightness;
 
       // -----------------------------
       // Terrain (if not cached)

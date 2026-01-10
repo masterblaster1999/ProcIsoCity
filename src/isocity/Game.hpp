@@ -143,7 +143,7 @@ private:
   void ensureTransitPlanUpToDate();
   void ensureTransitVizUpToDate();
   void drawTransitOverlay();
-  void drawTransitPanel(int uiW, int uiH);
+  void drawTransitPanel(int x0, int y0);
   void adjustTransitPanel(int dir, bool bigStep);
   void exportTransitArtifacts();
 
@@ -151,7 +151,7 @@ private:
   void ensureRoadUpgradePlanUpToDate();
   void ensureRoadUpgradeSelectedMaskUpToDate();
   void drawRoadUpgradeOverlay();
-  void drawRoadUpgradePanel(int uiW, int uiH);
+  void drawRoadUpgradePanel(int x0, int y0);
   void adjustRoadUpgradePanel(int dir, bool bigStep);
   bool applyRoadUpgradePlan();
   void exportRoadUpgradeArtifacts();
