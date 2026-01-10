@@ -417,11 +417,10 @@ private:
 
   // Road upgrade planner overlay (street->avenue/highway suggestions).
   // Toggle panel with Ctrl+U. Export artifacts with Ctrl+Shift+U.
-  enum class RoadUpgradeDemandMode : std::uint8_t { Commute = 0, Goods = 1, Combined = 2 };
-
+  // Uses the same demand-mode enum as the transit planner (commute/goods/combined).
   bool m_showRoadUpgradePanel = false;
   bool m_showRoadUpgradeOverlay = false;
-  RoadUpgradeDemandMode m_roadUpgradeDemandMode = RoadUpgradeDemandMode::Combined;
+  TransitDemandMode m_roadUpgradeDemandMode = TransitDemandMode::Combined;
 
   // Planner configuration. Note: budget is overridden when m_roadUpgradeBudgetAuto==true.
   RoadUpgradePlannerConfig m_roadUpgradeCfg{};

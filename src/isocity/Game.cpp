@@ -5872,16 +5872,6 @@ void Game::drawRoadResilienceOverlay()
 
 namespace {
 
-const char* TransitDemandModeName(TransitDemandMode m)
-{
-  switch (m) {
-    case TransitDemandMode::Commute: return "commute";
-    case TransitDemandMode::Goods: return "goods";
-    case TransitDemandMode::Combined: return "combined";
-  }
-  return "combined";
-}
-
 Color TransitLineColor(int idx, unsigned char alpha)
 {
   // A small cycle of high-contrast colors for map overlays.
@@ -5960,16 +5950,16 @@ void Game::ensureTransitPlanUpToDate()
       TrafficConfig tc;
       tc.requireOutsideConnection = requireOutside;
       {
-        const TrafficModelSettings& tm = m_sim.trafficModel();
-        tc.congestionAwareRouting = tm.congestionAwareRouting;
-        tc.congestionIterations = tm.congestionIterations;
-        tc.congestionAlpha = tm.congestionAlpha;
-        tc.congestionBeta = tm.congestionBeta;
-        tc.congestionCapacityScale = tm.congestionCapacityScale;
-        tc.congestionRatioClamp = tm.congestionRatioClamp;
-        tc.capacityAwareJobs = tm.capacityAwareJobs;
-        tc.jobAssignmentIterations = tm.jobAssignmentIterations;
-        tc.jobPenaltyBaseMilli = tm.jobPenaltyBaseMilli;
+        const TrafficModelSettings& trafficModel = m_sim.trafficModel();
+        tc.congestionAwareRouting = trafficModel.congestionAwareRouting;
+        tc.congestionIterations = trafficModel.congestionIterations;
+        tc.congestionAlpha = trafficModel.congestionAlpha;
+        tc.congestionBeta = trafficModel.congestionBeta;
+        tc.congestionCapacityScale = trafficModel.congestionCapacityScale;
+        tc.congestionRatioClamp = trafficModel.congestionRatioClamp;
+        tc.capacityAwareJobs = trafficModel.capacityAwareJobs;
+        tc.jobAssignmentIterations = trafficModel.jobAssignmentIterations;
+        tc.jobPenaltyBaseMilli = trafficModel.jobPenaltyBaseMilli;
       }
 
       const std::vector<std::uint8_t>* pre = (tc.requireOutsideConnection ? roadToEdgeMask : nullptr);
@@ -6459,16 +6449,6 @@ void Game::exportTransitArtifacts()
 
 namespace {
 
-const char* RoadUpgradeDemandModeName(Game::RoadUpgradeDemandMode m)
-{
-  switch (m) {
-    case Game::RoadUpgradeDemandMode::Commute: return "commute";
-    case Game::RoadUpgradeDemandMode::Goods: return "goods";
-    case Game::RoadUpgradeDemandMode::Combined: return "combined";
-  }
-  return "combined";
-}
-
 const char* RoadUpgradeObjectiveLabel(RoadUpgradeObjective obj)
 {
   switch (obj) {
@@ -6499,10 +6479,10 @@ void Game::ensureRoadUpgradePlanUpToDate()
 {
   // If the plan isn't explicitly dirty, still replan if any of the upstream
   // inputs changed (roads, traffic/goods caches, or auto-budget money).
-  const bool needCommute = (m_roadUpgradeDemandMode == RoadUpgradeDemandMode::Commute) ||
-                           (m_roadUpgradeDemandMode == RoadUpgradeDemandMode::Combined);
-  const bool needGoods = (m_roadUpgradeDemandMode == RoadUpgradeDemandMode::Goods) ||
-                         (m_roadUpgradeDemandMode == RoadUpgradeDemandMode::Combined);
+  const bool needCommute = (m_roadUpgradeDemandMode == TransitDemandMode::Commute) ||
+                           (m_roadUpgradeDemandMode == TransitDemandMode::Combined);
+  const bool needGoods = (m_roadUpgradeDemandMode == TransitDemandMode::Goods) ||
+                         (m_roadUpgradeDemandMode == TransitDemandMode::Combined);
 
   const int w = m_world.width();
   const int h = m_world.height();
@@ -6799,7 +6779,7 @@ void Game::drawRoadUpgradePanel(int uiW, int uiH)
   };
 
   row(0, "Overlay", m_showRoadUpgradeOverlay ? "ON" : "AUTO (panel)");
-  row(1, "Demand", RoadUpgradeDemandModeName(m_roadUpgradeDemandMode));
+  row(1, "Demand", TransitDemandModeName(m_roadUpgradeDemandMode));
   row(2, "Objective", RoadUpgradeObjectiveLabel(m_roadUpgradeCfg.objective));
 
   // Budget row: Shift+[ / ] toggles AUTO vs MANUAL. In MANUAL, [ / ] adjusts limit.
@@ -6830,8 +6810,8 @@ void Game::drawRoadUpgradePanel(int uiW, int uiH)
   row(8, "Hybrid excess", TextFormat("%.2f", static_cast<double>(m_roadUpgradeCfg.hybridExcessWeight)), hybrid);
   row(9, "Hybrid time", TextFormat("%.2f", static_cast<double>(m_roadUpgradeCfg.hybridTimeWeight)), hybrid);
 
-  const bool goodsMode = (m_roadUpgradeDemandMode == RoadUpgradeDemandMode::Goods) ||
-                         (m_roadUpgradeDemandMode == RoadUpgradeDemandMode::Combined);
+  const bool goodsMode = (m_roadUpgradeDemandMode == TransitDemandMode::Goods) ||
+                         (m_roadUpgradeDemandMode == TransitDemandMode::Combined);
   row(10, "Goods weight", TextFormat("%.2f", static_cast<double>(m_roadUpgradeGoodsWeight)), goodsMode);
 
   // Selected edge highlight.
@@ -6886,8 +6866,8 @@ void Game::adjustRoadUpgradePanel(int dir, bool bigStep)
       m += (dir > 0) ? 1 : -1;
       if (m < 0) m = 2;
       if (m > 2) m = 0;
-      m_roadUpgradeDemandMode = static_cast<RoadUpgradeDemandMode>(m);
-      showToast(std::string("Upgrade demand: ") + RoadUpgradeDemandModeName(m_roadUpgradeDemandMode), 2.0f);
+      m_roadUpgradeDemandMode = static_cast<TransitDemandMode>(m);
+      showToast(std::string("Upgrade demand: ") + TransitDemandModeName(m_roadUpgradeDemandMode), 2.0f);
       planChanged = true;
     } break;
 
@@ -7260,7 +7240,7 @@ void Game::exportEvacuationArtifacts()
 
   auto overlayPixel = [&](PpmImage& img, int x, int y, std::uint8_t r, std::uint8_t g, std::uint8_t b,
                           std::uint8_t a) {
-    const int w = img.w;
+    const int w = img.width;
     const std::size_t idx = static_cast<std::size_t>(y * w + x) * 3u;
     if (idx + 2u >= img.rgb.size()) return;
     img.rgb[idx + 0u] = blendOver(img.rgb[idx + 0u], r, a);
@@ -8243,16 +8223,16 @@ void Game::handleInput(float dt)
       TrafficConfig tc;
       tc.requireOutsideConnection = m_sim.config().requireOutsideConnection;
       {
-        const TrafficModelSettings& tm = m_sim.trafficModel();
-        tc.congestionAwareRouting = tm.congestionAwareRouting;
-        tc.congestionIterations = tm.congestionIterations;
-        tc.congestionAlpha = tm.congestionAlpha;
-        tc.congestionBeta = tm.congestionBeta;
-        tc.congestionCapacityScale = tm.congestionCapacityScale;
-        tc.congestionRatioClamp = tm.congestionRatioClamp;
-        tc.capacityAwareJobs = tm.capacityAwareJobs;
-        tc.jobAssignmentIterations = tm.jobAssignmentIterations;
-        tc.jobPenaltyBaseMilli = tm.jobPenaltyBaseMilli;
+        const TrafficModelSettings& trafficModel = m_sim.trafficModel();
+        tc.congestionAwareRouting = trafficModel.congestionAwareRouting;
+        tc.congestionIterations = trafficModel.congestionIterations;
+        tc.congestionAlpha = trafficModel.congestionAlpha;
+        tc.congestionBeta = trafficModel.congestionBeta;
+        tc.congestionCapacityScale = trafficModel.congestionCapacityScale;
+        tc.congestionRatioClamp = trafficModel.congestionRatioClamp;
+        tc.capacityAwareJobs = trafficModel.capacityAwareJobs;
+        tc.jobAssignmentIterations = trafficModel.jobAssignmentIterations;
+        tc.jobPenaltyBaseMilli = trafficModel.jobPenaltyBaseMilli;
       }
 
       // Traffic overlay should respect the sim's outside-connection rule even

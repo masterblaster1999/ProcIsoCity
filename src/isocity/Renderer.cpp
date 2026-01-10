@@ -2122,8 +2122,8 @@ static void DrawRoadIndicators(const World& world, int x, int y, const Tile& t,
             }
 
             for (int sIdx = 0; sIdx < stripes; ++sIdx) {
-              const float t = 0.22f + (static_cast<float>(sIdx) / static_cast<float>(std::max(1, stripes - 1))) * 0.56f;
-              Vector2 base = LerpV(edgeA[edge], edgeB[edge], t);
+              const float tStripe = 0.22f + (static_cast<float>(sIdx) / static_cast<float>(std::max(1, stripes - 1))) * 0.56f;
+              Vector2 base = LerpV(edgeA[edge], edgeB[edge], tStripe);
               Vector2 p0 = LerpV(base, tileCenter, 0.08f);
               Vector2 p1 = Vector2{p0.x + in.x * tileH * 0.09f, p0.y + in.y * tileH * 0.09f};
               DrawLineEx(p0, p1, thickDash, white);
@@ -3891,6 +3891,14 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
   const bool drawGridEff = layerOverlays && drawGrid;
   const bool showDistrictOverlayEff = layerOverlays && showDistrictOverlay;
   const bool showDistrictBordersEff = layerOverlays && showDistrictBorders;
+
+  // Active district highlight (0 = none). When enabled we increase contrast for the selected district
+  // and downplay other districts to make painting/inspection easier.
+  const std::uint8_t highlightDistrictId =
+    (showDistrictOverlayEff && highlightDistrict > 0 && highlightDistrict < 256)
+      ? static_cast<std::uint8_t>(highlightDistrict)
+      : 0u;
+  const bool highlightDistrictActive = (highlightDistrictId != 0u);
   const std::vector<Point>* highlightPathEff = (layerOverlays ? highlightPath : nullptr);
 
   // -----------------------------
@@ -4149,7 +4157,6 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
       const Rectangle dst = Rectangle{center.x - tileWf * 0.5f, center.y - tileHf * 0.5f, tileWf, tileHf};
 
       const TileLighting light = ComputeTileLighting(world, x, y, tileWf, tileHf, m_elev, timeSec, animatedLighting);
-      const float baseBrightness = light.base;
       const float brightness = animatedLighting ? light.animated : light.base;
 
       // -----------------------------
@@ -4573,7 +4580,6 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
 
       // Lighting (must match pass 1 so overlays/structures agree).
       const TileLighting light = ComputeTileLighting(world, x, y, tileWf, tileHf, m_elev, timeSec, animatedLighting);
-      const float baseBrightness = light.base;
       const float brightness = animatedLighting ? light.animated : light.base;
 
       // -----------------------------
@@ -4582,10 +4588,20 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
       if (showDistrictOverlayEff && tileScreenW >= 6.0f) {
         const std::uint8_t did = t.district;
         if (did != 0u) {
-          // Soft fill; alpha reduced when zoomed out.
+          // Soft fill; alpha reduced when zoomed out. When a district is selected, increase
+          // the selected district's contrast and deemphasize all others.
           const float alphaK = std::clamp((tileScreenW - 6.0f) / 18.0f, 0.0f, 1.0f);
-          const unsigned char a = static_cast<unsigned char>(40.0f + 80.0f * alphaK);
-          DrawDiamond(center, tileWf, tileHf, DistrictFillColor(did, a));
+
+          int a = static_cast<int>(40.0f + 80.0f * alphaK);
+          if (highlightDistrictActive) {
+            if (did == highlightDistrictId) {
+              a = static_cast<int>(70.0f + 140.0f * alphaK);
+            } else {
+              a = static_cast<int>(20.0f + 40.0f * alphaK);
+            }
+          }
+
+          DrawDiamond(center, tileWf, tileHf, DistrictFillColor(did, ClampU8(a)));
         }
       }
 
@@ -4626,10 +4642,25 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
           if (nx < 0 || ny < 0 || nx >= mapW || ny >= mapH) return;
           const std::uint8_t nd = world.at(nx, ny).district;
           if (nd != t.district) {
+            const bool hiEdge = highlightDistrictActive && (t.district == highlightDistrictId || nd == highlightDistrictId);
+
             Vector2 corners[4];
             TileDiamondCorners(center, tileWf, tileHf, corners);
-            DrawLineEx(corners[cornerA], corners[cornerB], w, Color{0, 0, 0, 160});
-            DrawLineEx(corners[cornerA], corners[cornerB], w * 0.5f, Color{255, 255, 255, 70});
+
+            if (hiEdge) {
+              // Brighter, thicker outline for the active district boundary.
+              const float ww = w * 1.35f;
+              DrawLineEx(corners[cornerA], corners[cornerB], ww, Color{0, 0, 0, 200});
+              DrawLineEx(corners[cornerA], corners[cornerB], ww * 0.70f,
+                         DistrictFillColor(highlightDistrictId, 180));
+              DrawLineEx(corners[cornerA], corners[cornerB], ww * 0.32f, Color{255, 255, 255, 120});
+            } else {
+              // If a district is selected, downplay unrelated borders to reduce visual noise.
+              const unsigned char aOuter = highlightDistrictActive ? 110 : 160;
+              const unsigned char aInner = highlightDistrictActive ? 45 : 70;
+              DrawLineEx(corners[cornerA], corners[cornerB], w, Color{0, 0, 0, aOuter});
+              DrawLineEx(corners[cornerA], corners[cornerB], w * 0.5f, Color{255, 255, 255, aInner});
+            }
           }
         };
 
