@@ -28,6 +28,7 @@
 #include "isocity/FloodRisk.hpp"
 #include "isocity/FlowField.hpp"
 #include "isocity/Evacuation.hpp"
+#include "isocity/EvacuationScenario.hpp"
 #include "isocity/Hydrology.hpp"
 #include "isocity/MeshExport.hpp"
 #include "isocity/GltfExport.hpp"
@@ -1437,6 +1438,98 @@ void TestEvacuationReachabilityUnderHazard()
   EXPECT_EQ(e1.population, 10);
   EXPECT_EQ(e1.reachablePopulation, 0);
   EXPECT_EQ(e1.unreachablePopulation, 10);
+}
+
+void TestEvacuationScenarioSeaBridgePassability()
+{
+  using namespace isocity;
+
+  World w(5, 5, 1u);
+
+  // Flat base heights.
+  for (int y = 0; y < w.height(); ++y) {
+    for (int x = 0; x < w.width(); ++x) {
+      w.at(x, y).height = 0.5f;
+      w.at(x, y).terrain = Terrain::Grass;
+    }
+  }
+
+  // Build a vertical road spine to the top edge exit.
+  for (int y = 0; y < w.height(); ++y) {
+    w.setRoad(2, y);
+  }
+
+  // Residential tile adjacent to the road.
+  w.setOverlay(Overlay::Residential, 1, 3);
+  w.at(1, 3).occupants = 10;
+
+  // Make the road tile at (2,1) a "bridge" by placing it on water.
+  w.at(2, 1).terrain = Terrain::Water;
+  // Also make it floodable.
+  w.at(2, 1).height = 0.0f;
+
+  EvacuationScenarioConfig cfg;
+  cfg.hazardMode = EvacuationHazardMode::Sea;
+  cfg.seaCfg.requireEdgeConnection = false; // flood-by-threshold
+  cfg.seaLevel = 0.2f;
+  cfg.evac.useTravelTime = false;
+  cfg.evac.walkCostMilli = 1000;
+  cfg.evac.roadTileCapacity = 28;
+
+  // With bridges passable, the flooded bridge tile should not block the route.
+  cfg.bridgesPassable = true;
+  const EvacuationScenarioResult r0 = ComputeEvacuationScenario(w, cfg);
+  EXPECT_EQ(r0.hazardMask[static_cast<std::size_t>(1 * w.width() + 2)], 0);
+  EXPECT_EQ(r0.evac.population, 10);
+  EXPECT_EQ(r0.evac.reachablePopulation, 10);
+  EXPECT_EQ(r0.evac.unreachablePopulation, 0);
+
+  // With bridges blocked, the same hazard should sever the only route to the exit.
+  cfg.bridgesPassable = false;
+  const EvacuationScenarioResult r1 = ComputeEvacuationScenario(w, cfg);
+  EXPECT_EQ(r1.hazardMask[static_cast<std::size_t>(1 * w.width() + 2)], 1);
+  EXPECT_EQ(r1.evac.population, 10);
+  EXPECT_EQ(r1.evac.reachablePopulation, 0);
+  EXPECT_EQ(r1.evac.unreachablePopulation, 10);
+}
+
+void TestEvacuationScenarioPondingHazardBlocksFloodedResidential()
+{
+  using namespace isocity;
+
+  World w(3, 3, 2u);
+
+  // A simple bowl: center low, ring high. Priority-Flood should fill the center.
+  for (int y = 0; y < w.height(); ++y) {
+    for (int x = 0; x < w.width(); ++x) {
+      w.at(x, y).height = 1.0f;
+      w.at(x, y).terrain = Terrain::Grass;
+    }
+  }
+  w.at(1, 1).height = 0.0f;
+
+  // Give the world an exit road (not strictly required for this check, but keeps evac inputs realistic).
+  w.setRoad(1, 0);
+
+  // Flooded residential tile in the depression.
+  w.setOverlay(Overlay::Residential, 1, 1);
+  w.at(1, 1).occupants = 7;
+
+  EvacuationScenarioConfig cfg;
+  cfg.hazardMode = EvacuationHazardMode::Ponding;
+  cfg.pondCfg.epsilon = 0.0f;
+  cfg.pondCfg.includeEdges = true;
+  cfg.pondMinDepth = 0.5f;
+
+  const EvacuationScenarioResult r = ComputeEvacuationScenario(w, cfg);
+  const std::size_t center = static_cast<std::size_t>(1 * w.width() + 1);
+  EXPECT_TRUE(center < r.hazardMask.size());
+  EXPECT_EQ(r.hazardMask[center], 1);
+  EXPECT_TRUE(r.pond.maxDepth >= 0.99f);
+  EXPECT_EQ(r.evac.population, 7);
+  EXPECT_EQ(r.evac.floodedPopulation, 7);
+  EXPECT_EQ(r.evac.reachablePopulation, 0);
+  EXPECT_EQ(r.evac.unreachablePopulation, 0);
 }
 
 
@@ -6588,6 +6681,8 @@ int main()
   TestRoadToEdgeMask();
   TestFlowFieldRespectsBlockedRoadMask();
   TestEvacuationReachabilityUnderHazard();
+  TestEvacuationScenarioSeaBridgePassability();
+  TestEvacuationScenarioPondingHazardBlocksFloodedResidential();
   TestRoadGraphPlusIntersection();
   TestRoadGraphCornerCreatesNode();
   TestRoadGraphExportMetricsAndJson();

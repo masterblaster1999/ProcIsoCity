@@ -74,6 +74,7 @@ add_library(isocity_core
   src/isocity/DepressionFill.cpp
   src/isocity/FloodRisk.cpp
   src/isocity/Evacuation.cpp
+  src/isocity/EvacuationScenario.cpp
   src/isocity/Hydrology.cpp
   src/isocity/Contours.cpp
   src/isocity/Isochrone.cpp

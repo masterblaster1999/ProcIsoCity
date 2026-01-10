@@ -312,6 +312,149 @@ inline void DrawGlow(const Vector2& p, float radius, Color outer, Color inner)
 }
 
 // ---------------------------------------------------------------------------------------------
+// Terrain macro variation + coastline helpers (purely procedural)
+// ---------------------------------------------------------------------------------------------
+
+// Multiply two raylib tint colors (component-wise).
+//
+// Note: raylib's tint is multiplicative (0..255). We keep the alpha at 255 here and treat opacity
+// separately via geometry alpha.
+inline Color MulTints(Color a, Color b)
+{
+  auto mul = [](unsigned char x, unsigned char y) -> unsigned char {
+    const int v = (static_cast<int>(x) * static_cast<int>(y) + 127) / 255;
+    return ClampU8(v);
+  };
+  return Color{mul(a.r, b.r), mul(a.g, b.g), mul(a.b, b.b), 255};
+}
+
+inline Color TintFromMul(float r, float g, float b, unsigned char a = 255)
+{
+  const int rr = static_cast<int>(std::round(255.0f * std::clamp(r, 0.0f, 1.0f)));
+  const int gg = static_cast<int>(std::round(255.0f * std::clamp(g, 0.0f, 1.0f)));
+  const int bb = static_cast<int>(std::round(255.0f * std::clamp(b, 0.0f, 1.0f)));
+  return Color{ClampU8(rr), ClampU8(gg), ClampU8(bb), a};
+}
+
+inline float TileSlope01Fast(const World& world, int x, int y)
+{
+  const int w = world.width();
+  const int h = world.height();
+
+  auto hAt = [&](int ix, int iy) -> float {
+    ix = std::clamp(ix, 0, w - 1);
+    iy = std::clamp(iy, 0, h - 1);
+    return world.at(ix, iy).height;
+  };
+
+  const float dx = std::fabs(hAt(x + 1, y) - hAt(x - 1, y));
+  const float dy = std::fabs(hAt(x, y + 1) - hAt(x, y - 1));
+  const float slope = std::sqrt(dx * dx + dy * dy);
+  return std::clamp(slope * 1.25f, 0.0f, 1.0f);
+}
+
+inline int ManhattanDistanceToNonWater(const World& world, int x, int y, int maxR)
+{
+  const int w = world.width();
+  const int h = world.height();
+  auto isLand = [&](int ix, int iy) -> bool {
+    // Treat OOB as land to keep edges shallow and avoid out-of-bounds branching in the caller.
+    if (ix < 0 || iy < 0 || ix >= w || iy >= h) return true;
+    return (world.at(ix, iy).terrain != Terrain::Water);
+  };
+
+  for (int r = 1; r <= maxR; ++r) {
+    for (int dx = -r; dx <= r; ++dx) {
+      const int dy = r - std::abs(dx);
+      if (isLand(x + dx, y + dy)) return r;
+      if (dy != 0 && isLand(x + dx, y - dy)) return r;
+    }
+  }
+  return maxR + 1;
+}
+
+inline float MacroField01(int tx, int ty, std::uint32_t seed32)
+{
+  const float x = static_cast<float>(tx);
+  const float y = static_cast<float>(ty);
+
+  // Low-frequency domain-warped value noise (cheap, stable, non-tiling).
+  const float warpF = 0.012f;
+  const float baseF = 0.035f;
+
+  const float wx = ValueNoise2D(x * warpF + 19.37f, y * warpF + 47.11f, seed32 ^ 0x68BC21EBu);
+  const float wy = ValueNoise2D(x * warpF - 31.17f, y * warpF + 11.83f, seed32 ^ 0x02E5BE93u);
+
+  const float dx = (wx * 2.0f - 1.0f) * 1.35f;
+  const float dy = (wy * 2.0f - 1.0f) * 1.35f;
+
+  const float n0 = ValueNoise2D((x + dx) * baseF, (y + dy) * baseF, seed32 ^ 0xA5A5A5A5u);
+  const float n1 = ValueNoise2D(x * 0.11f, y * 0.11f, seed32 ^ 0x0BADC0DEu);
+
+  return std::clamp(0.75f * n0 + 0.25f * n1, 0.0f, 1.0f);
+}
+
+struct TerrainMacroVisual {
+  Color tint = Color{255, 255, 255, 255};  // multiplicative tint for base textures
+  float rock = 0.0f;                       // 0..1 (steepness -> exposed rock)
+  float snow = 0.0f;                       // 0..1 (altitude -> permanent snow cap)
+  float waterDepth = 0.0f;                 // 0..1 (distance from shore)
+};
+
+inline TerrainMacroVisual ComputeTerrainMacroVisual(const World& world, int x, int y, const Tile& t,
+                                                   std::uint32_t seed32)
+{
+  TerrainMacroVisual v{};
+
+  const float macro = MacroField01(x, y, seed32);
+
+  if (t.terrain == Terrain::Grass) {
+    const float dry = macro;
+    float r = ::isocity::Lerp(0.90f, 1.00f, dry);
+    float g = ::isocity::Lerp(1.00f, 0.90f, dry);
+    float b = ::isocity::Lerp(0.90f, 0.75f, dry);
+
+    const float slope = TileSlope01Fast(world, x, y);
+    v.rock = SmoothStep(0.16f, 0.42f, slope);
+
+    // Exposed rock desaturates/darkens steep slopes.
+    r = ::isocity::Lerp(r, 0.78f, v.rock);
+    g = ::isocity::Lerp(g, 0.78f, v.rock);
+    b = ::isocity::Lerp(b, 0.78f, v.rock);
+
+    // High-altitude snowline (independent of weather), reduced on very steep rock.
+    v.snow = SmoothStep(0.76f, 0.90f, t.height) * (1.0f - 0.65f * v.rock);
+
+    v.tint = TintFromMul(r, g, b);
+  } else if (t.terrain == Terrain::Sand) {
+    // Sand variation: pale beige -> warmer/redder dunes.
+    const float warm = SmoothStep(0.35f, 0.85f, macro);
+    const float r = 1.00f;
+    const float g = ::isocity::Lerp(1.00f, 0.88f, warm);
+    const float b = ::isocity::Lerp(1.00f, 0.80f, warm);
+    v.tint = TintFromMul(r, g, b);
+  } else if (t.terrain == Terrain::Water) {
+    constexpr int kMaxR = 3;
+    const int d = ManhattanDistanceToNonWater(world, x, y, kMaxR);
+    v.waterDepth = std::clamp(static_cast<float>(d - 1) / static_cast<float>(kMaxR), 0.0f, 1.0f);
+
+    // Shallow water stays brighter/turquoise; deep water gets darker/bluer.
+    float r = ::isocity::Lerp(0.92f, 0.72f, v.waterDepth);
+    float g = ::isocity::Lerp(0.95f, 0.78f, v.waterDepth);
+    float b = ::isocity::Lerp(1.00f, 0.88f, v.waterDepth);
+
+    // Patchy algae tint near shore (macro-driven).
+    const float algae = SmoothStep(0.55f, 0.85f, macro) * (1.0f - 0.60f * v.waterDepth);
+    r *= (1.0f - 0.10f * algae);
+    b *= (1.0f - 0.14f * algae);
+
+    v.tint = TintFromMul(r, g, b);
+  }
+
+  return v;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Procedural micro-details (no external art)
 // ---------------------------------------------------------------------------------------------
 
@@ -354,7 +497,6 @@ static void DrawProceduralTileDetails(const World& world, int x, int y, const Ti
                                      float tileW, float tileH, float zoom, float brightness, std::uint32_t seed32,
                                      float timeSec)
 {
-  (void)world;
   // Purely aesthetic; keep utility overlays readable by suppressing detail on man-made tiles.
   if (t.overlay == Overlay::Road || t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
       t.overlay == Overlay::Industrial)
@@ -373,7 +515,24 @@ static void DrawProceduralTileDetails(const World& world, int x, int y, const Ti
 
   if (t.terrain == Terrain::Grass) {
     // Grass tufts + occasional flowers. Parks get more/larger tree canopies.
-    const int tufts = std::clamp(1 + static_cast<int>((h0 >> 28) & 0x3u), 1, isPark ? 4 : 3);
+    const float slope = TileSlope01Fast(world, x, y);
+    const float rock = SmoothStep(0.22f, 0.58f, slope);
+
+    int tufts = std::clamp(1 + static_cast<int>((h0 >> 28) & 0x3u), 1, isPark ? 4 : 3);
+    if (rock > 0.35f) tufts = std::max(1, tufts - 1);
+
+    // Rocky slopes get a few exposed stones to break up large grassy mountains.
+    if (!isPark && rock > 0.12f) {
+      const int stones = std::clamp(1 + static_cast<int>(rock * 3.2f) + static_cast<int>((h0 >> 25) & 1u), 1, 4);
+      for (int i = 0; i < stones; ++i) {
+        const Vector2 p = DeterministicDiamondPoint(x, y, base ^ 0xFEEDC0DEu, 40 + i, center, tileW, tileH, 0.86f);
+        const float r = tileH * (0.020f + 0.018f * Frac01(HashCoords32(x + i * 19, y - i * 13, base ^ 0x9E3779B9u)));
+        const Color stone = ShadeDetail(Color{95, 95, 105, 255}, brightness, 0.95f, 150);
+        const Color hi = ShadeDetail(Color{170, 170, 180, 255}, brightness, 1.05f, 85);
+        DrawCircleV(p, r, stone);
+        DrawCircleV(Vector2{p.x - r * 0.22f, p.y - r * 0.20f}, r * 0.55f, hi);
+      }
+    }
 
     for (int i = 0; i < tufts; ++i) {
       const Vector2 p = DeterministicDiamondPoint(x, y, base ^ 0x13579BDFu, i, center, tileW, tileH, 0.82f);
@@ -1782,18 +1941,253 @@ static void DrawZoneTileIndicators(const Tile& t, float tileW, float tileH, floa
 }
 
 
-// Road indicators: show small pips for upgraded road class (2..3) when zoomed in.
-static void DrawRoadIndicators(const Tile& t, float tileW, float tileH, float zoom, const Vector2& tileCenter, float tileBrightness)
+// Road indicators + procedural markings: lane center-lines, crosswalk hints, and subtle wear.
+// Kept purely aesthetic and gated by zoom so it doesn't clutter utility overlays.
+static void DrawRoadIndicators(const World& world, int x, int y, const Tile& t,
+                               float tileW, float tileH, float zoom, const Vector2& tileCenter, float tileBrightness,
+                               const DayNightState& dn, const WeatherState& wx, std::uint32_t seed32, float timeSec)
 {
-  (void)tileBrightness; // reserved for future shading tweaks
+  (void)timeSec; // reserved for subtle animation (e.g., wet shimmer) if desired
 
   const float tileScreenW = tileW * zoom;
   if (tileScreenW < 28.0f) return;
 
+  const float invZoom = 1.0f / std::max(0.001f, zoom);
   const int lvl = std::clamp<int>(static_cast<int>(t.level), 1, 3);
+
+  // -----------------------------
+  // Procedural road markings (aesthetic)
+  // -----------------------------
+  if (tileScreenW >= 34.0f) {
+    // Shared road connectivity mask.
+    // Bits: 1=North, 2=East, 4=South, 8=West.
+    auto roadMaskAt = [&](int rx, int ry) -> std::uint8_t {
+      if (!world.inBounds(rx, ry)) return 0;
+      const Tile& rt = world.at(rx, ry);
+      if (rt.overlay != Overlay::Road) return 0;
+      std::uint8_t m = static_cast<std::uint8_t>(rt.variation & 0x0Fu);
+      if (m != 0) return m;
+      if (world.inBounds(rx, ry - 1) && world.at(rx, ry - 1).overlay == Overlay::Road) m |= 0x01u;
+      if (world.inBounds(rx + 1, ry) && world.at(rx + 1, ry).overlay == Overlay::Road) m |= 0x02u;
+      if (world.inBounds(rx, ry + 1) && world.at(rx, ry + 1).overlay == Overlay::Road) m |= 0x04u;
+      if (world.inBounds(rx - 1, ry) && world.at(rx - 1, ry).overlay == Overlay::Road) m |= 0x08u;
+      return m;
+    };
+
+    std::uint8_t mask = roadMaskAt(x, y);
+    const int conn = Popcount4(mask);
+
+    if (conn > 0) {
+      const bool n = (mask & 0x01u) != 0u;
+      const bool e = (mask & 0x02u) != 0u;
+      const bool s = (mask & 0x04u) != 0u;
+      const bool w = (mask & 0x08u) != 0u;
+
+      Vector2 c[4];
+      TileDiamondCorners(tileCenter, tileW, tileH, c);
+      const Vector2 edgeA[4] = {c[0], c[1], c[2], c[3]};
+      const Vector2 edgeB[4] = {c[1], c[2], c[3], c[0]};
+
+      Vector2 edgeMid[4];
+      Vector2 end[4];
+      for (int i = 0; i < 4; ++i) {
+        edgeMid[i] = LerpV(edgeA[i], edgeB[i], 0.5f);
+        end[i] = LerpV(edgeMid[i], tileCenter, 0.30f);
+      }
+
+      // Reflective markings: boost when wet + at night so they remain visible after global grading.
+      const float night = std::clamp(dn.nightLights, 0.0f, 1.0f);
+      const float wet = std::clamp(wx.wetness, 0.0f, 1.0f);
+
+      const float refl = std::clamp(0.20f + 0.80f * wet, 0.0f, 1.0f) * (0.55f + 0.45f * night);
+      const float mul = 1.05f + 0.55f * refl;
+      const unsigned char aLine = ClampU8(static_cast<int>(50.0f + 135.0f * refl));
+
+      Color white = ShadeDetail(Color{250, 250, 245, 255}, tileBrightness, mul, aLine);
+      Color yellow = ShadeDetail(Color{250, 220, 120, 255}, tileBrightness, mul, ClampU8(static_cast<int>(aLine * 0.85f)));
+
+      if (t.terrain == Terrain::Water) {
+        // Bridges read better with slightly cooler paint.
+        white = ShadeDetail(Color{235, 250, 255, 255}, tileBrightness, mul, aLine);
+        yellow = ShadeDetail(Color{225, 240, 255, 255}, tileBrightness, mul, ClampU8(static_cast<int>(aLine * 0.70f)));
+      }
+
+      const float thick = std::clamp(1.30f * invZoom, 0.70f * invZoom, 2.7f * invZoom);
+      const float thickDash = std::clamp(1.05f * invZoom, 0.60f * invZoom, 2.2f * invZoom);
+
+      auto drawSolid = [&](Vector2 a, Vector2 b, Color col) {
+        DrawLineEx(a, b, thick, col);
+      };
+
+      auto drawDashed = [&](Vector2 a, Vector2 b, Color col, int dashes, float phase01) {
+        dashes = std::max(1, dashes);
+        const float seg = 1.0f / (static_cast<float>(dashes) * 2.0f);
+        for (int i = 0; i < dashes; ++i) {
+          float t0 = phase01 + static_cast<float>(i) * 2.0f * seg;
+          float t1 = t0 + seg;
+          if (t1 <= 0.0f || t0 >= 1.0f) continue;
+          t0 = std::clamp(t0, 0.0f, 1.0f);
+          t1 = std::clamp(t1, 0.0f, 1.0f);
+          DrawLineEx(LerpV(a, b, t0), LerpV(a, b, t1), thickDash, col);
+        }
+      };
+
+      auto drawCenterLine = [&](Vector2 a, Vector2 b) {
+        // Per-tile dash phase.
+        const std::uint32_t hh = HashCoords32(x, y, seed32 ^ 0xD00DCAFEu);
+        const float phase01 = Frac01(hh ^ 0x9E3779B9u) * 0.12f;
+
+        // Perpendicular for double-line offset.
+        Vector2 d{b.x - a.x, b.y - a.y};
+        const float dl2 = d.x * d.x + d.y * d.y;
+        if (dl2 > 1.0e-6f) {
+          const float inv = 1.0f / std::sqrt(dl2);
+          d.x *= inv;
+          d.y *= inv;
+        } else {
+          d = Vector2{1.0f, 0.0f};
+        }
+        Vector2 perp{-d.y, d.x};
+
+        if (lvl <= 1) {
+          const int dashes = (tileScreenW >= 44.0f) ? 4 : 3;
+          drawDashed(a, b, white, dashes, phase01);
+        } else if (lvl == 2) {
+          drawSolid(a, b, yellow);
+        } else {
+          // Double center line.
+          const float off = 1.65f * invZoom;
+          drawSolid(Vector2{a.x + perp.x * off, a.y + perp.y * off},
+                    Vector2{b.x + perp.x * off, b.y + perp.y * off}, yellow);
+          drawSolid(Vector2{a.x - perp.x * off, a.y - perp.y * off},
+                    Vector2{b.x - perp.x * off, b.y - perp.y * off}, yellow);
+        }
+      };
+
+      // Decide marking geometry.
+      if (conn == 2) {
+        // Straight vs corner.
+        if (n && s) {
+          drawCenterLine(end[0], end[2]);
+        } else if (e && w) {
+          drawCenterLine(end[3], end[1]);
+        } else {
+          // Corner turn: build a gentle 2-segment polyline through a biased midpoint.
+          int aEdge = n ? 0 : (e ? 1 : (s ? 2 : 3));
+          int bEdge = aEdge;
+          if (aEdge == 0) bEdge = e ? 1 : 3;
+          else if (aEdge == 1) bEdge = s ? 2 : 0;
+          else if (aEdge == 2) bEdge = w ? 3 : 1;
+          else if (aEdge == 3) bEdge = n ? 0 : 2;
+
+          Vector2 dirA{tileCenter.x - edgeMid[aEdge].x, tileCenter.y - edgeMid[aEdge].y};
+          Vector2 dirB{tileCenter.x - edgeMid[bEdge].x, tileCenter.y - edgeMid[bEdge].y};
+
+          const float la = std::sqrt(dirA.x * dirA.x + dirA.y * dirA.y);
+          const float lb = std::sqrt(dirB.x * dirB.x + dirB.y * dirB.y);
+          if (la > 0.001f) { dirA.x /= la; dirA.y /= la; }
+          if (lb > 0.001f) { dirB.x /= lb; dirB.y /= lb; }
+
+          Vector2 mid = tileCenter;
+          mid.x += (dirA.x + dirB.x) * tileH * 0.10f;
+          mid.y += (dirA.y + dirB.y) * tileH * 0.10f;
+
+          drawCenterLine(end[aEdge], mid);
+          drawCenterLine(mid, end[bEdge]);
+        }
+      } else if (conn >= 3) {
+        // Intersections: stop line + crosswalk hints per connected edge (only at high zoom).
+        if (tileScreenW >= 42.0f) {
+          const int stripes = (tileScreenW >= 58.0f) ? 5 : 4;
+          for (int edge = 0; edge < 4; ++edge) {
+            const std::uint8_t bit = static_cast<std::uint8_t>(1u << edge);
+            if ((mask & bit) == 0u) continue;
+
+            // Stop line (parallel to edge).
+            Vector2 a0 = LerpV(edgeA[edge], edgeB[edge], 0.28f);
+            Vector2 b0 = LerpV(edgeA[edge], edgeB[edge], 0.72f);
+            a0 = LerpV(a0, tileCenter, 0.16f);
+            b0 = LerpV(b0, tileCenter, 0.16f);
+            DrawLineEx(a0, b0, thickDash * 1.15f, white);
+
+            // Crosswalk stripes (perpendicular to edge, pointing inward).
+            Vector2 in{tileCenter.x - edgeMid[edge].x, tileCenter.y - edgeMid[edge].y};
+            const float il2 = in.x * in.x + in.y * in.y;
+            if (il2 > 1.0e-6f) {
+              const float inv = 1.0f / std::sqrt(il2);
+              in.x *= inv;
+              in.y *= inv;
+            } else {
+              in = Vector2{0.0f, 1.0f};
+            }
+
+            for (int sIdx = 0; sIdx < stripes; ++sIdx) {
+              const float t = 0.22f + (static_cast<float>(sIdx) / static_cast<float>(std::max(1, stripes - 1))) * 0.56f;
+              Vector2 base = LerpV(edgeA[edge], edgeB[edge], t);
+              Vector2 p0 = LerpV(base, tileCenter, 0.08f);
+              Vector2 p1 = Vector2{p0.x + in.x * tileH * 0.09f, p0.y + in.y * tileH * 0.09f};
+              DrawLineEx(p0, p1, thickDash, white);
+            }
+          }
+        }
+      } else if (conn == 1) {
+        // Dead end: short center line plus an end bar.
+        int edge = n ? 0 : (e ? 1 : (s ? 2 : 3));
+        drawCenterLine(end[edge], tileCenter);
+
+        if (tileScreenW >= 42.0f) {
+          // End bar at the unconnected side (opposite edge), inset slightly.
+          const int opp = (edge + 2) & 3;
+          Vector2 a0 = LerpV(edgeA[opp], edgeB[opp], 0.28f);
+          Vector2 b0 = LerpV(edgeA[opp], edgeB[opp], 0.72f);
+          a0 = LerpV(a0, tileCenter, 0.22f);
+          b0 = LerpV(b0, tileCenter, 0.22f);
+          DrawLineEx(a0, b0, thickDash * 1.10f, white);
+        }
+      }
+
+      // Subtle wear/cracks: only when very zoomed in so it doesn't look like noise.
+      if (tileScreenW >= 48.0f) {
+        const std::uint32_t hb = HashCoords32(x, y, seed32 ^ 0xA57A11u);
+        const int cracks = 1 + static_cast<int>((hb >> 29) & 1u);
+
+        // Fewer cracks on higher-class roads.
+        const float wearMul = (lvl >= 3) ? 0.55f : (lvl == 2) ? 0.75f : 1.0f;
+
+        const unsigned char aCrack = ClampU8(static_cast<int>(22.0f * wearMul + 38.0f * wearMul * (1.0f - night)));
+        const Color crackC = ShadeDetail(Color{20, 20, 22, 255}, tileBrightness, 0.95f, aCrack);
+
+        for (int i = 0; i < cracks; ++i) {
+          Vector2 p0 = DeterministicDiamondPoint(x, y, hb ^ 0x51A5EEDu, 120 + i * 11, tileCenter, tileW, tileH, 0.80f);
+          Vector2 p1 = DeterministicDiamondPoint(x, y, hb ^ 0xBADC0DEu, 160 + i * 17, tileCenter, tileW, tileH, 0.80f);
+
+          // Bias crack to follow main road direction when straight.
+          if (conn == 2 && (n && s)) {
+            p0.x = tileCenter.x + (p0.x - tileCenter.x) * 0.25f;
+            p1.x = tileCenter.x + (p1.x - tileCenter.x) * 0.25f;
+          } else if (conn == 2 && (e && w)) {
+            p0.y = tileCenter.y + (p0.y - tileCenter.y) * 0.25f;
+            p1.y = tileCenter.y + (p1.y - tileCenter.y) * 0.25f;
+          }
+
+          DrawLineEx(p0, p1, 0.95f * invZoom, crackC);
+
+          // Tiny branch.
+          if (((hb >> (i * 7)) & 3u) == 0u) {
+            Vector2 mid = LerpV(p0, p1, 0.55f);
+            Vector2 q = DeterministicDiamondPoint(x, y, hb ^ 0x13579BDFu, 200 + i * 5, tileCenter, tileW, tileH, 0.55f);
+            DrawLineEx(mid, q, 0.75f * invZoom, crackC);
+          }
+        }
+      }
+    }
+  }
+
+  // -----------------------------
+  // Upgrade pips (road class 2..3)
+  // -----------------------------
   if (lvl <= 1) return;
 
-  const float invZoom = 1.0f / std::max(0.001f, zoom);
   const float y0 = tileCenter.y - tileH * 0.02f;
 
   const float pip = 4.0f * invZoom;
@@ -2251,7 +2645,9 @@ void Renderer::rebuildTerrainCacheBand(const World& world, BandCache& band)
       const float brightness = light.base;
 
       // Draw terrain tops.
-      DrawTexturePro(terrain(t.terrain, t.variation), src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
+      const TerrainMacroVisual macroV = ComputeTerrainMacroVisual(world, x, y, t, m_gfxSeed32);
+      const Color terrainTint = MulTints(BrightnessTint(brightness), macroV.tint);
+      DrawTexturePro(terrain(t.terrain, t.variation), src, dst, Vector2{0, 0}, 0.0f, terrainTint);
 
       // Draw cliff walls for higher neighbors behind this tile.
       {
@@ -2260,7 +2656,10 @@ void Renderer::rebuildTerrainCacheBand(const World& world, BandCache& band)
 
         const float eps = 0.5f;
 
-        auto drawCliffEdge = [&](Vector2 e0, Vector2 e1, float topElev, float botElev, Color c) {
+        const std::uint32_t cliffSeedBase = HashCoords32(x, y, m_gfxSeed32 ^ 0xC1FFEE11u);
+
+        auto drawCliffEdge = [&](Vector2 e0, Vector2 e1, float topElev, float botElev, Color c,
+                                 std::uint32_t edgeSeed, bool wetBase) {
           if (topElev <= botElev + eps) return;
           Vector2 top0 = e0;
           Vector2 top1 = e1;
@@ -2273,20 +2672,55 @@ void Renderer::rebuildTerrainCacheBand(const World& world, BandCache& band)
 
           DrawTriangle(top0, top1, bot1, c);
           DrawTriangle(top0, bot1, bot0, c);
+
+          const float h = topElev - botElev;
+
+          // Stratified cliff detail (a few horizontal bands) to avoid large flat walls.
+          if (h > tileHf * 0.65f) {
+            const int bands = std::clamp(static_cast<int>(h / (tileHf * 0.23f)), 2, 8);
+            for (int i = 0; i < bands; ++i) {
+              const std::uint32_t hh = HashCoords32(i * 31, bands * 17, edgeSeed ^ 0x9E3779B9u);
+              if ((hh & 0x3u) == 0u) continue;
+
+              float t = (static_cast<float>(i) + 1.0f) / (static_cast<float>(bands) + 1.0f);
+              t += (Frac01(hh) - 0.5f) * 0.06f;
+              t = std::clamp(t, 0.08f, 0.92f);
+
+              const Vector2 a = LerpV(bot0, top0, t);
+              const Vector2 b = LerpV(bot1, top1, t);
+
+              Color lc = Mul(c, 0.78f);
+              lc.a = 75;
+              DrawLineEx(a, b, 0.95f, lc);
+            }
+          }
+
+          // Wet darkening + faint highlight at the base when cliffs meet water.
+          if (wetBase) {
+            const float bandH = std::min(h, tileHf * 0.32f);
+            const float tt = (h > 0.001f) ? (bandH / h) : 1.0f;
+            const Vector2 m0 = LerpV(bot0, top0, tt);
+            const Vector2 m1 = LerpV(bot1, top1, tt);
+            DrawTriangle(bot0, bot1, m1, Color{0, 0, 0, 38});
+            DrawTriangle(bot0, m1, m0, Color{0, 0, 0, 38});
+            DrawLineEx(bot0, bot1, 0.8f, Color{210, 230, 255, 26});
+          }
         };
 
         if (x > 0) {
           const Tile& n = world.at(x - 1, y);
           const float ne = TileElevationPx(n, m_elev);
           const Color base = TerrainCliffBaseColor(n.terrain);
-          drawCliffEdge(baseCorners[3], baseCorners[0], ne, elevPx, Mul(base, 0.70f));
+          drawCliffEdge(baseCorners[3], baseCorners[0], ne, elevPx, Mul(base, 0.70f),
+                        cliffSeedBase ^ 0x51A5EEDu, (t.terrain == Terrain::Water));
         }
 
         if (y > 0) {
           const Tile& n = world.at(x, y - 1);
           const float ne = TileElevationPx(n, m_elev);
           const Color base = TerrainCliffBaseColor(n.terrain);
-          drawCliffEdge(baseCorners[0], baseCorners[1], ne, elevPx, Mul(base, 0.85f));
+          drawCliffEdge(baseCorners[0], baseCorners[1], ne, elevPx, Mul(base, 0.85f),
+                        cliffSeedBase ^ 0xBADC0DEu, (t.terrain == Terrain::Water));
         }
       }
     }
@@ -3722,14 +4156,20 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
       // Terrain (if not cached)
       // -----------------------------
       if (layerTerrain && !terrainCacheReady) {
-        DrawTexturePro(terrain(tile.terrain, tile.variation), src, dst, Vector2{0, 0}, 0.0f, BrightnessTint(brightness));
+        const TerrainMacroVisual macroV = ComputeTerrainMacroVisual(world, x, y, tile, m_gfxSeed32);
+        const Color terrainTint = MulTints(BrightnessTint(brightness), macroV.tint);
+        DrawTexturePro(terrain(tile.terrain, tile.variation), src, dst, Vector2{0, 0}, 0.0f, terrainTint);
 
         // Cliff walls for higher tiles behind.
         Vector2 baseCorners[4];
         TileDiamondCorners(baseCenter, tileWf, tileHf, baseCorners);
 
         const float eps = 0.5f;
-        auto drawCliffEdge = [&](Vector2 e0, Vector2 e1, float topElev, float botElev, Color c) {
+        const float invZoom = 1.0f / std::max(0.001f, camera.zoom);
+        const std::uint32_t cliffSeedBase = HashCoords32(x, y, m_gfxSeed32 ^ 0xC1FFEE11u);
+
+        auto drawCliffEdge = [&](Vector2 e0, Vector2 e1, float topElev, float botElev, Color c,
+                                 std::uint32_t edgeSeed, bool wetBase) {
           if (topElev <= botElev + eps) return;
           Vector2 top0 = e0;
           Vector2 top1 = e1;
@@ -3742,20 +4182,57 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
 
           DrawTriangle(top0, top1, bot1, c);
           DrawTriangle(top0, bot1, bot0, c);
+
+          const float h = topElev - botElev;
+
+          // Stratified cliff detail (horizontal bands) - tuned to be subtle at low zoom.
+          if (h > tileHf * 0.65f && tileScreenW >= 14.0f) {
+            const int bands = std::clamp(static_cast<int>(h / (tileHf * 0.23f)), 2, 8);
+            const float thick = std::clamp(1.10f * invZoom, 0.55f * invZoom, 2.2f * invZoom);
+
+            for (int i = 0; i < bands; ++i) {
+              const std::uint32_t hh = HashCoords32(i * 31, bands * 17, edgeSeed ^ 0x9E3779B9u);
+              if ((hh & 0x3u) == 0u) continue;
+
+              float t = (static_cast<float>(i) + 1.0f) / (static_cast<float>(bands) + 1.0f);
+              t += (Frac01(hh) - 0.5f) * 0.06f;
+              t = std::clamp(t, 0.08f, 0.92f);
+
+              const Vector2 a = LerpV(bot0, top0, t);
+              const Vector2 b = LerpV(bot1, top1, t);
+
+              Color lc = Mul(c, 0.78f);
+              lc.a = 80;
+              DrawLineEx(a, b, thick, lc);
+            }
+          }
+
+          // Wet darkening + faint highlight at the base when cliffs meet water.
+          if (wetBase) {
+            const float bandH = std::min(h, tileHf * 0.32f);
+            const float tt = (h > 0.001f) ? (bandH / h) : 1.0f;
+            const Vector2 m0 = LerpV(bot0, top0, tt);
+            const Vector2 m1 = LerpV(bot1, top1, tt);
+            DrawTriangle(bot0, bot1, m1, Color{0, 0, 0, 38});
+            DrawTriangle(bot0, m1, m0, Color{0, 0, 0, 38});
+            DrawLineEx(bot0, bot1, std::clamp(0.95f * invZoom, 0.55f * invZoom, 2.0f * invZoom), Color{210, 230, 255, 26});
+          }
         };
 
         if (x > 0) {
           const Tile& n = world.at(x - 1, y);
           const float ne = TileElevationPx(n, m_elev);
           const Color base = TerrainCliffBaseColor(n.terrain);
-          drawCliffEdge(baseCorners[3], baseCorners[0], ne, elevPx, Mul(base, 0.70f));
+          drawCliffEdge(baseCorners[3], baseCorners[0], ne, elevPx, Mul(base, 0.70f),
+                        cliffSeedBase ^ 0x51A5EEDu, (tile.terrain == Terrain::Water));
         }
 
         if (y > 0) {
           const Tile& n = world.at(x, y - 1);
           const float ne = TileElevationPx(n, m_elev);
           const Color base = TerrainCliffBaseColor(n.terrain);
-          drawCliffEdge(baseCorners[0], baseCorners[1], ne, elevPx, Mul(base, 0.85f));
+          drawCliffEdge(baseCorners[0], baseCorners[1], ne, elevPx, Mul(base, 0.85f),
+                        cliffSeedBase ^ 0xBADC0DEu, (tile.terrain == Terrain::Water));
         }
       }
 
@@ -3841,6 +4318,29 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
         DrawProceduralTileDetails(world, x, y, tile, center, tileWf, tileHf,
                                  camera.zoom, brightness, m_gfxSeed32, timeSec);
 
+        // Permanent altitude-driven snow caps (independent of the active weather mode).
+        // Kept subtle so it doesn't fight utility overlays; also fades out when it's actively snowing.
+        {
+          const TerrainMacroVisual macroV = ComputeTerrainMacroVisual(world, x, y, tile, m_gfxSeed32);
+          float snow = macroV.snow * (1.0f - 0.80f * weather.snow);
+
+          if (tile.overlay == Overlay::Road) snow *= 0.40f;
+          else if (IsZoneOverlay(tile.overlay) || tile.overlay == Overlay::Park) snow *= 0.25f;
+
+          if (snow > 0.01f) {
+            Vector2 c[4];
+            TileDiamondCorners(center, tileWf, tileHf, c);
+            for (int i = 0; i < 4; ++i) {
+              c[i] = LerpV(c[i], center, 0.05f);
+            }
+
+            const unsigned char a = ClampU8(static_cast<int>(160.0f * snow));
+            const Color snowC = ShadeDetail(Color{250, 250, 255, 255}, brightness, 1.08f, a);
+            DrawTriangle(c[0], c[1], c[2], snowC);
+            DrawTriangle(c[0], c[2], c[3], snowC);
+          }
+        }
+
         // Ground weather effects (wet sheen, snow cover, etc.)
         if (m_weather.affectGround) {
           DrawWeatherGroundEffects(world, x, y, tile, center, tileWf, tileHf,
@@ -3848,36 +4348,151 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
         }
       }
 
-      // Shoreline highlight is a subtle readability aid; keep it as a decal even when aesthetic details are suppressed.
+      // Coastline: keep a thin highlight for readability when aesthetics are suppressed.
+      // When aesthetics are on, upgrade to procedural shallow-water, foam, and wet-sand bands.
       if (layerDecals && tileScreenW >= 18.0f) {
+        const bool rich = drawAestheticDetails && tileScreenW >= 24.0f;
+
+        Vector2 c[4];
+        TileDiamondCorners(center, tileWf, tileHf, c);
+        const Vector2 edgeA[4] = {c[0], c[1], c[2], c[3]};
+        const Vector2 edgeB[4] = {c[1], c[2], c[3], c[0]};
+
+        // Neighbor queries; out-of-bounds treated as "land" for water tiles (so map-edge water gets outlined).
+        const bool leftWater = (x > 0) && (world.at(x - 1, y).terrain == Terrain::Water);
+        const bool rightWater = (x < mapW - 1) && (world.at(x + 1, y).terrain == Terrain::Water);
+        const bool upWater = (y > 0) && (world.at(x, y - 1).terrain == Terrain::Water);
+        const bool downWater = (y < mapH - 1) && (world.at(x, y + 1).terrain == Terrain::Water);
+
+        const bool leftLand = !leftWater;
+        const bool rightLand = !rightWater;
+        const bool upLand = !upWater;
+        const bool downLand = !downWater;
+
+        const float invZoom = 1.0f / std::max(0.001f, camera.zoom);
+
+        auto drawBand = [&](int edge, float inset0, float inset1, Color col) {
+          const Vector2 a0 = LerpV(edgeA[edge], center, inset0);
+          const Vector2 a1 = LerpV(edgeB[edge], center, inset0);
+          const Vector2 b0 = LerpV(edgeA[edge], center, inset1);
+          const Vector2 b1 = LerpV(edgeB[edge], center, inset1);
+          DrawTriangle(a0, a1, b1, col);
+          DrawTriangle(a0, b1, b0, col);
+        };
+
+        auto drawFoam = [&](int edge, std::uint32_t edgeSeed) {
+          // Broken, slightly inset segments so coastlines don't look like a single perfect stroke.
+          const Vector2 e0 = LerpV(edgeA[edge], center, 0.06f);
+          const Vector2 e1 = LerpV(edgeB[edge], center, 0.06f);
+
+          const int segCount = (tileScreenW >= 44.0f) ? 4 : 3;
+          const float thick = std::clamp(1.45f * invZoom, 0.75f * invZoom, 2.6f * invZoom);
+
+          for (int s = 0; s < segCount; ++s) {
+            const float tA = static_cast<float>(s) / static_cast<float>(segCount);
+            const float tB = static_cast<float>(s + 1) / static_cast<float>(segCount);
+            const std::uint32_t hs = HashCoords32(s * 31, edge * 17, edgeSeed ^ 0xA3613F13u);
+            const float r0 = Frac01(hs);
+            const float r1 = Frac01(hs ^ 0x9E3779B9u);
+            if (r0 < 0.20f) continue;
+
+            float s0 = tA + (0.10f + 0.25f * r0) * (tB - tA);
+            float s1 = tB - (0.10f + 0.25f * r1) * (tB - tA);
+            if (s1 <= s0) continue;
+
+            Vector2 p0 = LerpV(e0, e1, s0);
+            Vector2 p1 = LerpV(e0, e1, s1);
+
+            // Small inward push to keep foam away from the exact tile seam.
+            const Vector2 mid = LerpV(p0, p1, 0.5f);
+            Vector2 dir{center.x - mid.x, center.y - mid.y};
+            const float dlen = std::sqrt(dir.x * dir.x + dir.y * dir.y);
+            if (dlen > 0.001f) {
+              dir.x /= dlen;
+              dir.y /= dlen;
+            }
+            const float off = (0.8f + 0.6f * Frac01(hs ^ 0x85EBCA6Bu)) * invZoom;
+            p0.x += dir.x * off;
+            p0.y += dir.y * off;
+            p1.x += dir.x * off;
+            p1.y += dir.y * off;
+
+            Color foam = ShadeDetail(Color{255, 255, 255, 255}, brightness, 1.12f,
+                                     ClampU8(40 + static_cast<int>(60.0f * (1.0f - 0.35f * r0))));
+            DrawLineEx(p0, p1, thick, foam);
+
+            // Occasional bubbles.
+            if (tileScreenW >= 40.0f && ((hs >> 28) & 3u) == 0u) {
+              const Vector2 bp = LerpV(p0, p1, 0.5f + (Frac01(hs ^ 0xC3A5C85Cu) - 0.5f) * 0.25f);
+              DrawCircleV(bp, std::clamp(1.05f * invZoom, 0.65f * invZoom, 2.0f * invZoom),
+                          Color{255, 255, 255, 35});
+            }
+          }
+        };
+
         const bool tileIsWater = (tile.terrain == Terrain::Water);
         if (tileIsWater) {
-          const bool leftLand = (x > 0) && world.at(x - 1, y).terrain != Terrain::Water;
-          const bool rightLand = (x < mapW - 1) && world.at(x + 1, y).terrain != Terrain::Water;
-          const bool upLand = (y > 0) && world.at(x, y - 1).terrain != Terrain::Water;
-          const bool downLand = (y < mapH - 1) && world.at(x, y + 1).terrain != Terrain::Water;
-
-          const bool hasLandNeighbor = leftLand || rightLand || upLand || downLand;
+          const bool edgeLand[4] = {upLand, rightLand, downLand, leftLand};
+          const bool hasLandNeighbor = edgeLand[0] || edgeLand[1] || edgeLand[2] || edgeLand[3];
           if (hasLandNeighbor) {
-            Vector2 c[4];
-            TileDiamondCorners(center, tileWf, tileHf, c);
+            if (!rich) {
+              // Thin fallback highlight.
+              const float shoreT = 0.12f;
+              const Vector2 cTop = LerpV(c[0], c[1], 0.5f);
+              const Vector2 cRight = LerpV(c[1], c[2], 0.5f);
+              const Vector2 cBottom = LerpV(c[2], c[3], 0.5f);
+              const Vector2 cLeft = LerpV(c[3], c[0], 0.5f);
 
-            const float shoreT = 0.12f;
-            const Vector2 cTop = LerpV(c[0], c[1], 0.5f);
-            const Vector2 cRight = LerpV(c[1], c[2], 0.5f);
-            const Vector2 cBottom = LerpV(c[2], c[3], 0.5f);
-            const Vector2 cLeft = LerpV(c[3], c[0], 0.5f);
+              auto drawSeg = [&](Vector2 a, Vector2 b) {
+                const float thick = std::max(0.8f, 1.6f / std::max(0.25f, camera.zoom));
+                DrawLineEx(a, b, thick, Color{255, 255, 255, 60});
+                DrawLineEx(a, b, thick * 0.5f, Color{200, 220, 255, 60});
+              };
 
-            auto drawSeg = [&](Vector2 a, Vector2 b) {
-              const float thick = std::max(0.8f, 1.6f / std::max(0.25f, camera.zoom));
-              DrawLineEx(a, b, thick, Color{255, 255, 255, 60});
-              DrawLineEx(a, b, thick * 0.5f, Color{200, 220, 255, 60});
-            };
+              if (upLand) drawSeg(LerpV(c[0], cTop, shoreT), LerpV(c[1], cTop, shoreT));
+              if (rightLand) drawSeg(LerpV(c[1], cRight, shoreT), LerpV(c[2], cRight, shoreT));
+              if (downLand) drawSeg(LerpV(c[2], cBottom, shoreT), LerpV(c[3], cBottom, shoreT));
+              if (leftLand) drawSeg(LerpV(c[3], cLeft, shoreT), LerpV(c[0], cLeft, shoreT));
+            } else {
+              // Shallow water band + foam.
+              const std::uint32_t baseSeed = HashCoords32(x, y, m_gfxSeed32 ^ 0xF00DFACEu);
+              for (int e = 0; e < 4; ++e) {
+                if (!edgeLand[e]) continue;
 
-            if (upLand) drawSeg(LerpV(c[0], cTop, shoreT), LerpV(c[1], cTop, shoreT));
-            if (rightLand) drawSeg(LerpV(c[1], cRight, shoreT), LerpV(c[2], cRight, shoreT));
-            if (downLand) drawSeg(LerpV(c[2], cBottom, shoreT), LerpV(c[3], cBottom, shoreT));
-            if (leftLand) drawSeg(LerpV(c[3], cLeft, shoreT), LerpV(c[0], cLeft, shoreT));
+                const std::uint32_t hs = HashCoords32(e * 97, e * 131, baseSeed ^ 0x27D4EB2Du);
+                const float w = 0.18f + 0.05f * (Frac01(hs) - 0.5f);
+
+                Color shallow = ShadeDetail(Color{85, 165, 230, 255}, brightness, 1.05f,
+                                            ClampU8(42 + static_cast<int>(40.0f * Frac01(hs ^ 0x9E3779B9u))));
+                drawBand(e, 0.02f, 0.02f + w, shallow);
+
+                drawFoam(e, baseSeed ^ (0x9E3779B9u * static_cast<std::uint32_t>(e + 1)));
+              }
+            }
+          }
+        }
+
+        // Wet sand / wet grass fringe on the land side (only when aesthetics are on).
+        if (rich && tile.overlay == Overlay::None) {
+          const bool edgeWater[4] = {upWater, rightWater, downWater, leftWater};
+          const bool hasWaterNeighbor = edgeWater[0] || edgeWater[1] || edgeWater[2] || edgeWater[3];
+          if (hasWaterNeighbor) {
+            if (tile.terrain == Terrain::Sand) {
+              Color wet = ShadeDetail(Color{65, 55, 45, 255}, brightness, 1.00f, 55);
+              for (int e = 0; e < 4; ++e) {
+                if (!edgeWater[e]) continue;
+                drawBand(e, 0.02f, 0.16f, wet);
+                DrawLineEx(LerpV(edgeA[e], center, 0.08f), LerpV(edgeB[e], center, 0.08f),
+                           std::clamp(0.85f * invZoom, 0.55f * invZoom, 1.8f * invZoom),
+                           Color{240, 235, 220, 18});
+              }
+            } else if (tile.terrain == Terrain::Grass) {
+              Color wet = ShadeDetail(Color{20, 55, 28, 255}, brightness, 1.00f, 45);
+              for (int e = 0; e < 4; ++e) {
+                if (!edgeWater[e]) continue;
+                drawBand(e, 0.03f, 0.11f, wet);
+              }
+            }
           }
         }
       }
@@ -4072,7 +4687,7 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
       // Road indicators (upgrade pips, etc.)
       // -----------------------------
       if (layerStructures && t.overlay == Overlay::Road && tileScreenW >= 18.0f) {
-        DrawRoadIndicators(t, tileWf, tileHf, camera.zoom, center, brightness);
+        DrawRoadIndicators(world, x, y, t, tileWf, tileHf, camera.zoom, center, brightness, dayNight, weather, m_gfxSeed32, timeSec);
       }
     }
 

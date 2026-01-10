@@ -1197,14 +1197,14 @@ void Game::setupDevConsole()
             return;
           }
           const EvacuationResult& r = m_evacScenario.evac;
-          const double reach = (r.totalResidentialPopulation > 0)
-                                   ? (100.0 * static_cast<double>(r.reachableResidentialPopulation) /
-                                      static_cast<double>(r.totalResidentialPopulation))
+          const double reach = (r.population > 0)
+                                   ? (100.0 * static_cast<double>(r.reachablePopulation) /
+                                      static_cast<double>(r.population))
                                    : 0.0;
           c.print(TextFormat(
               "  exits=%d  resTiles=%d  pop=%d  reach=%.1f%%  floodedPop=%d  unreachablePop=%d  avg=%.1f  p95=%.1f  maxFlow=%u",
-              r.exitSources, r.residentialTiles, r.totalResidentialPopulation, reach, r.floodedResidentialPopulation,
-              r.unreachableResidentialPopulation, r.avgEvacTime, r.p95EvacTime, r.maxEvacRoadFlow));
+              r.exitSources, r.residentialTiles, r.population, reach, r.floodedPopulation,
+              r.unreachablePopulation, r.avgEvacTime, r.p95EvacTime, r.maxEvacRoadFlow));
         };
 
         if (args.empty() || toLower(args[0]) == "status" || toLower(args[0]) == "show") {
@@ -1342,9 +1342,9 @@ void Game::setupDevConsole()
           printStatsIfReady();
           if (!m_evacDirty) {
             const EvacuationResult& r = m_evacScenario.evac;
-            const double reach = (r.totalResidentialPopulation > 0)
-                                     ? (100.0 * static_cast<double>(r.reachableResidentialPopulation) /
-                                        static_cast<double>(r.totalResidentialPopulation))
+            const double reach = (r.population > 0)
+                                     ? (100.0 * static_cast<double>(r.reachablePopulation) /
+                                        static_cast<double>(r.population))
                                      : 0.0;
             showToast(TextFormat("Evac: %.0f%% reachable (p95 %.1f)", reach, r.p95EvacTime), 2.5f);
           }
@@ -7238,10 +7238,10 @@ void Game::exportEvacuationArtifacts()
       out << "  \"evacSummary\": {\n";
       out << "    \"exitSources\": " << r.exitSources << ",\n";
       out << "    \"residentialTiles\": " << r.residentialTiles << ",\n";
-      out << "    \"totalResidentialPopulation\": " << r.totalResidentialPopulation << ",\n";
-      out << "    \"reachableResidentialPopulation\": " << r.reachableResidentialPopulation << ",\n";
-      out << "    \"floodedResidentialPopulation\": " << r.floodedResidentialPopulation << ",\n";
-      out << "    \"unreachableResidentialPopulation\": " << r.unreachableResidentialPopulation << ",\n";
+      out << "    \"totalResidentialPopulation\": " << r.population << ",\n";
+      out << "    \"reachableResidentialPopulation\": " << r.reachablePopulation << ",\n";
+      out << "    \"floodedResidentialPopulation\": " << r.floodedPopulation << ",\n";
+      out << "    \"unreachableResidentialPopulation\": " << r.unreachablePopulation << ",\n";
       out << "    \"avgEvacTime\": " << r.avgEvacTime << ",\n";
       out << "    \"p95EvacTime\": " << r.p95EvacTime << ",\n";
       out << "    \"maxEvacRoadFlow\": " << r.maxEvacRoadFlow << "\n";
@@ -10080,11 +10080,11 @@ void Game::draw()
         const double t = static_cast<double>(costMilli) / 1000.0;
         std::snprintf(buf, sizeof(buf), "Heatmap: %s (%s)  tile %.1f%s  p95 %.1f%s  unreachPop %d%s", heatmapName,
                       EvacuationHazardModeName(m_evacCfg.hazardMode), t, unit,
-                      static_cast<double>(r.p95EvacTime), unit, r.unreachableResidentialPopulation,
+                      static_cast<double>(r.p95EvacTime), unit, r.unreachablePopulation,
                       hazard ? "  (hazard)" : "");
       } else {
         std::snprintf(buf, sizeof(buf), "Heatmap: %s (%s)  tile UNREACHABLE  unreachPop %d%s", heatmapName,
-                      EvacuationHazardModeName(m_evacCfg.hazardMode), r.unreachableResidentialPopulation,
+                      EvacuationHazardModeName(m_evacCfg.hazardMode), r.unreachablePopulation,
                       hazard ? "  (hazard)" : "");
       }
     } else if (m_heatmapOverlay == HeatmapOverlay::EvacuationUnreachable) {
@@ -10095,7 +10095,7 @@ void Game::draw()
       std::snprintf(buf, sizeof(buf), "Heatmap: %s (%s)  tile %s%s  unreachPop %d", heatmapName,
                     EvacuationHazardModeName(m_evacCfg.hazardMode),
                     unreach ? "UNREACHABLE" : "ok", hazard ? " (hazard)" : "",
-                    r.unreachableResidentialPopulation);
+                    r.unreachablePopulation);
     } else if (m_heatmapOverlay == HeatmapOverlay::EvacuationFlow) {
       ensureEvacuationScenarioUpToDate();
       const EvacuationResult& r = m_evacScenario.evac;
@@ -10121,9 +10121,9 @@ void Game::draw()
       ensureEvacuationScenarioUpToDate();
       const EvacuationResult& r = m_evacScenario.evac;
       const char* unit = m_evacCfg.evac.useTravelTime ? "s" : "steps";
-      const double reachPct = (r.totalResidentialPopulation > 0)
-                                  ? (100.0 * static_cast<double>(r.reachableResidentialPopulation) /
-                                     static_cast<double>(r.totalResidentialPopulation))
+      const double reachPct = (r.population > 0)
+                                  ? (100.0 * static_cast<double>(r.reachablePopulation) /
+                                     static_cast<double>(r.population))
                                   : 0.0;
       char buf[256];
       if (m_heatmapOverlay == HeatmapOverlay::EvacuationTime) {
@@ -10132,8 +10132,8 @@ void Game::draw()
                       static_cast<double>(r.p95EvacTime), unit);
       } else if (m_heatmapOverlay == HeatmapOverlay::EvacuationUnreachable) {
         std::snprintf(buf, sizeof(buf), "Heatmap: %s (%s)  unreachPop %d  floodedPop %d", heatmapName,
-                      EvacuationHazardModeName(m_evacCfg.hazardMode), r.unreachableResidentialPopulation,
-                      r.floodedResidentialPopulation);
+                      EvacuationHazardModeName(m_evacCfg.hazardMode), r.unreachablePopulation,
+                      r.floodedPopulation);
       } else {
         std::snprintf(buf, sizeof(buf), "Heatmap: %s (%s)  maxFlow %u", heatmapName,
                       EvacuationHazardModeName(m_evacCfg.hazardMode), r.maxEvacRoadFlow);
