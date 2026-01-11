@@ -1,4 +1,5 @@
 #include "isocity/Export.hpp"
+#include "isocity/Json.hpp"
 #include "isocity/Pathfinding.hpp"
 #include "isocity/ProcGen.hpp"
 #include "isocity/SaveLoad.hpp"
@@ -92,29 +93,6 @@ static bool ParsePointXY(const std::string& s, Point& out)
   if (!ParseI32(s.substr(pos + 1), &y)) return false;
   out = Point{x, y};
   return true;
-}
-
-static std::string EscapeJson(const std::string& s)
-{
-  std::ostringstream oss;
-  for (unsigned char uc : s) {
-    const char c = static_cast<char>(uc);
-    switch (c) {
-      case '\\': oss << "\\\\"; break;
-      case '"': oss << "\\\""; break;
-      case '\n': oss << "\\n"; break;
-      case '\r': oss << "\\r"; break;
-      case '\t': oss << "\\t"; break;
-      default:
-        if (uc < 0x20) {
-          oss << "\\u" << std::hex << std::setw(4) << std::setfill('0') << static_cast<int>(uc) << std::dec;
-        } else {
-          oss << c;
-        }
-        break;
-    }
-  }
-  return oss.str();
 }
 
 static bool EnsureParentDir(const std::string& path)
@@ -387,55 +365,75 @@ static bool WriteJsonReport(const std::string& outPath,
     return false;
   }
 
-  std::ofstream f(outPath, std::ios::binary);
-  if (!f) {
-    err = "failed to open " + outPath;
+  using isocity::JsonValue;
+  JsonValue root = JsonValue::MakeObject();
+  auto add = [](JsonValue& obj, const char* key, JsonValue v) {
+    obj.objectValue.emplace_back(key, std::move(v));
+  };
+
+  add(root, "mode", JsonValue::MakeString(ModeName(opt.mode)));
+  if (!opt.loadPath.empty()) {
+    add(root, "load", JsonValue::MakeString(opt.loadPath));
+  } else {
+    add(root, "seed", JsonValue::MakeNumber(static_cast<double>(opt.seed)));
+    add(root, "size", JsonValue::MakeString(std::to_string(opt.w) + "x" + std::to_string(opt.h)));
+  }
+  add(root, "worldWidth", JsonValue::MakeNumber(static_cast<double>(world.width())));
+  add(root, "worldHeight", JsonValue::MakeNumber(static_cast<double>(world.height())));
+
+  JsonValue start = JsonValue::MakeObject();
+  add(start, "x", JsonValue::MakeNumber(static_cast<double>(opt.start.x)));
+  add(start, "y", JsonValue::MakeNumber(static_cast<double>(opt.start.y)));
+  add(root, "start", std::move(start));
+
+  if (opt.mode != Mode::ToEdge) {
+    JsonValue goal = JsonValue::MakeObject();
+    add(goal, "x", JsonValue::MakeNumber(static_cast<double>(opt.goal.x)));
+    add(goal, "y", JsonValue::MakeNumber(static_cast<double>(opt.goal.y)));
+    add(root, "goal", std::move(goal));
+  }
+
+  if (found && !tiles.empty()) {
+    const Point end = tiles.back();
+    JsonValue endObj = JsonValue::MakeObject();
+    add(endObj, "x", JsonValue::MakeNumber(static_cast<double>(end.x)));
+    add(endObj, "y", JsonValue::MakeNumber(static_cast<double>(end.y)));
+    add(root, "end", std::move(endObj));
+  }
+
+  add(root, "found", JsonValue::MakeBool(found));
+  add(root, "steps", JsonValue::MakeNumber(static_cast<double>(steps)));
+  add(root, "turns", JsonValue::MakeNumber(static_cast<double>(turns)));
+
+  if (opt.mode == Mode::RoadBuild) {
+    JsonValue rb = JsonValue::MakeObject();
+    add(rb, "allowBridges", JsonValue::MakeBool(opt.allowBridges));
+    add(rb, "costModel", JsonValue::MakeString(CostModelName(opt.costModel)));
+    add(rb, "targetLevel", JsonValue::MakeNumber(static_cast<double>(opt.targetLevel)));
+    add(rb, "primaryCost", JsonValue::MakeNumber(static_cast<double>(primaryCost)));
+    add(rb, "newRoadTiles", JsonValue::MakeNumber(static_cast<double>(newRoadTiles)));
+    add(root, "roadbuild", std::move(rb));
+  }
+
+  add(root, "pathLength", JsonValue::MakeNumber(static_cast<double>(tiles.size())));
+
+  JsonValue arr = JsonValue::MakeArray();
+  arr.arrayValue.reserve(tiles.size());
+  for (const Point& p : tiles) {
+    JsonValue pair = JsonValue::MakeArray();
+    pair.arrayValue.emplace_back(JsonValue::MakeNumber(static_cast<double>(p.x)));
+    pair.arrayValue.emplace_back(JsonValue::MakeNumber(static_cast<double>(p.y)));
+    arr.arrayValue.emplace_back(std::move(pair));
+  }
+  add(root, "path", std::move(arr));
+
+  std::string jsonErr;
+  if (!isocity::WriteJsonFile(outPath, root, jsonErr, isocity::JsonWriteOptions{.pretty = true, .indent = 2, .sortKeys = false})) {
+    err = jsonErr;
     return false;
   }
 
-  f << "{\n";
-  f << "  \"mode\": \"" << ModeName(opt.mode) << "\",\n";
-  if (!opt.loadPath.empty()) {
-    f << "  \"load\": \"" << EscapeJson(opt.loadPath) << "\",\n";
-  } else {
-    f << "  \"seed\": " << opt.seed << ",\n";
-    f << "  \"size\": \"" << opt.w << "x" << opt.h << "\",\n";
-  }
-  f << "  \"worldWidth\": " << world.width() << ",\n";
-  f << "  \"worldHeight\": " << world.height() << ",\n";
-  f << "  \"start\": {\"x\": " << opt.start.x << ", \"y\": " << opt.start.y << "},\n";
-  if (opt.mode != Mode::ToEdge) {
-    f << "  \"goal\": {\"x\": " << opt.goal.x << ", \"y\": " << opt.goal.y << "},\n";
-  }
-  if (found && !tiles.empty()) {
-    const Point end = tiles.back();
-    f << "  \"end\": {\"x\": " << end.x << ", \"y\": " << end.y << "},\n";
-  }
-  f << "  \"found\": " << (found ? "true" : "false") << ",\n";
-  f << "  \"steps\": " << steps << ",\n";
-  f << "  \"turns\": " << turns << ",\n";
-
-  if (opt.mode == Mode::RoadBuild) {
-    f << "  \"roadbuild\": {\n";
-    f << "    \"allowBridges\": " << (opt.allowBridges ? "true" : "false") << ",\n";
-    f << "    \"costModel\": \"" << CostModelName(opt.costModel) << "\",\n";
-    f << "    \"targetLevel\": " << opt.targetLevel << ",\n";
-    f << "    \"primaryCost\": " << primaryCost << ",\n";
-    f << "    \"newRoadTiles\": " << newRoadTiles << "\n";
-    f << "  },\n";
-  }
-
-  f << "  \"pathLength\": " << static_cast<int>(tiles.size()) << ",\n";
-  f << "  \"path\": [";
-  for (std::size_t i = 0; i < tiles.size(); ++i) {
-    const Point p = tiles[i];
-    if (i) f << ",";
-    f << "[" << p.x << "," << p.y << "]";
-  }
-  f << "]\n";
-  f << "}\n";
-
-  return static_cast<bool>(f);
+  return true;
 }
 
 static void ApplyRoadPath(World& world, const std::vector<Point>& path, int targetLevel)

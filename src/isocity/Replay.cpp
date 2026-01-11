@@ -17,7 +17,8 @@ namespace {
 constexpr std::uint8_t kMagic[8] = {'I','S','O','R','E','P','L','\0'};
 constexpr std::uint32_t kReplayVersionV1 = 1;
 constexpr std::uint32_t kReplayVersionV2 = 2;
-constexpr std::uint32_t kReplayVersion = kReplayVersionV2;
+constexpr std::uint32_t kReplayVersionV3 = 3;
+constexpr std::uint32_t kReplayVersion = kReplayVersionV3;
 
 bool ReadExact(std::istream& in, void* dst, std::size_t n)
 {
@@ -71,6 +72,105 @@ bool WriteString(std::ostream& out, const std::string& s)
   return WriteExact(out, s.data(), s.size());
 }
 
+bool WriteTrafficModelSettings(std::ostream& out, const TrafficModelSettings& s)
+{
+  const std::uint8_t cong = s.congestionAwareRouting ? 1u : 0u;
+  if (!WritePOD(out, cong)) return false;
+  if (!WritePOD(out, s.congestionIterations)) return false;
+  if (!WritePOD(out, s.congestionAlpha)) return false;
+  if (!WritePOD(out, s.congestionBeta)) return false;
+  if (!WritePOD(out, s.congestionCapacityScale)) return false;
+  if (!WritePOD(out, s.congestionRatioClamp)) return false;
+
+  const std::uint8_t capJobs = s.capacityAwareJobs ? 1u : 0u;
+  if (!WritePOD(out, capJobs)) return false;
+  if (!WritePOD(out, s.jobAssignmentIterations)) return false;
+  if (!WritePOD(out, s.jobPenaltyBaseMilli)) return false;
+  return out.good();
+}
+
+bool ReadTrafficModelSettings(std::istream& in, TrafficModelSettings& s)
+{
+  std::uint8_t b = 0;
+  if (!ReadPOD(in, b)) return false;
+  s.congestionAwareRouting = (b & 1u) != 0u;
+  if (!ReadPOD(in, s.congestionIterations)) return false;
+  if (!ReadPOD(in, s.congestionAlpha)) return false;
+  if (!ReadPOD(in, s.congestionBeta)) return false;
+  if (!ReadPOD(in, s.congestionCapacityScale)) return false;
+  if (!ReadPOD(in, s.congestionRatioClamp)) return false;
+  if (!ReadPOD(in, b)) return false;
+  s.capacityAwareJobs = (b & 1u) != 0u;
+  if (!ReadPOD(in, s.jobAssignmentIterations)) return false;
+  if (!ReadPOD(in, s.jobPenaltyBaseMilli)) return false;
+  return in.good();
+}
+
+bool WriteTransitPlannerConfig(std::ostream& out, const TransitPlannerConfig& c)
+{
+  if (!WritePOD(out, c.maxLines)) return false;
+  if (!WritePOD(out, c.endpointCandidates)) return false;
+  const std::uint8_t wm = static_cast<std::uint8_t>(c.weightMode);
+  if (!WritePOD(out, wm)) return false;
+  if (!WritePOD(out, c.demandBias)) return false;
+  if (!WritePOD(out, c.maxDetour)) return false;
+  if (!WritePOD(out, c.coverFraction)) return false;
+  if (!WritePOD(out, c.minEdgeDemand)) return false;
+  if (!WritePOD(out, c.minLineDemand)) return false;
+  if (!WritePOD(out, c.seedSalt)) return false;
+  return out.good();
+}
+
+bool ReadTransitPlannerConfig(std::istream& in, TransitPlannerConfig& c)
+{
+  if (!ReadPOD(in, c.maxLines)) return false;
+  if (!ReadPOD(in, c.endpointCandidates)) return false;
+  std::uint8_t wm = 0;
+  if (!ReadPOD(in, wm)) return false;
+  c.weightMode = static_cast<TransitEdgeWeightMode>(wm);
+  if (!ReadPOD(in, c.demandBias)) return false;
+  if (!ReadPOD(in, c.maxDetour)) return false;
+  if (!ReadPOD(in, c.coverFraction)) return false;
+  if (!ReadPOD(in, c.minEdgeDemand)) return false;
+  if (!ReadPOD(in, c.minLineDemand)) return false;
+  if (!ReadPOD(in, c.seedSalt)) return false;
+  return in.good();
+}
+
+bool WriteTransitModelSettings(std::ostream& out, const TransitModelSettings& s)
+{
+  const std::uint8_t enabled = s.enabled ? 1u : 0u;
+  if (!WritePOD(out, enabled)) return false;
+  if (!WritePOD(out, s.serviceLevel)) return false;
+  if (!WritePOD(out, s.maxModeShare)) return false;
+  if (!WritePOD(out, s.travelTimeMultiplier)) return false;
+  if (!WritePOD(out, s.stopSpacingTiles)) return false;
+  if (!WritePOD(out, s.costPerTile)) return false;
+  if (!WritePOD(out, s.costPerStop)) return false;
+  const std::uint8_t dm = static_cast<std::uint8_t>(s.demandMode);
+  if (!WritePOD(out, dm)) return false;
+  if (!WriteTransitPlannerConfig(out, s.plannerCfg)) return false;
+  return out.good();
+}
+
+bool ReadTransitModelSettings(std::istream& in, TransitModelSettings& s)
+{
+  std::uint8_t enabled = 0;
+  if (!ReadPOD(in, enabled)) return false;
+  s.enabled = (enabled & 1u) != 0u;
+  if (!ReadPOD(in, s.serviceLevel)) return false;
+  if (!ReadPOD(in, s.maxModeShare)) return false;
+  if (!ReadPOD(in, s.travelTimeMultiplier)) return false;
+  if (!ReadPOD(in, s.stopSpacingTiles)) return false;
+  if (!ReadPOD(in, s.costPerTile)) return false;
+  if (!ReadPOD(in, s.costPerStop)) return false;
+  std::uint8_t dm = 0;
+  if (!ReadPOD(in, dm)) return false;
+  s.demandMode = static_cast<TransitDemandMode>(dm);
+  if (!ReadTransitPlannerConfig(in, s.plannerCfg)) return false;
+  return in.good();
+}
+
 // Load an embedded save blob into a World.
 //
 // SaveLoad now supports in-memory loading, so replay playback can avoid temp files.
@@ -114,7 +214,7 @@ bool SaveReplayBinary(const Replay& replay, const std::string& path, std::string
   }
 
   const std::uint32_t version = (replay.version == 0) ? kReplayVersion : replay.version;
-  if (version != kReplayVersionV1 && version != kReplayVersionV2) {
+  if (version != kReplayVersionV1 && version != kReplayVersionV2 && version != kReplayVersionV3) {
     outError = "Unsupported replay version (writer)";
     return false;
   }
@@ -133,8 +233,8 @@ bool SaveReplayBinary(const Replay& replay, const std::string& path, std::string
     return false;
   }
 
-  // v2 adds an explicit event count.
-  if (version == kReplayVersionV2) {
+  // v2+ adds an explicit event count.
+  if (version >= kReplayVersionV2) {
     if (replay.events.size() > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
       outError = "Replay has too many events";
       return false;
@@ -176,8 +276,8 @@ bool SaveReplayBinary(const Replay& replay, const std::string& path, std::string
         break;
       }
       case ReplayEventType::Note: {
-        if (version != kReplayVersionV2) {
-          outError = "Replay Note events require replay v2";
+        if (version < kReplayVersionV2) {
+          outError = "Replay Note events require replay v2+";
           return false;
         }
         if (e.note.size() > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
@@ -192,8 +292,8 @@ bool SaveReplayBinary(const Replay& replay, const std::string& path, std::string
         break;
       }
       case ReplayEventType::AssertHash: {
-        if (version != kReplayVersionV2) {
-          outError = "Replay AssertHash events require replay v2";
+        if (version < kReplayVersionV2) {
+          outError = "Replay AssertHash events require replay v2+";
           return false;
         }
         if (!WritePOD(out, e.expectedHash)) {
@@ -212,6 +312,21 @@ bool SaveReplayBinary(const Replay& replay, const std::string& path, std::string
         const std::uint32_t sz = static_cast<std::uint32_t>(e.label.size());
         if (!WritePOD(out, sz) || !WriteString(out, e.label)) {
           outError = "Write failed (assert label)";
+          return false;
+        }
+        break;
+      }
+      case ReplayEventType::SimTuning: {
+        if (version < kReplayVersionV3) {
+          outError = "Replay SimTuning events require replay v3+";
+          return false;
+        }
+        if (!WriteTrafficModelSettings(out, e.trafficModel)) {
+          outError = "Write failed (sim tuning traffic settings)";
+          return false;
+        }
+        if (!WriteTransitModelSettings(out, e.transitModel)) {
+          outError = "Write failed (sim tuning transit settings)";
           return false;
         }
         break;
@@ -249,7 +364,7 @@ bool LoadReplayBinary(Replay& outReplay, const std::string& path, std::string& o
     outError = "Read failed (version)";
     return false;
   }
-  if (version != kReplayVersionV1 && version != kReplayVersionV2) {
+  if (version != kReplayVersionV1 && version != kReplayVersionV2 && version != kReplayVersionV3) {
     outError = "Unsupported replay version";
     return false;
   }
@@ -331,7 +446,7 @@ bool LoadReplayBinary(Replay& outReplay, const std::string& path, std::string& o
     return true;
   }
 
-  // v2: explicit event count.
+  // v2+: explicit event count.
   std::uint32_t eventCount = 0;
   if (!ReadPOD(in, eventCount)) {
     outError = "Read failed (event count)";
@@ -347,8 +462,13 @@ bool LoadReplayBinary(Replay& outReplay, const std::string& path, std::string& o
     }
 
     const ReplayEventType type = static_cast<ReplayEventType>(typeU8);
-    if (type != ReplayEventType::Tick && type != ReplayEventType::Patch && type != ReplayEventType::Snapshot &&
-        type != ReplayEventType::Note && type != ReplayEventType::AssertHash) {
+    const bool typeAllowed =
+      (type == ReplayEventType::Tick) ||
+      (type == ReplayEventType::Patch) ||
+      (type == ReplayEventType::Snapshot) ||
+      ((version >= kReplayVersionV2) && (type == ReplayEventType::Note || type == ReplayEventType::AssertHash)) ||
+      ((version >= kReplayVersionV3) && (type == ReplayEventType::SimTuning));
+    if (!typeAllowed) {
       outError = "Unknown replay event type";
       return false;
     }
@@ -419,6 +539,21 @@ bool LoadReplayBinary(Replay& outReplay, const std::string& path, std::string& o
         }
         break;
       }
+      case ReplayEventType::SimTuning: {
+        if (version < kReplayVersionV3) {
+          outError = "Replay SimTuning events require replay v3+";
+          return false;
+        }
+        if (!ReadTrafficModelSettings(in, e.trafficModel)) {
+          outError = "Read failed (sim tuning traffic settings)";
+          return false;
+        }
+        if (!ReadTransitModelSettings(in, e.transitModel)) {
+          outError = "Read failed (sim tuning transit settings)";
+          return false;
+        }
+        break;
+      }
     }
 
     outReplay.events.push_back(std::move(e));
@@ -448,6 +583,17 @@ bool PlayReplay(const Replay& replay, World& outWorld, ProcGenConfig& outProcCfg
   Simulator sim(outSimCfg);
   sim.resetTimer();
 
+  // These settings are intentionally not part of SimConfig (and therefore not
+  // stored in saves). Replays restore them via SimTuning events.
+  TrafficModelSettings trafficModel = sim.trafficModel();
+  TransitModelSettings transitModel = sim.transitModel();
+
+  auto applyTuning = [&]() {
+    sim.trafficModel() = trafficModel;
+    sim.transitModel() = transitModel;
+  };
+  applyTuning();
+
   for (std::size_t i = 0; i < replay.events.size(); ++i) {
     const ReplayEvent& e = replay.events[i];
     switch (e.type) {
@@ -470,6 +616,7 @@ bool PlayReplay(const Replay& replay, World& outWorld, ProcGenConfig& outProcCfg
           return false;
         }
         sim.config() = outSimCfg;
+        applyTuning();
         sim.resetTimer();
         break;
       }
@@ -479,8 +626,16 @@ bool PlayReplay(const Replay& replay, World& outWorld, ProcGenConfig& outProcCfg
           return false;
         }
         sim = Simulator(outSimCfg);
+        applyTuning();
         sim.resetTimer();
         if (outTickStats) outTickStats->push_back(outWorld.stats());
+        break;
+      }
+      case ReplayEventType::SimTuning: {
+        trafficModel = e.trafficModel;
+        transitModel = e.transitModel;
+        applyTuning();
+        sim.resetTimer();
         break;
       }
       case ReplayEventType::Note: {

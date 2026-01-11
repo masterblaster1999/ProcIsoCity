@@ -1,4 +1,5 @@
 #include "isocity/Hash.hpp"
+#include "isocity/Json.hpp"
 #include "isocity/ProcGen.hpp"
 #include "isocity/SaveLoad.hpp"
 #include "isocity/Sim.hpp"
@@ -179,42 +180,45 @@ bool WriteJsonSummary(const isocity::World& world, std::uint64_t hash, const std
 {
   const isocity::Stats& s = world.stats();
 
-  std::ostringstream oss;
-  oss << "{\n";
-  oss << "  \"width\": " << world.width() << ",\n";
-  oss << "  \"height\": " << world.height() << ",\n";
-  oss << "  \"seed\": " << world.seed() << ",\n";
-  oss << "  \"hash\": \"" << HexU64(hash) << "\",\n";
-  oss << "  \"stats\": {\n";
-  oss << "    \"day\": " << s.day << ",\n";
-  oss << "    \"population\": " << s.population << ",\n";
-  oss << "    \"housingCapacity\": " << s.housingCapacity << ",\n";
-  oss << "    \"jobsCapacity\": " << s.jobsCapacity << ",\n";
-  oss << "    \"jobsCapacityAccessible\": " << s.jobsCapacityAccessible << ",\n";
-  oss << "    \"employed\": " << s.employed << ",\n";
-  oss << "    \"happiness\": " << s.happiness << ",\n";
-  oss << "    \"money\": " << s.money << ",\n";
-  oss << "    \"roads\": " << s.roads << ",\n";
-  oss << "    \"parks\": " << s.parks << ",\n";
-  oss << "    \"avgCommuteTime\": " << s.avgCommuteTime << ",\n";
-  oss << "    \"trafficCongestion\": " << s.trafficCongestion << ",\n";
-  oss << "    \"goodsDemand\": " << s.goodsDemand << ",\n";
-  oss << "    \"goodsDelivered\": " << s.goodsDelivered << ",\n";
-  oss << "    \"goodsSatisfaction\": " << s.goodsSatisfaction << ",\n";
-  oss << "    \"avgLandValue\": " << s.avgLandValue << ",\n";
-  oss << "    \"demandResidential\": " << s.demandResidential << "\n";
-  oss << "  }\n";
-  oss << "}\n";
+  using isocity::JsonValue;
+  JsonValue root = JsonValue::MakeObject();
+  auto add = [](JsonValue& obj, const char* key, JsonValue v) {
+    obj.objectValue.emplace_back(key, std::move(v));
+  };
 
+  add(root, "width", JsonValue::MakeNumber(static_cast<double>(world.width())));
+  add(root, "height", JsonValue::MakeNumber(static_cast<double>(world.height())));
+  add(root, "seed", JsonValue::MakeNumber(static_cast<double>(world.seed())));
+  add(root, "hash", JsonValue::MakeString(HexU64(hash)));
+
+  JsonValue st = JsonValue::MakeObject();
+  add(st, "day", JsonValue::MakeNumber(static_cast<double>(s.day)));
+  add(st, "population", JsonValue::MakeNumber(static_cast<double>(s.population)));
+  add(st, "housingCapacity", JsonValue::MakeNumber(static_cast<double>(s.housingCapacity)));
+  add(st, "jobsCapacity", JsonValue::MakeNumber(static_cast<double>(s.jobsCapacity)));
+  add(st, "jobsCapacityAccessible", JsonValue::MakeNumber(static_cast<double>(s.jobsCapacityAccessible)));
+  add(st, "employed", JsonValue::MakeNumber(static_cast<double>(s.employed)));
+  add(st, "happiness", JsonValue::MakeNumber(static_cast<double>(s.happiness)));
+  add(st, "money", JsonValue::MakeNumber(static_cast<double>(s.money)));
+  add(st, "roads", JsonValue::MakeNumber(static_cast<double>(s.roads)));
+  add(st, "parks", JsonValue::MakeNumber(static_cast<double>(s.parks)));
+  add(st, "avgCommuteTime", JsonValue::MakeNumber(static_cast<double>(s.avgCommuteTime)));
+  add(st, "trafficCongestion", JsonValue::MakeNumber(static_cast<double>(s.trafficCongestion)));
+  add(st, "goodsDemand", JsonValue::MakeNumber(static_cast<double>(s.goodsDemand)));
+  add(st, "goodsDelivered", JsonValue::MakeNumber(static_cast<double>(s.goodsDelivered)));
+  add(st, "goodsSatisfaction", JsonValue::MakeNumber(static_cast<double>(s.goodsSatisfaction)));
+  add(st, "avgLandValue", JsonValue::MakeNumber(static_cast<double>(s.avgLandValue)));
+  add(st, "demandResidential", JsonValue::MakeNumber(static_cast<double>(s.demandResidential)));
+  add(root, "stats", std::move(st));
+
+  const isocity::JsonWriteOptions wopt{.pretty = true, .indent = 2, .sortKeys = false};
+  std::string err;
   if (outPath.empty()) {
-    std::cout << oss.str();
+    std::cout << isocity::JsonStringify(root, wopt);
     return true;
   }
 
-  std::ofstream f(outPath, std::ios::binary);
-  if (!f) return false;
-  f << oss.str();
-  return static_cast<bool>(f);
+  return isocity::WriteJsonFile(outPath, root, err, wopt);
 }
 
 bool WriteCsvRow(std::ostream& os, const isocity::Stats& s)

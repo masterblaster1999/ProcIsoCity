@@ -1,5 +1,6 @@
 #include "isocity/GfxProps.hpp"
 
+#include "isocity/GfxCanvas.hpp"
 #include "isocity/Random.hpp"
 
 #include <algorithm>
@@ -12,125 +13,16 @@ namespace {
 
 inline float Frac01(std::uint32_t u) { return static_cast<float>(u) / 4294967295.0f; }
 
-inline std::uint8_t ClampU8(int v)
-{
-  if (v < 0) return 0;
-  if (v > 255) return 255;
-  return static_cast<std::uint8_t>(v);
-}
-
-inline Rgba8 Mul(Rgba8 c, float m)
-{
-  const int r = static_cast<int>(std::lround(static_cast<float>(c.r) * m));
-  const int g = static_cast<int>(std::lround(static_cast<float>(c.g) * m));
-  const int b = static_cast<int>(std::lround(static_cast<float>(c.b) * m));
-  return Rgba8{ClampU8(r), ClampU8(g), ClampU8(b), c.a};
-}
-
-inline Rgba8 Lerp(Rgba8 a, Rgba8 b, float t)
-{
-  t = std::clamp(t, 0.0f, 1.0f);
-  const float it = 1.0f - t;
-  const int r = static_cast<int>(std::lround(static_cast<float>(a.r) * it + static_cast<float>(b.r) * t));
-  const int g = static_cast<int>(std::lround(static_cast<float>(a.g) * it + static_cast<float>(b.g) * t));
-  const int bb = static_cast<int>(std::lround(static_cast<float>(a.b) * it + static_cast<float>(b.b) * t));
-  const int aa = static_cast<int>(std::lround(static_cast<float>(a.a) * it + static_cast<float>(b.a) * t));
-  return Rgba8{ClampU8(r), ClampU8(g), ClampU8(bb), ClampU8(aa)};
-}
-
-inline void BlendPixel(RgbaImage& img, int x, int y, Rgba8 src)
-{
-  if (src.a == 0) return;
-  if (x < 0 || y < 0 || x >= img.width || y >= img.height) return;
-
-  const std::size_t i = (static_cast<std::size_t>(y) * static_cast<std::size_t>(img.width) + static_cast<std::size_t>(x)) * 4u;
-
-  const std::uint8_t dr = img.rgba[i + 0];
-  const std::uint8_t dg = img.rgba[i + 1];
-  const std::uint8_t db = img.rgba[i + 2];
-  const std::uint8_t da = img.rgba[i + 3];
-
-  const int sa = static_cast<int>(src.a);
-  const int ida = 255 - sa;
-  const int outA = sa + (static_cast<int>(da) * ida + 127) / 255;
-  if (outA <= 0) {
-    img.rgba[i + 0] = 0;
-    img.rgba[i + 1] = 0;
-    img.rgba[i + 2] = 0;
-    img.rgba[i + 3] = 0;
-    return;
-  }
-
-  // Accumulate in premultiplied space, then unpremultiply.
-  const int premR = static_cast<int>(src.r) * sa + (static_cast<int>(dr) * static_cast<int>(da) * ida + 127) / 255;
-  const int premG = static_cast<int>(src.g) * sa + (static_cast<int>(dg) * static_cast<int>(da) * ida + 127) / 255;
-  const int premB = static_cast<int>(src.b) * sa + (static_cast<int>(db) * static_cast<int>(da) * ida + 127) / 255;
-
-  const int outR = (premR + outA / 2) / outA;
-  const int outG = (premG + outA / 2) / outA;
-  const int outB = (premB + outA / 2) / outA;
-
-  img.rgba[i + 0] = ClampU8(outR);
-  img.rgba[i + 1] = ClampU8(outG);
-  img.rgba[i + 2] = ClampU8(outB);
-  img.rgba[i + 3] = ClampU8(outA);
-}
-
-void FillRect(RgbaImage& img, int x0, int y0, int x1, int y1, Rgba8 c)
-{
-  const int minX = std::max(0, std::min(x0, x1));
-  const int maxX = std::min(img.width - 1, std::max(x0, x1));
-  const int minY = std::max(0, std::min(y0, y1));
-  const int maxY = std::min(img.height - 1, std::max(y0, y1));
-  for (int y = minY; y <= maxY; ++y) {
-    for (int x = minX; x <= maxX; ++x) {
-      BlendPixel(img, x, y, c);
-    }
-  }
-}
-
-void FillCircleSoft(RgbaImage& img, float cx, float cy, float r, float feather, Rgba8 c)
-{
-  if (r <= 0.5f) return;
-  feather = std::max(0.0f, feather);
-  const int minX = std::max(0, static_cast<int>(std::floor(cx - r - 1.0f)));
-  const int maxX = std::min(img.width - 1, static_cast<int>(std::ceil(cx + r + 1.0f)));
-  const int minY = std::max(0, static_cast<int>(std::floor(cy - r - 1.0f)));
-  const int maxY = std::min(img.height - 1, static_cast<int>(std::ceil(cy + r + 1.0f)));
-
-  const float inner = std::max(0.0f, r - feather);
-  const float inner2 = inner * inner;
-  const float r2 = r * r;
-
-  for (int y = minY; y <= maxY; ++y) {
-    for (int x = minX; x <= maxX; ++x) {
-      const float dx = (static_cast<float>(x) + 0.5f) - cx;
-      const float dy = (static_cast<float>(y) + 0.5f) - cy;
-      const float d2 = dx * dx + dy * dy;
-      if (d2 > r2) continue;
-
-      float a = 1.0f;
-      if (feather > 0.001f && d2 > inner2) {
-        const float d = std::sqrt(d2);
-        a = std::clamp((r - d) / feather, 0.0f, 1.0f);
-      }
-
-      Rgba8 cc = c;
-      cc.a = static_cast<std::uint8_t>(std::lround(static_cast<float>(c.a) * a));
-      BlendPixel(img, x, y, cc);
-    }
-  }
-}
-
-// Slight isometric-ish lighting: brighter on upper-left, darker on lower-right.
-inline float SpriteLight(float nx, float ny)
-{
-  // nx,ny in [-1,1] roughly. Light from (-0.6,-0.5).
-  const float lx = -0.60f;
-  const float ly = -0.55f;
-  const float d = (nx * lx + ny * ly);
-  return std::clamp(0.92f + 0.20f * d, 0.70f, 1.20f);
-}
+using gfx::BlendMode;
+using gfx::BlendPixel;
+using gfx::ClampU8;
+using gfx::FillCircleSoft;
+using gfx::FillRect;
+using gfx::Lerp;
+using gfx::Mul;
+using gfx::SdfRoundRect;
+using gfx::SmoothStep01;
+using gfx::SpriteLight;
 
 struct TallSpriteLayout {
   int tileW = 0;
@@ -391,10 +283,10 @@ void MakeStreetLight(int variant, std::uint32_t seedv, const GfxPropsConfig& cfg
   if (cfg.includeEmissive && !out.emissive.rgba.empty()) {
     const Rgba8 glow = Rgba8{pal.roadMarkYellow.r, pal.roadMarkYellow.g, pal.roadMarkYellow.b, 255};
     FillCircleSoft(out.emissive, static_cast<float>(lampX), static_cast<float>(lampY + 1), 2.4f, 1.2f,
-                   Rgba8{glow.r, glow.g, glow.b, 220});
+                   Rgba8{glow.r, glow.g, glow.b, 220}, BlendMode::Additive);
     // Subtle falloff.
     FillCircleSoft(out.emissive, static_cast<float>(lampX), static_cast<float>(lampY + 2), 4.5f, 2.4f,
-                   Rgba8{glow.r, glow.g, glow.b, 85});
+                   Rgba8{glow.r, glow.g, glow.b, 85}, BlendMode::Additive);
   }
 }
 
@@ -418,14 +310,22 @@ void MakeVehicle(bool truck, int variant, std::uint32_t seedv, const GfxPropsCon
     return Frac01(HashCoords32(x, y, seedv ^ salt));
   };
 
-  // Orient along one of the two isometric diagonals.
-  const bool diagNE = (h01(1, 2, 0xF1u) < 0.5f);
+  // Deterministic diagonal orientation.
+  //
+  // - diagNE=true  => major axis slopes up-right on screen (negative covariance)
+  // - diagNE=false => major axis slopes down-right on screen (positive covariance)
+  //
+  // We base this on variant parity so rebuildVehicleSprites can quickly collect a balanced
+  // set of both diagonal orientations.
+  const bool diagNE = ((variant & 1) == 0);
+
+  // Style bucket (separate from the diagonal bit).
+  const int style = (variant / 2) % (truck ? 4 : 5);
+  const bool isTaxi = (!truck && style == 3);
 
   // Base colors: choose a vivid paint from a small set of variant-driven schemes.
-  //
-  // NOTE: `seedv` already incorporates `variant`, but using the explicit variant index here makes
-  // the different variants reliably look different even if the global seed changes.
-  const int scheme = (variant >= 0) ? (variant % 6) : ((-variant) % 6);
+  int scheme = (variant >= 0) ? (variant % 6) : ((-variant) % 6);
+  if (isTaxi) scheme = 3;
 
   Rgba8 s0 = pal.overlayCommercial;
   Rgba8 s1 = pal.overlayIndustrial;
@@ -462,67 +362,490 @@ void MakeVehicle(bool truck, int variant, std::uint32_t seedv, const GfxPropsCon
     break;
   }
 
-  const Rgba8 paint = Lerp(Lerp(s0, s1, h01(3, 4, 0xF2u)), s2, h01(5, 6, 0xF3u));
-  const Rgba8 dark = Mul(paint, 0.72f);
-  const Rgba8 light = Mul(paint, 1.15f);
-  const Rgba8 glass = Mul(pal.water, 0.85f);
-  const Rgba8 tire = Mul(pal.roadAsphalt3, 1.05f);
+  const Rgba8 paintBase = Lerp(Lerp(s0, s1, h01(3, 4, 0xF2u)), s2, h01(5, 6, 0xF3u));
+  const Rgba8 paintDark = Mul(paintBase, 0.70f);
+  const Rgba8 paintLight = Mul(paintBase, 1.18f);
 
-  // Vehicle footprint in diamond coords.
-  const float hw = truck ? 0.33f : 0.27f;
-  const float hh = truck ? 0.20f : 0.16f;
-  const float yOff = truck ? 0.03f : 0.00f;
+  // Trucks look better with a slightly more utilitarian cargo body.
+  Rgba8 cargoBase = Lerp(Mul(pal.roadMarkWhite, 0.96f), Mul(pal.overlayIndustrial, 1.02f), 0.35f);
+  cargoBase = Lerp(cargoBase, Mul(paintBase, 0.92f), 0.20f + 0.35f * h01(9, 10, 0xABu));
+  const Rgba8 cargoDark = Mul(cargoBase, 0.82f);
+  const Rgba8 cargoLight = Mul(cargoBase, 1.10f);
+
+  const Rgba8 glass = Mul(pal.water, 0.88f);
+  const Rgba8 trim = Mul(pal.roadAsphalt2, 1.10f);
+  const Rgba8 tire = Mul(pal.roadAsphalt3, 1.08f);
+
+  // Vehicle footprint in (u,v) diamond coords.
+  // u aligns with the chosen screen-space diagonal, v is the perpendicular diagonal.
+  float halfLen = truck ? 0.40f : 0.33f;
+  float halfWid = truck ? 0.22f : 0.18f;
+
+  // Style variation.
+  const float vLen = (h01(11, 12, 0xC0u) - 0.5f) * 0.06f;
+  const float vWid = (h01(13, 14, 0xC1u) - 0.5f) * 0.05f;
+  halfLen = std::clamp(halfLen + vLen, truck ? 0.34f : 0.28f, truck ? 0.46f : 0.40f);
+  halfWid = std::clamp(halfWid + vWid, truck ? 0.19f : 0.15f, truck ? 0.26f : 0.21f);
+
+  if (!truck) {
+    // van / hatch / sporty tweaks
+    if (style == 2) halfLen = std::min(0.41f, halfLen + 0.03f);
+    if (style == 1) halfLen = std::min(0.40f, halfLen + 0.01f);
+    if (style == 4) halfLen = std::max(0.28f, halfLen - 0.02f);
+    if (style == 2) halfWid = std::min(0.22f, halfWid + 0.02f);
+  } else {
+    // flatbed slightly shorter, box truck slightly longer
+    if (style == 1) halfLen = std::max(0.33f, halfLen - 0.03f);
+    if (style == 0) halfLen = std::min(0.48f, halfLen + 0.02f);
+  }
+
+  const float yOff = truck ? 0.05f : 0.02f;
 
   const float cx = static_cast<float>(out.pivotX);
   const float cy = static_cast<float>(out.pivotY) + static_cast<float>(cfg.tileH) * yOff;
   const float sx = static_cast<float>(cfg.tileW) * 0.5f;
   const float sy = static_cast<float>(cfg.tileH) * 0.5f;
 
-  // Simple raster: draw a rotated-ish rectangle by sampling diamond-space coordinates.
+  // Soft under-shadow to anchor the sprite to the road surface.
+  {
+    const float shA = truck ? 75.0f : 62.0f;
+    const float shR = (truck ? 0.54f : 0.50f) * static_cast<float>(cfg.tileH);
+    const float shY = cy + static_cast<float>(cfg.tileH) * 0.14f;
+    const float feather = shR * 0.75f;
+
+    FillCircleSoft(out.color, cx - 1.0f, shY, shR, feather, Rgba8{0, 0, 0, static_cast<std::uint8_t>(shA)});
+    FillCircleSoft(out.color, cx + 1.0f, shY, shR, feather, Rgba8{0, 0, 0, static_cast<std::uint8_t>(shA)});
+  }
+
+  const float rBody = std::min(halfLen, halfWid) * 0.36f;
+  const float feather = 0.055f;
+
+  // Wheel placement in (u,v) coords.
+  const float wheelUFront = halfLen * 0.55f;
+  const float wheelUBack = -halfLen * (truck ? 0.48f : 0.55f);
+  const float wheelV = halfWid * 0.88f;
+  const float wheelR = halfWid * (truck ? 0.34f : 0.37f);
+
+  // Roof dimensions (cars) / cab roof (trucks).
+  float roofHalfLen = halfLen * (truck ? 0.26f : 0.62f);
+  float roofHalfWid = halfWid * (truck ? 0.55f : 0.56f);
+  float roofCenterU = truck ? (halfLen * 0.55f) : (halfLen * 0.10f);
+
+  // Vehicles are small; we intentionally exaggerate the roof a bit for readability.
+  if (!truck && style == 2) {
+    // van: longer roof
+    roofHalfLen = halfLen * 0.70f;
+    roofCenterU = halfLen * 0.05f;
+  }
+
+  // Primary raster pass.
   for (int y = 0; y < out.color.height; ++y) {
     for (int x = 0; x < out.color.width; ++x) {
       const float nx = ((static_cast<float>(x) + 0.5f) - cx) / sx;
       const float ny = ((static_cast<float>(y) + 0.5f) - cy) / sy;
-      // Rotate 45° in diamond space by swapping/negating.
-      const float ux = diagNE ? (nx * 0.7071f - ny * 0.7071f) : (nx * 0.7071f + ny * 0.7071f);
-      const float uy = diagNE ? (nx * 0.7071f + ny * 0.7071f) : (-nx * 0.7071f + ny * 0.7071f);
 
-      if (std::fabs(ux) > hw || std::fabs(uy) > hh) continue;
+      // Rotate into (u,v) (two diagonals). Both variants keep +u pointing screen-right.
+      const float ux = diagNE ? (nx * 0.70710678f - ny * 0.70710678f)
+                              : (nx * 0.70710678f + ny * 0.70710678f);
+      const float uy = diagNE ? (nx * 0.70710678f + ny * 0.70710678f)
+                              : (-nx * 0.70710678f + ny * 0.70710678f);
 
-      // Height profile: cab on one side.
-      const float cab = truck ? 0.35f : 0.42f;
-      const bool isCab = (diagNE ? (ux > (hw * (1.0f - cab))) : (ux < -(hw * (1.0f - cab))));
+      const float sd = SdfRoundRect(ux, uy, halfLen, halfWid, rBody);
+      if (sd > feather) continue;
 
-      Rgba8 c = isCab ? light : dark;
-      c.a = 245;
-
-      // Window stripe.
-      if (isCab && std::fabs(uy) < hh * 0.45f && (std::fabs(ux) > hw * 0.55f)) {
-        c = Mul(glass, 1.10f);
-        c.a = 235;
+      float aa = 1.0f;
+      if (sd > 0.0f) {
+        aa = (feather - sd) / feather;
+        aa = SmoothStep01(aa);
       }
 
-      // Tires as darker pixels at the corners.
-      const float tireBand = hh * 0.88f;
-      if (std::fabs(uy) > tireBand) {
+      // Base alpha: slightly translucent so sprites blend with the world (keeps them from looking like stickers).
+      const float baseA = 245.0f;
+      const std::uint8_t a8 = static_cast<std::uint8_t>(std::lround(baseA * aa));
+      if (a8 == 0) continue;
+
+      // Wheels (sit "under" the body but still visible at the corners).
+      const float dV = std::fabs(std::fabs(uy) - wheelV);
+      const float dF = ux - wheelUFront;
+      const float dB = ux - wheelUBack;
+      const bool wheel = ((dF * dF + dV * dV) <= (wheelR * wheelR)) || ((dB * dB + dV * dV) <= (wheelR * wheelR));
+
+      // Truck body split: cargo vs cab.
+      bool cab = false;
+      if (truck) {
+        const float cabCut = halfLen * (style == 0 ? 0.12f : 0.18f);
+        cab = (ux > cabCut);
+      }
+
+      // Roof mask.
+      const float sdRoof = SdfRoundRect(ux - roofCenterU, uy, roofHalfLen, roofHalfWid, rBody * 0.65f);
+      const bool roof = (sdRoof <= 0.0f);
+
+      // Window band (glass) on the roof.
+      bool window = false;
+      if (!truck) {
+        window = roof && (ux > (-halfLen * 0.10f)) && (std::fabs(uy) < roofHalfWid * 0.36f);
+      } else {
+        // Truck windshield near the very front of the cab.
+        window = roof && (ux > (halfLen * 0.42f)) && (std::fabs(uy) < roofHalfWid * 0.42f);
+      }
+
+      // Trim/bumpers near the front/back.
+      const float bumper = rBody * 0.55f;
+      const bool frontTrim = (ux > (halfLen - bumper));
+      const bool backTrim = (ux < (-halfLen + bumper));
+
+      // Base material.
+      Rgba8 c = paintDark;
+      if (truck && !cab) {
+        c = cargoDark;
+      }
+
+      // Roof reads slightly lighter.
+      if (roof) {
+        c = truck && !cab ? cargoLight : paintLight;
+      }
+
+      // Windows override.
+      if (window) {
+        c = Mul(glass, 1.05f);
+      }
+
+      // Wheels override.
+      if (wheel) {
         c = tire;
-        c.a = 255;
       }
 
+      // Front/back trim override.
+      if (!wheel && (frontTrim || backTrim)) {
+        c = Mul(trim, roof ? 1.05f : 0.95f);
+      }
+
+      // Taxi roof sign (tiny but readable at high zoom).
+      if (isTaxi && roof && (std::fabs(uy) < roofHalfWid * 0.22f) && (ux > halfLen * 0.05f) && (ux < halfLen * 0.28f)) {
+        c = Mul(pal.roadMarkYellow, 1.10f);
+      }
+
+      // Simple isometric-ish lighting + slight grime.
+      float light = SpriteLight(nx, ny);
+      // Lower-right side reads darker.
+      if (uy > 0.0f && !roof) light *= 0.92f;
+      // Tiny per-pixel variation (deterministic).
+      const float jitter = (h01(x, y, 0xD1u) - 0.5f) * 0.06f;
+      light = std::clamp(light + jitter, 0.70f, 1.25f);
+
+      c = Mul(c, light);
+      c.a = a8;
       BlendPixel(out.color, x, y, c);
+
+      // Tiny cargo separation seam for trucks.
+      if (truck && !wheel && !window) {
+        const float seamU = halfLen * (style == 0 ? 0.12f : 0.18f);
+        if (std::fabs(ux - seamU) < (rBody * 0.25f) && std::fabs(uy) < (halfWid * 0.85f)) {
+          BlendPixel(out.color, x, y, Rgba8{trim.r, trim.g, trim.b, static_cast<std::uint8_t>(std::min(255, a8 + 15))});
+        }
+      }
     }
   }
 
-  // Headlights emissive.
+  // Darken boundary pixels to create a crisp outline (improves readability on bright terrain).
+  {
+    const int w = out.color.width;
+    const int h = out.color.height;
+    if (w > 2 && h > 2 && static_cast<int>(out.color.rgba.size()) >= w * h * 4) {
+      std::vector<std::uint8_t> alpha;
+      alpha.resize(static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
+      for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+          const std::size_t i = (static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x)) * 4u;
+          alpha[static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x)] = out.color.rgba[i + 3u];
+        }
+      }
+
+      auto aAt = [&](int x, int y) -> std::uint8_t {
+        if (x < 0 || y < 0 || x >= w || y >= h) return 0;
+        return alpha[static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x)];
+      };
+
+      for (int y = 1; y < h - 1; ++y) {
+        for (int x = 1; x < w - 1; ++x) {
+          const std::uint8_t a0 = aAt(x, y);
+          if (a0 < 170) continue; // skip shadow / feather pixels
+
+          const bool edge = (aAt(x - 1, y) < 60) || (aAt(x + 1, y) < 60) || (aAt(x, y - 1) < 60) || (aAt(x, y + 1) < 60);
+          if (!edge) continue;
+
+          const std::size_t i = (static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x)) * 4u;
+          out.color.rgba[i + 0] = ClampU8(static_cast<int>(std::lround(static_cast<float>(out.color.rgba[i + 0]) * 0.58f)));
+          out.color.rgba[i + 1] = ClampU8(static_cast<int>(std::lround(static_cast<float>(out.color.rgba[i + 1]) * 0.58f)));
+          out.color.rgba[i + 2] = ClampU8(static_cast<int>(std::lround(static_cast<float>(out.color.rgba[i + 2]) * 0.58f)));
+        }
+      }
+    }
+  }
+
+  // Emissive: headlights + taillights (and taxi roof sign when applicable).
   if (cfg.includeEmissive && !out.emissive.rgba.empty()) {
-    const Rgba8 hl = Rgba8{255, 245, 210, 255};
-    const int dir = diagNE ? 1 : -1;
-    const int hx = out.pivotX + dir * static_cast<int>(std::lround(static_cast<float>(cfg.tileW) * 0.14f));
-    const int hy = out.pivotY + static_cast<int>(std::lround(static_cast<float>(cfg.tileH) * 0.02f));
-    FillCircleSoft(out.emissive, static_cast<float>(hx), static_cast<float>(hy), 1.4f, 0.6f, Rgba8{hl.r, hl.g, hl.b, 170});
-    FillCircleSoft(out.emissive, static_cast<float>(hx), static_cast<float>(hy), 3.0f, 1.8f, Rgba8{hl.r, hl.g, hl.b, 55});
+    // Forward direction in pixel space (points to screen-right).
+    const float slope = (cfg.tileW > 0) ? (static_cast<float>(cfg.tileH) / static_cast<float>(cfg.tileW)) : 0.5f;
+    float fx = 1.0f;
+    float fy = diagNE ? (-slope) : (slope);
+    const float fl = std::sqrt(fx * fx + fy * fy);
+    if (fl > 1.0e-6f) {
+      fx /= fl;
+      fy /= fl;
+    }
+    // Perpendicular (vehicle width) direction.
+    const float rx = -fy;
+    const float ry = fx;
+
+    const float frontOff = static_cast<float>(cfg.tileW) * (truck ? 0.17f : 0.155f);
+    const float backOff = static_cast<float>(cfg.tileW) * (truck ? 0.150f : 0.135f);
+    const float sideOff = static_cast<float>(cfg.tileH) * (truck ? 0.11f : 0.10f);
+
+    const float frontCx = cx + fx * frontOff;
+    const float frontCy = cy + fy * frontOff;
+    const float backCx = cx - fx * backOff;
+    const float backCy = cy - fy * backOff;
+
+    const Rgba8 head = Rgba8{255, 245, 210, 255};
+    const Rgba8 tail = Rgba8{235, 70, 55, 255};
+
+    auto addLight = [&](float lx, float ly, float r0, float a0, float r1, float a1, const Rgba8& col) {
+      Rgba8 c0 = col;
+      c0.a = static_cast<std::uint8_t>(std::clamp<int>(static_cast<int>(std::lround(a0)), 0, 255));
+      FillCircleSoft(out.emissive, lx, ly, r0, r0 * 0.55f, c0, BlendMode::Additive);
+
+      Rgba8 c1 = col;
+      c1.a = static_cast<std::uint8_t>(std::clamp<int>(static_cast<int>(std::lround(a1)), 0, 255));
+      FillCircleSoft(out.emissive, lx, ly, r1, r1 * 0.75f, c1, BlendMode::Additive);
+    };
+
+    // Headlights (brighter, with a small halo).
+    addLight(frontCx + rx * sideOff, frontCy + ry * sideOff, 1.35f, 175.0f, 3.2f, 55.0f, head);
+    addLight(frontCx - rx * sideOff, frontCy - ry * sideOff, 1.35f, 175.0f, 3.2f, 55.0f, head);
+
+    // Taillights (smaller, red).
+    addLight(backCx + rx * (sideOff * 0.85f), backCy + ry * (sideOff * 0.85f), 1.10f, 130.0f, 2.6f, 35.0f, tail);
+    addLight(backCx - rx * (sideOff * 0.85f), backCy - ry * (sideOff * 0.85f), 1.10f, 130.0f, 2.6f, 35.0f, tail);
+
+    // Taxi roof sign (tiny warm marker).
+    if (isTaxi) {
+      const float sx0 = cx + fx * (static_cast<float>(cfg.tileW) * 0.04f);
+      const float sy0 = cy + fy * (static_cast<float>(cfg.tileW) * 0.04f) - static_cast<float>(cfg.tileH) * 0.15f;
+      const Rgba8 sign = Rgba8{pal.roadMarkYellow.r, pal.roadMarkYellow.g, pal.roadMarkYellow.b, 255};
+      addLight(sx0, sy0, 1.10f, 120.0f, 2.8f, 25.0f, sign);
+    }
   }
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// Pedestrians (tiny decorative “city life” sprites)
+// ---------------------------------------------------------------------------------------------
+
+void MakePedestrian(int variant, std::uint32_t seedv, const GfxPropsConfig& cfg, const GfxPalette& pal,
+                    GfxPropSprite& out)
+{
+  // We treat variants in pairs so the renderer can flip between poses for a simple walk animation:
+  //   style = variant/2, pose = variant&1.
+  const int v = std::max(0, variant);
+  const int style = v >> 1;
+  const int pose = v & 1;
+
+  const int w = cfg.tileW;
+
+  // Keep people compact to reduce overdraw.
+  const int marginTop = 3;
+  const int marginBot = 2;
+  const int autoH = static_cast<int>(std::lround(static_cast<float>(cfg.tileH) * 1.65f)) + marginTop + marginBot;
+  const int h = (cfg.tallSpriteH > 0) ? cfg.tallSpriteH : autoH;
+
+  out.color.width = w;
+  out.color.height = h;
+  out.color.rgba.assign(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u, 0u);
+
+  if (cfg.includeEmissive) {
+    out.emissive.width = w;
+    out.emissive.height = h;
+    out.emissive.rgba.assign(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u, 0u);
+  }
+
+  // Pivot at the feet.
+  out.pivotX = w / 2;
+  out.pivotY = h - marginBot;
+
+  auto h01 = [&](int x, int y, std::uint32_t salt) {
+    return Frac01(HashCoords32(x, y, seedv ^ salt));
+  };
+
+  const float cx = static_cast<float>(out.pivotX) + (h01(style, 1, 0xA11u) - 0.5f) * 1.0f;
+  const float footY = static_cast<float>(out.pivotY);
+
+  // Colors: pick from theme-ish palette but add variety.
+  const Rgba8 skinA = Mul(pal.sand, 0.98f);
+  const Rgba8 skinB = Mul(pal.overlayResidential, 0.92f);
+  const Rgba8 skin = Lerp(skinA, skinB, 0.20f + 0.60f * h01(style, 2, 0xA12u));
+
+  const Rgba8 clothA = Lerp(pal.overlayResidential, pal.overlayCommercial, 0.35f);
+  const Rgba8 clothB = Lerp(pal.overlayIndustrial, pal.overlayCommercial, 0.55f);
+  const Rgba8 shirt = Lerp(clothA, clothB, h01(style, 3, 0xA13u));
+  const Rgba8 pants = Mul(pal.roadAsphalt2, 0.85f + 0.22f * h01(style, 4, 0xA14u));
+  const Rgba8 shoe = Mul(pal.roadAsphalt1, 0.62f);
+
+  // A tiny soft shadow blob at the feet so people don't look like they float.
+  {
+    const float r = static_cast<float>(cfg.tileH) * 0.11f;
+    const float f = r * 0.75f;
+    FillCircleSoft(out.color, cx, footY + 0.8f, r, f, Rgba8{0, 0, 0, 70});
+    FillCircleSoft(out.color, cx + 1.4f, footY + 1.0f, r * 0.70f, f * 0.70f, Rgba8{0, 0, 0, 48});
+  }
+
+  // Scale varies slightly per style.
+  const float scale = 0.90f + 0.18f * h01(style, 5, 0xA15u);
+
+  const float legH = static_cast<float>(cfg.tileH) * (0.28f + 0.08f * h01(style, 6, 0xA16u)) * scale;
+  const float torsoH = static_cast<float>(cfg.tileH) * (0.34f + 0.10f * h01(style, 7, 0xA17u)) * scale;
+  const float headR = 2.6f + 0.85f * h01(style, 8, 0xA18u);
+
+  const float torsoW = 4.2f + 1.8f * h01(style, 9, 0xA19u);
+  const float hipY = footY - legH;
+  const float torsoTopY = hipY - torsoH;
+  const float headCy = torsoTopY - headR * (0.72f + 0.10f * h01(style, 10, 0xA1Au));
+
+  // Leg pose: alternate forward/back to create a cheap walking cycle.
+  const float legSep = 1.05f + 0.45f * h01(style, 11, 0xA1Bu);
+  const float step = (pose == 0 ? -1.0f : 1.0f) * (0.8f + 0.55f * h01(style, 12, 0xA1Cu));
+
+  const int yFoot = static_cast<int>(std::lround(footY));
+  const int yHip = static_cast<int>(std::lround(hipY));
+  const int legW = (h01(style, 13, 0xA1Du) > 0.55f) ? 2 : 1;
+
+  const int lx0 = static_cast<int>(std::lround(cx - legSep + step * 0.35f));
+  const int rx0 = static_cast<int>(std::lround(cx + legSep - step * 0.35f));
+
+  FillRect(out.color, lx0 - legW / 2, yHip, lx0 + legW / 2, yFoot, Rgba8{pants.r, pants.g, pants.b, 240});
+  FillRect(out.color, rx0 - legW / 2, yHip + (pose ? 1 : 0), rx0 + legW / 2, yFoot, Rgba8{pants.r, pants.g, pants.b, 240});
+
+  // Shoes.
+  FillRect(out.color, lx0 - legW / 2, yFoot - 1, lx0 + legW / 2, yFoot, Rgba8{shoe.r, shoe.g, shoe.b, 230});
+  FillRect(out.color, rx0 - legW / 2, yFoot - 1, rx0 + legW / 2, yFoot, Rgba8{shoe.r, shoe.g, shoe.b, 230});
+
+  // Torso.
+  const int tHalfW = static_cast<int>(std::lround(torsoW * 0.5f));
+  const int yTorso0 = static_cast<int>(std::lround(torsoTopY));
+  const int yTorso1 = static_cast<int>(std::lround(hipY));
+  const int xTorso0 = static_cast<int>(std::lround(cx)) - tHalfW;
+  const int xTorso1 = static_cast<int>(std::lround(cx)) + tHalfW;
+  FillRect(out.color, xTorso0, yTorso0, xTorso1, yTorso1, Rgba8{shirt.r, shirt.g, shirt.b, 245});
+
+  // A small belt seam helps readability.
+  const int yBelt = static_cast<int>(std::lround(hipY - 1.0f));
+  FillRect(out.color, xTorso0, yBelt, xTorso1, yBelt, Rgba8{pants.r, pants.g, pants.b, 130});
+
+  // Arms: two short strokes. Occasionally add a bag.
+  {
+    const bool bag = (h01(style, 14, 0xA1Eu) > 0.72f);
+    const int yArm = static_cast<int>(std::lround(torsoTopY + torsoH * 0.45f));
+    const int axL = xTorso0 - 1;
+    const int axR = xTorso1 + 1;
+
+    FillRect(out.color, axL, yArm, axL, yArm + 2, Rgba8{skin.r, skin.g, skin.b, 235});
+    FillRect(out.color, axR, yArm, axR, yArm + 2, Rgba8{skin.r, skin.g, skin.b, 235});
+
+    if (bag) {
+      const Rgba8 bagC = Mul(pal.overlayIndustrial, 0.92f);
+      FillRect(out.color, axR + 1, yArm + 1, axR + 3, yArm + 5, Rgba8{bagC.r, bagC.g, bagC.b, 210});
+    }
+  }
+
+  // Head.
+  FillCircleSoft(out.color, cx, headCy, headR, 0.75f, Rgba8{skin.r, skin.g, skin.b, 245});
+
+  // Hair/hat: a simple darker cap on top.
+  {
+    const bool hat = (h01(style, 15, 0xA1Fu) > 0.58f);
+    const Rgba8 hair = Mul(pal.roadAsphalt2, 0.58f + 0.25f * h01(style, 16, 0xA20u));
+    const float r = headR * (hat ? 1.02f : 0.92f);
+    FillCircleSoft(out.color, cx, headCy - headR * 0.35f, r, 0.65f, Rgba8{hair.r, hair.g, hair.b, 235});
+
+    if (hat) {
+      const Rgba8 brim = Mul(hair, 0.92f);
+      FillRect(out.color,
+               static_cast<int>(std::lround(cx - headR * 0.95f)),
+               static_cast<int>(std::lround(headCy + headR * 0.20f)),
+               static_cast<int>(std::lround(cx + headR * 0.95f)),
+               static_cast<int>(std::lround(headCy + headR * 0.35f)),
+               Rgba8{brim.r, brim.g, brim.b, 210});
+    }
+  }
+
+  // Lighting + tiny per-pixel variation to avoid flat silhouettes.
+  for (int y = 0; y < out.color.height; ++y) {
+    for (int x = 0; x < out.color.width; ++x) {
+      const std::size_t i = (static_cast<std::size_t>(y) * static_cast<std::size_t>(out.color.width) + static_cast<std::size_t>(x)) * 4u;
+      const std::uint8_t a = out.color.rgba[i + 3u];
+      if (a == 0) continue;
+      if (a < 160) continue; // skip shadow pixels
+
+      const float nx = (static_cast<float>(x) + 0.5f - cx) / (torsoW + 1.0f);
+      const float ny = (static_cast<float>(y) + 0.5f - headCy) / (torsoH + headR * 2.0f + 1.0f);
+      float light = SpriteLight(nx, ny);
+      light = std::clamp(light + (h01(x, y, 0xB1u) - 0.5f) * 0.08f, 0.72f, 1.22f);
+
+      out.color.rgba[i + 0u] = ClampU8(static_cast<int>(std::lround(static_cast<float>(out.color.rgba[i + 0u]) * light)));
+      out.color.rgba[i + 1u] = ClampU8(static_cast<int>(std::lround(static_cast<float>(out.color.rgba[i + 1u]) * light)));
+      out.color.rgba[i + 2u] = ClampU8(static_cast<int>(std::lround(static_cast<float>(out.color.rgba[i + 2u]) * light)));
+    }
+  }
+
+  // Darken boundary pixels to create a crisp outline.
+  {
+    const int ww = out.color.width;
+    const int hh = out.color.height;
+    std::vector<std::uint8_t> alpha;
+    alpha.resize(static_cast<std::size_t>(ww) * static_cast<std::size_t>(hh));
+    for (int y = 0; y < hh; ++y) {
+      for (int x = 0; x < ww; ++x) {
+        const std::size_t i = (static_cast<std::size_t>(y) * static_cast<std::size_t>(ww) + static_cast<std::size_t>(x)) * 4u;
+        alpha[static_cast<std::size_t>(y) * static_cast<std::size_t>(ww) + static_cast<std::size_t>(x)] = out.color.rgba[i + 3u];
+      }
+    }
+
+    auto aAt = [&](int x, int y) -> std::uint8_t {
+      if (x < 0 || y < 0 || x >= ww || y >= hh) return 0;
+      return alpha[static_cast<std::size_t>(y) * static_cast<std::size_t>(ww) + static_cast<std::size_t>(x)];
+    };
+
+    for (int y = 1; y < hh - 1; ++y) {
+      for (int x = 1; x < ww - 1; ++x) {
+        const std::uint8_t a0 = aAt(x, y);
+        if (a0 < 180) continue; // skip shadow / feather pixels
+        const bool edge = (aAt(x - 1, y) < 70) || (aAt(x + 1, y) < 70) || (aAt(x, y - 1) < 70) || (aAt(x, y + 1) < 70);
+        if (!edge) continue;
+        const std::size_t i = (static_cast<std::size_t>(y) * static_cast<std::size_t>(ww) + static_cast<std::size_t>(x)) * 4u;
+        out.color.rgba[i + 0u] = ClampU8(static_cast<int>(std::lround(static_cast<float>(out.color.rgba[i + 0u]) * 0.55f)));
+        out.color.rgba[i + 1u] = ClampU8(static_cast<int>(std::lround(static_cast<float>(out.color.rgba[i + 1u]) * 0.55f)));
+        out.color.rgba[i + 2u] = ClampU8(static_cast<int>(std::lround(static_cast<float>(out.color.rgba[i + 2u]) * 0.55f)));
+      }
+    }
+  }
+
+  // Optional emissive: a tiny “phone” screen that only reads at high zoom.
+  if (cfg.includeEmissive && !out.emissive.rgba.empty()) {
+    const bool phone = (h01(style, 17, 0xA21u) > 0.60f);
+    if (phone) {
+      const float px = static_cast<float>(xTorso1 + 1);
+      const float py = torsoTopY + torsoH * 0.55f;
+      FillCircleSoft(out.emissive, px, py, 1.55f, 1.25f, Rgba8{215, 245, 255, 175}, BlendMode::Additive);
+      FillCircleSoft(out.emissive, px, py, 3.25f, 2.8f, Rgba8{215, 245, 255, 45}, BlendMode::Additive);
+    } else {
+      // Avoid emitting (and uploading) a fully-transparent emissive texture when it's unused.
+      out.emissive = RgbaImage{};
+    }
+  }
+}
+
 
 } // namespace
 
@@ -559,6 +882,9 @@ bool GenerateGfxPropSprite(GfxPropKind kind, int variant, std::uint32_t seed,
     return true;
   case GfxPropKind::VehicleTruck:
     MakeVehicle(true, v, seedv, cfg, pal, out);
+    return true;
+  case GfxPropKind::Pedestrian:
+    MakePedestrian(v, seedv, cfg, pal, out);
     return true;
   default:
     break;

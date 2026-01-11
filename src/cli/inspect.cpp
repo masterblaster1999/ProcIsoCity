@@ -1,4 +1,5 @@
 #include "isocity/SaveLoad.hpp"
+#include "isocity/Json.hpp"
 
 #include <cctype>
 #include <cstdint>
@@ -35,45 +36,39 @@ static std::string HexU64(std::uint64_t v)
 
 static bool WriteJson(const std::string& outPath, const std::string& inPath, const SaveSummary& s)
 {
-  std::ostringstream oss;
-  oss << "{\n";
-  oss << "  \"file\": \"";
-  for (char c : inPath) {
-    if (c == '\\') oss << "\\\\";
-    else if (c == '"') oss << "\\\"";
-    else oss << c;
-  }
-  oss << "\",\n";
-  oss << "  \"version\": " << s.version << ",\n";
-  oss << "  \"width\": " << s.width << ",\n";
-  oss << "  \"height\": " << s.height << ",\n";
-  oss << "  \"seed\": " << s.seed << ",\n";
+  using isocity::JsonValue;
+  JsonValue root = JsonValue::MakeObject();
+  auto add = [](JsonValue& obj, const char* key, JsonValue v) {
+    obj.objectValue.emplace_back(key, std::move(v));
+  };
 
-  oss << "  \"hasProcCfg\": " << (s.hasProcCfg ? "true" : "false") << ",\n";
-  oss << "  \"hasStats\": " << (s.hasStats ? "true" : "false") << ",\n";
-  oss << "  \"hasSimCfg\": " << (s.hasSimCfg ? "true" : "false") << ",\n";
+  add(root, "file", JsonValue::MakeString(inPath));
+  add(root, "version", JsonValue::MakeNumber(static_cast<double>(s.version)));
+  add(root, "width", JsonValue::MakeNumber(static_cast<double>(s.width)));
+  add(root, "height", JsonValue::MakeNumber(static_cast<double>(s.height)));
+  add(root, "seed", JsonValue::MakeNumber(static_cast<double>(s.seed)));
+
+  add(root, "hasProcCfg", JsonValue::MakeBool(s.hasProcCfg));
+  add(root, "hasStats", JsonValue::MakeBool(s.hasStats));
+  add(root, "hasSimCfg", JsonValue::MakeBool(s.hasSimCfg));
 
   if (s.hasStats) {
-    oss << "  \"stats\": {\n";
-    oss << "    \"day\": " << s.stats.day << ",\n";
-    oss << "    \"population\": " << s.stats.population << ",\n";
-    oss << "    \"housingCapacity\": " << s.stats.housingCapacity << ",\n";
-    oss << "    \"jobsCapacity\": " << s.stats.jobsCapacity << ",\n";
-    oss << "    \"employed\": " << s.stats.employed << ",\n";
-    oss << "    \"happiness\": " << s.stats.happiness << ",\n";
-    oss << "    \"money\": " << s.stats.money << "\n";
-    oss << "  },\n";
+    JsonValue st = JsonValue::MakeObject();
+    add(st, "day", JsonValue::MakeNumber(static_cast<double>(s.stats.day)));
+    add(st, "population", JsonValue::MakeNumber(static_cast<double>(s.stats.population)));
+    add(st, "housingCapacity", JsonValue::MakeNumber(static_cast<double>(s.stats.housingCapacity)));
+    add(st, "jobsCapacity", JsonValue::MakeNumber(static_cast<double>(s.stats.jobsCapacity)));
+    add(st, "employed", JsonValue::MakeNumber(static_cast<double>(s.stats.employed)));
+    add(st, "happiness", JsonValue::MakeNumber(static_cast<double>(s.stats.happiness)));
+    add(st, "money", JsonValue::MakeNumber(static_cast<double>(s.stats.money)));
+    add(root, "stats", std::move(st));
   }
 
-  oss << "  \"crcChecked\": " << (s.crcChecked ? "true" : "false") << ",\n";
-  oss << "  \"crcOk\": " << (s.crcOk ? "true" : "false") << "\n";
+  add(root, "crcChecked", JsonValue::MakeBool(s.crcChecked));
+  add(root, "crcOk", JsonValue::MakeBool(s.crcOk));
 
-  oss << "}\n";
-
-  std::ofstream f(outPath, std::ios::binary);
-  if (!f) return false;
-  f << oss.str();
-  return static_cast<bool>(f);
+  std::string err;
+  return isocity::WriteJsonFile(outPath, root, err, isocity::JsonWriteOptions{.pretty = true, .indent = 2, .sortKeys = false});
 }
 
 static void PrintSummary(const std::string& path, const SaveSummary& s)

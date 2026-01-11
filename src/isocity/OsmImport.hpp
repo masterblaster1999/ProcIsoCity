@@ -14,12 +14,12 @@ namespace isocity {
 // portable ingestion suitable for headless tooling and regression pipelines.
 //
 // Supported (configurable) feature mapping:
-//   - Roads:        highway=* ways           -> Overlay::Road (tiered levels)
-//   - Water areas:  natural=water (closed)   -> Terrain::Water
-//   - Waterways:    waterway=river/stream    -> Terrain::Water (thin line)
-//   - Landuse:      landuse=residential/...  -> zone overlays
-//   - Parks:        leisure=park/garden      -> Overlay::Park
-//   - Buildings:    building=* (closed)      -> zone overlays (rough heuristic)
+//   - Roads:        highway=* ways                      -> Overlay::Road (tiered levels)
+//   - Water areas:  natural=water (closed way/relation) -> Terrain::Water
+//   - Waterways:    waterway=river/stream               -> Terrain::Water (thin line)
+//   - Landuse:      landuse=residential/...             -> zone overlays (ways + multipolygons)
+//   - Parks:        leisure=park/garden/etc             -> Overlay::Park (ways + multipolygons)
+//   - Buildings:    building=* (closed way/relation)    -> zone overlays (rough heuristic)
 
 struct OsmLatLonBounds {
   double minLat = 0.0;
@@ -77,6 +77,7 @@ struct OsmImportConfig {
 struct OsmImportStats {
   std::size_t nodesParsed = 0;
   std::size_t waysParsed = 0;
+  std::size_t relationsParsed = 0;
 
   // --- Imported way counts ---
   std::size_t highwayWaysImported = 0;
@@ -84,6 +85,12 @@ struct OsmImportStats {
   std::size_t landuseWaysImported = 0;
   std::size_t parkWaysImported = 0;
   std::size_t buildingWaysImported = 0;
+
+  // --- Imported relation counts (multipolygons) ---
+  std::size_t waterRelationsImported = 0;
+  std::size_t landuseRelationsImported = 0;
+  std::size_t parkRelationsImported = 0;
+  std::size_t buildingRelationsImported = 0;
 
   // --- Resulting tile counts (final world state) ---
   std::size_t roadTilesPainted = 0;

@@ -1,5 +1,6 @@
 #include "isocity/Export.hpp"
 #include "isocity/Hash.hpp"
+#include "isocity/Json.hpp"
 #include "isocity/SaveLoad.hpp"
 #include "isocity/WorldDiff.hpp"
 
@@ -53,40 +54,6 @@ static std::string HexU64(std::uint64_t v)
 {
   std::ostringstream oss;
   oss << "0x" << std::hex << std::setw(16) << std::setfill('0') << v;
-  return oss.str();
-}
-
-static std::string JsonEscape(const std::string& s)
-{
-  std::ostringstream oss;
-  for (unsigned char uc : s) {
-    const char c = static_cast<char>(uc);
-    switch (c) {
-      case '\\':
-        oss << "\\\\";
-        break;
-      case '"':
-        oss << "\\\"";
-        break;
-      case '\n':
-        oss << "\\n";
-        break;
-      case '\r':
-        oss << "\\r";
-        break;
-      case '\t':
-        oss << "\\t";
-        break;
-      default:
-        if (uc < 0x20) {
-          // Control characters must be escaped.
-          oss << "\\u" << std::hex << std::setw(4) << std::setfill('0') << static_cast<int>(uc) << std::dec;
-        } else {
-          oss << c;
-        }
-        break;
-    }
-  }
   return oss.str();
 }
 
@@ -234,51 +201,49 @@ static void WriteStdoutSummary(const std::string& pathA, const std::string& path
 static bool WriteJson(const std::string& outPath, const std::string& pathA, const std::string& pathB, const World& a,
                       const World& b, std::uint64_t hashA, std::uint64_t hashB, const WorldDiffStats& d)
 {
-  std::ostringstream oss;
-  oss << "{\n";
-  oss << "  \"fileA\": \"" << JsonEscape(pathA) << "\",\n";
-  oss << "  \"fileB\": \"" << JsonEscape(pathB) << "\",\n";
-  oss << "  \"hashA\": \"" << HexU64(hashA) << "\",\n";
-  oss << "  \"hashB\": \"" << HexU64(hashB) << "\",\n";
-  oss << "  \"hashMatch\": " << (hashA == hashB ? "true" : "false") << ",\n";
-
-  auto writeWorld = [&](const char* name, const World& w) {
-    const Stats& s = w.stats();
-    oss << "  \"" << name << "\": {\n";
-    oss << "    \"width\": " << w.width() << ",\n";
-    oss << "    \"height\": " << w.height() << ",\n";
-    oss << "    \"seed\": " << w.seed() << ",\n";
-    oss << "    \"stats\": {\n";
-    oss << "      \"day\": " << s.day << ",\n";
-    oss << "      \"population\": " << s.population << ",\n";
-    oss << "      \"money\": " << s.money << "\n";
-    oss << "    }\n";
-    oss << "  }";
+  JsonValue root = JsonValue::MakeObject();
+  auto add = [](JsonValue& obj, const char* key, JsonValue v) {
+    obj.objectValue.emplace_back(key, std::move(v));
   };
 
-  writeWorld("worldA", a);
-  oss << ",\n";
-  writeWorld("worldB", b);
-  oss << ",\n";
+  add(root, "fileA", JsonValue::MakeString(pathA));
+  add(root, "fileB", JsonValue::MakeString(pathB));
+  add(root, "hashA", JsonValue::MakeString(HexU64(hashA)));
+  add(root, "hashB", JsonValue::MakeString(HexU64(hashB)));
+  add(root, "hashMatch", JsonValue::MakeBool(hashA == hashB));
 
-  oss << "  \"diff\": {\n";
-  oss << "    \"sizeMismatch\": " << (d.sizeMismatch ? "true" : "false") << ",\n";
-  oss << "    \"tilesCompared\": " << d.tilesCompared << ",\n";
-  oss << "    \"tilesDifferent\": " << d.tilesDifferent << ",\n";
-  oss << "    \"terrainDifferent\": " << d.terrainDifferent << ",\n";
-  oss << "    \"overlayDifferent\": " << d.overlayDifferent << ",\n";
-  oss << "    \"heightDifferent\": " << d.heightDifferent << ",\n";
-  oss << "    \"variationDifferent\": " << d.variationDifferent << ",\n";
-  oss << "    \"levelDifferent\": " << d.levelDifferent << ",\n";
-  oss << "    \"occupantsDifferent\": " << d.occupantsDifferent << ",\n";
-  oss << "    \"districtDifferent\": " << d.districtDifferent << "\n";
-  oss << "  }\n";
-  oss << "}\n";
+  auto makeWorld = [&](const World& w) {
+    const Stats& s = w.stats();
+    JsonValue wo = JsonValue::MakeObject();
+    add(wo, "width", JsonValue::MakeNumber(static_cast<double>(w.width())));
+    add(wo, "height", JsonValue::MakeNumber(static_cast<double>(w.height())));
+    add(wo, "seed", JsonValue::MakeNumber(static_cast<double>(w.seed())));
+    JsonValue st = JsonValue::MakeObject();
+    add(st, "day", JsonValue::MakeNumber(static_cast<double>(s.day)));
+    add(st, "population", JsonValue::MakeNumber(static_cast<double>(s.population)));
+    add(st, "money", JsonValue::MakeNumber(static_cast<double>(s.money)));
+    add(wo, "stats", std::move(st));
+    return wo;
+  };
 
-  std::ofstream f(outPath, std::ios::binary);
-  if (!f) return false;
-  f << oss.str();
-  return static_cast<bool>(f);
+  add(root, "worldA", makeWorld(a));
+  add(root, "worldB", makeWorld(b));
+
+  JsonValue diff = JsonValue::MakeObject();
+  add(diff, "sizeMismatch", JsonValue::MakeBool(d.sizeMismatch));
+  add(diff, "tilesCompared", JsonValue::MakeNumber(static_cast<double>(d.tilesCompared)));
+  add(diff, "tilesDifferent", JsonValue::MakeNumber(static_cast<double>(d.tilesDifferent)));
+  add(diff, "terrainDifferent", JsonValue::MakeNumber(static_cast<double>(d.terrainDifferent)));
+  add(diff, "overlayDifferent", JsonValue::MakeNumber(static_cast<double>(d.overlayDifferent)));
+  add(diff, "heightDifferent", JsonValue::MakeNumber(static_cast<double>(d.heightDifferent)));
+  add(diff, "variationDifferent", JsonValue::MakeNumber(static_cast<double>(d.variationDifferent)));
+  add(diff, "levelDifferent", JsonValue::MakeNumber(static_cast<double>(d.levelDifferent)));
+  add(diff, "occupantsDifferent", JsonValue::MakeNumber(static_cast<double>(d.occupantsDifferent)));
+  add(diff, "districtDifferent", JsonValue::MakeNumber(static_cast<double>(d.districtDifferent)));
+  add(root, "diff", std::move(diff));
+
+  std::string err;
+  return WriteJsonFile(outPath, root, err, JsonWriteOptions{.pretty = true, .indent = 2, .sortKeys = false});
 }
 
 static void DiffTileMask(const Tile& ta, const Tile& tb, float heightEps,

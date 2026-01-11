@@ -102,7 +102,14 @@ void EditHistory::noteTilePreEdit(const World& world, int x, int y)
 
 void EditHistory::endStroke(World& world)
 {
-  if (!m_strokeActive) return;
+  (void)endStroke(world, nullptr);
+}
+
+bool EditHistory::endStroke(World& world, Command* outCmd)
+{
+  if (outCmd) *outCmd = Command{};
+
+  if (!m_strokeActive) return false;
   m_strokeActive = false;
 
   if (world.width() != m_strokeW || world.height() != m_strokeH) {
@@ -110,7 +117,7 @@ void EditHistory::endStroke(World& world)
     m_indices.clear();
     m_before.clear();
     m_visited.clear();
-    return;
+    return false;
   }
 
   Command cmd;
@@ -133,7 +140,9 @@ void EditHistory::endStroke(World& world)
   m_before.clear();
   m_visited.clear();
 
-  if (cmd.tiles.empty() && cmd.moneyDelta == 0) return;
+  if (cmd.tiles.empty() && cmd.moneyDelta == 0) return false;
+
+  if (outCmd) *outCmd = cmd;
 
   m_undo.push_back(std::move(cmd));
   m_redo.clear();
@@ -143,10 +152,18 @@ void EditHistory::endStroke(World& world)
     const std::size_t extra = m_undo.size() - m_maxCommands;
     m_undo.erase(m_undo.begin(), m_undo.begin() + static_cast<std::ptrdiff_t>(extra));
   }
+
+  return true;
 }
 
 bool EditHistory::undo(World& world)
 {
+  return undo(world, nullptr);
+}
+
+bool EditHistory::undo(World& world, Command* outCmd)
+{
+  if (outCmd) *outCmd = Command{};
   if (m_undo.empty()) return false;
 
   Command cmd = std::move(m_undo.back());
@@ -173,12 +190,20 @@ bool EditHistory::undo(World& world)
 
   world.stats().money -= cmd.moneyDelta; // reverse
 
+  if (outCmd) *outCmd = cmd;
+
   m_redo.push_back(std::move(cmd));
   return true;
 }
 
 bool EditHistory::redo(World& world)
 {
+  return redo(world, nullptr);
+}
+
+bool EditHistory::redo(World& world, Command* outCmd)
+{
+  if (outCmd) *outCmd = Command{};
   if (m_redo.empty()) return false;
 
   Command cmd = std::move(m_redo.back());
@@ -202,6 +227,8 @@ bool EditHistory::redo(World& world)
   }
 
   world.stats().money += cmd.moneyDelta;
+
+  if (outCmd) *outCmd = cmd;
 
   m_undo.push_back(std::move(cmd));
   return true;

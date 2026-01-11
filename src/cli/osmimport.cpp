@@ -404,10 +404,13 @@ if (a == "--waterway-radius") {
           << "  size=" << world.width() << "x" << world.height() << " seed=" << world.seed() << "\n"
           << "  bounds=" << stats.bounds.minLat << "," << stats.bounds.minLon << " .. " << stats.bounds.maxLat
           << "," << stats.bounds.maxLon << "\n"
-          << "  nodes=" << stats.nodesParsed << " ways=" << stats.waysParsed << "\n"
+          << "  nodes=" << stats.nodesParsed << " ways=" << stats.waysParsed << " rels=" << stats.relationsParsed
+          << "\n"
           << "  ways: highways=" << stats.highwayWaysImported << " water=" << stats.waterWaysImported
           << " landuse=" << stats.landuseWaysImported << " parks=" << stats.parkWaysImported
           << " buildings=" << stats.buildingWaysImported << "\n"
+          << "  rels: water=" << stats.waterRelationsImported << " landuse=" << stats.landuseRelationsImported
+          << " parks=" << stats.parkRelationsImported << " buildings=" << stats.buildingRelationsImported << "\n"
           << "  tiles: roads=" << stats.roadTilesPainted << " water=" << stats.waterTilesPainted
           << " zones=" << stats.zoneTilesPainted << " parks=" << stats.parkTilesPainted << "\n";
 

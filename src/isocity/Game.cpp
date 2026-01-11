@@ -4,12 +4,14 @@
 #include "isocity/Districting.hpp"
 #include "isocity/Export.hpp"
 #include "isocity/FloodFill.hpp"
+#include "isocity/Hash.hpp"
 #include "isocity/Pathfinding.hpp"
 #include "isocity/Random.hpp"
 #include "isocity/Road.hpp"
 #include "isocity/RoadGraphTraffic.hpp"
 #include "isocity/RoadUpgradePlannerExport.hpp"
 #include "isocity/SaveLoad.hpp"
+#include "isocity/Script.hpp"
 #include "isocity/TransitPlannerExport.hpp"
 #include "isocity/ZoneAccess.hpp"
 
@@ -473,6 +475,10 @@ bool Game::loadFromPath(const std::string& path, const char* toastLabel)
   m_renderer.rebuildTextures(m_cfg.seed);
   SetWindowTitle(TextFormat("ProcIsoCity  |  seed: %llu", static_cast<unsigned long long>(m_cfg.seed)));
 
+  // Loaded world invalidates the software 3D preview.
+  m_3dPreviewDirty = true;
+  m_3dPreviewTimer = 0.0f;
+
   // Recenter camera on loaded map.
   m_camera.target = TileToWorldCenterElevated(m_world, m_cfg.mapWidth / 2, m_cfg.mapHeight / 2,
                                               static_cast<float>(m_cfg.tileWidth),
@@ -758,6 +764,214 @@ void Game::setupDevConsole()
         c.print(joinArgs(args, 0));
       });
 
+  // ScriptRunner bridge: run the same deterministic headless scripts used by the CLI tools
+  // directly inside the interactive app.
+  //
+  // This is intentionally implemented as a "transaction": we clone the current world/sim
+  // into a ScriptRunner, run the script, and only commit the new state back to the game if
+  // the script succeeds. This makes experimentation safer (a failing script won't leave the
+  // world half-mutated).
+  m_console.registerCommand(
+      "script",
+      "script [vars|clear|-e <cmd...>|[-v] <file>]  - run a ScriptRunner script and apply the result",
+      [this, toLower, joinArgs](DevConsole& c, const DevConsole::Args& args) {
+        auto printUsage = [&]() {
+          c.print("Usage:");
+          c.print("  script <file>           Run a script file and apply the result");
+          c.print("  script -v <file>        Same, but verbose (prints progress/info)");
+          c.print("  script -e <cmd...>      Evaluate a single script command line");
+          c.print("  script vars             Show persistent script variables");
+          c.print("  script clear            Clear persistent script variables");
+        };
+
+        if (args.empty()) {
+          printUsage();
+          return;
+        }
+
+        const std::string a0 = toLower(args[0]);
+        if (a0 == "vars") {
+          if (m_consoleScriptVars.empty()) {
+            c.print("(no script vars)");
+            return;
+          }
+          c.print("script vars:");
+          for (const auto& kv : m_consoleScriptVars) {
+            c.print("  " + kv.first + "=" + kv.second);
+          }
+          return;
+        }
+
+        if (a0 == "clear" || a0 == "reset") {
+          m_consoleScriptVars.clear();
+          m_consoleScriptRunIndex = 0;
+          c.print("script vars cleared");
+          return;
+        }
+
+        bool eval = false;
+        bool verbose = false;
+        std::string path;
+        std::string text;
+
+        if (a0 == "-e" || a0 == "eval") {
+          eval = true;
+          if (args.size() < 2) {
+            c.print("Usage: script -e <cmd...>");
+            return;
+          }
+          text = joinArgs(args, 1);
+        } else if (a0 == "-v" || a0 == "--verbose") {
+          verbose = true;
+          if (args.size() < 2) {
+            c.print("Usage: script -v <file>");
+            return;
+          }
+          path = args[1];
+        } else {
+          path = args[0];
+        }
+
+        // Ensure we don't run scripts mid-paint-stroke (keeps undo/state consistent).
+        endPaintStroke();
+
+        // Seed runner with a copy of the current game state so the script has a starting point.
+        ScriptRunner runner;
+        ScriptCallbacks cb;
+        cb.print = [&c](const std::string& line) { c.print(line); };
+        cb.info = [&c](const std::string& line) { c.print(line); };
+        cb.error = [&c](const std::string& line) { c.print(std::string("[script] ") + line); };
+        runner.setCallbacks(std::move(cb));
+
+        ScriptRunOptions opt;
+        opt.quiet = !verbose;
+        runner.setOptions(opt);
+
+        runner.state().vars = m_consoleScriptVars;
+        runner.state().runIndex = m_consoleScriptRunIndex;
+
+        runner.state().procCfg = m_procCfg;
+        runner.state().simCfg = m_sim.config();
+        runner.state().sim = m_sim;
+        runner.state().world = m_world;
+        runner.state().hasWorld = true;
+        runner.state().dirtyDerived = true;
+
+        auto commitState = [&](ScriptRunnerState& st, const char* toastLabel) {
+          // Persist vars across runs.
+          m_consoleScriptVars = st.vars;
+          m_consoleScriptRunIndex = st.runIndex;
+
+          // Commit the new world/sim config to the game.
+          const std::uint64_t prevSeed = m_cfg.seed;
+
+          m_world = std::move(st.world);
+          m_procCfg = st.procCfg;
+          m_sim = st.sim;
+          m_sim.resetTimer();
+
+          m_renderer.markMinimapDirty();
+          m_renderer.markBaseCacheDirtyAll();
+          m_roadGraphDirty = true;
+          m_trafficDirty = true;
+          m_goodsDirty = true;
+          m_landValueDirty = true;
+          m_transitPlanDirty = true;
+          m_transitVizDirty = true;
+          m_evacDirty = true;
+          m_roadUpgradePlanDirty = true;
+          m_roadUpgradeSelectedMaskDirty = true;
+          invalidateHydrology();
+          m_vehiclesDirty = true;
+          m_vehicles.clear();
+
+          // Road-resilience caches/suggestions are tied to the road graph.
+          m_resilienceDirty = true;
+          m_resilienceBypassesDirty = true;
+          m_resilienceBypasses.clear();
+          m_roadGraphTileToNode.clear();
+          m_roadGraphTileToEdge.clear();
+
+          // Keep flood overlay defaults in sync with the current proc-gen thresholds.
+          m_seaLevel = std::clamp(m_procCfg.waterLevel, 0.0f, 1.0f);
+
+          // Deterministic vehicle RNG seed per world seed.
+          m_vehicleRngState = (m_world.seed() ^ 0x9E3779B97F4A7C15ULL);
+
+          // Script commit invalidates undo/redo history (treat as a new session).
+          m_history.clear();
+          m_painting = false;
+
+          // Clear inspect selection/debug overlays.
+          m_inspectSelected.reset();
+          m_inspectPath.clear();
+          m_inspectPathCost = 0;
+          m_inspectInfo.clear();
+
+          // Clear any in-progress road drag preview.
+          m_roadDragActive = false;
+          m_roadDragStart.reset();
+          m_roadDragEnd.reset();
+          m_roadDragPath.clear();
+          m_roadDragBuildCost = 0;
+          m_roadDragUpgradeTiles = 0;
+          m_roadDragBridgeTiles = 0;
+          m_roadDragMoneyCost = 0;
+          m_roadDragValid = false;
+
+          // Keep config in sync with the new world, so regen & camera recenter behave.
+          m_cfg.mapWidth = m_world.width();
+          m_cfg.mapHeight = m_world.height();
+          m_cfg.seed = m_world.seed();
+
+          // If the seed changed, also vary procedural textures per seed.
+          if (m_cfg.seed != prevSeed) {
+            m_renderer.rebuildTextures(m_cfg.seed);
+          }
+
+          SetWindowTitle(TextFormat("ProcIsoCity  |  seed: %llu", static_cast<unsigned long long>(m_cfg.seed)));
+
+          // Any script commit invalidates the software 3D preview.
+          m_3dPreviewDirty = true;
+          m_3dPreviewTimer = 0.0f;
+
+          // Recenter camera on the updated map.
+          m_camera.target = TileToWorldCenterElevated(m_world, m_cfg.mapWidth / 2, m_cfg.mapHeight / 2,
+                                                      static_cast<float>(m_cfg.tileWidth),
+                                                      static_cast<float>(m_cfg.tileHeight), m_elev);
+
+          // Make HUD stats immediately correct (without waiting for the next sim tick).
+          m_sim.refreshDerivedStats(m_world);
+          clearHistory();
+          recordHistorySample(m_world.stats());
+
+          if (toastLabel && toastLabel[0] != '\0') {
+            showToast(toastLabel);
+          } else {
+            showToast("Script applied");
+          }
+
+          if (m_showSaveMenu) refreshSaveMenu();
+        };
+
+        const bool ok = eval ? runner.runText(text, "<console>") : runner.runFile(path);
+        if (!ok) {
+          const std::string err = runner.lastError().empty() ? "Script failed" : runner.lastError();
+          c.print(err);
+          if (!runner.lastErrorPath().empty() && runner.lastErrorLine() > 0) {
+            c.print("  at " + runner.lastErrorPath() + ":" + std::to_string(runner.lastErrorLine()));
+          }
+          showToast("Script failed", 4.0f);
+          return;
+        }
+
+        if (eval) {
+          commitState(runner.state(), "Script eval applied");
+        } else {
+          commitState(runner.state(), "Script applied");
+        }
+      });
+
   // --- world/simulation ---
   m_console.registerCommand(
       "seed", "seed <uint64>  - regenerate the world with a specific seed",
@@ -952,7 +1166,17 @@ void Game::setupDevConsole()
       "step", "step         - advance the simulation by one day (like 'N' while paused)",
       [this](DevConsole& c, const DevConsole::Args&) {
         endPaintStroke();
+
+        if (m_replayCapture.active()) {
+          std::string err;
+          (void)m_replayCapture.captureSettingsIfChanged(m_world, m_procCfg, m_sim, err);
+        }
+
         m_sim.stepOnce(m_world);
+
+        if (m_replayCapture.active()) {
+          m_replayCapture.recordTicks(1);
+        }
         recordHistorySample(m_world.stats());
         m_trafficDirty = true;
         m_goodsDirty = true;
@@ -960,7 +1184,7 @@ void Game::setupDevConsole()
         m_vehiclesDirty = true;
         m_transitPlanDirty = true;
         m_transitVizDirty = true;
-  m_evacDirty = true;
+        m_evacDirty = true;
         m_roadUpgradePlanDirty = true;
         m_roadUpgradeSelectedMaskDirty = true;
         showToast("Sim step");
@@ -5215,6 +5439,11 @@ void Game::beginPaintStroke()
   m_tilesEditedThisStroke.clear();
   m_history.beginStroke(m_world);
 
+  if (m_replayCapture.active()) {
+    // World hash before any stroke modifications (used as the patch base hash).
+    m_replayStrokeBaseHash = HashWorld(m_world, true);
+  }
+
   // Snapshot heights for order-independent smoothing.
   m_heightSnapshot.clear();
   if (m_tool == Tool::SmoothTerrain) {
@@ -5241,7 +5470,9 @@ void Game::endPaintStroke()
 {
   if (!m_painting) return;
   m_painting = false;
-  m_history.endStroke(m_world);
+
+  EditHistory::Command cmd;
+  const bool committed = m_history.endStroke(m_world, m_replayCapture.active() ? &cmd : nullptr);
 
   // A stroke potentially changes many tiles; update the minimap lazily.
   m_renderer.markMinimapDirty();
@@ -5265,6 +5496,13 @@ void Game::endPaintStroke()
 
   // Keep HUD numbers (roads/parks/capacities) responsive even before the next sim tick.
   m_sim.refreshDerivedStats(m_world);
+
+  if (committed && m_replayCapture.active()) {
+    std::string err;
+    (void)m_replayCapture.recordTileCommandPatch(m_world, cmd, m_replayStrokeBaseHash, /*useBeforeAsTarget=*/false,
+                                                 err);
+  }
+  m_replayStrokeBaseHash = 0;
 
   // Any edit stroke potentially changes travel demand and the road graph.
   m_transitPlanDirty = true;
@@ -7410,8 +7648,20 @@ void Game::doUndo()
   // Commit any in-progress stroke before undoing.
   endPaintStroke();
 
-  if (m_history.undo(m_world)) {
+  std::uint64_t baseHash = 0;
+  EditHistory::Command cmd;
+  if (m_replayCapture.active()) {
+    baseHash = HashWorld(m_world, true);
+  }
+
+  if (m_history.undo(m_world, m_replayCapture.active() ? &cmd : nullptr)) {
     m_sim.refreshDerivedStats(m_world);
+
+    if (m_replayCapture.active()) {
+      std::string err;
+      (void)m_replayCapture.recordTileCommandPatch(m_world, cmd, baseHash, /*useBeforeAsTarget=*/true, err);
+    }
+
     m_renderer.markMinimapDirty();
     m_renderer.markBaseCacheDirtyAll();
     m_roadGraphDirty = true;
@@ -7420,7 +7670,7 @@ void Game::doUndo()
     m_landValueDirty = true;
     m_transitPlanDirty = true;
     m_transitVizDirty = true;
-  m_evacDirty = true;
+    m_evacDirty = true;
     m_roadUpgradePlanDirty = true;
     m_roadUpgradeSelectedMaskDirty = true;
     invalidateHydrology();
@@ -7435,8 +7685,20 @@ void Game::doRedo()
 {
   endPaintStroke();
 
-  if (m_history.redo(m_world)) {
+  std::uint64_t baseHash = 0;
+  EditHistory::Command cmd;
+  if (m_replayCapture.active()) {
+    baseHash = HashWorld(m_world, true);
+  }
+
+  if (m_history.redo(m_world, m_replayCapture.active() ? &cmd : nullptr)) {
     m_sim.refreshDerivedStats(m_world);
+
+    if (m_replayCapture.active()) {
+      std::string err;
+      (void)m_replayCapture.recordTileCommandPatch(m_world, cmd, baseHash, /*useBeforeAsTarget=*/false, err);
+    }
+
     m_renderer.markMinimapDirty();
     m_renderer.markBaseCacheDirtyAll();
     m_roadGraphDirty = true;
@@ -7445,7 +7707,7 @@ void Game::doRedo()
     m_landValueDirty = true;
     m_transitPlanDirty = true;
     m_transitVizDirty = true;
-  m_evacDirty = true;
+    m_evacDirty = true;
     m_roadUpgradePlanDirty = true;
     m_roadUpgradeSelectedMaskDirty = true;
     invalidateHydrology();
@@ -7998,7 +8260,17 @@ void Game::handleInput(float dt)
 
   if (m_simPaused && IsKeyPressed(KEY_N)) {
     endPaintStroke();
+
+    if (m_replayCapture.active()) {
+      std::string err;
+      (void)m_replayCapture.captureSettingsIfChanged(m_world, m_procCfg, m_sim, err);
+    }
+
     m_sim.stepOnce(m_world);
+
+    if (m_replayCapture.active()) {
+      m_replayCapture.recordTicks(1);
+    }
     recordHistorySample(m_world.stats());
     m_trafficDirty = true;
     m_goodsDirty = true;
@@ -8006,7 +8278,7 @@ void Game::handleInput(float dt)
     m_vehiclesDirty = true;
     m_transitPlanDirty = true;
     m_transitVizDirty = true;
-  m_evacDirty = true;
+    m_evacDirty = true;
     m_roadUpgradePlanDirty = true;
     m_roadUpgradeSelectedMaskDirty = true;
     showToast("Sim step");
@@ -8444,7 +8716,7 @@ void Game::handleInput(float dt)
       m_vehiclesDirty = true;
       m_transitPlanDirty = true;
       m_transitVizDirty = true;
-  m_evacDirty = true;
+      m_evacDirty = true;
       m_outsideOverlayRoadToEdge.clear();
     } else if (m_showTrafficModel) {
       // Traffic model adjustments
@@ -9260,11 +9532,19 @@ void Game::update(float dt)
     const int si = std::clamp(m_simSpeedIndex, 0, kSimSpeedCount - 1);
     const float speed = kSimSpeeds[static_cast<std::size_t>(si)];
 
+    if (m_replayCapture.active()) {
+      std::string err;
+      (void)m_replayCapture.captureSettingsIfChanged(m_world, m_procCfg, m_sim, err);
+    }
+
     std::vector<Stats> tickStats;
     tickStats.reserve(4);
     const int ticks = m_sim.update(m_world, dt * speed, &tickStats);
 
     if (ticks > 0) {
+      if (m_replayCapture.active()) {
+        m_replayCapture.recordTicks(static_cast<std::uint32_t>(ticks));
+      }
       // The sim advanced 1..N ticks. These derived overlays depend on occupants/jobs.
       m_trafficDirty = true;
       m_goodsDirty = true;

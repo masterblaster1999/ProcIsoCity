@@ -37,12 +37,20 @@ public:
   // Stroke lifecycle.
   void beginStroke(const World& world);
   void noteTilePreEdit(const World& world, int x, int y);
+  // Returns true and optionally outputs the committed command if a command was
+  // recorded (i.e., there were tile changes and/or a money delta).
+  bool endStroke(World& world, Command* outCmd);
+  // Back-compat wrapper (ignores the committed command).
   void endStroke(World& world);
   bool strokeActive() const { return m_strokeActive; }
 
   // Undo/redo.
   bool canUndo() const { return !m_undo.empty(); }
   bool canRedo() const { return !m_redo.empty(); }
+  // Optional outCmd allows callers (e.g. deterministic replay capture) to
+  // record exactly what was applied.
+  bool undo(World& world, Command* outCmd);
+  bool redo(World& world, Command* outCmd);
   bool undo(World& world);
   bool redo(World& world);
 

@@ -1,5 +1,8 @@
 #include "isocity/TransitPlannerExport.hpp"
 
+#include "isocity/Geometry.hpp"
+#include "isocity/Json.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -99,17 +102,22 @@ bool EnsureParentDir(const std::string& path)
   return true;
 }
 
-void WriteJsonPointArray(std::ostream& os, const Point& p)
+void WriteJsonPointArray(JsonWriter& jw, const Point& p)
 {
-  os << '[' << p.x << ',' << p.y << ']';
+  jw.beginArray();
+  jw.intValue(p.x);
+  jw.intValue(p.y);
+  jw.endArray();
 }
 
-void WriteGeoJsonPointCoords(std::ostream& os, const Point& p)
+void WriteGeoJsonTileCenterCoords(JsonWriter& jw, const Point& p)
 {
-  // Tile coordinate space; users can interpret these however they want.
-  os << '[' << p.x << ',' << p.y << ']';
+  // Tile-center coordinate space (x+0.5, y+0.5) so the output aligns with mapexport road centerlines.
+  jw.beginArray();
+  jw.numberValue(static_cast<double>(p.x) + 0.5);
+  jw.numberValue(static_cast<double>(p.y) + 0.5);
+  jw.endArray();
 }
-
 struct StopSet {
   std::vector<Point> points;
   std::vector<int> nodeIds; // -1 for tile-sampled stops
@@ -170,75 +178,109 @@ bool WriteTransitPlanJson(std::ostream& os, const RoadGraph& g, const TransitPla
     return false;
   }
 
-  os << "{\n";
-  os << "  \"version\":1,\n";
-  os << "  \"weightMode\":\"" << TransitEdgeWeightModeName(plan.cfg.weightMode) << "\",\n";
-  os << "  \"stopMode\":\"" << TransitStopModeName(cfg.stopMode) << "\",\n";
-  os << "  \"stopSpacingTiles\":" << cfg.stopSpacingTiles << ",\n";
-  os << "  \"totalDemand\":" << plan.totalDemand << ",\n";
-  os << "  \"coveredDemand\":" << plan.coveredDemand << ",\n";
-  os << "  \"lines\":[\n";
+  JsonWriteOptions jopt{};
+  jopt.pretty = true;
+  jopt.indent = 2;
+  jopt.sortKeys = false;
 
-  for (std::size_t li = 0; li < plan.lines.size(); ++li) {
-    const TransitLine& line = plan.lines[li];
+  JsonWriter jw(os, jopt);
 
-    os << "    {\n";
-    os << "      \"id\":" << line.id << ",\n";
-    os << "      \"sumDemand\":" << line.sumDemand << ",\n";
-    os << "      \"baseCost\":" << line.baseCost << ",\n";
+  jw.beginObject();
+
+  jw.key("version");
+  jw.intValue(1);
+
+  jw.key("weightMode");
+  jw.stringValue(TransitEdgeWeightModeName(plan.cfg.weightMode));
+
+  jw.key("stopMode");
+  jw.stringValue(TransitStopModeName(cfg.stopMode));
+
+  jw.key("stopSpacingTiles");
+  jw.intValue(cfg.stopSpacingTiles);
+
+  jw.key("totalDemand");
+  jw.uintValue(plan.totalDemand);
+
+  jw.key("coveredDemand");
+  jw.uintValue(plan.coveredDemand);
+
+  jw.key("lines");
+  jw.beginArray();
+
+  for (const TransitLine& line : plan.lines) {
+    jw.beginObject();
+
+    jw.key("id");
+    jw.intValue(line.id);
+
+    jw.key("sumDemand");
+    jw.uintValue(line.sumDemand);
+
+    jw.key("baseCost");
+    jw.uintValue(line.baseCost);
 
     // Node ids + coords.
-    os << "      \"nodes\":[";
-    for (std::size_t i = 0; i < line.nodes.size(); ++i) {
-      const int nid = line.nodes[i];
-      if (i) os << ',';
+    jw.key("nodes");
+    jw.beginArray();
+    for (int nid : line.nodes) {
       Point p{};
       if (nid >= 0 && nid < static_cast<int>(g.nodes.size())) p = g.nodes[static_cast<std::size_t>(nid)].pos;
-      os << "{\"id\":" << nid << ",\"x\":" << p.x << ",\"y\":" << p.y << "}";
+
+      jw.beginObject();
+      jw.key("id");
+      jw.intValue(nid);
+      jw.key("x");
+      jw.intValue(p.x);
+      jw.key("y");
+      jw.intValue(p.y);
+      jw.endObject();
     }
-    os << "]";
+    jw.endArray();
 
     // Optional stops (redundant but handy for some pipelines).
     if (cfg.includeStops) {
       const StopSet stops = ComputeStops(g, line, cfg);
-      os << ",\n      \"stops\":[";
-      for (std::size_t i = 0; i < stops.points.size(); ++i) {
-        if (i) os << ',';
-        WriteJsonPointArray(os, stops.points[i]);
+      jw.key("stops");
+      jw.beginArray();
+      for (const Point& p : stops.points) {
+        WriteJsonPointArray(jw, p);
       }
-      os << "]";
+      jw.endArray();
     }
 
     // Edge indices.
-    os << ",\n      \"edges\":[";
-    for (std::size_t i = 0; i < line.edges.size(); ++i) {
-      if (i) os << ',';
-      os << line.edges[i];
+    jw.key("edges");
+    jw.beginArray();
+    for (int eidx : line.edges) {
+      jw.intValue(eidx);
     }
-    os << "]";
+    jw.endArray();
 
     // Optional tile polyline.
     if (cfg.includeTiles) {
       std::vector<Point> tiles;
-      if (!BuildTransitLineTilePolyline(g, line, tiles)) {
-        // Keep output valid; just emit empty tiles.
-        tiles.clear();
+      if (!BuildTransitLineTilePolyline(g, line, tiles)) tiles.clear();
+
+      jw.key("tiles");
+      jw.beginArray();
+      for (const Point& p : tiles) {
+        WriteJsonPointArray(jw, p);
       }
-      os << ",\n      \"tiles\":[";
-      for (std::size_t i = 0; i < tiles.size(); ++i) {
-        if (i) os << ',';
-        WriteJsonPointArray(os, tiles[i]);
-      }
-      os << "]";
+      jw.endArray();
     }
 
-    os << "\n    }";
-    if (li + 1 < plan.lines.size()) os << ',';
-    os << "\n";
+    jw.endObject();
   }
 
-  os << "  ]\n";
-  os << "}\n";
+  jw.endArray();  // lines
+  jw.endObject(); // root
+
+  if (!jw.ok() || !os.good()) {
+    if (outError) *outError = jw.error().empty() ? "failed to write JSON" : jw.error();
+    return false;
+  }
+
   return true;
 }
 
@@ -267,38 +309,78 @@ bool WriteTransitPlanGeoJson(std::ostream& os, const RoadGraph& g, const Transit
     return false;
   }
 
-  os << "{\n";
-  os << "  \"type\":\"FeatureCollection\",\n";
-  os << "  \"features\":[\n";
+  JsonWriteOptions jopt{};
+  jopt.pretty = true;
+  jopt.indent = 2;
+  jopt.sortKeys = false;
 
-  bool firstFeature = true;
-  auto emitComma = [&]() {
-    if (!firstFeature) os << ",\n";
-    firstFeature = false;
+  JsonWriter jw(os, jopt);
+
+  auto writeLineCoords = [&](const std::vector<Point>& pts) {
+    jw.beginArray();
+    for (const Point& p : pts) {
+      WriteGeoJsonTileCenterCoords(jw, p);
+    }
+    jw.endArray();
   };
+
+  jw.beginObject();
+  jw.key("type");
+  jw.stringValue("FeatureCollection");
+
+  jw.key("properties");
+  jw.beginObject();
+  jw.key("coordSpace");
+  jw.stringValue("tile_center");
+  jw.key("weightMode");
+  jw.stringValue(TransitEdgeWeightModeName(plan.cfg.weightMode));
+  jw.key("stopMode");
+  jw.stringValue(TransitStopModeName(cfg.stopMode));
+  jw.key("stopSpacingTiles");
+  jw.intValue(cfg.stopSpacingTiles);
+  jw.endObject();
+
+  jw.key("features");
+  jw.beginArray();
 
   for (const TransitLine& line : plan.lines) {
     std::vector<Point> tiles;
     if (!BuildTransitLineTilePolyline(g, line, tiles)) tiles.clear();
 
+    // For visualization, reduce vertex count (does not change geometry).
+    std::vector<Point> simplified = tiles;
+    SimplifyPolylineCollinear(simplified);
+
     // LineString feature.
-    emitComma();
-    os << "    {\n";
-    os << "      \"type\":\"Feature\",\n";
-    os << "      \"properties\":{\"id\":" << line.id
-       << ",\"sumDemand\":" << line.sumDemand
-       << ",\"baseCost\":" << line.baseCost
-       << "},\n";
-    os << "      \"geometry\":{\n";
-    os << "        \"type\":\"LineString\",\n";
-    os << "        \"coordinates\":[";
-    for (std::size_t i = 0; i < tiles.size(); ++i) {
-      if (i) os << ',';
-      WriteGeoJsonPointCoords(os, tiles[i]);
-    }
-    os << "]\n";
-    os << "      }\n";
-    os << "    }";
+    jw.beginObject();
+    jw.key("type");
+    jw.stringValue("Feature");
+
+    jw.key("properties");
+    jw.beginObject();
+    jw.key("layer");
+    jw.stringValue("transit_line");
+    jw.key("id");
+    jw.intValue(line.id);
+    jw.key("sumDemand");
+    jw.uintValue(line.sumDemand);
+    jw.key("baseCost");
+    jw.uintValue(line.baseCost);
+    jw.key("tiles");
+    jw.intValue(static_cast<int>(tiles.size()));
+    jw.key("points");
+    jw.intValue(static_cast<int>(simplified.size()));
+    jw.endObject();
+
+    jw.key("geometry");
+    jw.beginObject();
+    jw.key("type");
+    jw.stringValue("LineString");
+    jw.key("coordinates");
+    writeLineCoords(simplified);
+    jw.endObject();
+
+    jw.endObject();
 
     if (cfg.includeStops) {
       const StopSet stops = ComputeStops(g, line, cfg);
@@ -306,23 +388,43 @@ bool WriteTransitPlanGeoJson(std::ostream& os, const RoadGraph& g, const Transit
         const Point p = stops.points[si];
         const int nid = (si < stops.nodeIds.size()) ? stops.nodeIds[si] : -1;
 
-        emitComma();
-        os << "    {\n";
-        os << "      \"type\":\"Feature\",\n";
-        os << "      \"properties\":{\"lineId\":" << line.id
-           << ",\"stop\":" << si
-           << ",\"nodeId\":" << nid
-           << "},\n";
-        os << "      \"geometry\":{\"type\":\"Point\",\"coordinates\":";
-        WriteGeoJsonPointCoords(os, p);
-        os << "}\n";
-        os << "    }";
+        jw.beginObject();
+        jw.key("type");
+        jw.stringValue("Feature");
+
+        jw.key("properties");
+        jw.beginObject();
+        jw.key("layer");
+        jw.stringValue("transit_stop");
+        jw.key("lineId");
+        jw.intValue(line.id);
+        jw.key("stop");
+        jw.intValue(static_cast<int>(si));
+        jw.key("nodeId");
+        jw.intValue(nid);
+        jw.endObject();
+
+        jw.key("geometry");
+        jw.beginObject();
+        jw.key("type");
+        jw.stringValue("Point");
+        jw.key("coordinates");
+        WriteGeoJsonTileCenterCoords(jw, p);
+        jw.endObject();
+
+        jw.endObject();
       }
     }
   }
 
-  os << "\n  ]\n";
-  os << "}\n";
+  jw.endArray();
+  jw.endObject();
+
+  if (!jw.ok() || !os.good()) {
+    if (outError) *outError = jw.error().empty() ? "failed to write GeoJSON" : jw.error();
+    return false;
+  }
+
   return true;
 }
 

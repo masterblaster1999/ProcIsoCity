@@ -65,6 +65,7 @@ add_library(isocity_core
   src/isocity/Script.cpp
   src/isocity/AutoBuild.cpp
   src/isocity/Replay.cpp
+  src/isocity/ReplayCapture.cpp
   src/isocity/WorldPatch.cpp
   src/isocity/World.cpp
   src/isocity/WorldDiff.cpp

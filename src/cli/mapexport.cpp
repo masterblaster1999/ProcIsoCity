@@ -9,7 +9,9 @@
 
 #include "isocity/DistrictStats.hpp"
 #include "isocity/GeoJsonExport.hpp"
+#include "isocity/Geometry.hpp"
 #include "isocity/Hash.hpp"
+#include "isocity/Json.hpp"
 #include "isocity/LandValue.hpp"
 #include "isocity/ProcGen.hpp"
 #include "isocity/RoadGraph.hpp"
@@ -350,31 +352,70 @@ int main(int argc, char** argv)
     return 4;
   }
 
-  // Deterministic float formatting for tile centers.
-  os.setf(std::ios::fixed);
-  os << std::setprecision(6);
 
   const std::uint64_t hashTiles = HashWorld(world, false);
   const std::uint64_t hashAll = HashWorld(world, true);
 
-  os << "{\n";
-  os << "  \"type\":\"FeatureCollection\",\n";
-  os << "  \"properties\":{\"w\":" << world.width()
-     << ",\"h\":" << world.height()
-     << ",\"seed\":" << world.seed()
-     << ",\"hashTiles\":" << hashTiles
-     << ",\"hash\":" << hashAll
-     << "},\n";
-  os << "  \"features\":[\n";
+  JsonWriteOptions jopt{};
+  jopt.pretty = true;
+  jopt.indent = 2;
+  jopt.sortKeys = false;
 
-  bool firstFeature = true;
-  auto emitComma = [&]() {
-    if (!firstFeature) os << ",\n";
-    firstFeature = false;
-  };
+  JsonWriter jw(os, jopt);
 
   const int W = world.width();
   const int H = world.height();
+
+  auto writeTileCenter = [&](const Point& p) {
+    jw.beginArray();
+    jw.numberValue(static_cast<double>(p.x) + 0.5);
+    jw.numberValue(static_cast<double>(p.y) + 0.5);
+    jw.endArray();
+  };
+
+  auto writeLineStringTileCenters = [&](const std::vector<Point>& pts) {
+    jw.beginArray();
+    for (const Point& p : pts) {
+      writeTileCenter(p);
+    }
+    jw.endArray();
+  };
+
+  jw.beginObject();
+  jw.key("type");
+  jw.stringValue("FeatureCollection");
+
+  // Useful for GIS tooling and sanity-checking.
+  jw.key("bbox");
+  jw.beginArray();
+  jw.numberValue(0.0);
+  jw.numberValue(0.0);
+  jw.numberValue(static_cast<double>(W));
+  jw.numberValue(static_cast<double>(H));
+  jw.endArray();
+
+  jw.key("properties");
+  jw.beginObject();
+  jw.key("w");
+  jw.intValue(W);
+  jw.key("h");
+  jw.intValue(H);
+  jw.key("seed");
+  jw.uintValue(world.seed());
+  jw.key("hashTiles");
+  jw.uintValue(hashTiles);
+  jw.key("hash");
+  jw.uintValue(hashAll);
+  jw.key("coordSpace");
+  jw.stringValue("tile_grid");
+  jw.key("polygonSpace");
+  jw.stringValue("tile_corner");
+  jw.key("lineSpace");
+  jw.stringValue("tile_center");
+  jw.endObject();
+
+  jw.key("features");
+  jw.beginArray();
 
   // --- Water polygons ---
   if (includeWater) {
@@ -398,14 +439,25 @@ int main(int argc, char** argv)
       return 5;
     }
 
-    for (const LabeledGeometry& g : geoms) {
+    for (LabeledGeometry& g : geoms) {
       if (g.label != 1) continue;
-      emitComma();
-      os << "    {\"type\":\"Feature\",\"properties\":{";
-      os << "\"layer\":\"water\",\"tiles\":" << waterTiles;
-      os << "},\"geometry\":";
-      WriteGeoJsonGeometry(os, g.geom);
-      os << "}";
+      SimplifyVectorMultiPolygonCollinear(g.geom);
+
+      jw.beginObject();
+      jw.key("type");
+      jw.stringValue("Feature");
+
+      jw.key("properties");
+      jw.beginObject();
+      jw.key("layer");
+      jw.stringValue("water");
+      jw.key("tiles");
+      jw.intValue(waterTiles);
+      jw.endObject();
+
+      jw.key("geometry");
+      WriteGeoJsonGeometry(jw, g.geom);
+      jw.endObject();
     }
   }
 
@@ -461,27 +513,41 @@ int main(int argc, char** argv)
     }
 
     auto emitLanduse = [&](int label, const LayerAgg& agg) {
-      for (const LabeledGeometry& g : geoms) {
+      for (LabeledGeometry& g : geoms) {
         if (g.label != label) continue;
-        emitComma();
-        os << "    {\"type\":\"Feature\",\"properties\":{";
-        os << "\"layer\":\"landuse\",\"kind\":\"" << LanduseNameForLabel(label) << "\"";
-        os << ",\"tiles\":" << agg.tiles;
+        SimplifyVectorMultiPolygonCollinear(g.geom);
+
+        jw.beginObject();
+        jw.key("type");
+        jw.stringValue("Feature");
+
+        jw.key("properties");
+        jw.beginObject();
+        jw.key("layer");
+        jw.stringValue("landuse");
+        jw.key("kind");
+        jw.stringValue(LanduseNameForLabel(label));
+        jw.key("tiles");
+        jw.intValue(agg.tiles);
+
         if (label >= 1 && label <= 3) {
-          os << ",\"capacity\":" << agg.capacity;
-          os << ",\"occupants\":" << agg.occupants;
-          if (agg.tiles > 0) {
-            const double avgLvl = static_cast<double>(agg.levelSum) / static_cast<double>(agg.tiles);
-            os << ",\"avgLevel\":" << avgLvl;
-          } else {
-            os << ",\"avgLevel\":0";
-          }
-          os << ",\"minLevel\":" << agg.minLevel;
-          os << ",\"maxLevel\":" << agg.maxLevel;
+          jw.key("capacity");
+          jw.intValue(agg.capacity);
+          jw.key("occupants");
+          jw.intValue(agg.occupants);
+          jw.key("avgLevel");
+          jw.numberValue((agg.tiles > 0) ? (static_cast<double>(agg.levelSum) / static_cast<double>(agg.tiles)) : 0.0);
+          jw.key("minLevel");
+          jw.intValue(agg.minLevel);
+          jw.key("maxLevel");
+          jw.intValue(agg.maxLevel);
         }
-        os << "},\"geometry\":";
-        WriteGeoJsonGeometry(os, g.geom);
-        os << "}";
+
+        jw.endObject();
+
+        jw.key("geometry");
+        WriteGeoJsonGeometry(jw, g.geom);
+        jw.endObject();
       }
     };
 
@@ -518,14 +584,25 @@ int main(int argc, char** argv)
       return 5;
     }
 
-    for (const LabeledGeometry& g : geoms) {
+    for (LabeledGeometry& g : geoms) {
       if (g.label != 1) continue;
-      emitComma();
-      os << "    {\"type\":\"Feature\",\"properties\":{";
-      os << "\"layer\":\"road_tiles\",\"tiles\":" << roadTiles;
-      os << "},\"geometry\":";
-      WriteGeoJsonGeometry(os, g.geom);
-      os << "}";
+      SimplifyVectorMultiPolygonCollinear(g.geom);
+
+      jw.beginObject();
+      jw.key("type");
+      jw.stringValue("Feature");
+
+      jw.key("properties");
+      jw.beginObject();
+      jw.key("layer");
+      jw.stringValue("road_tiles");
+      jw.key("tiles");
+      jw.intValue(roadTiles);
+      jw.endObject();
+
+      jw.key("geometry");
+      WriteGeoJsonGeometry(jw, g.geom);
+      jw.endObject();
     }
   }
 
@@ -536,13 +613,30 @@ int main(int argc, char** argv)
     if (includeRoadNodes) {
       for (std::size_t i = 0; i < g.nodes.size(); ++i) {
         const RoadGraphNode& n = g.nodes[i];
-        emitComma();
-        os << "    {\"type\":\"Feature\",\"properties\":{";
-        os << "\"layer\":\"road_node\",\"id\":" << i;
-        os << ",\"degree\":" << n.edges.size();
-        os << "},\"geometry\":{\"type\":\"Point\",\"coordinates\":";
-        WriteGeoJsonTileCenter(os, n.pos);
-        os << "}}";
+
+        jw.beginObject();
+        jw.key("type");
+        jw.stringValue("Feature");
+
+        jw.key("properties");
+        jw.beginObject();
+        jw.key("layer");
+        jw.stringValue("road_node");
+        jw.key("id");
+        jw.intValue(static_cast<int>(i));
+        jw.key("degree");
+        jw.intValue(static_cast<int>(n.edges.size()));
+        jw.endObject();
+
+        jw.key("geometry");
+        jw.beginObject();
+        jw.key("type");
+        jw.stringValue("Point");
+        jw.key("coordinates");
+        writeTileCenter(n.pos);
+        jw.endObject();
+
+        jw.endObject();
       }
     }
 
@@ -565,21 +659,51 @@ int main(int argc, char** argv)
         minLvl = 0;
         maxLvl = 0;
       }
-      const double avgLvl = (!e.tiles.empty()) ? (static_cast<double>(sumLvl) / static_cast<double>(e.tiles.size())) : 0.0;
+      const double avgLvl =
+          (!e.tiles.empty()) ? (static_cast<double>(sumLvl) / static_cast<double>(e.tiles.size())) : 0.0;
 
-      emitComma();
-      os << "    {\"type\":\"Feature\",\"properties\":{";
-      os << "\"layer\":\"road\",\"id\":" << ei;
-      os << ",\"a\":" << e.a << ",\"b\":" << e.b;
-      os << ",\"length\":" << e.length;
-      os << ",\"tiles\":" << e.tiles.size();
-      os << ",\"minLevel\":" << minLvl;
-      os << ",\"maxLevel\":" << maxLvl;
-      os << ",\"avgLevel\":" << avgLvl;
-      os << ",\"waterTiles\":" << waterCount;
-      os << "},\"geometry\":{\"type\":\"LineString\",\"coordinates\":";
-      WriteGeoJsonLineStringCoords(os, e.tiles);
-      os << "}}";
+      std::vector<Point> pts = e.tiles;
+      SimplifyPolylineCollinear(pts);
+
+      jw.beginObject();
+      jw.key("type");
+      jw.stringValue("Feature");
+
+      jw.key("properties");
+      jw.beginObject();
+      jw.key("layer");
+      jw.stringValue("road");
+      jw.key("id");
+      jw.intValue(static_cast<int>(ei));
+      jw.key("a");
+      jw.intValue(e.a);
+      jw.key("b");
+      jw.intValue(e.b);
+      jw.key("length");
+      jw.intValue(e.length);
+      jw.key("tiles");
+      jw.intValue(static_cast<int>(e.tiles.size()));
+      jw.key("points");
+      jw.intValue(static_cast<int>(pts.size()));
+      jw.key("minLevel");
+      jw.intValue(minLvl);
+      jw.key("maxLevel");
+      jw.intValue(maxLvl);
+      jw.key("avgLevel");
+      jw.numberValue(avgLvl);
+      jw.key("waterTiles");
+      jw.intValue(waterCount);
+      jw.endObject();
+
+      jw.key("geometry");
+      jw.beginObject();
+      jw.key("type");
+      jw.stringValue("LineString");
+      jw.key("coordinates");
+      writeLineStringTileCenters(pts);
+      jw.endObject();
+
+      jw.endObject();
     }
   }
 
@@ -587,7 +711,8 @@ int main(int argc, char** argv)
   if (includeDistricts) {
     // Compute land value so district stats can report avgLandValue and tax revenue.
     const LandValueResult lv = ComputeLandValue(world, LandValueConfig{}, nullptr, nullptr);
-    const std::vector<float>* lvField = (lv.value.size() == static_cast<std::size_t>(W) * static_cast<std::size_t>(H)) ? &lv.value : nullptr;
+    const std::vector<float>* lvField =
+        (lv.value.size() == static_cast<std::size_t>(W) * static_cast<std::size_t>(H)) ? &lv.value : nullptr;
     const DistrictStatsResult ds = ComputeDistrictStats(world, simCfg, lvField, nullptr);
 
     const int bg = -1;
@@ -598,7 +723,8 @@ int main(int argc, char** argv)
         if (!districtIncludeWater && t.terrain == Terrain::Water) {
           labels[static_cast<std::size_t>(y) * static_cast<std::size_t>(W) + static_cast<std::size_t>(x)] = bg;
         } else {
-          labels[static_cast<std::size_t>(y) * static_cast<std::size_t>(W) + static_cast<std::size_t>(x)] = static_cast<int>(t.district);
+          labels[static_cast<std::size_t>(y) * static_cast<std::size_t>(W) + static_cast<std::size_t>(x)] =
+              static_cast<int>(t.district);
         }
       }
     }
@@ -611,38 +737,80 @@ int main(int argc, char** argv)
       return 5;
     }
 
-    for (const LabeledGeometry& g : geoms) {
+    for (LabeledGeometry& g : geoms) {
       const int id = g.label;
       if (id < 0 || id >= kDistrictCount) continue;
+
+      SimplifyVectorMultiPolygonCollinear(g.geom);
       const DistrictSummary& d = ds.districts[static_cast<std::size_t>(id)];
 
-      emitComma();
-      os << "    {\"type\":\"Feature\",\"properties\":{";
-      os << "\"layer\":\"district\",\"id\":" << id;
-      os << ",\"tiles\":" << d.tiles;
-      os << ",\"landTiles\":" << d.landTiles;
-      os << ",\"waterTiles\":" << d.waterTiles;
-      os << ",\"roads\":" << d.roads;
-      os << ",\"parks\":" << d.parks;
-      os << ",\"resTiles\":" << d.resTiles;
-      os << ",\"comTiles\":" << d.comTiles;
-      os << ",\"indTiles\":" << d.indTiles;
-      os << ",\"population\":" << d.population;
-      os << ",\"housingCapacity\":" << d.housingCapacity;
-      os << ",\"jobsCapacity\":" << d.jobsCapacity;
-      os << ",\"employed\":" << d.employed;
-      os << ",\"avgLandValue\":" << static_cast<double>(d.avgLandValue);
-      os << ",\"taxRevenue\":" << d.taxRevenue;
-      os << ",\"maintenanceCost\":" << d.maintenanceCost;
-      os << ",\"net\":" << d.net;
-      os << "},\"geometry\":";
-      WriteGeoJsonGeometry(os, g.geom);
-      os << "}";
+      jw.beginObject();
+      jw.key("type");
+      jw.stringValue("Feature");
+
+      jw.key("properties");
+      jw.beginObject();
+      jw.key("layer");
+      jw.stringValue("district");
+      jw.key("id");
+      jw.intValue(id);
+      jw.key("tiles");
+      jw.intValue(d.tiles);
+      jw.key("landTiles");
+      jw.intValue(d.landTiles);
+      jw.key("waterTiles");
+      jw.intValue(d.waterTiles);
+      jw.key("roads");
+      jw.intValue(d.roads);
+      jw.key("parks");
+      jw.intValue(d.parks);
+      jw.key("resTiles");
+      jw.intValue(d.resTiles);
+      jw.key("comTiles");
+      jw.intValue(d.comTiles);
+      jw.key("indTiles");
+      jw.intValue(d.indTiles);
+      jw.key("zoneTiles");
+      jw.intValue(d.zoneTiles);
+      jw.key("zoneTilesAccessible");
+      jw.intValue(d.zoneTilesAccessible);
+      jw.key("population");
+      jw.intValue(d.population);
+      jw.key("housingCapacity");
+      jw.intValue(d.housingCapacity);
+      jw.key("jobsCapacity");
+      jw.intValue(d.jobsCapacity);
+      jw.key("jobsCapacityAccessible");
+      jw.intValue(d.jobsCapacityAccessible);
+      jw.key("employed");
+      jw.intValue(d.employed);
+      jw.key("avgLandValue");
+      jw.numberValue(static_cast<double>(d.avgLandValue));
+      jw.key("taxRevenue");
+      jw.intValue(d.taxRevenue);
+      jw.key("roadMaintenanceCost");
+      jw.intValue(d.roadMaintenanceCost);
+      jw.key("parkMaintenanceCost");
+      jw.intValue(d.parkMaintenanceCost);
+      jw.key("maintenanceCost");
+      jw.intValue(d.maintenanceCost);
+      jw.key("net");
+      jw.intValue(d.net);
+      jw.endObject();
+
+      jw.key("geometry");
+      WriteGeoJsonGeometry(jw, g.geom);
+      jw.endObject();
     }
   }
 
-  os << "\n  ]\n";
-  os << "}\n";
+  jw.endArray();  // features
+  jw.endObject(); // root
+
+  if (!jw.ok() || !os.good()) {
+    std::cerr << "GeoJSON write failed: " << jw.error() << "\n";
+    return 6;
+  }
 
   return 0;
 }

@@ -1,5 +1,7 @@
 #include "isocity/GeoJsonExport.hpp"
 
+#include "isocity/Json.hpp"
+
 #include <ostream>
 
 namespace isocity {
@@ -53,5 +55,72 @@ void WriteGeoJsonGeometry(std::ostream& os, const VectorMultiPolygon& mp)
   WriteGeoJsonMultiPolygonCoords(os, mp);
   os << "}";
 }
+
+
+
+// Streaming (JsonWriter) overloads ---------------------------------------------------------------
+
+void WriteGeoJsonRing(JsonWriter& w, const std::vector<IPoint>& ring)
+{
+  w.beginArray();
+  for (const IPoint& p : ring) {
+    w.beginArray();
+    w.intValue(p.x);
+    w.intValue(p.y);
+    w.endArray();
+  }
+  w.endArray();
+}
+
+void WriteGeoJsonPolygonCoords(JsonWriter& w, const VectorPolygon& poly)
+{
+  w.beginArray();
+  WriteGeoJsonRing(w, poly.outer);
+  for (const auto& hole : poly.holes) {
+    WriteGeoJsonRing(w, hole);
+  }
+  w.endArray();
+}
+
+void WriteGeoJsonMultiPolygonCoords(JsonWriter& w, const VectorMultiPolygon& mp)
+{
+  w.beginArray();
+  for (const auto& poly : mp.polygons) {
+    WriteGeoJsonPolygonCoords(w, poly);
+  }
+  w.endArray();
+}
+
+void WriteGeoJsonGeometry(JsonWriter& w, const VectorMultiPolygon& mp)
+{
+  if (mp.polygons.empty()) {
+    w.beginObject();
+    w.key("type");
+    w.stringValue("GeometryCollection");
+    w.key("geometries");
+    w.beginArray();
+    w.endArray();
+    w.endObject();
+    return;
+  }
+
+  if (mp.polygons.size() == 1) {
+    w.beginObject();
+    w.key("type");
+    w.stringValue("Polygon");
+    w.key("coordinates");
+    WriteGeoJsonPolygonCoords(w, mp.polygons[0]);
+    w.endObject();
+    return;
+  }
+
+  w.beginObject();
+  w.key("type");
+  w.stringValue("MultiPolygon");
+  w.key("coordinates");
+  WriteGeoJsonMultiPolygonCoords(w, mp);
+  w.endObject();
+}
+
 
 } // namespace isocity

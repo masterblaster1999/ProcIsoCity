@@ -212,6 +212,17 @@ public:
     int pivotY = 0;
   };
 
+  // Tall-ish procedural prop sprites (trees, streetlights, etc.).
+  //
+  // These are rendered as world-space sprites anchored to the isometric tile grid,
+  // keeping the project asset-free while improving “city life” visuals when zoomed in.
+  struct PropSprite {
+    Texture2D color{};
+    Texture2D emissive{}; // optional (e.g., streetlight glow)
+    int pivotX = 0;
+    int pivotY = 0;
+  };
+
   // Simple depth-sorted sprite primitive that can be injected into the world render.
   //
   // The renderer's world pass is drawn in a deterministic isometric order (diagonals / x+y).
@@ -402,6 +413,20 @@ private:
   ShadowSettings m_shadows{};
 
   std::array<std::array<Texture2D, kTerrainVariants>, kTerrainTypes> m_terrainTex{};
+
+  // Terrain transitions (auto-tiling) for shorelines and biome edges.
+  //
+  // Masks use the same 4-bit layout as roads (see World::computeRoadMask):
+  //  0x01 = (x, y-1)  (screen up-right)
+  //  0x02 = (x+1, y)  (screen down-right)
+  //  0x04 = (x, y+1)  (screen down-left)
+  //  0x08 = (x-1, y)  (screen up-left)
+  //
+  // For each mask and each terrain variant we pre-bake a blended tile:
+  //  - Water->Sand (shoreline + optional foam)
+  //  - Sand->Grass (biome edge)
+  std::array<std::array<Texture2D, kTerrainVariants>, 16> m_terrainTransWaterSand{};
+  std::array<std::array<Texture2D, kTerrainVariants>, 16> m_terrainTransSandGrass{};
   std::array<Texture2D, 6> m_overlayTex{};
 
   // Roads are auto-tiled: for each road class (level 1..3) and each connection mask (0..15)
@@ -417,8 +442,36 @@ private:
   std::vector<VehicleSprite> m_vehicleTruckPosSlope;
   std::vector<VehicleSprite> m_vehicleTruckNegSlope;
 
+  // World prop sprite variants (trees / streetlights). These are rendered directly in the world pass
+  // (not baked into band caches) because they can extend well above the tile diamond.
+  std::vector<PropSprite> m_propTreeDeciduous;
+  std::vector<PropSprite> m_propTreeConifer;
+  std::vector<PropSprite> m_propStreetLight;
+  std::vector<PropSprite> m_propPedestrian;
+
+  // Procedural building sprite variants (zone buildings). These are generated at runtime so the
+  // project stays asset-free, but provide much richer visuals than simple geometric prisms when
+  // zoomed in.
+  struct BuildingSprite {
+    Texture2D color{};
+    Texture2D emissive{}; // optional (lit windows / signage)
+    int pivotX = 0;
+    int pivotY = 0;
+  };
+
+  // Indexed by [level-1] => variant list.
+  std::array<std::vector<BuildingSprite>, 3> m_buildingResidential;
+  std::array<std::vector<BuildingSprite>, 3> m_buildingCommercial;
+  std::array<std::vector<BuildingSprite>, 3> m_buildingIndustrial;
+
   void unloadVehicleSprites();
   void rebuildVehicleSprites();
+
+  void unloadBuildingSprites();
+  void rebuildBuildingSprites();
+
+  void unloadPropSprites();
+  void rebuildPropSprites();
 
   void rebuildCloudShadowTexture();
 
@@ -470,6 +523,10 @@ private:
 
   void unloadMinimap();
   void ensureMinimapUpToDate(const World& world);
+
+  // Resolve a terrain tile texture, optionally replacing it with a transition tile when the
+  // tile borders a different biome (shorelines / sand->grass blends).
+  Texture2D& terrainWithTransitions(const World& world, int x, int y, const Tile& t);
 
   Texture2D& terrain(Terrain t, std::uint8_t variation);
   Texture2D& overlay(Overlay o);

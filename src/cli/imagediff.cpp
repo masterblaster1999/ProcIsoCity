@@ -1,4 +1,5 @@
 #include "isocity/Export.hpp"
+#include "isocity/Json.hpp"
 
 #include <cmath>
 #include <cctype>
@@ -38,29 +39,6 @@ bool ParseI32(const std::string& s, int* out)
 {
   std::ostringstream oss;
   oss << "0x" << std::hex << std::setw(16) << std::setfill('0') << v;
-  return oss.str();
-}
-
-std::string EscapeJson(const std::string& s)
-{
-  std::ostringstream oss;
-  for (unsigned char uc : s) {
-    const char c = static_cast<char>(uc);
-    switch (c) {
-      case '\\': oss << "\\\\"; break;
-      case '"': oss << "\\\""; break;
-      case '\n': oss << "\\n"; break;
-      case '\r': oss << "\\r"; break;
-      case '\t': oss << "\\t"; break;
-      default:
-        if (uc < 0x20) {
-          oss << "\\u" << std::hex << std::setw(4) << std::setfill('0') << static_cast<int>(uc) << std::dec;
-        } else {
-          oss << c;
-        }
-        break;
-    }
-  }
   return oss.str();
 }
 
@@ -211,32 +189,36 @@ int main(int argc, char** argv)
 
   // JSON report.
   if (!outJsonPath.empty()) {
-    std::ofstream f(outJsonPath, std::ios::binary);
-    if (!f) {
-      std::cerr << "failed to write json report: " << outJsonPath << "\n";
+    using isocity::JsonValue;
+    JsonValue root = JsonValue::MakeObject();
+    auto add = [](JsonValue& obj, const char* key, JsonValue v) {
+      obj.objectValue.emplace_back(key, std::move(v));
+    };
+
+    add(root, "fileA", JsonValue::MakeString(pathA));
+    add(root, "fileB", JsonValue::MakeString(pathB));
+    add(root, "width", JsonValue::MakeNumber(static_cast<double>(stats.width)));
+    add(root, "height", JsonValue::MakeNumber(static_cast<double>(stats.height)));
+    add(root, "threshold", JsonValue::MakeNumber(static_cast<double>(threshold)));
+    add(root, "pixelsCompared", JsonValue::MakeNumber(static_cast<double>(stats.pixelsCompared)));
+    add(root, "pixelsDifferent", JsonValue::MakeNumber(static_cast<double>(stats.pixelsDifferent)));
+    add(root, "maxAbsDiff", JsonValue::MakeNumber(static_cast<double>(stats.maxAbsDiff)));
+    add(root, "meanAbsDiff", JsonValue::MakeNumber(static_cast<double>(stats.meanAbsDiff)));
+    add(root, "mse", JsonValue::MakeNumber(static_cast<double>(stats.mse)));
+    if (std::isinf(stats.psnr)) {
+      add(root, "psnr", JsonValue::MakeNull());
+      add(root, "psnrIsInf", JsonValue::MakeBool(true));
+    } else {
+      add(root, "psnr", JsonValue::MakeNumber(static_cast<double>(stats.psnr)));
+      add(root, "psnrIsInf", JsonValue::MakeBool(false));
+    }
+    add(root, "match", JsonValue::MakeBool(match));
+
+    std::string jsonErr;
+    if (!isocity::WriteJsonFile(outJsonPath, root, jsonErr, isocity::JsonWriteOptions{.pretty = true, .indent = 2, .sortKeys = false})) {
+      std::cerr << "failed to write json report: " << jsonErr << "\n";
       return 2;
     }
-
-    f << "{\n";
-    f << "  \"fileA\": \"" << EscapeJson(pathA) << "\",\n";
-    f << "  \"fileB\": \"" << EscapeJson(pathB) << "\",\n";
-    f << "  \"width\": " << stats.width << ",\n";
-    f << "  \"height\": " << stats.height << ",\n";
-    f << "  \"threshold\": " << threshold << ",\n";
-    f << "  \"pixelsCompared\": " << stats.pixelsCompared << ",\n";
-    f << "  \"pixelsDifferent\": " << stats.pixelsDifferent << ",\n";
-    f << "  \"maxAbsDiff\": " << static_cast<int>(stats.maxAbsDiff) << ",\n";
-    f << "  \"meanAbsDiff\": " << std::fixed << std::setprecision(9) << stats.meanAbsDiff << ",\n";
-    f << "  \"mse\": " << std::fixed << std::setprecision(9) << stats.mse << ",\n";
-    if (std::isinf(stats.psnr)) {
-      f << "  \"psnr\": null,\n";
-      f << "  \"psnrIsInf\": true,\n";
-    } else {
-      f << "  \"psnr\": " << std::fixed << std::setprecision(6) << stats.psnr << ",\n";
-      f << "  \"psnrIsInf\": false,\n";
-    }
-    f << "  \"match\": " << (match ? "true" : "false") << "\n";
-    f << "}\n";
   }
 
   return match ? 0 : 1;

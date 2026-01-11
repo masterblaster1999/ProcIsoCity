@@ -5,6 +5,7 @@
 #include "isocity/RoadGraphTraffic.hpp"
 #include "isocity/RoadGraphTrafficExport.hpp"
 #include "isocity/SaveLoad.hpp"
+#include "isocity/Json.hpp"
 #include "isocity/Sim.hpp"
 
 #include <algorithm>
@@ -173,11 +174,36 @@ bool ExportOdGeoJson(const std::string& path, const isocity::World& world, const
     outY = (w > 0) ? (ridx / w) : 0;
   };
 
-  f << "{\n";
-  f << "  \"type\": \"FeatureCollection\",\n";
-  f << "  \"features\": [\n";
+  isocity::JsonWriteOptions jopt{};
+  jopt.pretty = true;
+  jopt.indent = 2;
+  jopt.sortKeys = false;
 
-  bool first = true;
+  isocity::JsonWriter jw(f, jopt);
+
+  auto writeCoord = [&](double x, double y) {
+    jw.beginArray();
+    jw.numberValue(x);
+    jw.numberValue(y);
+    jw.endArray();
+  };
+
+  jw.beginObject();
+  jw.key("type");
+  jw.stringValue("FeatureCollection");
+  jw.key("properties");
+  jw.beginObject();
+  jw.key("coordSpace");
+  jw.stringValue("tile_center");
+  jw.key("minAmount");
+  jw.intValue(minAmount);
+  jw.key("topN");
+  jw.intValue(topN);
+  jw.endObject();
+
+  jw.key("features");
+  jw.beginArray();
+
   for (const OdRow& r : rows) {
     if (!r.e) continue;
     const isocity::GoodsOdEdge& e = *r.e;
@@ -187,11 +213,10 @@ bool ExportOdGeoJson(const std::string& path, const isocity::World& world, const
     xyOf(e.srcRoadIdx, sx, sy);
     xyOf(e.dstRoadIdx, dx, dy);
 
-    const double meanSteps = (e.amount > 0) ? (static_cast<double>(e.totalSteps) / static_cast<double>(e.amount)) : 0.0;
-    const double meanCost = (e.amount > 0) ? (static_cast<double>(e.totalCostMilli) / static_cast<double>(e.amount)) : 0.0;
-
-    if (!first) f << ",\n";
-    first = false;
+    const double meanSteps =
+        (e.amount > 0) ? (static_cast<double>(e.totalSteps) / static_cast<double>(e.amount)) : 0.0;
+    const double meanCost =
+        (e.amount > 0) ? (static_cast<double>(e.totalCostMilli) / static_cast<double>(e.amount)) : 0.0;
 
     // Coordinates are tile-center points in world grid space.
     const double sxf = static_cast<double>(sx) + 0.5;
@@ -199,29 +224,55 @@ bool ExportOdGeoJson(const std::string& path, const isocity::World& world, const
     const double dxf = static_cast<double>(dx) + 0.5;
     const double dyf = static_cast<double>(dy) + 0.5;
 
-    f << "    {\n";
-    f << "      \"type\": \"Feature\",\n";
-    f << "      \"properties\": {\n";
-    f << "        \"flow_type\": \"" << isocity::GoodsOdTypeName(e.type) << "\",\n";
-    f << "        \"amount\": " << e.amount << ",\n";
-    f << "        \"src_idx\": " << e.srcRoadIdx << ",\n";
-    f << "        \"dst_idx\": " << e.dstRoadIdx << ",\n";
-    f << "        \"mean_steps\": " << meanSteps << ",\n";
-    f << "        \"mean_cost_milli\": " << meanCost << ",\n";
-    f << "        \"min_steps\": " << e.minSteps << ",\n";
-    f << "        \"max_steps\": " << e.maxSteps << ",\n";
-    f << "        \"min_cost_milli\": " << e.minCostMilli << ",\n";
-    f << "        \"max_cost_milli\": " << e.maxCostMilli << "\n";
-    f << "      },\n";
-    f << "      \"geometry\": {\n";
-    f << "        \"type\": \"LineString\",\n";
-    f << "        \"coordinates\": [[" << sxf << ", " << syf << "], [" << dxf << ", " << dyf << "]]\n";
-    f << "      }\n";
-    f << "    }";
+    jw.beginObject();
+    jw.key("type");
+    jw.stringValue("Feature");
+
+    jw.key("properties");
+    jw.beginObject();
+    jw.key("flow_type");
+    jw.stringValue(isocity::GoodsOdTypeName(e.type));
+    jw.key("amount");
+    jw.intValue(e.amount);
+    jw.key("src_idx");
+    jw.intValue(e.srcRoadIdx);
+    jw.key("dst_idx");
+    jw.intValue(e.dstRoadIdx);
+    jw.key("mean_steps");
+    jw.numberValue(meanSteps);
+    jw.key("mean_cost_milli");
+    jw.numberValue(meanCost);
+    jw.key("min_steps");
+    jw.intValue(e.minSteps);
+    jw.key("max_steps");
+    jw.intValue(e.maxSteps);
+    jw.key("min_cost_milli");
+    jw.intValue(e.minCostMilli);
+    jw.key("max_cost_milli");
+    jw.intValue(e.maxCostMilli);
+    jw.endObject();
+
+    jw.key("geometry");
+    jw.beginObject();
+    jw.key("type");
+    jw.stringValue("LineString");
+    jw.key("coordinates");
+    jw.beginArray();
+    writeCoord(sxf, syf);
+    writeCoord(dxf, dyf);
+    jw.endArray();
+    jw.endObject();
+
+    jw.endObject();
   }
 
-  f << "\n  ]\n";
-  f << "}\n";
+  jw.endArray();
+  jw.endObject();
+
+  if (!jw.ok() || !f.good()) {
+    outError = jw.error();
+    return false;
+  }
   return true;
 }
 

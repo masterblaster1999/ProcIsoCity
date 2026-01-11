@@ -2,6 +2,7 @@
 
 #include "isocity/Export.hpp"
 #include "isocity/Hash.hpp"
+#include "isocity/Json.hpp"
 #include "isocity/SaveLoad.hpp"
 
 #include <algorithm>
@@ -140,28 +141,6 @@ std::string SanitizeName(const std::string& s)
   // Avoid empty.
   if (out.empty()) out = "case";
   return out;
-}
-
-std::string EscapeJson(const std::string& s)
-{
-  std::ostringstream oss;
-  for (char c : s) {
-    switch (c) {
-      case '\\': oss << "\\\\"; break;
-      case '"': oss << "\\\""; break;
-      case '\n': oss << "\\n"; break;
-      case '\r': oss << "\\r"; break;
-      case '\t': oss << "\\t"; break;
-      default:
-        if (static_cast<unsigned char>(c) < 0x20) {
-          oss << "\\u" << std::hex << std::setw(4) << std::setfill('0') << (int)(unsigned char)c << std::dec;
-        } else {
-          oss << c;
-        }
-        break;
-    }
-  }
-  return oss.str();
 }
 
 std::string EscapeXml(const std::string& s)
@@ -471,47 +450,49 @@ bool WriteGoldenArtifacts(const fs::path& caseDir, const GoldenConfig& cfg, cons
 
   // golden.json
   {
-    std::ofstream f(caseDir / "golden.json", std::ios::binary);
-    if (!f) {
-      outErr = "failed to write golden.json";
-      return false;
+    using isocity::JsonValue;
+    JsonValue root = JsonValue::MakeObject();
+    auto add = [](JsonValue& obj, const char* key, JsonValue v) {
+      obj.objectValue.emplace_back(key, std::move(v));
+    };
+
+    add(root, "enabled", JsonValue::MakeBool(cfg.enabled));
+    add(root, "updateMode", JsonValue::MakeBool(cfg.update));
+    add(root, "format", JsonValue::MakeString(cfg.iso ? "iso" : "top"));
+    add(root, "layer", JsonValue::MakeString(isocity::ExportLayerName(cfg.layer)));
+    add(root, "scale", JsonValue::MakeNumber(static_cast<double>(cfg.scale)));
+    add(root, "threshold", JsonValue::MakeNumber(static_cast<double>(cfg.threshold)));
+    add(root, "goldenPath", JsonValue::MakeString(res.goldenPath));
+    add(root, "attempted", JsonValue::MakeBool(res.attempted));
+    add(root, "ok", JsonValue::MakeBool(res.ok));
+    add(root, "updated", JsonValue::MakeBool(res.updated));
+    add(root, "matched", JsonValue::MakeBool(res.matched));
+    add(root, "error", JsonValue::MakeString(res.error));
+
+    if (res.hasStats) {
+      JsonValue st = JsonValue::MakeObject();
+      add(st, "width", JsonValue::MakeNumber(static_cast<double>(res.stats.width)));
+      add(st, "height", JsonValue::MakeNumber(static_cast<double>(res.stats.height)));
+      add(st, "pixelsCompared", JsonValue::MakeNumber(static_cast<double>(res.stats.pixelsCompared)));
+      add(st, "pixelsDifferent", JsonValue::MakeNumber(static_cast<double>(res.stats.pixelsDifferent)));
+      add(st, "maxAbsDiff", JsonValue::MakeNumber(static_cast<double>(res.stats.maxAbsDiff)));
+      add(st, "meanAbsDiff", JsonValue::MakeNumber(static_cast<double>(res.stats.meanAbsDiff)));
+      add(st, "mse", JsonValue::MakeNumber(static_cast<double>(res.stats.mse)));
+      if (std::isinf(res.stats.psnr)) {
+        add(st, "psnr", JsonValue::MakeNull());
+        add(st, "psnrIsInf", JsonValue::MakeBool(true));
+      } else {
+        add(st, "psnr", JsonValue::MakeNumber(static_cast<double>(res.stats.psnr)));
+        add(st, "psnrIsInf", JsonValue::MakeBool(false));
+      }
+      add(root, "stats", std::move(st));
     }
 
-    f << "{\n";
-    f << "  \"enabled\": " << (cfg.enabled ? "true" : "false") << ",\n";
-    f << "  \"updateMode\": " << (cfg.update ? "true" : "false") << ",\n";
-    f << "  \"format\": \"" << (cfg.iso ? "iso" : "top") << "\",\n";
-    f << "  \"layer\": \"" << isocity::ExportLayerName(cfg.layer) << "\",\n";
-    f << "  \"scale\": " << cfg.scale << ",\n";
-    f << "  \"threshold\": " << cfg.threshold << ",\n";
-    f << "  \"goldenPath\": \"" << EscapeJson(res.goldenPath) << "\",\n";
-    f << "  \"attempted\": " << (res.attempted ? "true" : "false") << ",\n";
-    f << "  \"ok\": " << (res.ok ? "true" : "false") << ",\n";
-    f << "  \"updated\": " << (res.updated ? "true" : "false") << ",\n";
-    f << "  \"matched\": " << (res.matched ? "true" : "false") << ",\n";
-    f << "  \"error\": \"" << EscapeJson(res.error) << "\"";
-    if (res.hasStats) {
-      f << ",\n";
-      f << "  \"stats\": {\n";
-      f << "    \"width\": " << res.stats.width << ",\n";
-      f << "    \"height\": " << res.stats.height << ",\n";
-      f << "    \"pixelsCompared\": " << res.stats.pixelsCompared << ",\n";
-      f << "    \"pixelsDifferent\": " << res.stats.pixelsDifferent << ",\n";
-      f << "    \"maxAbsDiff\": " << static_cast<int>(res.stats.maxAbsDiff) << ",\n";
-      f << "    \"meanAbsDiff\": " << std::fixed << std::setprecision(9) << res.stats.meanAbsDiff << ",\n";
-      f << "    \"mse\": " << std::fixed << std::setprecision(9) << res.stats.mse << ",\n";
-      if (std::isinf(res.stats.psnr)) {
-        f << "    \"psnr\": null,\n";
-        f << "    \"psnrIsInf\": true\n";
-      } else {
-        f << "    \"psnr\": " << std::fixed << std::setprecision(6) << res.stats.psnr << ",\n";
-        f << "    \"psnrIsInf\": false\n";
-      }
-      f << "  }\n";
-      f << "}\n";
-    } else {
-      f << "\n";
-      f << "}\n";
+    const std::string outPath = (caseDir / "golden.json").string();
+    std::string jsonErr;
+    if (!isocity::WriteJsonFile(outPath, root, jsonErr, isocity::JsonWriteOptions{.pretty = true, .indent = 2, .sortKeys = false})) {
+      outErr = "failed to write golden.json: " + jsonErr;
+      return false;
     }
   }
 
@@ -532,43 +513,49 @@ bool WriteCaseArtifacts(const fs::path& caseDir, const isocity::ScenarioRunOutpu
   // summary.json
   {
     const isocity::Stats& s = out.world.stats();
-    std::ostringstream oss;
-    oss << "{\n";
-    oss << "  \"case\": {\n";
-    oss << "    \"path\": \"" << EscapeJson(sc.path) << "\",\n";
-    oss << "    \"kind\": \"" << KindName(sc.kind) << "\"\n";
-    oss << "  },\n";
-    oss << "  \"width\": " << out.world.width() << ",\n";
-    oss << "  \"height\": " << out.world.height() << ",\n";
-    oss << "  \"seed\": " << out.world.seed() << ",\n";
-    oss << "  \"hash\": \"" << HexU64(out.finalHash) << "\",\n";
-    oss << "  \"stats\": {\n";
-    oss << "    \"day\": " << s.day << ",\n";
-    oss << "    \"population\": " << s.population << ",\n";
-    oss << "    \"housingCapacity\": " << s.housingCapacity << ",\n";
-    oss << "    \"jobsCapacity\": " << s.jobsCapacity << ",\n";
-    oss << "    \"jobsCapacityAccessible\": " << s.jobsCapacityAccessible << ",\n";
-    oss << "    \"employed\": " << s.employed << ",\n";
-    oss << "    \"happiness\": " << s.happiness << ",\n";
-    oss << "    \"money\": " << s.money << ",\n";
-    oss << "    \"roads\": " << s.roads << ",\n";
-    oss << "    \"parks\": " << s.parks << ",\n";
-    oss << "    \"avgCommuteTime\": " << s.avgCommuteTime << ",\n";
-    oss << "    \"trafficCongestion\": " << s.trafficCongestion << ",\n";
-    oss << "    \"goodsDemand\": " << s.goodsDemand << ",\n";
-    oss << "    \"goodsDelivered\": " << s.goodsDelivered << ",\n";
-    oss << "    \"goodsSatisfaction\": " << s.goodsSatisfaction << ",\n";
-    oss << "    \"avgLandValue\": " << s.avgLandValue << ",\n";
-    oss << "    \"demandResidential\": " << s.demandResidential << "\n";
-    oss << "  }\n";
-    oss << "}\n";
 
-    std::ofstream f(caseDir / "summary.json", std::ios::binary);
-    if (!f) {
-      outErr = "failed to write summary.json";
+    using isocity::JsonValue;
+    JsonValue root = JsonValue::MakeObject();
+    auto add = [](JsonValue& obj, const char* key, JsonValue v) {
+      obj.objectValue.emplace_back(key, std::move(v));
+    };
+
+    JsonValue caseObj = JsonValue::MakeObject();
+    add(caseObj, "path", JsonValue::MakeString(sc.path));
+    add(caseObj, "kind", JsonValue::MakeString(KindName(sc.kind)));
+    add(root, "case", std::move(caseObj));
+
+    add(root, "width", JsonValue::MakeNumber(static_cast<double>(out.world.width())));
+    add(root, "height", JsonValue::MakeNumber(static_cast<double>(out.world.height())));
+    add(root, "seed", JsonValue::MakeNumber(static_cast<double>(out.world.seed())));
+    add(root, "hash", JsonValue::MakeString(HexU64(out.finalHash)));
+
+    JsonValue st = JsonValue::MakeObject();
+    add(st, "day", JsonValue::MakeNumber(static_cast<double>(s.day)));
+    add(st, "population", JsonValue::MakeNumber(static_cast<double>(s.population)));
+    add(st, "housingCapacity", JsonValue::MakeNumber(static_cast<double>(s.housingCapacity)));
+    add(st, "jobsCapacity", JsonValue::MakeNumber(static_cast<double>(s.jobsCapacity)));
+    add(st, "jobsCapacityAccessible", JsonValue::MakeNumber(static_cast<double>(s.jobsCapacityAccessible)));
+    add(st, "employed", JsonValue::MakeNumber(static_cast<double>(s.employed)));
+    add(st, "happiness", JsonValue::MakeNumber(static_cast<double>(s.happiness)));
+    add(st, "money", JsonValue::MakeNumber(static_cast<double>(s.money)));
+    add(st, "roads", JsonValue::MakeNumber(static_cast<double>(s.roads)));
+    add(st, "parks", JsonValue::MakeNumber(static_cast<double>(s.parks)));
+    add(st, "avgCommuteTime", JsonValue::MakeNumber(static_cast<double>(s.avgCommuteTime)));
+    add(st, "trafficCongestion", JsonValue::MakeNumber(static_cast<double>(s.trafficCongestion)));
+    add(st, "goodsDemand", JsonValue::MakeNumber(static_cast<double>(s.goodsDemand)));
+    add(st, "goodsDelivered", JsonValue::MakeNumber(static_cast<double>(s.goodsDelivered)));
+    add(st, "goodsSatisfaction", JsonValue::MakeNumber(static_cast<double>(s.goodsSatisfaction)));
+    add(st, "avgLandValue", JsonValue::MakeNumber(static_cast<double>(s.avgLandValue)));
+    add(st, "demandResidential", JsonValue::MakeNumber(static_cast<double>(s.demandResidential)));
+    add(root, "stats", std::move(st));
+
+    const std::string outPath = (caseDir / "summary.json").string();
+    std::string jsonErr;
+    if (!isocity::WriteJsonFile(outPath, root, jsonErr, isocity::JsonWriteOptions{.pretty = true, .indent = 2, .sortKeys = false})) {
+      outErr = "failed to write summary.json: " + jsonErr;
       return false;
     }
-    f << oss.str();
   }
 
   // final.bin
@@ -1569,59 +1556,68 @@ int main(int argc, char** argv)
 
   // Suite JSON report.
   if (!jsonReport.empty()) {
-    std::ofstream f(jsonReport, std::ios::binary);
-    if (!f) {
-      std::cerr << "failed to write json report: " << jsonReport << "\n";
-    } else {
-      f << "{\n";
-      f << "  \"total\": " << results.size() << ",\n";
-      f << "  \"passed\": " << passed << ",\n";
-      f << "  \"failed\": " << failed << ",\n";
-      f << "  \"seconds\": " << std::fixed << std::setprecision(6) << suiteSeconds << ",\n";
-      f << "  \"jobsRequested\": " << jobs << ",\n";
-      f << "  \"jobsUsed\": " << threads << ",\n";
-      f << "  \"cases\": [\n";
-      for (std::size_t i = 0; i < results.size(); ++i) {
-        const CaseResult& r = results[i];
-        f << "    {\"path\": \"" << EscapeJson(r.sc.path) << "\", \"kind\": \"" << KindName(r.sc.kind)
-          << "\", \"ok\": " << (r.ok ? "true" : "false")
-          << ", \"seconds\": " << std::fixed << std::setprecision(6) << r.seconds
-          << ", \"hash\": \"" << HexU64(r.hash) << "\", \"error\": \"" << EscapeJson(r.error) << "\"";
+    using isocity::JsonValue;
+    JsonValue root = JsonValue::MakeObject();
+    auto add = [](JsonValue& obj, const char* key, JsonValue v) {
+      obj.objectValue.emplace_back(key, std::move(v));
+    };
 
-        if (!r.artifactsDir.empty()) {
-          f << ", \"artifactsDir\": \"" << EscapeJson(r.artifactsDir) << "\"";
-        }
-        if (!r.warnings.empty()) {
-          f << ", \"warnings\": [";
-          for (std::size_t wi = 0; wi < r.warnings.size(); ++wi) {
-            f << "\"" << EscapeJson(r.warnings[wi]) << "\"";
-            if (wi + 1 < r.warnings.size()) f << ',';
-          }
-          f << "]";
-        }
-        if (golden.enabled) {
-          f << ", \"golden\": {\"attempted\": " << (r.golden.attempted ? "true" : "false")
-            << ", \"ok\": " << (r.golden.ok ? "true" : "false")
-            << ", \"updated\": " << (r.golden.updated ? "true" : "false")
-            << ", \"matched\": " << (r.golden.matched ? "true" : "false")
-            << ", \"goldenPath\": \"" << EscapeJson(r.golden.goldenPath) << "\""
-            << ", \"error\": \"" << EscapeJson(r.golden.error) << "\"}";
-        }
-        if (hashGolden.enabled) {
-          f << ", \"hashGolden\": {\"attempted\": " << (r.hashGolden.attempted ? "true" : "false")
-            << ", \"ok\": " << (r.hashGolden.ok ? "true" : "false")
-            << ", \"updated\": " << (r.hashGolden.updated ? "true" : "false")
-            << ", \"matched\": " << (r.hashGolden.matched ? "true" : "false")
-            << ", \"goldenPath\": \"" << EscapeJson(r.hashGolden.path) << "\""
-            << ", \"expected\": \"" << (r.hashGolden.hasExpected ? HexU64(r.hashGolden.expected) : std::string()) << "\""
-            << ", \"error\": \"" << EscapeJson(r.hashGolden.error) << "\"}";
-        }
-        f << "}";
-        if (i + 1 < results.size()) f << ',';
-        f << "\n";
+    add(root, "total", JsonValue::MakeNumber(static_cast<double>(results.size())));
+    add(root, "passed", JsonValue::MakeNumber(static_cast<double>(passed)));
+    add(root, "failed", JsonValue::MakeNumber(static_cast<double>(failed)));
+    add(root, "seconds", JsonValue::MakeNumber(suiteSeconds));
+    add(root, "jobsRequested", JsonValue::MakeNumber(static_cast<double>(jobs)));
+    add(root, "jobsUsed", JsonValue::MakeNumber(static_cast<double>(threads)));
+
+    JsonValue casesArr = JsonValue::MakeArray();
+    casesArr.arrayValue.reserve(results.size());
+    for (const CaseResult& r : results) {
+      JsonValue c = JsonValue::MakeObject();
+      add(c, "path", JsonValue::MakeString(r.sc.path));
+      add(c, "kind", JsonValue::MakeString(KindName(r.sc.kind)));
+      add(c, "ok", JsonValue::MakeBool(r.ok));
+      add(c, "seconds", JsonValue::MakeNumber(r.seconds));
+      add(c, "hash", JsonValue::MakeString(HexU64(r.hash)));
+      add(c, "error", JsonValue::MakeString(r.error));
+
+      if (!r.artifactsDir.empty()) {
+        add(c, "artifactsDir", JsonValue::MakeString(r.artifactsDir));
       }
-      f << "  ]\n";
-      f << "}\n";
+      if (!r.warnings.empty()) {
+        JsonValue warn = JsonValue::MakeArray();
+        warn.arrayValue.reserve(r.warnings.size());
+        for (const auto& w : r.warnings) warn.arrayValue.emplace_back(JsonValue::MakeString(w));
+        add(c, "warnings", std::move(warn));
+      }
+      if (golden.enabled) {
+        JsonValue g = JsonValue::MakeObject();
+        add(g, "attempted", JsonValue::MakeBool(r.golden.attempted));
+        add(g, "ok", JsonValue::MakeBool(r.golden.ok));
+        add(g, "updated", JsonValue::MakeBool(r.golden.updated));
+        add(g, "matched", JsonValue::MakeBool(r.golden.matched));
+        add(g, "goldenPath", JsonValue::MakeString(r.golden.goldenPath));
+        add(g, "error", JsonValue::MakeString(r.golden.error));
+        add(c, "golden", std::move(g));
+      }
+      if (hashGolden.enabled) {
+        JsonValue g = JsonValue::MakeObject();
+        add(g, "attempted", JsonValue::MakeBool(r.hashGolden.attempted));
+        add(g, "ok", JsonValue::MakeBool(r.hashGolden.ok));
+        add(g, "updated", JsonValue::MakeBool(r.hashGolden.updated));
+        add(g, "matched", JsonValue::MakeBool(r.hashGolden.matched));
+        add(g, "goldenPath", JsonValue::MakeString(r.hashGolden.path));
+        add(g, "expected", JsonValue::MakeString(r.hashGolden.hasExpected ? HexU64(r.hashGolden.expected) : std::string()));
+        add(g, "error", JsonValue::MakeString(r.hashGolden.error));
+        add(c, "hashGolden", std::move(g));
+      }
+
+      casesArr.arrayValue.emplace_back(std::move(c));
+    }
+    add(root, "cases", std::move(casesArr));
+
+    std::string jsonErr;
+    if (!isocity::WriteJsonFile(jsonReport, root, jsonErr, isocity::JsonWriteOptions{.pretty = true, .indent = 2, .sortKeys = false})) {
+      std::cerr << "failed to write json report: " << jsonErr << "\n";
     }
   }
 

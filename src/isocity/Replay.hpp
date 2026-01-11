@@ -17,6 +17,7 @@ namespace isocity {
 //   - Tick: advance the simulation by N ticks
 //   - Patch: apply an ISOPATCH blob (WorldPatch binary)
 //   - Snapshot: replace the whole world with another embedded save blob
+//   - SimTuning: set non-persistent runtime tuning (traffic/transit model settings)
 //
 // This is primarily intended for debugging/regression: you can ship a single
 // .isoreplay file that deterministically rebuilds a city state.
@@ -31,6 +32,10 @@ enum class ReplayEventType : std::uint8_t {
   // Assert that the current world hash matches an expected value.
   // Useful for regression testing and deterministic playback verification.
   AssertHash = 4,
+  // Set non-persistent runtime simulation tuning (traffic/transit model settings).
+  // This exists because these settings are intentionally not part of SimConfig
+  // (and therefore not stored in saves).
+  SimTuning = 5,
 };
 
 struct ReplayEvent {
@@ -44,6 +49,10 @@ struct ReplayEvent {
 
   // Snapshot: raw ISOCITY save bytes.
   std::vector<std::uint8_t> snapshot;
+
+  // SimTuning: traffic + transit model settings.
+  TrafficModelSettings trafficModel{};
+  TransitModelSettings transitModel{};
 
   // Note: UTF-8 text.
   std::string note;
@@ -61,7 +70,8 @@ struct Replay {
   // On-disk format version.
   // v1: base save blob + events until EOF (Tick/Patch/Snapshot only)
   // v2: adds explicit eventCount + new event types (Note, AssertHash)
-  std::uint32_t version = 2;
+  // v3: adds SimTuning events (non-persistent runtime tuning)
+  std::uint32_t version = 3;
 
   // Base save bytes (ISOCITY binary save format).
   std::vector<std::uint8_t> baseSave;

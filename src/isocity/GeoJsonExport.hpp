@@ -6,6 +6,8 @@
 
 namespace isocity {
 
+class JsonWriter;
+
 // Minimal helpers for writing GeoJSON geometries from Vectorize output.
 //
 // These functions intentionally avoid a full JSON library so they can be used
@@ -39,5 +41,11 @@ void WriteGeoJsonMultiPolygonCoords(std::ostream& os, const VectorMultiPolygon& 
 // If mp.polygons is empty, emits a null geometry:
 //   {"type":"GeometryCollection","geometries":[]}
 void WriteGeoJsonGeometry(std::ostream& os, const VectorMultiPolygon& mp);
+
+// Overloads that write directly to a JsonWriter (streaming).
+void WriteGeoJsonRing(JsonWriter& w, const std::vector<IPoint>& ring);
+void WriteGeoJsonPolygonCoords(JsonWriter& w, const VectorPolygon& poly);
+void WriteGeoJsonMultiPolygonCoords(JsonWriter& w, const VectorMultiPolygon& mp);
+void WriteGeoJsonGeometry(JsonWriter& w, const VectorMultiPolygon& mp);
 
 } // namespace isocity

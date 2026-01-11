@@ -1,6 +1,7 @@
 #include "isocity/Script.hpp"
 
 #include "isocity/Hash.hpp"
+#include "isocity/Json.hpp"
 
 #include <cctype>
 #include <cstdint>
@@ -153,29 +154,6 @@ static std::string HexU64(std::uint64_t v)
   return oss.str();
 }
 
-static std::string JsonEscape(const std::string& in)
-{
-  std::ostringstream oss;
-  for (unsigned char uc : in) {
-    const char c = static_cast<char>(uc);
-    switch (c) {
-      case '\\': oss << "\\\\"; break;
-      case '"': oss << "\\\""; break;
-      case '\n': oss << "\\n"; break;
-      case '\r': oss << "\\r"; break;
-      case '\t': oss << "\\t"; break;
-      default:
-        if (uc < 0x20) {
-          oss << "\\u" << std::hex << std::setw(4) << std::setfill('0') << static_cast<int>(uc) << std::dec;
-        } else {
-          oss << c;
-        }
-        break;
-    }
-  }
-  return oss.str();
-}
-
 static bool WriteJsonSummary(const std::string& outPath, const std::string& scriptPath, const isocity::World& world,
                             std::uint64_t hash, int runIndex)
 {
@@ -183,26 +161,28 @@ static bool WriteJsonSummary(const std::string& outPath, const std::string& scri
 
   const isocity::Stats& s = world.stats();
 
-  std::ostringstream oss;
-  oss << "{\n";
-  oss << "  \"script\": \"" << JsonEscape(scriptPath) << "\",\n";
-  oss << "  \"run\": " << runIndex << ",\n";
-  oss << "  \"width\": " << world.width() << ",\n";
-  oss << "  \"height\": " << world.height() << ",\n";
-  oss << "  \"seed\": " << world.seed() << ",\n";
-  oss << "  \"hash\": \"" << HexU64(hash) << "\",\n";
-  oss << "  \"stats\": {\n";
-  oss << "    \"day\": " << s.day << ",\n";
-  oss << "    \"population\": " << s.population << ",\n";
-  oss << "    \"money\": " << s.money << ",\n";
-  oss << "    \"happiness\": " << s.happiness << "\n";
-  oss << "  }\n";
-  oss << "}\n";
+  using isocity::JsonValue;
+  JsonValue root = JsonValue::MakeObject();
+  auto add = [](JsonValue& obj, const char* key, JsonValue v) {
+    obj.objectValue.emplace_back(key, std::move(v));
+  };
 
-  std::ofstream f(outPath, std::ios::binary);
-  if (!f) return false;
-  f << oss.str();
-  return static_cast<bool>(f);
+  add(root, "script", JsonValue::MakeString(scriptPath));
+  add(root, "run", JsonValue::MakeNumber(static_cast<double>(runIndex)));
+  add(root, "width", JsonValue::MakeNumber(static_cast<double>(world.width())));
+  add(root, "height", JsonValue::MakeNumber(static_cast<double>(world.height())));
+  add(root, "seed", JsonValue::MakeNumber(static_cast<double>(world.seed())));
+  add(root, "hash", JsonValue::MakeString(HexU64(hash)));
+
+  JsonValue st = JsonValue::MakeObject();
+  add(st, "day", JsonValue::MakeNumber(static_cast<double>(s.day)));
+  add(st, "population", JsonValue::MakeNumber(static_cast<double>(s.population)));
+  add(st, "money", JsonValue::MakeNumber(static_cast<double>(s.money)));
+  add(st, "happiness", JsonValue::MakeNumber(static_cast<double>(s.happiness)));
+  add(root, "stats", std::move(st));
+
+  std::string err;
+  return isocity::WriteJsonFile(outPath, root, err, isocity::JsonWriteOptions{.pretty = true, .indent = 2, .sortKeys = false});
 }
 
 struct Options {

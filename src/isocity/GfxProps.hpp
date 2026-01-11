@@ -20,6 +20,7 @@ enum class GfxPropKind : std::uint8_t {
   StreetLight = 2,
   VehicleCar = 3,
   VehicleTruck = 4,
+  Pedestrian = 5,
 };
 
 struct GfxPropSprite {

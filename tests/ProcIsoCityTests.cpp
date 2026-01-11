@@ -19,8 +19,10 @@
 #include "isocity/LandValue.hpp"
 #include "isocity/Replay.hpp"
 #include "isocity/Hash.hpp"
+#include "isocity/Json.hpp"
 #include "isocity/Compression.hpp"
 #include "isocity/Export.hpp"
+#include "isocity/GfxCanvas.hpp"
 #include "isocity/Isochrone.hpp"
 #include "isocity/Heightmap.hpp"
 #include "isocity/Contours.hpp"
@@ -6653,6 +6655,381 @@ void TestOsmImportBasic()
   fs::remove(tmp, ec);
 }
 
+void TestOsmImportMultipolygonRelationHoles()
+{
+  // Validates that:
+  //  - we parse multipolygon relations
+  //  - we stitch member ways into closed rings
+  //  - inner rings cut holes (even/odd fill)
+
+  const char* osmNoHole = R"OSM(
+<osm version="0.6" generator="proc_isocity_tests">
+  <bounds minlat="0.0" minlon="0.0" maxlat="0.01" maxlon="0.01"/>
+
+  <!-- Outer ring nodes -->
+  <node id="1" lat="0.002" lon="0.002"/>
+  <node id="2" lat="0.002" lon="0.008"/>
+  <node id="3" lat="0.008" lon="0.008"/>
+  <node id="4" lat="0.008" lon="0.002"/>
+
+  <!-- Outer ring split across 2 untagged ways -->
+  <way id="100">
+    <nd ref="1"/>
+    <nd ref="2"/>
+    <nd ref="3"/>
+  </way>
+  <way id="101">
+    <nd ref="3"/>
+    <nd ref="4"/>
+    <nd ref="1"/>
+  </way>
+
+  <relation id="300">
+    <member type="way" ref="100" role="outer"/>
+    <member type="way" ref="101" role="outer"/>
+    <tag k="type" v="multipolygon"/>
+    <tag k="natural" v="water"/>
+  </relation>
+</osm>
+)OSM";
+
+  const char* osmWithHole = R"OSM(
+<osm version="0.6" generator="proc_isocity_tests">
+  <bounds minlat="0.0" minlon="0.0" maxlat="0.01" maxlon="0.01"/>
+
+  <!-- Outer ring nodes -->
+  <node id="1" lat="0.002" lon="0.002"/>
+  <node id="2" lat="0.002" lon="0.008"/>
+  <node id="3" lat="0.008" lon="0.008"/>
+  <node id="4" lat="0.008" lon="0.002"/>
+
+  <!-- Inner ring nodes (island) -->
+  <node id="5" lat="0.004" lon="0.004"/>
+  <node id="6" lat="0.004" lon="0.006"/>
+  <node id="7" lat="0.006" lon="0.006"/>
+  <node id="8" lat="0.006" lon="0.004"/>
+
+  <!-- Outer ring split across 2 untagged ways -->
+  <way id="100">
+    <nd ref="1"/>
+    <nd ref="2"/>
+    <nd ref="3"/>
+  </way>
+  <way id="101">
+    <nd ref="3"/>
+    <nd ref="4"/>
+    <nd ref="1"/>
+  </way>
+
+  <!-- Inner ring is a closed way -->
+  <way id="200">
+    <nd ref="5"/>
+    <nd ref="6"/>
+    <nd ref="7"/>
+    <nd ref="8"/>
+    <nd ref="5"/>
+  </way>
+
+  <relation id="300">
+    <member type="way" ref="100" role="outer"/>
+    <member type="way" ref="101" role="outer"/>
+    <member type="way" ref="200" role="inner"/>
+    <tag k="type" v="multipolygon"/>
+    <tag k="natural" v="water"/>
+  </relation>
+</osm>
+)OSM";
+
+  const fs::path tmpA = fs::temp_directory_path() / "procisocity_osmimport_rel_nohole.osm";
+  const fs::path tmpB = fs::temp_directory_path() / "procisocity_osmimport_rel_hole.osm";
+  {
+    std::ofstream f(tmpA);
+    EXPECT_TRUE(static_cast<bool>(f));
+    f << osmNoHole;
+  }
+  {
+    std::ofstream f(tmpB);
+    EXPECT_TRUE(static_cast<bool>(f));
+    f << osmWithHole;
+  }
+
+  isocity::OsmImportConfig cfg;
+  cfg.width = 64;
+  cfg.height = 64;
+  cfg.importRoads = false;
+  cfg.importWater = true;
+  cfg.importLanduse = false;
+  cfg.importParks = false;
+  cfg.importBuildings = false;
+  cfg.preferBoundsTag = true;
+  cfg.padding = 1;
+
+  isocity::World wNoHole;
+  isocity::World wHole;
+  isocity::OsmImportStats sNoHole;
+  isocity::OsmImportStats sHole;
+  std::string errA;
+  std::string errB;
+
+  const bool okA = isocity::ImportOsmXmlRoadsToNewWorld(tmpA.string(), 1337u, cfg, wNoHole, &sNoHole, errA);
+  EXPECT_TRUE(okA);
+  EXPECT_TRUE(errA.empty());
+
+  const bool okB = isocity::ImportOsmXmlRoadsToNewWorld(tmpB.string(), 1337u, cfg, wHole, &sHole, errB);
+  EXPECT_TRUE(okB);
+  EXPECT_TRUE(errB.empty());
+
+  // Relations should be detected + imported; no water-tagged ways exist in these snippets.
+  EXPECT_TRUE(sHole.relationsParsed >= 1);
+  EXPECT_TRUE(sHole.waterRelationsImported >= 1);
+  EXPECT_EQ(sHole.waterWaysImported, 0u);
+
+  // The hole should remove at least some tiles that were water in the no-hole case.
+  std::size_t removed = 0;
+  for (int y = 0; y < wNoHole.height(); ++y) {
+    for (int x = 0; x < wNoHole.width(); ++x) {
+      const bool a = (wNoHole.at(x, y).terrain == isocity::Terrain::Water);
+      const bool b = (wHole.at(x, y).terrain == isocity::Terrain::Water);
+      if (a && !b) removed++;
+    }
+  }
+  EXPECT_TRUE(removed > 0);
+
+  std::error_code ec;
+  fs::remove(tmpA, ec);
+  fs::remove(tmpB, ec);
+}
+
+
+void TestJsonUnicodeEscapesAndStringify()
+{
+  using namespace isocity;
+
+  // JsonEscape should emit valid \u00XX escapes for control characters.
+  EXPECT_EQ(JsonEscape(std::string("\x01", 1)), std::string("\\u0001"));
+  EXPECT_EQ(JsonEscape(std::string("\x1F", 1)), std::string("\\u001F"));
+  EXPECT_EQ(JsonEscape(std::string("a\nb")), std::string("a\\nb"));
+
+  // ParseJson should fully decode \uXXXX escapes (including surrogate pairs) into UTF-8.
+  {
+    JsonValue v;
+    std::string err;
+    EXPECT_TRUE(ParseJson("\"\\u00E9\"", v, err));
+    EXPECT_TRUE(err.empty());
+    EXPECT_EQ(v.type, JsonValue::Type::String);
+    EXPECT_EQ(v.stringValue, std::string("\xC3\xA9")); // "é"
+  }
+
+  {
+    JsonValue v;
+    std::string err;
+    EXPECT_TRUE(ParseJson("\"\\uD83D\\uDE00\"", v, err));
+    EXPECT_TRUE(err.empty());
+    EXPECT_EQ(v.type, JsonValue::Type::String);
+    EXPECT_EQ(v.stringValue, std::string("\xF0\x9F\x98\x80")); // 😀
+  }
+
+  // Invalid surrogate sequences should be rejected.
+  {
+    JsonValue v;
+    std::string err;
+    EXPECT_TRUE(!ParseJson("\"\\uD83D\\u0041\"", v, err));
+    EXPECT_TRUE(!err.empty());
+  }
+
+  // Stringify + parse should round-trip structure and escaped strings.
+  {
+    JsonValue root = JsonValue::MakeObject();
+    root.objectValue.emplace_back("s", JsonValue::MakeString("x\n"));
+    root.objectValue.emplace_back("n", JsonValue::MakeNumber(1.25));
+    JsonValue a = JsonValue::MakeArray();
+    a.arrayValue.emplace_back(JsonValue::MakeBool(true));
+    a.arrayValue.emplace_back(JsonValue::MakeNull());
+    root.objectValue.emplace_back("a", std::move(a));
+
+    const std::string json = JsonStringify(root, JsonWriteOptions{.pretty = false, .indent = 2, .sortKeys = true});
+    EXPECT_TRUE(json.find("\\n") != std::string::npos); // newline must be escaped
+
+    JsonValue parsed;
+    std::string err;
+    EXPECT_TRUE(ParseJson(json, parsed, err));
+    EXPECT_TRUE(err.empty());
+
+    const JsonValue* sv = FindJsonMember(parsed, "s");
+    EXPECT_TRUE(sv != nullptr);
+    if (sv) {
+      EXPECT_EQ(sv->type, JsonValue::Type::String);
+      EXPECT_EQ(sv->stringValue, std::string("x\n"));
+    }
+  }
+}
+
+
+void TestJsonWriterStreaming()
+{
+  using namespace isocity;
+
+  // Build a small JSON document via streaming writer and verify it parses back.
+  std::ostringstream oss;
+  JsonWriteOptions opt{};
+  opt.pretty = false;
+  opt.indent = 2;
+  opt.sortKeys = false;
+
+  JsonWriter jw(oss, opt);
+
+  EXPECT_TRUE(jw.beginObject());
+
+  EXPECT_TRUE(jw.key("a"));
+  EXPECT_TRUE(jw.intValue(1));
+
+  EXPECT_TRUE(jw.key("b"));
+  EXPECT_TRUE(jw.beginArray());
+  EXPECT_TRUE(jw.stringValue("x\n"));
+  EXPECT_TRUE(jw.boolValue(false));
+  EXPECT_TRUE(jw.nullValue());
+  EXPECT_TRUE(jw.endArray());
+
+  EXPECT_TRUE(jw.key("c"));
+  EXPECT_TRUE(jw.beginObject());
+  EXPECT_TRUE(jw.key("k"));
+  EXPECT_TRUE(jw.stringValue("v"));
+  EXPECT_TRUE(jw.endObject());
+
+  EXPECT_TRUE(jw.endObject());
+  EXPECT_TRUE(jw.ok());
+
+  JsonValue parsed;
+  std::string err;
+  EXPECT_TRUE(ParseJson(oss.str(), parsed, err));
+  EXPECT_TRUE(err.empty());
+
+  const JsonValue* a = FindJsonMember(parsed, "a");
+  EXPECT_TRUE(a != nullptr);
+  if (a) {
+    EXPECT_EQ(a->type, JsonValue::Type::Number);
+    EXPECT_NEAR(a->numberValue, 1.0, 1e-9);
+  }
+
+  const JsonValue* b = FindJsonMember(parsed, "b");
+  EXPECT_TRUE(b != nullptr);
+  if (b) {
+    EXPECT_EQ(b->type, JsonValue::Type::Array);
+    EXPECT_EQ(b->arrayValue.size(), 3u);
+    if (b->arrayValue.size() >= 1) {
+      EXPECT_EQ(b->arrayValue[0].type, JsonValue::Type::String);
+      EXPECT_EQ(b->arrayValue[0].stringValue, std::string("x\n"));
+    }
+    if (b->arrayValue.size() >= 2) {
+      EXPECT_EQ(b->arrayValue[1].type, JsonValue::Type::Bool);
+      EXPECT_TRUE(!b->arrayValue[1].boolValue);
+    }
+    if (b->arrayValue.size() >= 3) {
+      EXPECT_EQ(b->arrayValue[2].type, JsonValue::Type::Null);
+    }
+  }
+
+  const JsonValue* c = FindJsonMember(parsed, "c");
+  EXPECT_TRUE(c != nullptr);
+  if (c) {
+    EXPECT_EQ(c->type, JsonValue::Type::Object);
+    const JsonValue* k = FindJsonMember(*c, "k");
+    EXPECT_TRUE(k != nullptr);
+    if (k) {
+      EXPECT_EQ(k->type, JsonValue::Type::String);
+      EXPECT_EQ(k->stringValue, std::string("v"));
+    }
+  }
+
+  // Misuse should be detected.
+  {
+    std::ostringstream oss2;
+    JsonWriter jw2(oss2, JsonWriteOptions{.pretty = false, .indent = 2, .sortKeys = false});
+    EXPECT_TRUE(jw2.beginObject());
+    EXPECT_TRUE(!jw2.stringValue("oops")); // value written while object expects key()
+    EXPECT_TRUE(!jw2.ok());
+    EXPECT_TRUE(!jw2.error().empty());
+  }
+}
+
+
+void TestGfxCanvasAffineAndSampling()
+{
+  using namespace isocity;
+  using namespace isocity::gfx;
+
+  // 2x2 checker with distinct colors (opaque).
+  RgbaImage src;
+  src.width = 2;
+  src.height = 2;
+  src.rgba.assign(static_cast<std::size_t>(src.width) * static_cast<std::size_t>(src.height) * 4u, 0u);
+
+  auto setPx = [&](int x, int y, Rgba8 c) {
+    const std::size_t i = (static_cast<std::size_t>(y) * static_cast<std::size_t>(src.width) + static_cast<std::size_t>(x)) * 4u;
+    src.rgba[i + 0] = c.r;
+    src.rgba[i + 1] = c.g;
+    src.rgba[i + 2] = c.b;
+    src.rgba[i + 3] = c.a;
+  };
+
+  setPx(0, 0, Rgba8{255, 0, 0, 255});
+  setPx(1, 0, Rgba8{0, 255, 0, 255});
+  setPx(0, 1, Rgba8{0, 0, 255, 255});
+  setPx(1, 1, Rgba8{255, 255, 255, 255});
+
+  // Sample at the center between the 4 pixels should average.
+  {
+    const Rgba8 s = SampleBilinearPremultiplied(src, 0.5f, 0.5f);
+    EXPECT_EQ(s.a, 255);
+    EXPECT_TRUE(std::abs(static_cast<int>(s.r) - 128) <= 1);
+    EXPECT_TRUE(std::abs(static_cast<int>(s.g) - 128) <= 1);
+    EXPECT_TRUE(std::abs(static_cast<int>(s.b) - 128) <= 1);
+  }
+
+  // Premultiplied sampling should not "bleed" color from fully transparent pixels.
+  setPx(0, 0, Rgba8{255, 0, 0, 0}); // transparent red
+  {
+    const Rgba8 s = SampleBilinearPremultiplied(src, 0.5f, 0.5f);
+    EXPECT_TRUE(std::abs(static_cast<int>(s.a) - 191) <= 1);
+    EXPECT_TRUE(std::abs(static_cast<int>(s.r) - 85) <= 2);
+    EXPECT_TRUE(std::abs(static_cast<int>(s.g) - 170) <= 2);
+    EXPECT_TRUE(std::abs(static_cast<int>(s.b) - 170) <= 2);
+  }
+
+  // Affine blit: place a 1x1 pixel into a larger image.
+  {
+    RgbaImage dot;
+    dot.width = 1;
+    dot.height = 1;
+    dot.rgba.assign(4u, 0u);
+    dot.rgba[0] = 200;
+    dot.rgba[1] = 10;
+    dot.rgba[2] = 20;
+    dot.rgba[3] = 255;
+
+    RgbaImage dst;
+    dst.width = 3;
+    dst.height = 3;
+    dst.rgba.assign(static_cast<std::size_t>(dst.width) * static_cast<std::size_t>(dst.height) * 4u, 0u);
+
+    // Map src pixel (0,0) -> dst pixel (1,1) in pixel-center coordinates.
+    const Affine2D m = AffineTranslate(1.0f, 1.0f);
+    BlitImageAffine(dst, dot, m, SampleMode::Nearest, BlendMode::Alpha);
+
+    const Rgba8 got = ReadPixel(dst, 1, 1);
+    EXPECT_EQ(got.r, 200);
+    EXPECT_EQ(got.g, 10);
+    EXPECT_EQ(got.b, 20);
+    EXPECT_EQ(got.a, 255);
+
+    // Neighboring pixels should remain transparent.
+    EXPECT_EQ(ReadPixel(dst, 0, 0).a, 0);
+    EXPECT_EQ(ReadPixel(dst, 2, 2).a, 0);
+  }
+}
+
+
+
 
 int main()
 {
@@ -6668,6 +7045,9 @@ int main()
   TestSaveLoadRoundTrip();
   TestSaveLoadBytesRoundTrip();
   TestSLLZCompressionRoundTrip();
+  TestJsonUnicodeEscapesAndStringify();
+  TestJsonWriterStreaming();
+  TestGfxCanvasAffineAndSampling();
   TestPngReadersSupportDeflateAndFilters();
   TestSaveV8UsesCompressionForLargeDeltaPayload();
   TestSaveLoadDetectsCorruption();
@@ -6745,6 +7125,7 @@ int main()
   TestZoneBuildingParcelsDeterministic();
   TestBrushRasterShapes();
   TestOsmImportBasic();
+  TestOsmImportMultipolygonRelationHoles();
   TestFloodFillRegions();
   TestCityBlocksBasic();
   TestVectorizeLabelGridWithHole();

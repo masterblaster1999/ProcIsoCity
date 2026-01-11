@@ -3,6 +3,7 @@
 #include "isocity/Config.hpp"
 #include "isocity/Console.hpp"
 #include "isocity/EditHistory.hpp"
+#include "isocity/ReplayCapture.hpp"
 #include "isocity/Export.hpp"
 #include "isocity/FloodRisk.hpp"
 #include "isocity/DepressionFill.hpp"
@@ -26,6 +27,7 @@
 #include "isocity/World.hpp"
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -188,6 +190,10 @@ private:
   bool saveVisualPrefsFile(const std::string& path, bool showToast = false);
   void updateVisualPrefsAutosave(float dt);
 
+  // Developer-console script runner (persistent variables across runs).
+  std::map<std::string, std::string> m_consoleScriptVars;
+  int m_consoleScriptRunIndex = 0;
+
   struct StrokeFeedback {
     bool noMoney = false;
     bool water = false;
@@ -215,6 +221,10 @@ private:
   Renderer m_renderer;
 
   EditHistory m_history;
+
+  // Optional deterministic replay capture (debug/regression).
+  ReplayCapture m_replayCapture;
+  std::uint64_t m_replayStrokeBaseHash = 0;
 
   Camera2D m_camera{};
 
@@ -598,6 +608,14 @@ private:
   int m_windowedH = 720;
 
   DevConsole m_console;
+
+  // Persistent ScriptRunner variables used by the in-game dev console `script` command.
+  //
+  // This lets you run a sequence of script files/commands that share a small amount
+  // of state (e.g. output directories, counters, etc.) without having to re-define
+  // variables every time.
+  std::map<std::string, std::string> m_consoleScriptVars;
+  int m_consoleScriptRunIndex = 0;
 
   // Screenshot capture (queued from input and executed in draw() so the capture includes the rendered frame)
   bool m_pendingScreenshot = false;
