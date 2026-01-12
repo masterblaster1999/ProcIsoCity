@@ -529,6 +529,7 @@ void TestSaveLoadRoundTrip()
   cfg.terrainPresetStrength = 1.35f;
   cfg.roadHierarchyEnabled = true;
   cfg.roadHierarchyStrength = 1.65f;
+  cfg.roadLayout = ProcGenRoadLayout::Radial;
   const std::uint64_t seed = 0xC0FFEEu;
 
   World w = GenerateWorld(32, 32, seed, cfg);
@@ -627,6 +628,7 @@ void TestSaveLoadRoundTrip()
     EXPECT_EQ(sum.procCfg.roadHierarchyEnabled, cfg.roadHierarchyEnabled);
     EXPECT_NEAR(sum.procCfg.roadHierarchyStrength, cfg.roadHierarchyStrength, 1e-6f);
     EXPECT_EQ(sum.procCfg.districtingMode, cfg.districtingMode);
+    EXPECT_EQ(sum.procCfg.roadLayout, cfg.roadLayout);
     EXPECT_TRUE(sum.hasSimCfg);
     EXPECT_EQ(sum.simCfg.taxResidential, simCfg.taxResidential);
     EXPECT_TRUE(sum.crcChecked);
@@ -645,6 +647,7 @@ void TestSaveLoadRoundTrip()
   EXPECT_EQ(loadedCfg.roadHierarchyEnabled, cfg.roadHierarchyEnabled);
   EXPECT_NEAR(loadedCfg.roadHierarchyStrength, cfg.roadHierarchyStrength, 1e-6f);
   EXPECT_EQ(loadedCfg.districtingMode, cfg.districtingMode);
+  EXPECT_EQ(loadedCfg.roadLayout, cfg.roadLayout);
 
   // SimConfig should round-trip (within reasonable float epsilon).
   EXPECT_NEAR(loadedSimCfg.tickSeconds, simCfg.tickSeconds, 1e-6f);
@@ -3144,6 +3147,19 @@ void TestPpmReadWriteAndCompare()
   EXPECT_EQ(readPng.height, 2);
   EXPECT_TRUE(readPng.rgb == img.rgb);
 
+  // --- PNG sanity: ensure we actually compress (avoid stored/raw-size output) ---
+  PpmImage big{};
+  big.width = 128;
+  big.height = 128;
+  big.rgb.assign(static_cast<std::size_t>(big.width) * static_cast<std::size_t>(big.height) * 3u, 42u);
+  const fs::path pathBig = tmp / "big.png";
+  EXPECT_TRUE(WritePng(pathBig.string(), big, err));
+  EXPECT_TRUE(err.empty());
+  const std::uintmax_t fsz = fs::file_size(pathBig, ec);
+  EXPECT_TRUE(!ec);
+  const std::uintmax_t rawSz = static_cast<std::uintmax_t>((1 + big.width * 3) * big.height);
+  EXPECT_TRUE(fsz < (rawSz / 2u));
+
   // --- Auto format helpers (extension or magic) ---
   const fs::path pathAuto = tmp / "auto.png";
   EXPECT_TRUE(WriteImageAuto(pathAuto.string(), img, err));
@@ -3935,6 +3951,7 @@ void TestConfigJsonIO()
   proc.sandLevel = 0.60f;
   proc.hubs = 3;
   proc.extraConnections = 7;
+  proc.roadLayout = ProcGenRoadLayout::Grid;
   proc.zoneChance = 0.10f;
   proc.parkChance = 0.99f;
   proc.terrainPreset = ProcGenTerrainPreset::MountainRing;
@@ -3967,6 +3984,7 @@ void TestConfigJsonIO()
   EXPECT_TRUE(std::fabs(proc2.sandLevel - proc.sandLevel) < 1e-6f);
   EXPECT_EQ(proc2.hubs, proc.hubs);
   EXPECT_EQ(proc2.extraConnections, proc.extraConnections);
+  EXPECT_EQ(proc2.roadLayout, proc.roadLayout);
   EXPECT_TRUE(std::fabs(proc2.zoneChance - proc.zoneChance) < 1e-6f);
   EXPECT_TRUE(std::fabs(proc2.parkChance - proc.parkChance) < 1e-6f);
   EXPECT_EQ(proc2.terrainPreset, proc.terrainPreset);
@@ -5440,6 +5458,72 @@ void TestMeshExportObjMtlMergeBuildings()
     EXPECT_EQ(st.triangles, 10ULL);
     EXPECT_TRUE(obj.str().find("usemtl mat_building_res") != std::string::npos);
   }
+
+  // Finally, verify slope-tolerant merging. Parcel base heights differ, but remain
+  // within the configured range.
+  {
+    w.at(0, 0).height = 0.0f;
+    w.at(1, 0).height = 0.10f;
+
+    cfg.mergeBuildings = true;
+    cfg.heightQuantization = 0.0f;
+
+    // Legacy mode: require perfect flatness.
+    cfg.mergeBuildingsMaxBaseHeightRange = 0.0f;
+    {
+      std::ostringstream obj;
+      std::ostringstream mtl;
+      MeshExportStats st;
+      std::string err;
+      EXPECT_TRUE(WriteWorldObjMtl(obj, mtl, w, cfg, &st, &err));
+      EXPECT_TRUE(err.empty());
+      EXPECT_EQ(st.vertices, 40ULL);
+      EXPECT_EQ(st.triangles, 20ULL);
+    }
+
+    // Modern mode: allow gentle slopes.
+    cfg.mergeBuildingsMaxBaseHeightRange = 0.25f;
+    {
+      std::ostringstream obj;
+      std::ostringstream mtl;
+      MeshExportStats st;
+      std::string err;
+      EXPECT_TRUE(WriteWorldObjMtl(obj, mtl, w, cfg, &st, &err));
+      EXPECT_TRUE(err.empty());
+      EXPECT_EQ(st.vertices, 20ULL);
+      EXPECT_EQ(st.triangles, 10ULL);
+    }
+  }
+}
+
+void TestMeshExportDefaultsAndPresets()
+{
+  using namespace isocity;
+
+  // The in-struct defaults are the project's "modern" preset.
+  {
+    MeshExportConfig cfg;
+    EXPECT_TRUE(cfg.mergeTopSurfaces);
+    EXPECT_NEAR(cfg.heightQuantization, 0.25f, 1e-6f);
+    EXPECT_TRUE(cfg.mergeBuildings);
+    EXPECT_NEAR(cfg.mergeBuildingsMaxBaseHeightRange, 1.0f, 1e-6f);
+    EXPECT_NEAR(cfg.buildingFootprint, 0.70f, 1e-6f);
+  }
+
+  // Legacy defaults helper should revert key fields deterministically.
+  {
+    MeshExportConfig cfg;
+    cfg.mtlFileName = "keep.mtl";
+    cfg.objectName = "keep_obj";
+    ApplyLegacyMeshExportDefaults(cfg);
+    EXPECT_EQ(cfg.mtlFileName, "keep.mtl");
+    EXPECT_EQ(cfg.objectName, "keep_obj");
+    EXPECT_TRUE(!cfg.mergeTopSurfaces);
+    EXPECT_NEAR(cfg.heightQuantization, 0.0f, 1e-6f);
+    EXPECT_TRUE(!cfg.mergeBuildings);
+    EXPECT_NEAR(cfg.mergeBuildingsMaxBaseHeightRange, 0.0f, 1e-6f);
+    EXPECT_NEAR(cfg.buildingFootprint, 0.60f, 1e-6f);
+  }
 }
 
 void TestGltfExportBasic()
@@ -5501,9 +5585,77 @@ void TestGltfExportBasic()
     const std::string json = oss.str();
     EXPECT_TRUE(json.find("\"version\":\"2.0\"") != std::string::npos);
     EXPECT_TRUE(json.find(binPath.filename().string()) != std::string::npos);
-    EXPECT_TRUE(json.find("\"POSITION\":0") != std::string::npos);
     EXPECT_TRUE(json.find("\"min\":[") != std::string::npos);
     EXPECT_TRUE(json.find("\"max\":[") != std::string::npos);
+
+    // Parse the JSON and validate the shape of the exported structure.
+    JsonValue root;
+    std::string jerr;
+    EXPECT_TRUE(ParseJson(json, root, jerr));
+    EXPECT_TRUE(jerr.empty());
+    EXPECT_TRUE(root.isObject());
+
+    const JsonValue* extUsed = FindJsonMember(root, "extensionsUsed");
+    EXPECT_TRUE(extUsed && extUsed->isArray());
+    bool foundUnlit = false;
+    if (extUsed && extUsed->isArray()) {
+      for (const JsonValue& v : extUsed->arrayValue) {
+        if (v.isString() && v.stringValue == "KHR_materials_unlit") {
+          foundUnlit = true;
+          break;
+        }
+      }
+    }
+    EXPECT_TRUE(foundUnlit);
+
+    const JsonValue* materials = FindJsonMember(root, "materials");
+    const JsonValue* meshes = FindJsonMember(root, "meshes");
+    EXPECT_TRUE(materials && materials->isArray());
+    EXPECT_TRUE(meshes && meshes->isArray());
+    EXPECT_TRUE(meshes && !meshes->arrayValue.empty());
+
+    const JsonValue& mesh0 = meshes->arrayValue[0];
+    EXPECT_TRUE(mesh0.isObject());
+    const JsonValue* prims = FindJsonMember(mesh0, "primitives");
+    EXPECT_TRUE(prims && prims->isArray());
+    EXPECT_TRUE(prims && prims->arrayValue.size() >= 2);
+
+    // In this tiny 2x2 world we intentionally use multiple surface materials.
+    EXPECT_TRUE(materials->arrayValue.size() == prims->arrayValue.size());
+
+    // Each primitive should have POSITION + NORMAL attributes, and no COLOR_0 (we use per-material colors).
+    for (const JsonValue& p : prims->arrayValue) {
+      EXPECT_TRUE(p.isObject());
+      const JsonValue* attrs = FindJsonMember(p, "attributes");
+      EXPECT_TRUE(attrs && attrs->isObject());
+      if (attrs && attrs->isObject()) {
+        EXPECT_TRUE(FindJsonMember(*attrs, "POSITION") != nullptr);
+        EXPECT_TRUE(FindJsonMember(*attrs, "NORMAL") != nullptr);
+        EXPECT_TRUE(FindJsonMember(*attrs, "COLOR_0") == nullptr);
+      }
+    }
+
+    // Accessors should be 3 per primitive (POSITION, NORMAL, INDICES).
+    const JsonValue* accessors = FindJsonMember(root, "accessors");
+    EXPECT_TRUE(accessors && accessors->isArray());
+    if (accessors && accessors->isArray() && prims && prims->isArray()) {
+      EXPECT_EQ(accessors->arrayValue.size(), prims->arrayValue.size() * 3);
+      // For this case, we expect small meshes to use UNSIGNED_BYTE indices (componentType 5121).
+      // Indices accessors are at positions 2, 5, 8, ...
+      for (std::size_t pi = 0; pi < prims->arrayValue.size(); ++pi) {
+        const std::size_t idxAcc = pi * 3 + 2;
+        EXPECT_TRUE(idxAcc < accessors->arrayValue.size());
+        if (idxAcc < accessors->arrayValue.size()) {
+          const JsonValue& a = accessors->arrayValue[idxAcc];
+          EXPECT_TRUE(a.isObject());
+          const JsonValue* ct = FindJsonMember(a, "componentType");
+          EXPECT_TRUE(ct && ct->isNumber());
+          if (ct && ct->isNumber()) {
+            EXPECT_EQ(static_cast<int>(ct->numberValue), 5121);
+          }
+        }
+      }
+    }
 
     const std::uintmax_t binSize = fs::file_size(binPath);
     EXPECT_TRUE(json.find("\"byteLength\":" + std::to_string(binSize)) != std::string::npos);
@@ -7119,6 +7271,7 @@ int main()
   TestMeshExportObjMtlBasic();
   TestMeshExportObjMtlMergeTopSurfaces();
   TestMeshExportObjMtlMergeBuildings();
+  TestMeshExportDefaultsAndPresets();
   TestGltfExportBasic();
   TestWorldTransformRotateMirrorCrop();
 

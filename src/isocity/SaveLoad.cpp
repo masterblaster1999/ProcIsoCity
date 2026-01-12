@@ -298,7 +298,9 @@ struct ProcGenConfigBinV10 {
   float parkChance = 0.06f;
 
   std::uint8_t terrainPreset = 0; // ProcGenTerrainPreset
-  std::uint8_t _pad0 = 0;
+  // v12 originally had a padding byte here; we now use it to persist the
+  // macro road layout mode without bumping the save version.
+  std::uint8_t roadLayout = 0;
   std::uint8_t _pad1 = 0;
   std::uint8_t _pad2 = 0;
 
@@ -317,7 +319,9 @@ struct ProcGenConfigBinV11 {
 
   std::uint8_t terrainPreset = 0;        // ProcGenTerrainPreset
   std::uint8_t roadHierarchyEnabled = 0; // bool
-  std::uint8_t _pad0 = 0;
+  // v12 originally had a padding byte here; we now use it to persist the
+  // macro road layout mode without bumping the save version.
+  std::uint8_t roadLayout = 0;
   std::uint8_t _pad1 = 0;
 
   float terrainPresetStrength = 1.0f;
@@ -337,7 +341,9 @@ struct ProcGenConfigBinV12 {
   std::uint8_t terrainPreset = 0;        // ProcGenTerrainPreset
   std::uint8_t roadHierarchyEnabled = 0; // bool
   std::uint8_t districtingMode = 0;      // ProcGenDistrictingMode
-  std::uint8_t _pad0 = 0;
+  // v12 originally had a padding byte here; we now use it to persist the
+  // macro road layout mode without bumping the save version.
+  std::uint8_t roadLayout = 0;
 
   float terrainPresetStrength = 1.0f;
   float roadHierarchyStrength = 0.0f;
@@ -403,6 +409,7 @@ ProcGenConfigBinV12 ToBinV12(const ProcGenConfig& cfg)
   b.terrainPreset = static_cast<std::uint8_t>(cfg.terrainPreset);
   b.roadHierarchyEnabled = static_cast<std::uint8_t>(cfg.roadHierarchyEnabled ? 1u : 0u);
   b.districtingMode = static_cast<std::uint8_t>(cfg.districtingMode);
+  b.roadLayout = static_cast<std::uint8_t>(cfg.roadLayout);
   b.terrainPresetStrength = cfg.terrainPresetStrength;
   b.roadHierarchyStrength = cfg.roadHierarchyStrength;
   return b;
@@ -426,6 +433,9 @@ void FromBin(ProcGenConfig& cfg, const ProcGenConfigBin& b)
 
   // v11 and older did not persist districting mode; default to legacy Voronoi to preserve determinism.
   cfg.districtingMode = ProcGenDistrictingMode::Voronoi;
+
+  // Older save versions did not persist the macro road layout; default to the historical behavior.
+  cfg.roadLayout = ProcGenRoadLayout::Organic;
 
   // Older save versions did not persist erosion settings. Default to disabled and let newer versions override.
   cfg.erosion = ErosionConfig{};
@@ -457,6 +467,9 @@ void FromBinV10(ProcGenConfig& cfg, const ProcGenConfigBinV10& b)
   // v11 and older did not persist districting mode; default to legacy Voronoi to preserve determinism.
   cfg.districtingMode = ProcGenDistrictingMode::Voronoi;
 
+  // v12-: macro road layout did not exist; default to historical behavior.
+  cfg.roadLayout = ProcGenRoadLayout::Organic;
+
   // Erosion settings are persisted separately starting in v9; loader will override.
   cfg.erosion = ErosionConfig{};
 }
@@ -483,6 +496,9 @@ void FromBinV11(ProcGenConfig& cfg, const ProcGenConfigBinV11& b)
 
   // v11 did not persist districting mode; default to legacy Voronoi to preserve determinism.
   cfg.districtingMode = ProcGenDistrictingMode::Voronoi;
+
+  // v12-: macro road layout did not exist; default to historical behavior.
+  cfg.roadLayout = ProcGenRoadLayout::Organic;
 
   // Erosion settings are persisted separately starting in v9; loader will override.
   cfg.erosion = ErosionConfig{};
@@ -514,6 +530,12 @@ void FromBinV12(ProcGenConfig& cfg, const ProcGenConfigBinV12& b)
   }
   cfg.districtingMode = static_cast<ProcGenDistrictingMode>(modeU8);
 
+  std::uint8_t layoutU8 = b.roadLayout;
+  if (layoutU8 > static_cast<std::uint8_t>(ProcGenRoadLayout::Radial)) {
+    layoutU8 = static_cast<std::uint8_t>(ProcGenRoadLayout::Organic);
+  }
+  cfg.roadLayout = static_cast<ProcGenRoadLayout>(layoutU8);
+
   // Erosion settings are persisted separately starting in v9; loader will override.
   cfg.erosion = ErosionConfig{};
 }
@@ -522,7 +544,9 @@ void FromBinV12(ProcGenConfig& cfg, const ProcGenConfigBinV12& b)
 struct ErosionConfigBin {
   std::uint8_t enabled = 1;
   std::uint8_t riversEnabled = 1;
-  std::uint8_t _pad0 = 0;
+  // v12 originally had a padding byte here; we now use it to persist the
+  // macro road layout mode without bumping the save version.
+  std::uint8_t roadLayout = 0;
   std::uint8_t _pad1 = 0;
 
   std::int32_t thermalIterations = 20;
@@ -2304,7 +2328,9 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
         std::uint8_t terrainPreset = 0;
         std::uint8_t roadHierarchyEnabled = 0;
         std::uint8_t districtingMode = 0;
-        std::uint8_t _pad0 = 0;
+        // v12 originally had a padding byte here; we now use it to persist the
+  // macro road layout mode without bumping the save version.
+  std::uint8_t roadLayout = 0;
 
         float terrainPresetStrength = 1.0f;
         float roadHierarchyStrength = 0.0f;
@@ -2351,7 +2377,9 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
 
         std::uint8_t terrainPreset = 0;
         std::uint8_t roadHierarchyEnabled = 0;
-        std::uint8_t _pad0 = 0;
+        // v12 originally had a padding byte here; we now use it to persist the
+  // macro road layout mode without bumping the save version.
+  std::uint8_t roadLayout = 0;
         std::uint8_t _pad1 = 0;
 
         float terrainPresetStrength = 1.0f;
@@ -2395,7 +2423,9 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
         float parkChance = 0.06f;
 
         std::uint8_t terrainPreset = 0;
-        std::uint8_t _pad0 = 0;
+        // v12 originally had a padding byte here; we now use it to persist the
+  // macro road layout mode without bumping the save version.
+  std::uint8_t roadLayout = 0;
         std::uint8_t _pad1 = 0;
         std::uint8_t _pad2 = 0;
 
@@ -2468,7 +2498,9 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
       struct ErosionConfigBinLocal {
         std::uint8_t enabled = 1;
         std::uint8_t riversEnabled = 1;
-        std::uint8_t _pad0 = 0;
+        // v12 originally had a padding byte here; we now use it to persist the
+  // macro road layout mode without bumping the save version.
+  std::uint8_t roadLayout = 0;
         std::uint8_t _pad1 = 0;
 
         std::int32_t thermalIterations = 20;

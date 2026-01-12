@@ -1538,6 +1538,14 @@ static bool CmdProc(ScriptRunnerState& ctx, ScriptRunner& runner, const std::vec
   if (key == "extraconnections" || key == "extra_connections") {
     return ParseI32(val, &ctx.procCfg.extraConnections);
   }
+  if (key == "roadlayout" || key == "road_layout") {
+    ProcGenRoadLayout layout{};
+    if (!ParseProcGenRoadLayout(val, layout)) {
+      return runner.fail(path, lineNo, "unknown road_layout (try: organic|grid|radial)");
+    }
+    ctx.procCfg.roadLayout = layout;
+    return true;
+  }
   if (key == "zonechance" || key == "zone_chance") {
     return ParseF32(val, &ctx.procCfg.zoneChance);
   }

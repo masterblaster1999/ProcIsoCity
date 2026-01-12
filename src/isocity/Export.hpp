@@ -61,13 +61,14 @@ struct RgbaImage {
 //
 // The encoder remains intentionally tiny and always writes:
 //  - bit depth 8, no interlace
-//  - filter 0 (None)
-//  - zlib stream with stored (uncompressed) DEFLATE blocks
+//  - per-row PNG filters (0..4), chosen by a cheap deterministic heuristic
+//  - zlib stream with fixed-Huffman DEFLATE blocks (no external zlib dependency)
 //
 // The decoder is also intentionally tiny. It can read the subset produced by our tools:
 //  - color type 6 (RGBA), 2 (RGB), or 3 (indexed with PLTE + optional tRNS)
-//  - bit depth 8, no interlace, filter 0 (None)
-//  - zlib stream with stored (uncompressed) DEFLATE blocks
+//  - bit depth 8, no interlace
+//  - filter 0..4
+//  - zlib stream with stored/fixed/dynamic DEFLATE blocks
 //
 // Useful for generated sprite atlases / tilesets where preserving alpha is important.
 bool WritePngRGBA(const std::string& path, const RgbaImage& img, std::string& outError);
@@ -78,7 +79,7 @@ bool ReadPngRGBA(const std::string& path, RgbaImage& outImg, std::string& outErr
 // -----------------------------------------------------------------------------------------------
 //
 // This is useful for procedural sprite atlases intended for distribution/modding.
-// Because our PNG encoder intentionally uses stored (uncompressed) DEFLATE blocks,
+// Because our PNG encoder uses proper DEFLATE compression (while staying dependency-free),
 // indexed-color output can dramatically reduce file size vs RGBA.
 //
 // The palette is provided as RGBA bytes: paletteRgba.size() must be 4 * paletteSize,
@@ -89,8 +90,8 @@ bool ReadPngRGBA(const std::string& path, RgbaImage& outImg, std::string& outErr
 //      * color type 3 (indexed)
 //      * PLTE chunk for RGB
 //      * tRNS chunk for alpha (one byte per palette entry)
-//      * filter 0 (None)
-//      * stored DEFLATE in the zlib stream
+//      * per-row PNG filters (0..4)
+//      * fixed-Huffman DEFLATE in the zlib stream
 bool WritePngIndexed(const std::string& path, int width, int height,
                      const std::vector<std::uint8_t>& indices,
                      const std::vector<std::uint8_t>& paletteRgba,
@@ -155,8 +156,8 @@ bool ComparePpm(const PpmImage& a, const PpmImage& b, PpmDiffStats& outStats, in
 //
 // The encoder is intentionally minimal:
 //  - Color type 2 (RGB), bit depth 8
-//  - Filter 0 (None)
-//  - DEFLATE stream uses "stored" (uncompressed) blocks for simplicity
+//  - Per-row PNG filters (0..4)
+//  - DEFLATE stream uses fixed Huffman codes with a small built-in LZ77 matcher
 //
 // Returns true on success; on failure, outError contains a human-friendly error.
 bool WritePng(const std::string& path, const PpmImage& img, std::string& outError);
@@ -165,8 +166,8 @@ bool WritePng(const std::string& path, const PpmImage& img, std::string& outErro
 //
 // The decoder supports a small subset of PNG:
 //  - Color type 2 (RGB), bit depth 8, no interlace
-//  - Filter 0 (None)
-//  - Zlib stream with stored (uncompressed) blocks
+//  - Filter 0..4
+//  - Zlib stream with stored/fixed/dynamic DEFLATE blocks
 //
 // It is sufficient for deterministic snapshot artifacts and internal tooling.
 bool ReadPng(const std::string& path, PpmImage& outImg, std::string& outError);

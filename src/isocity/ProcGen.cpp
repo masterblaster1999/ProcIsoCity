@@ -116,6 +116,42 @@ bool ParseProcGenDistrictingMode(const std::string& s, ProcGenDistrictingMode& o
   return false;
 }
 
+const char* ToString(ProcGenRoadLayout m)
+{
+  switch (m) {
+  case ProcGenRoadLayout::Organic: return "organic";
+  case ProcGenRoadLayout::Grid: return "grid";
+  case ProcGenRoadLayout::Radial: return "radial";
+  default: return "organic";
+  }
+}
+
+bool ParseProcGenRoadLayout(const std::string& s, ProcGenRoadLayout& out)
+{
+  const std::string t = LowerCopy(s);
+  if (t.empty()) return false;
+
+  auto eq = [&](const char* a) { return t == a; };
+
+  if (eq("organic") || eq("org") || eq("classic") || eq("legacy") || eq("mst") || eq("default")) {
+    out = ProcGenRoadLayout::Organic;
+    return true;
+  }
+
+  if (eq("grid") || eq("manhattan") || eq("orthogonal") || eq("rect") || eq("rectilinear")) {
+    out = ProcGenRoadLayout::Grid;
+    return true;
+  }
+
+  if (eq("radial") || eq("ring") || eq("spoke") || eq("spokes") || eq("hubspoke") || eq("hub_spoke") ||
+      eq("hub-and-spoke") || eq("hub_and_spoke")) {
+    out = ProcGenRoadLayout::Radial;
+    return true;
+  }
+
+  return false;
+}
+
 namespace {
 
 // -----------------------------
@@ -594,8 +630,15 @@ static void SetRoadWithLevel(World& world, int x, int y, int level, bool allowBr
     return;
   }
 
+  const int nextLevel = ClampRoadLevel(level);
+  int curLevel = 0;
+  if (t.overlay == Overlay::Road) {
+    curLevel = ClampRoadLevel(static_cast<int>(t.level));
+  }
+
   world.setRoad(x, y);
-  world.at(x, y).level = static_cast<std::uint8_t>(ClampRoadLevel(level));
+  Tile& rt = world.at(x, y);
+  rt.level = static_cast<std::uint8_t>(std::max(curLevel, nextLevel));
 }
 
 static void CarveRoadWiggle(World& world, RNG& rng, P a, P b, int level, bool allowBridges)
@@ -965,6 +1008,358 @@ static std::vector<Edge> BuildHubMST(const std::vector<P>& hubs)
   }
 
   return edges;
+}
+
+
+// -----------------------------
+// Macro road layout modes
+// -----------------------------
+
+static void CarveHubConnectionsOrganic(World& world, RNG& rng, const std::vector<P>& hubPts, std::uint32_t seed32,
+                                      const ProcGenConfig& cfg)
+{
+  // Connect hubs with a minimum-spanning-tree (MST) backbone instead of an arbitrary
+  // sequential chain. This produces more natural arterial networks and guarantees
+  // every hub is reachable.
+  const std::vector<Edge> mst = BuildHubMST(hubPts);
+  std::vector<std::uint32_t> usedEdgeKeys;
+  usedEdgeKeys.reserve(mst.size() + static_cast<std::size_t>(cfg.extraConnections) + 4u);
+
+  for (const Edge& e : mst) {
+    usedEdgeKeys.push_back(EdgeKeyU32(e.a, e.b));
+    const P a = hubPts[static_cast<std::size_t>(e.a)];
+    const P b = hubPts[static_cast<std::size_t>(e.b)];
+    const int lvl = ChooseHubConnectionLevel(world, a, b);
+    CarveRoadCurvy(world, rng, a, b, lvl, /*allowBridges=*/(lvl >= 2), seed32 ^ HashCoords32(e.a, e.b, 0xC0FFEEu));
+  }
+
+  auto edgeUsed = [&](std::uint32_t key) {
+    return std::find(usedEdgeKeys.begin(), usedEdgeKeys.end(), key) != usedEdgeKeys.end();
+  };
+
+  // Extra connections: add short hub-to-hub loops via k-nearest-neighbor candidate edges.
+  if (cfg.extraConnections > 0 && hubPts.size() >= 3) {
+    const int n = static_cast<int>(hubPts.size());
+    const int kNeighbors = std::min(3, n - 1);
+
+    std::vector<Edge> candidates;
+    candidates.reserve(static_cast<std::size_t>(n) * static_cast<std::size_t>(kNeighbors));
+
+    for (int i = 0; i < n; ++i) {
+      std::vector<std::pair<int, int>> distTo;
+      distTo.reserve(static_cast<std::size_t>(n) - 1u);
+      for (int j = 0; j < n; ++j) {
+        if (i == j) continue;
+        distTo.push_back({ManhattanDist(hubPts[static_cast<std::size_t>(i)], hubPts[static_cast<std::size_t>(j)]), j});
+      }
+      std::sort(distTo.begin(), distTo.end(), [](const auto& a, const auto& b) {
+        if (a.first != b.first) return a.first < b.first;
+        return a.second < b.second;
+      });
+
+      for (int k = 0; k < kNeighbors && k < static_cast<int>(distTo.size()); ++k) {
+        const int j = distTo[static_cast<std::size_t>(k)].second;
+        const int dist = distTo[static_cast<std::size_t>(k)].first;
+        const int a = std::min(i, j);
+        const int b = std::max(i, j);
+        const std::uint32_t key = EdgeKeyU32(a, b);
+        if (edgeUsed(key)) continue;
+
+        // Also avoid duplicate candidate edges.
+        bool dup = false;
+        for (const Edge& e : candidates) {
+          if (EdgeKeyU32(e.a, e.b) == key) {
+            dup = true;
+            break;
+          }
+        }
+        if (dup) continue;
+
+        candidates.push_back(Edge{a, b, dist});
+      }
+    }
+
+    // Sort by distance, with a deterministic pseudo-random tiebreaker so different seeds
+    // get different loop choices.
+    std::sort(candidates.begin(), candidates.end(), [&](const Edge& ea, const Edge& eb) {
+      if (ea.dist != eb.dist) return ea.dist < eb.dist;
+      const std::uint32_t ha = HashCoords32(ea.a, ea.b, seed32 ^ 0xF00DFACEu);
+      const std::uint32_t hb = HashCoords32(eb.a, eb.b, seed32 ^ 0xF00DFACEu);
+      return ha < hb;
+    });
+
+    int added = 0;
+    for (const Edge& e : candidates) {
+      if (added >= cfg.extraConnections) break;
+      const std::uint32_t key = EdgeKeyU32(e.a, e.b);
+      if (edgeUsed(key)) continue;
+
+      const P a = hubPts[static_cast<std::size_t>(e.a)];
+      const P b = hubPts[static_cast<std::size_t>(e.b)];
+
+      // Loops should be at least avenue-class so they meaningfully take load off the backbone.
+      const int lvl = std::max(2, ChooseHubConnectionLevel(world, a, b));
+      CarveRoadCurvy(world, rng, a, b, lvl, /*allowBridges=*/true, seed32 ^ HashCoords32(e.a, e.b, 0xBADC0DEu));
+
+      usedEdgeKeys.push_back(key);
+      ++added;
+    }
+  }
+}
+
+static void CarveHubConnectionsGrid(World& world, RNG& rng, const std::vector<P>& hubPts, std::uint32_t seed32,
+                                   const ProcGenConfig& cfg)
+{
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return;
+  if (hubPts.empty()) return;
+
+  // Compute hub centroid (integer).
+  int cx = 0;
+  int cy = 0;
+  for (const P& p : hubPts) {
+    cx += p.x;
+    cy += p.y;
+  }
+  cx = static_cast<int>(std::lround(static_cast<float>(cx) / static_cast<float>(hubPts.size())));
+  cy = static_cast<int>(std::lround(static_cast<float>(cy) / static_cast<float>(hubPts.size())));
+  cx = std::clamp(cx, 0, w - 1);
+  cy = std::clamp(cy, 0, h - 1);
+
+  const int minDim = std::min(w, h);
+  int spacing = std::clamp(minDim / 6, 10, 18);
+  if (minDim <= 48) {
+    spacing = std::clamp(minDim / 5, 8, 14);
+  }
+
+  std::vector<int> xs;
+  std::vector<int> ys;
+  xs.reserve(16);
+  ys.reserve(16);
+
+  auto addUnique = [](std::vector<int>& v, int a) {
+    if (std::find(v.begin(), v.end(), a) == v.end()) v.push_back(a);
+  };
+
+  addUnique(xs, cx);
+  addUnique(ys, cy);
+
+  for (int step = 1; step < 32; ++step) {
+    const int x1 = cx + step * spacing;
+    const int x2 = cx - step * spacing;
+    if (x1 >= w && x2 < 0) break;
+    if (x1 >= 0 && x1 < w) addUnique(xs, x1);
+    if (x2 >= 0 && x2 < w) addUnique(xs, x2);
+  }
+
+  for (int step = 1; step < 32; ++step) {
+    const int y1 = cy + step * spacing;
+    const int y2 = cy - step * spacing;
+    if (y1 >= h && y2 < 0) break;
+    if (y1 >= 0 && y1 < h) addUnique(ys, y1);
+    if (y2 >= 0 && y2 < h) addUnique(ys, y2);
+  }
+
+  std::sort(xs.begin(), xs.end());
+  std::sort(ys.begin(), ys.end());
+
+  auto isCentral = [&](int v, int c) { return std::abs(v - c) <= std::max(2, spacing / 2); };
+
+  // Carve primary arterials as straight grid lines.
+  for (int x : xs) {
+    const int lvl = isCentral(x, cx) ? 3 : 2;
+    for (int y = 0; y < h; ++y) {
+      SetRoadWithLevel(world, x, y, lvl, /*allowBridges=*/true);
+    }
+  }
+
+  for (int y : ys) {
+    const int lvl = isCentral(y, cy) ? 3 : 2;
+    for (int x = 0; x < w; ++x) {
+      SetRoadWithLevel(world, x, y, lvl, /*allowBridges=*/true);
+    }
+  }
+
+  // Snap each hub into the arterial grid via the nearest intersection.
+  for (std::size_t i = 0; i < hubPts.size(); ++i) {
+    const P hub = hubPts[i];
+
+    int bestX = xs.empty() ? hub.x : xs[0];
+    int bestY = ys.empty() ? hub.y : ys[0];
+    int bestD = std::numeric_limits<int>::max();
+    std::uint32_t bestTie = std::numeric_limits<std::uint32_t>::max();
+
+    for (int x : xs) {
+      for (int y : ys) {
+        const int d = std::abs(hub.x - x) + std::abs(hub.y - y);
+        const std::uint32_t tie = HashCoords32(x, y, seed32 ^ HashCoords32(hub.x, hub.y, 0x4A7F3D21u));
+        if (d < bestD || (d == bestD && tie < bestTie)) {
+          bestD = d;
+          bestTie = tie;
+          bestX = x;
+          bestY = y;
+        }
+      }
+    }
+
+    P target{bestX, bestY};
+    (void)FindNearestWaypointTile(world, bestX, bestY, /*maxR=*/6, /*allowWater=*/false,
+                                 seed32 ^ HashCoords32(bestX, bestY, 0x9E3779B9u), target);
+
+    const int lvl = std::max(2, ChooseHubConnectionLevel(world, hub, target));
+    CarveRoadCurvy(world, rng, hub, target, lvl, /*allowBridges=*/true, seed32 ^ HashCoords32(static_cast<int>(i), lvl, 0x6A71D00u));
+  }
+
+  // Use the extraConnections budget to add a few diagonal express links between distant hubs.
+  if (cfg.extraConnections > 0 && hubPts.size() >= 2) {
+    const int n = static_cast<int>(hubPts.size());
+    std::vector<Edge> pairs;
+    pairs.reserve(static_cast<std::size_t>(n) * static_cast<std::size_t>(n - 1) / 2u);
+
+    for (int a = 0; a < n; ++a) {
+      for (int b = a + 1; b < n; ++b) {
+        pairs.push_back(Edge{a, b, ManhattanDist(hubPts[static_cast<std::size_t>(a)], hubPts[static_cast<std::size_t>(b)])});
+      }
+    }
+
+    std::sort(pairs.begin(), pairs.end(), [&](const Edge& ea, const Edge& eb) {
+      if (ea.dist != eb.dist) return ea.dist > eb.dist; // longest first
+      const std::uint32_t ha = HashCoords32(ea.a, ea.b, seed32 ^ 0xD1A60A1Eu);
+      const std::uint32_t hb = HashCoords32(eb.a, eb.b, seed32 ^ 0xD1A60A1Eu);
+      return ha < hb;
+    });
+
+    int added = 0;
+    std::vector<std::uint32_t> used;
+    used.reserve(static_cast<std::size_t>(cfg.extraConnections) + 4u);
+
+    for (const Edge& e : pairs) {
+      if (added >= cfg.extraConnections) break;
+      const std::uint32_t key = EdgeKeyU32(e.a, e.b);
+      if (std::find(used.begin(), used.end(), key) != used.end()) continue;
+      used.push_back(key);
+
+      const P a = hubPts[static_cast<std::size_t>(e.a)];
+      const P b = hubPts[static_cast<std::size_t>(e.b)];
+      CarveRoadCurvy(world, rng, a, b, /*level=*/3, /*allowBridges=*/true, seed32 ^ HashCoords32(e.a, e.b, 0x51D1A6u));
+      ++added;
+    }
+  }
+}
+
+static void CarveHubConnectionsRadial(World& world, RNG& rng, const std::vector<P>& hubPts, std::uint32_t seed32,
+                                     const ProcGenConfig& cfg)
+{
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return;
+  if (hubPts.size() < 2) return;
+
+  // Compute hub centroid.
+  float cx = 0.0f;
+  float cy = 0.0f;
+  for (const P& p : hubPts) {
+    cx += static_cast<float>(p.x);
+    cy += static_cast<float>(p.y);
+  }
+  cx /= static_cast<float>(hubPts.size());
+  cy /= static_cast<float>(hubPts.size());
+
+  // Pick the most "central" hub as the spoke origin.
+  int centerIdx = 0;
+  int bestD = std::numeric_limits<int>::max();
+  std::uint32_t bestTie = std::numeric_limits<std::uint32_t>::max();
+  for (int i = 0; i < static_cast<int>(hubPts.size()); ++i) {
+    const P p = hubPts[static_cast<std::size_t>(i)];
+    const int d = static_cast<int>(std::lround(std::fabs(static_cast<float>(p.x) - cx) + std::fabs(static_cast<float>(p.y) - cy)));
+    const std::uint32_t tie = HashCoords32(p.x, p.y, seed32 ^ 0x13579BDFu);
+    if (d < bestD || (d == bestD && tie < bestTie)) {
+      bestD = d;
+      bestTie = tie;
+      centerIdx = i;
+    }
+  }
+
+  const P center = hubPts[static_cast<std::size_t>(centerIdx)];
+
+  // Spokes from the center to every other hub.
+  for (int i = 0; i < static_cast<int>(hubPts.size()); ++i) {
+    if (i == centerIdx) continue;
+    const P p = hubPts[static_cast<std::size_t>(i)];
+    const int lvl = std::max(2, ChooseHubConnectionLevel(world, center, p));
+    CarveRoadCurvy(world, rng, center, p, lvl, /*allowBridges=*/true, seed32 ^ HashCoords32(centerIdx, i, 0x5F0CE001u));
+  }
+
+  // Outer ring: connect hubs around the centroid by angle.
+  struct HubAngle {
+    int idx = 0;
+    float ang = 0.0f;
+    float r = 0.0f;
+  };
+
+  std::vector<HubAngle> outer;
+  outer.reserve(hubPts.size());
+  for (int i = 0; i < static_cast<int>(hubPts.size()); ++i) {
+    if (i == centerIdx) continue;
+    const P p = hubPts[static_cast<std::size_t>(i)];
+    const float dx = static_cast<float>(p.x) - cx;
+    const float dy = static_cast<float>(p.y) - cy;
+    HubAngle ha;
+    ha.idx = i;
+    ha.ang = std::atan2(dy, dx);
+    ha.r = std::fabs(dx) + std::fabs(dy);
+    outer.push_back(ha);
+  }
+
+  if (outer.size() >= 3) {
+    std::sort(outer.begin(), outer.end(), [&](const HubAngle& a, const HubAngle& b) {
+      if (a.ang != b.ang) return a.ang < b.ang;
+      if (a.r != b.r) return a.r > b.r;
+      const std::uint32_t ha = HashCoords32(a.idx, static_cast<int>(std::lround(a.r)), seed32 ^ 0xBEEFBEEFu);
+      const std::uint32_t hb = HashCoords32(b.idx, static_cast<int>(std::lround(b.r)), seed32 ^ 0xBEEFBEEFu);
+      return ha < hb;
+    });
+
+    const int diag = w + h;
+
+    for (std::size_t i = 0; i < outer.size(); ++i) {
+      const int aIdx = outer[i].idx;
+      const int bIdx = outer[(i + 1) % outer.size()].idx;
+
+      const P a = hubPts[static_cast<std::size_t>(aIdx)];
+      const P b = hubPts[static_cast<std::size_t>(bIdx)];
+
+      int lvl = 2;
+      const int dist = ManhattanDist(a, b);
+      if (dist > diag / 3) lvl = 3;
+
+      CarveRoadCurvy(world, rng, a, b, lvl, /*allowBridges=*/true, seed32 ^ HashCoords32(aIdx, bIdx, 0xA71E0001u));
+    }
+  }
+
+  // ExtraConnections budget: add a few "chords" across the ring.
+  if (cfg.extraConnections > 0 && outer.size() >= 4) {
+    const int n = static_cast<int>(outer.size());
+    int added = 0;
+    std::vector<std::uint32_t> used;
+    used.reserve(static_cast<std::size_t>(cfg.extraConnections) + 4u);
+
+    for (int i = 0; i < n && added < cfg.extraConnections; ++i) {
+      const int aIdx = outer[static_cast<std::size_t>(i)].idx;
+      const int bIdx = outer[static_cast<std::size_t>((i + n / 2 + added) % n)].idx;
+      if (aIdx == bIdx) continue;
+
+      const std::uint32_t key = EdgeKeyU32(aIdx, bIdx);
+      if (std::find(used.begin(), used.end(), key) != used.end()) continue;
+      used.push_back(key);
+
+      const P a = hubPts[static_cast<std::size_t>(aIdx)];
+      const P b = hubPts[static_cast<std::size_t>(bIdx)];
+      CarveRoadCurvy(world, rng, a, b, /*level=*/3, /*allowBridges=*/true, seed32 ^ HashCoords32(aIdx, bIdx, 0xC0AD0001u));
+      ++added;
+    }
+  }
 }
 
 
@@ -3968,92 +4363,18 @@ World GenerateWorld(int width, int height, std::uint64_t seed, const ProcGenConf
     CarveHubGrid(world, rng, h);
   }
 
-  // Connect hubs with a minimum-spanning-tree (MST) backbone instead of an arbitrary
-  // sequential chain. This produces more natural arterial networks and guarantees
-  // every hub is reachable.
-  const std::vector<Edge> mst = BuildHubMST(hubPts);
-  std::vector<std::uint32_t> usedEdgeKeys;
-  usedEdgeKeys.reserve(mst.size() + static_cast<std::size_t>(cfg.extraConnections) + 4u);
-
-  for (const Edge& e : mst) {
-    usedEdgeKeys.push_back(EdgeKeyU32(e.a, e.b));
-    const P a = hubPts[static_cast<std::size_t>(e.a)];
-    const P b = hubPts[static_cast<std::size_t>(e.b)];
-    const int lvl = ChooseHubConnectionLevel(world, a, b);
-    CarveRoadCurvy(world, rng, a, b, lvl, /*allowBridges=*/(lvl >= 2), seed32 ^ HashCoords32(e.a, e.b, 0xC0FFEEu));
-  }
-
-  auto edgeUsed = [&](std::uint32_t key) {
-    return std::find(usedEdgeKeys.begin(), usedEdgeKeys.end(), key) != usedEdgeKeys.end();
-  };
-
-  // Extra connections: add short hub-to-hub loops via k-nearest-neighbor candidate edges.
-  if (cfg.extraConnections > 0 && hubPts.size() >= 3) {
-    const int n = static_cast<int>(hubPts.size());
-    const int kNeighbors = std::min(3, n - 1);
-
-    std::vector<Edge> candidates;
-    candidates.reserve(static_cast<std::size_t>(n) * static_cast<std::size_t>(kNeighbors));
-
-    for (int i = 0; i < n; ++i) {
-      std::vector<std::pair<int, int>> distTo;
-      distTo.reserve(static_cast<std::size_t>(n) - 1u);
-      for (int j = 0; j < n; ++j) {
-        if (i == j) continue;
-        distTo.push_back({ManhattanDist(hubPts[static_cast<std::size_t>(i)], hubPts[static_cast<std::size_t>(j)]), j});
-      }
-      std::sort(distTo.begin(), distTo.end(), [](const auto& a, const auto& b) {
-        if (a.first != b.first) return a.first < b.first;
-        return a.second < b.second;
-      });
-
-      for (int k = 0; k < kNeighbors && k < static_cast<int>(distTo.size()); ++k) {
-        const int j = distTo[static_cast<std::size_t>(k)].second;
-        const int dist = distTo[static_cast<std::size_t>(k)].first;
-        const int a = std::min(i, j);
-        const int b = std::max(i, j);
-        const std::uint32_t key = EdgeKeyU32(a, b);
-        if (edgeUsed(key)) continue;
-
-        // Also avoid duplicate candidate edges.
-        bool dup = false;
-        for (const Edge& e : candidates) {
-          if (EdgeKeyU32(e.a, e.b) == key) {
-            dup = true;
-            break;
-          }
-        }
-        if (dup) continue;
-
-        candidates.push_back(Edge{a, b, dist});
-      }
-    }
-
-    // Sort by distance, with a deterministic pseudo-random tiebreaker so different seeds
-    // get different loop choices.
-    std::sort(candidates.begin(), candidates.end(), [&](const Edge& ea, const Edge& eb) {
-      if (ea.dist != eb.dist) return ea.dist < eb.dist;
-      const std::uint32_t ha = HashCoords32(ea.a, ea.b, seed32 ^ 0xF00DFACEu);
-      const std::uint32_t hb = HashCoords32(eb.a, eb.b, seed32 ^ 0xF00DFACEu);
-      return ha < hb;
-    });
-
-    int added = 0;
-    for (const Edge& e : candidates) {
-      if (added >= cfg.extraConnections) break;
-      const std::uint32_t key = EdgeKeyU32(e.a, e.b);
-      if (edgeUsed(key)) continue;
-
-      const P a = hubPts[static_cast<std::size_t>(e.a)];
-      const P b = hubPts[static_cast<std::size_t>(e.b)];
-
-      // Loops should be at least avenue-class so they meaningfully take load off the backbone.
-      const int lvl = std::max(2, ChooseHubConnectionLevel(world, a, b));
-      CarveRoadCurvy(world, rng, a, b, lvl, /*allowBridges=*/true, seed32 ^ HashCoords32(e.a, e.b, 0xBADC0DEu));
-
-      usedEdgeKeys.push_back(key);
-      ++added;
-    }
+    // Connect hubs using the selected macro road layout.
+  switch (cfg.roadLayout) {
+  case ProcGenRoadLayout::Grid:
+    CarveHubConnectionsGrid(world, rng, hubPts, seed32, cfg);
+    break;
+  case ProcGenRoadLayout::Radial:
+    CarveHubConnectionsRadial(world, rng, hubPts, seed32, cfg);
+    break;
+  case ProcGenRoadLayout::Organic:
+  default:
+    CarveHubConnectionsOrganic(world, rng, hubPts, seed32, cfg);
+    break;
   }
 
   // Ensure at least one connection to the map edge (outside connection).
@@ -4079,7 +4400,10 @@ World GenerateWorld(int width, int height, std::uint64_t seed, const ProcGenConf
   }
 
   // Optional: carve a highway-ish beltway around the hub cluster.
-  CarveBeltwayIfUseful(world, rng, hubPts, seed32 ^ 0xB17BEEFu);
+  // For grid layouts we skip this so the macro structure reads more "planned".
+  if (cfg.roadLayout != ProcGenRoadLayout::Grid) {
+    CarveBeltwayIfUseful(world, rng, hubPts, seed32 ^ 0xB17BEEFu);
+  }
 
   // Subdivide large blocks with a small hierarchical street network before zoning.
   CarveInternalStreets(world, hubPts, seed32 ^ 0x1337C0DEu);

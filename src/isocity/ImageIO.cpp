@@ -776,6 +776,455 @@ std::vector<std::uint8_t> CompressZlibStored(const std::uint8_t* data, std::size
   return out;
 }
 
+// --- Minimal DEFLATE (fixed Huffman) encoder ---------------------------------------------------
+//
+// We already ship a fairly complete DEFLATE *decoder* for reading PNGs. Historically, the PNG
+// writer used stored (uncompressed) blocks to keep the implementation small.
+//
+// For tooling workflows (timelapse exports, GIS dumps, tilesets, etc.), this leads to very large
+// PNGs. The encoder below keeps the project dependency-free while giving a substantial file-size
+// reduction by implementing:
+//  - a tiny LZ77 matcher (32k window, 258 max match)
+//  - fixed-Huffman DEFLATE blocks (RFC1951 btype=1)
+//
+// This is not meant to compete with zlib; it is a deterministic, "good enough" compressor.
+
+struct BitWriter {
+  std::vector<std::uint8_t> out;
+  std::uint64_t bitbuf = 0;
+  int bitcount = 0;
+
+  void writeBits(std::uint32_t bits, int n)
+  {
+    if (n <= 0) return;
+    bitbuf |= static_cast<std::uint64_t>(bits) << bitcount;
+    bitcount += n;
+    while (bitcount >= 8) {
+      out.push_back(static_cast<std::uint8_t>(bitbuf & 0xFFu));
+      bitbuf >>= 8;
+      bitcount -= 8;
+    }
+  }
+
+  void alignToByte()
+  {
+    if (bitcount <= 0) return;
+    out.push_back(static_cast<std::uint8_t>(bitbuf & 0xFFu));
+    bitbuf = 0;
+    bitcount = 0;
+  }
+};
+
+struct HuffmanEncodeTable {
+  std::vector<std::uint16_t> code; // LSB-first (bit-reversed) canonical codes
+  std::vector<std::uint8_t> len;
+};
+
+bool BuildCanonicalHuffmanCodes(const std::vector<std::uint8_t>& lengths,
+                                HuffmanEncodeTable& out,
+                                std::string& outError)
+{
+  outError.clear();
+  out.code.assign(lengths.size(), 0);
+  out.len = lengths;
+
+  int maxLen = 0;
+  std::array<int, 16> count = {};
+  for (std::uint8_t l : lengths) {
+    if (l == 0u) continue;
+    if (l > 15u) {
+      outError = "invalid Huffman code length (>15)";
+      return false;
+    }
+    ++count[static_cast<std::size_t>(l)];
+    maxLen = std::max(maxLen, static_cast<int>(l));
+  }
+  if (maxLen == 0) {
+    outError = "empty Huffman tree";
+    return false;
+  }
+
+  // Canonical code assignment (RFC1951).
+  std::array<int, 16> nextCode = {};
+  int code = 0;
+  for (int len = 1; len <= maxLen; ++len) {
+    code = (code + count[static_cast<std::size_t>(len - 1)]) << 1;
+    nextCode[static_cast<std::size_t>(len)] = code;
+  }
+
+  for (std::size_t sym = 0; sym < lengths.size(); ++sym) {
+    const int l = static_cast<int>(lengths[sym]);
+    if (l == 0) continue;
+    const int codeVal = nextCode[static_cast<std::size_t>(l)]++;
+    if (codeVal < 0 || codeVal >= (1 << l)) {
+      outError = "invalid Huffman code (out of range)";
+      return false;
+    }
+    out.code[sym] = static_cast<std::uint16_t>(ReverseBits(static_cast<std::uint32_t>(codeVal), l));
+  }
+
+  return true;
+}
+
+bool GetFixedDeflateEncodeTables(HuffmanEncodeTable& outLitLen,
+                                 HuffmanEncodeTable& outDist,
+                                 std::string& outError)
+{
+  outError.clear();
+  static bool s_ready = false;
+  static HuffmanEncodeTable s_litLen;
+  static HuffmanEncodeTable s_dist;
+
+  if (!s_ready) {
+    std::vector<std::uint8_t> litLenLens(288, 0u);
+    for (int i = 0; i <= 143; ++i) litLenLens[static_cast<std::size_t>(i)] = 8u;
+    for (int i = 144; i <= 255; ++i) litLenLens[static_cast<std::size_t>(i)] = 9u;
+    for (int i = 256; i <= 279; ++i) litLenLens[static_cast<std::size_t>(i)] = 7u;
+    for (int i = 280; i <= 287; ++i) litLenLens[static_cast<std::size_t>(i)] = 8u;
+
+    std::vector<std::uint8_t> distLens(32, 5u);
+
+    std::string err;
+    if (!BuildCanonicalHuffmanCodes(litLenLens, s_litLen, err)) {
+      outError = "failed to build fixed lit/len encoder table: " + err;
+      return false;
+    }
+    if (!BuildCanonicalHuffmanCodes(distLens, s_dist, err)) {
+      outError = "failed to build fixed dist encoder table: " + err;
+      return false;
+    }
+    s_ready = true;
+  }
+
+  outLitLen = s_litLen;
+  outDist = s_dist;
+  return true;
+}
+
+inline void WriteHuff(BitWriter& bw, const HuffmanEncodeTable& t, std::uint16_t sym)
+{
+  const std::size_t i = static_cast<std::size_t>(sym);
+  if (i >= t.code.size() || i >= t.len.size()) return;
+  const int n = static_cast<int>(t.len[i]);
+  bw.writeBits(static_cast<std::uint32_t>(t.code[i]), n);
+}
+
+struct LzToken {
+  bool isMatch = false;
+  std::uint8_t lit = 0;
+  int length = 0;
+  int distance = 0;
+};
+
+inline std::uint32_t Hash3(const std::uint8_t* p)
+{
+  // A simple 3-byte rolling hash (enough for our small match finder).
+  const std::uint32_t v = (static_cast<std::uint32_t>(p[0]) << 16) ^
+                          (static_cast<std::uint32_t>(p[1]) << 8) ^
+                          static_cast<std::uint32_t>(p[2]);
+  return (v * 2654435761u);
+}
+
+// Tiny LZ77 matcher. This is intentionally simple and deterministic.
+void Lz77Tokenize(const std::uint8_t* data, std::size_t size, std::vector<LzToken>& out)
+{
+  out.clear();
+  if (!data || size == 0) return;
+
+  constexpr int kWindow = 32768;
+  constexpr int kMinMatch = 3;
+  constexpr int kMaxMatch = 258;
+  constexpr int kHashBits = 15;
+  constexpr int kHashSize = 1 << kHashBits;
+  constexpr int kMaxChain = 64;
+
+  std::vector<int> head(kHashSize, -1);
+  std::vector<int> prev(size, -1);
+
+  auto hashPos = [&](std::size_t i) -> int {
+    const std::uint32_t h = Hash3(&data[i]);
+    return static_cast<int>((h >> (32 - kHashBits)) & (kHashSize - 1));
+  };
+
+  auto insertPos = [&](std::size_t i) {
+    if (i + 2 >= size) return;
+    const int h = hashPos(i);
+    prev[i] = head[static_cast<std::size_t>(h)];
+    head[static_cast<std::size_t>(h)] = static_cast<int>(i);
+  };
+
+  std::size_t i = 0;
+  while (i < size) {
+    int bestLen = 0;
+    int bestDist = 0;
+
+    if (i + 2 < size) {
+      const int h = hashPos(i);
+      int cand = head[static_cast<std::size_t>(h)];
+      int tried = 0;
+
+      while (cand >= 0 && tried < kMaxChain) {
+        const int dist = static_cast<int>(i) - cand;
+        if (dist <= 0) break;
+        if (dist > kWindow) break;
+
+        int len = 0;
+        const std::size_t candU = static_cast<std::size_t>(cand);
+        const int maxLen = static_cast<int>(std::min<std::size_t>(kMaxMatch, size - i));
+        while (len < maxLen && data[candU + static_cast<std::size_t>(len)] == data[i + static_cast<std::size_t>(len)]) {
+          ++len;
+        }
+        if (len >= kMinMatch && len > bestLen) {
+          bestLen = len;
+          bestDist = dist;
+          if (bestLen == kMaxMatch) break;
+        }
+
+        cand = prev[static_cast<std::size_t>(cand)];
+        ++tried;
+      }
+    }
+
+    if (bestLen >= kMinMatch) {
+      out.push_back(LzToken{true, 0u, bestLen, bestDist});
+      // Insert the matched bytes into the dictionary so matches can overlap.
+      for (int k = 0; k < bestLen; ++k) {
+        insertPos(i + static_cast<std::size_t>(k));
+      }
+      i += static_cast<std::size_t>(bestLen);
+    } else {
+      out.push_back(LzToken{false, data[i], 0, 0});
+      insertPos(i);
+      ++i;
+    }
+  }
+}
+
+bool EncodeDeflateFixed(const std::uint8_t* data, std::size_t size,
+                        std::vector<std::uint8_t>& outDeflate,
+                        std::string& outError)
+{
+  outError.clear();
+  outDeflate.clear();
+
+  HuffmanEncodeTable litLen;
+  HuffmanEncodeTable dist;
+  if (!GetFixedDeflateEncodeTables(litLen, dist, outError)) return false;
+
+  // RFC1951 length/distance tables (same as the decoder's).
+  static constexpr int kLenBase[29] = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27,
+                                       31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+  static constexpr int kLenExtra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
+                                        2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+  static constexpr int kDistBase[30] = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129,
+                                        193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097,
+                                        6145, 8193, 12289, 16385, 24577};
+  static constexpr int kDistExtra[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6,
+                                         6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+
+  auto encodeLength = [&](int length, int& outSym, std::uint32_t& outExtra, int& outExtraBits) -> bool {
+    if (length < 3 || length > 258) return false;
+    for (int i = 0; i < 29; ++i) {
+      const int base = kLenBase[i];
+      const int eb = kLenExtra[i];
+      const int maxv = base + ((eb == 0) ? 0 : ((1 << eb) - 1));
+      if (length >= base && length <= maxv) {
+        outSym = 257 + i;
+        outExtraBits = eb;
+        outExtra = static_cast<std::uint32_t>(length - base);
+        return true;
+      }
+    }
+    return false;
+  };
+
+  auto encodeDist = [&](int distance, int& outSym, std::uint32_t& outExtra, int& outExtraBits) -> bool {
+    if (distance < 1 || distance > 32768) return false;
+    for (int i = 0; i < 30; ++i) {
+      const int base = kDistBase[i];
+      const int eb = kDistExtra[i];
+      const int maxv = base + ((eb == 0) ? 0 : ((1 << eb) - 1));
+      if (distance >= base && distance <= maxv) {
+        outSym = i;
+        outExtraBits = eb;
+        outExtra = static_cast<std::uint32_t>(distance - base);
+        return true;
+      }
+    }
+    return false;
+  };
+
+  std::vector<LzToken> toks;
+  Lz77Tokenize(data, size, toks);
+
+  BitWriter bw;
+  bw.out.reserve(size / 2 + 64);
+
+  // Single final block (BFINAL=1), fixed Huffman (BTYPE=01).
+  bw.writeBits(1u, 1);
+  bw.writeBits(1u, 2);
+
+  for (const LzToken& t : toks) {
+    if (!t.isMatch) {
+      WriteHuff(bw, litLen, static_cast<std::uint16_t>(t.lit));
+      continue;
+    }
+
+    int lenSym = 0;
+    std::uint32_t lenExtra = 0;
+    int lenExtraBits = 0;
+    if (!encodeLength(t.length, lenSym, lenExtra, lenExtraBits)) {
+      outError = "failed to encode match length";
+      return false;
+    }
+
+    int distSym = 0;
+    std::uint32_t distExtra = 0;
+    int distExtraBits = 0;
+    if (!encodeDist(t.distance, distSym, distExtra, distExtraBits)) {
+      outError = "failed to encode match distance";
+      return false;
+    }
+
+    WriteHuff(bw, litLen, static_cast<std::uint16_t>(lenSym));
+    if (lenExtraBits > 0) bw.writeBits(lenExtra, lenExtraBits);
+    WriteHuff(bw, dist, static_cast<std::uint16_t>(distSym));
+    if (distExtraBits > 0) bw.writeBits(distExtra, distExtraBits);
+  }
+
+  // End-of-block.
+  WriteHuff(bw, litLen, 256u);
+  bw.alignToByte();
+
+  outDeflate = std::move(bw.out);
+  return true;
+}
+
+std::vector<std::uint8_t> CompressZlibFixedDeflate(const std::uint8_t* data, std::size_t size, std::string& outError)
+{
+  outError.clear();
+  std::vector<std::uint8_t> out;
+  out.reserve(size / 2 + 64);
+
+  // zlib header: CMF=0x78 (deflate, 32k window), FLG=0x9C (default compression, check bits set).
+  out.push_back(0x78u);
+  out.push_back(0x9Cu);
+
+  std::vector<std::uint8_t> def;
+  std::string err;
+  if (!EncodeDeflateFixed(data, size, def, err)) {
+    // Fallback to stored blocks (should never fail, and keeps the writer robust).
+    outError = "deflate encoder failed, falling back to stored blocks: " + err;
+    const std::vector<std::uint8_t> stored = CompressZlibStored(data, size);
+    return stored;
+  }
+
+  out.insert(out.end(), def.begin(), def.end());
+
+  const std::uint32_t adler = Adler32(data, size);
+  out.push_back(static_cast<std::uint8_t>((adler >> 24) & 0xFFu));
+  out.push_back(static_cast<std::uint8_t>((adler >> 16) & 0xFFu));
+  out.push_back(static_cast<std::uint8_t>((adler >> 8) & 0xFFu));
+  out.push_back(static_cast<std::uint8_t>(adler & 0xFFu));
+
+  return out;
+}
+
+// --- PNG filter selection ----------------------------------------------------------------------
+
+inline int SignedByteScore(std::uint8_t b)
+{
+  const int v = (b < 128u) ? static_cast<int>(b) : static_cast<int>(b) - 256;
+  return (v < 0) ? -v : v;
+}
+
+void FilterScanline(std::uint8_t filterType, const std::uint8_t* row,
+                    const std::uint8_t* prevRow,
+                    std::vector<std::uint8_t>& outFiltered,
+                    std::size_t bpp)
+{
+  const std::size_t n = outFiltered.size();
+  switch (filterType) {
+    case 0: { // None
+      std::copy(row, row + static_cast<std::ptrdiff_t>(n), outFiltered.begin());
+      break;
+    }
+    case 1: { // Sub
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::uint8_t left = (i >= bpp) ? row[i - bpp] : 0u;
+        outFiltered[i] = static_cast<std::uint8_t>(row[i] - left);
+      }
+      break;
+    }
+    case 2: { // Up
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::uint8_t up = prevRow ? prevRow[i] : 0u;
+        outFiltered[i] = static_cast<std::uint8_t>(row[i] - up);
+      }
+      break;
+    }
+    case 3: { // Average
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::uint8_t left = (i >= bpp) ? row[i - bpp] : 0u;
+        const std::uint8_t up = prevRow ? prevRow[i] : 0u;
+        const int avg = (static_cast<int>(left) + static_cast<int>(up)) / 2;
+        outFiltered[i] = static_cast<std::uint8_t>(static_cast<int>(row[i]) - avg);
+      }
+      break;
+    }
+    case 4: { // Paeth
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::uint8_t left = (i >= bpp) ? row[i - bpp] : 0u;
+        const std::uint8_t up = prevRow ? prevRow[i] : 0u;
+        const std::uint8_t upLeft = (prevRow && i >= bpp) ? prevRow[i - bpp] : 0u;
+        const std::uint8_t pr = PaethPredictor(left, up, upLeft);
+        outFiltered[i] = static_cast<std::uint8_t>(row[i] - pr);
+      }
+      break;
+    }
+    default: {
+      // Should never happen.
+      std::copy(row, row + static_cast<std::ptrdiff_t>(n), outFiltered.begin());
+      break;
+    }
+  }
+}
+
+int ScoreFilteredScanline(const std::vector<std::uint8_t>& filt)
+{
+  int score = 0;
+  for (std::uint8_t b : filt) score += SignedByteScore(b);
+  return score;
+}
+
+std::uint8_t PickBestPngFilter(const std::uint8_t* row,
+                               const std::uint8_t* prevRow,
+                               std::size_t rowBytes,
+                               std::size_t bpp,
+                               std::vector<std::uint8_t>& outBest,
+                               std::vector<std::uint8_t>& scratchTmp)
+{
+  outBest.resize(rowBytes);
+  if (!row || rowBytes == 0) return 0u;
+
+  scratchTmp.resize(rowBytes);
+
+  std::uint8_t bestType = 0u;
+  int bestScore = std::numeric_limits<int>::max();
+
+  for (std::uint8_t t = 0u; t <= 4u; ++t) {
+    FilterScanline(t, row, prevRow, scratchTmp, bpp);
+    const int s = ScoreFilteredScanline(scratchTmp);
+    if (s < bestScore) {
+      bestScore = s;
+      bestType = t;
+      outBest = scratchTmp;
+    }
+  }
+
+  return bestType;
+}
+
 } // namespace
 
 bool WritePng(const std::string& path, const PpmImage& img, std::string& outError)
@@ -794,22 +1243,28 @@ bool WritePng(const std::string& path, const PpmImage& img, std::string& outErro
     return false;
   }
 
-  // Build raw scanlines (filter byte 0 + RGB data per row).
-  const std::size_t rowBytes = 1u + static_cast<std::size_t>(img.width) * 3u;
+  // Build raw scanlines (filter byte + filtered row data).
+  const std::size_t rowDataBytes = static_cast<std::size_t>(img.width) * 3u;
+  const std::size_t scanlineBytes = 1u + rowDataBytes;
   std::vector<std::uint8_t> raw;
-  raw.resize(rowBytes * static_cast<std::size_t>(img.height));
+  raw.resize(scanlineBytes * static_cast<std::size_t>(img.height));
+
+  std::vector<std::uint8_t> filtBest;
+  std::vector<std::uint8_t> filtTmp;
 
   for (int y = 0; y < img.height; ++y) {
-    const std::size_t dstRow = static_cast<std::size_t>(y) * rowBytes;
-    raw[dstRow] = 0u; // filter: none
+    const std::size_t dstRow = static_cast<std::size_t>(y) * scanlineBytes;
+    const std::size_t srcRow = static_cast<std::size_t>(y) * rowDataBytes;
+    const std::uint8_t* row = img.rgb.data() + srcRow;
+    const std::uint8_t* prev = (y > 0) ? (img.rgb.data() + (static_cast<std::size_t>(y - 1) * rowDataBytes)) : nullptr;
 
-    const std::size_t srcRow = static_cast<std::size_t>(y) * static_cast<std::size_t>(img.width) * 3u;
-    std::copy(img.rgb.begin() + static_cast<std::ptrdiff_t>(srcRow),
-              img.rgb.begin() + static_cast<std::ptrdiff_t>(srcRow + static_cast<std::size_t>(img.width) * 3u),
-              raw.begin() + static_cast<std::ptrdiff_t>(dstRow + 1u));
+    const std::uint8_t ftype = PickBestPngFilter(row, prev, rowDataBytes, /*bpp=*/3u, filtBest, filtTmp);
+    raw[dstRow] = ftype;
+    std::copy(filtBest.begin(), filtBest.end(), raw.begin() + static_cast<std::ptrdiff_t>(dstRow + 1u));
   }
 
-  const std::vector<std::uint8_t> z = CompressZlibStored(raw.data(), raw.size());
+  std::string zWarn;
+  const std::vector<std::uint8_t> z = CompressZlibFixedDeflate(raw.data(), raw.size(), zWarn);
 
   std::ofstream f(path, std::ios::binary);
   if (!f) {
@@ -890,23 +1345,28 @@ bool WritePngRGBA(const std::string& path, const RgbaImage& img, std::string& ou
     return false;
   }
 
-  // Build raw scanlines (filter byte 0 + RGBA data per row).
-  const std::size_t rowBytes = 1u + static_cast<std::size_t>(img.width) * 4u;
+  // Build raw scanlines (filter byte + filtered row data).
+  const std::size_t rowDataBytes = static_cast<std::size_t>(img.width) * 4u;
+  const std::size_t scanlineBytes = 1u + rowDataBytes;
   std::vector<std::uint8_t> raw;
-  raw.resize(rowBytes * static_cast<std::size_t>(img.height));
+  raw.resize(scanlineBytes * static_cast<std::size_t>(img.height));
+
+  std::vector<std::uint8_t> filtBest;
+  std::vector<std::uint8_t> filtTmp;
 
   for (int y = 0; y < img.height; ++y) {
-    const std::size_t dstRow = static_cast<std::size_t>(y) * rowBytes;
-    raw[dstRow] = 0u; // filter: none
+    const std::size_t dstRow = static_cast<std::size_t>(y) * scanlineBytes;
+    const std::size_t srcRow = static_cast<std::size_t>(y) * rowDataBytes;
+    const std::uint8_t* row = img.rgba.data() + srcRow;
+    const std::uint8_t* prev = (y > 0) ? (img.rgba.data() + (static_cast<std::size_t>(y - 1) * rowDataBytes)) : nullptr;
 
-    const std::size_t srcRow =
-        static_cast<std::size_t>(y) * static_cast<std::size_t>(img.width) * 4u;
-    std::copy(img.rgba.begin() + static_cast<std::ptrdiff_t>(srcRow),
-              img.rgba.begin() + static_cast<std::ptrdiff_t>(srcRow + static_cast<std::size_t>(img.width) * 4u),
-              raw.begin() + static_cast<std::ptrdiff_t>(dstRow + 1u));
+    const std::uint8_t ftype = PickBestPngFilter(row, prev, rowDataBytes, /*bpp=*/4u, filtBest, filtTmp);
+    raw[dstRow] = ftype;
+    std::copy(filtBest.begin(), filtBest.end(), raw.begin() + static_cast<std::ptrdiff_t>(dstRow + 1u));
   }
 
-  const std::vector<std::uint8_t> z = CompressZlibStored(raw.data(), raw.size());
+  std::string zWarn;
+  const std::vector<std::uint8_t> z = CompressZlibFixedDeflate(raw.data(), raw.size(), zWarn);
 
   std::ofstream f(path, std::ios::binary);
   if (!f) {
@@ -1226,21 +1686,28 @@ bool WritePngIndexed(const std::string& path, int width, int height,
     return false;
   }
 
-  // Build raw scanlines (filter byte 0 + index data per row).
-  const std::size_t rowBytes = 1u + static_cast<std::size_t>(width);
+  // Build raw scanlines (filter byte + filtered row data).
+  const std::size_t rowDataBytes = static_cast<std::size_t>(width);
+  const std::size_t scanlineBytes = 1u + rowDataBytes;
   std::vector<std::uint8_t> raw;
-  raw.resize(rowBytes * static_cast<std::size_t>(height));
+  raw.resize(scanlineBytes * static_cast<std::size_t>(height));
+
+  std::vector<std::uint8_t> filtBest;
+  std::vector<std::uint8_t> filtTmp;
 
   for (int y = 0; y < height; ++y) {
-    const std::size_t dstRow = static_cast<std::size_t>(y) * rowBytes;
-    raw[dstRow] = 0u; // filter: none
-    const std::size_t srcRow = static_cast<std::size_t>(y) * static_cast<std::size_t>(width);
-    std::copy(indices.begin() + static_cast<std::ptrdiff_t>(srcRow),
-              indices.begin() + static_cast<std::ptrdiff_t>(srcRow + static_cast<std::size_t>(width)),
-              raw.begin() + static_cast<std::ptrdiff_t>(dstRow + 1u));
+    const std::size_t dstRow = static_cast<std::size_t>(y) * scanlineBytes;
+    const std::size_t srcRow = static_cast<std::size_t>(y) * rowDataBytes;
+    const std::uint8_t* row = indices.data() + srcRow;
+    const std::uint8_t* prev = (y > 0) ? (indices.data() + (static_cast<std::size_t>(y - 1) * rowDataBytes)) : nullptr;
+
+    const std::uint8_t ftype = PickBestPngFilter(row, prev, rowDataBytes, /*bpp=*/1u, filtBest, filtTmp);
+    raw[dstRow] = ftype;
+    std::copy(filtBest.begin(), filtBest.end(), raw.begin() + static_cast<std::ptrdiff_t>(dstRow + 1u));
   }
 
-  const std::vector<std::uint8_t> z = CompressZlibStored(raw.data(), raw.size());
+  std::string zWarn;
+  const std::vector<std::uint8_t> z = CompressZlibFixedDeflate(raw.data(), raw.size(), zWarn);
 
   std::ofstream f(path, std::ios::binary);
   if (!f) {

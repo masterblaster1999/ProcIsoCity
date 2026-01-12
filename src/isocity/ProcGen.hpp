@@ -48,12 +48,31 @@ const char* ToString(ProcGenDistrictingMode m);
 // Parse mode from a string (case-insensitive). Accepts common aliases.
 bool ParseProcGenDistrictingMode(const std::string& s, ProcGenDistrictingMode& out);
 
+// High-level road network layout used during procedural generation.
+//
+// This influences how hubs are connected at the macro scale before the
+// street subdivision and road hierarchy upgrade passes run.
+enum class ProcGenRoadLayout : std::uint8_t {
+  Organic = 0, // Existing default: MST backbone + local loops.
+  Grid = 1,    // Manhattan-like arterial grid with hubs snapped onto it.
+  Radial = 2   // Hub-and-spoke with an outer ring / beltway bias.
+};
+
+// Human-readable name (stable for saves/CLI).
+const char* ToString(ProcGenRoadLayout m);
+
+// Parse layout from a string (case-insensitive). Accepts common aliases.
+bool ParseProcGenRoadLayout(const std::string& s, ProcGenRoadLayout& out);
+
 struct ProcGenConfig {
   float terrainScale = 0.08f;     // noise scale
   float waterLevel = 0.35f;       // below => water
   float sandLevel = 0.42f;        // below => sand (above water)
   int hubs = 4;                   // number of "town centers"
   int extraConnections = 2;       // extra road connections between hubs
+
+  // Macro road layout style used to connect hubs (Organic/Grid/Radial).
+  ProcGenRoadLayout roadLayout = ProcGenRoadLayout::Organic;
   float zoneChance = 0.22f;       // chance to place a zone next to a road
   float parkChance = 0.06f;       // chance to place a park next to a road
 

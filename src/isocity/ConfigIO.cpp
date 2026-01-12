@@ -194,6 +194,9 @@ static void WriteProcGenConfig(std::ostringstream& oss, const ProcGenConfig& cfg
   oss << "\"extra_connections\": " << cfg.extraConnections << ",\n";
 
   Indent(oss, base + indent);
+  oss << "\"road_layout\": \"" << ToString(cfg.roadLayout) << "\",\n";
+
+  Indent(oss, base + indent);
   oss << "\"zone_chance\": " << FloatToJson(cfg.zoneChance) << ",\n";
   Indent(oss, base + indent);
   oss << "\"park_chance\": " << FloatToJson(cfg.parkChance) << ",\n";
@@ -389,6 +392,20 @@ bool ApplyProcGenConfigJson(const JsonValue& root, ProcGenConfig& ioCfg, std::st
   if (!ApplyI32(root, "extra_connections", ioCfg.extraConnections, err)) {
     outError = err;
     return false;
+  }
+
+  const JsonValue* layout = FindJsonMember(root, "road_layout");
+  if (layout) {
+    if (!layout->isString()) {
+      outError = "expected string for key 'road_layout'";
+      return false;
+    }
+    ProcGenRoadLayout m{};
+    if (!ParseProcGenRoadLayout(layout->stringValue, m)) {
+      outError = "unknown road_layout: '" + layout->stringValue + "'";
+      return false;
+    }
+    ioCfg.roadLayout = m;
   }
 
   if (!ApplyF32(root, "zone_chance", ioCfg.zoneChance, err)) {
