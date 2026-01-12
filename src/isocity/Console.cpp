@@ -30,6 +30,83 @@ std::string EllipsizeToWidth(const std::string& s, int maxWidth, int fontSize)
 
 } // namespace
 
+// Split a single input line into multiple commands separated by ';'.
+// Semicolons inside single/double quotes are ignored.
+// Quotes and simple backslash escapes are preserved so the tokenizer can handle them.
+static std::vector<std::string> SplitCommands(const std::string& line)
+{
+  enum class Q : unsigned char { None = 0, Single, Double };
+  Q q = Q::None;
+
+  std::vector<std::string> out;
+  std::string cur;
+  cur.reserve(line.size());
+
+  auto push = [&]() {
+    out.push_back(cur);
+    cur.clear();
+  };
+
+  for (std::size_t i = 0; i < line.size(); ++i) {
+    const char c = line[i];
+
+    if (q == Q::None) {
+      if (c == ';') {
+        push();
+        continue;
+      }
+      if (c == '"') {
+        q = Q::Double;
+        cur.push_back(c);
+        continue;
+      }
+      if (c == '\'') {
+        q = Q::Single;
+        cur.push_back(c);
+        continue;
+      }
+      cur.push_back(c);
+      continue;
+    }
+
+    if (q == Q::Double) {
+      // Preserve escapes so the tokenizer can interpret them.
+      if (c == '\\' && (i + 1) < line.size()) {
+        const char n = line[i + 1];
+        if (n == '"' || n == '\\') {
+          cur.push_back(c);
+          cur.push_back(n);
+          ++i;
+          continue;
+        }
+      }
+      if (c == '"') {
+        q = Q::None;
+      }
+      cur.push_back(c);
+      continue;
+    }
+
+    // Single quotes.
+    if (c == '\\' && (i + 1) < line.size()) {
+      const char n = line[i + 1];
+      if (n == '\'' || n == '\\') {
+        cur.push_back(c);
+        cur.push_back(n);
+        ++i;
+        continue;
+      }
+    }
+    if (c == '\'') {
+      q = Q::None;
+    }
+    cur.push_back(c);
+  }
+
+  push();
+  return out;
+}
+
 DevConsole::DevConsole()
 {
   m_lines.reserve(128);
@@ -243,28 +320,42 @@ void DevConsole::draw(int screenW, int screenH)
 
 void DevConsole::executeLine(const std::string& line)
 {
-  print("> " + line);
-  const Args toks = tokenize(line);
-  if (toks.empty()) return;
+  // Support multiple commands separated by ';' (outside of quotes).
+  const std::vector<std::string> cmds = SplitCommands(line);
 
-  const std::string cmdKey = toLower(toks[0]);
-  auto it = m_commands.find(cmdKey);
-  if (it == m_commands.end()) {
-    print("Unknown command: " + toks[0] + " (try 'help')");
-    return;
-  }
+  auto executeOne = [&](const std::string& cmdLine) {
+    const std::string trimmed = trim(cmdLine);
+    if (trimmed.empty()) return;
 
-  Args args;
-  if (toks.size() > 1) {
-    args.assign(toks.begin() + 1, toks.end());
-  }
+    print("> " + trimmed);
 
-  try {
-    it->second.fn(*this, args);
-  } catch (const std::exception& e) {
-    print(std::string("Error: ") + e.what());
+    const Args toks = tokenize(trimmed);
+    if (toks.empty()) return;
+
+    const std::string cmdKey = toLower(toks[0]);
+    auto it = m_commands.find(cmdKey);
+    if (it == m_commands.end()) {
+      print("Unknown command: " + toks[0] + " (try 'help')");
+      return;
+    }
+
+    Args args;
+    if (toks.size() > 1) {
+      args.assign(toks.begin() + 1, toks.end());
+    }
+
+    try {
+      it->second.fn(*this, args);
+    } catch (const std::exception& e) {
+      print(std::string("Error: ") + e.what());
+    }
+  };
+
+  for (const std::string& cmd : cmds) {
+    executeOne(cmd);
   }
 }
+
 
 void DevConsole::autocomplete()
 {
@@ -334,14 +425,92 @@ std::string DevConsole::trim(const std::string& s)
 
 DevConsole::Args DevConsole::tokenize(const std::string& line)
 {
+  // A tiny shell-like tokenizer:
+  //  - splits on whitespace
+  //  - supports single and double quoted strings (quotes are removed)
+  //  - supports simple escapes inside quotes: \" and \\ in double quotes, \' and \\ in single quotes
+  //
+  // IMPORTANT: we intentionally do *not* treat backslashes as escapes outside of quotes so Windows paths
+  // like C:\\Users\\Name\\file.txt work as expected.
   Args out;
-  std::istringstream is(line);
-  std::string tok;
-  while (is >> tok) {
-    out.push_back(tok);
+  out.reserve(8);
+
+  enum class Q : unsigned char { None = 0, Single, Double };
+  Q q = Q::None;
+
+  std::string cur;
+  cur.reserve(line.size());
+
+  bool tokenStarted = false;
+
+  auto flush = [&]() {
+    if (!tokenStarted) return;
+    out.push_back(cur);
+    cur.clear();
+    tokenStarted = false;
+  };
+
+  for (std::size_t i = 0; i < line.size(); ++i) {
+    const char c = line[i];
+    const unsigned char uc = static_cast<unsigned char>(c);
+
+    if (q == Q::None) {
+      if (std::isspace(uc)) {
+        flush();
+        continue;
+      }
+      if (c == '"') {
+        q = Q::Double;
+        tokenStarted = true;
+        continue;
+      }
+      if (c == '\'') {
+        q = Q::Single;
+        tokenStarted = true;
+        continue;
+      }
+      tokenStarted = true;
+      cur.push_back(c);
+      continue;
+    }
+
+    if (q == Q::Double) {
+      if (c == '"') {
+        q = Q::None;
+        continue;
+      }
+      if (c == '\\' && (i + 1) < line.size()) {
+        const char n = line[i + 1];
+        if (n == '"' || n == '\\') {
+          cur.push_back(n);
+          ++i;
+          continue;
+        }
+      }
+      cur.push_back(c);
+      continue;
+    }
+
+    // Single quotes.
+    if (c == '\'') {
+      q = Q::None;
+      continue;
+    }
+    if (c == '\\' && (i + 1) < line.size()) {
+      const char n = line[i + 1];
+      if (n == '\'' || n == '\\') {
+        cur.push_back(n);
+        ++i;
+        continue;
+      }
+    }
+    cur.push_back(c);
   }
+
+  flush();
   return out;
 }
+
 
 std::string DevConsole::toLower(const std::string& s)
 {

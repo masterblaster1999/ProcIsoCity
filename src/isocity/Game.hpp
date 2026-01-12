@@ -190,10 +190,6 @@ private:
   bool saveVisualPrefsFile(const std::string& path, bool showToast = false);
   void updateVisualPrefsAutosave(float dt);
 
-  // Developer-console script runner (persistent variables across runs).
-  std::map<std::string, std::string> m_consoleScriptVars;
-  int m_consoleScriptRunIndex = 0;
-
   struct StrokeFeedback {
     bool noMoney = false;
     bool water = false;

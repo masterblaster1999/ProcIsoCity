@@ -4506,6 +4506,8 @@ static bool BuildZoneTileShadowCaster(const Tile& t, float tileW, float tileH, f
 static bool BuildZoneParcelShadowCaster(const World& world, const ZoneBuildingParcel& p, const ElevationSettings& elev, float tileW,
                                        float tileH, float zoom, float timeSec, BuildingShadowCaster& out) {
   (void)zoom;
+  (void)timeSec;
+  
   
   if (!p.isMultiTile()) {
     return false;
@@ -5654,7 +5656,7 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
     if (!drawZoneBuildingSprites) return false;
     if (!IsZoneOverlay(t.overlay)) return false;
 
-    const int lvl = std::clamp(t.level, 1, 3);
+    const int lvl = std::clamp(static_cast<int>(t.level), 1, 3);
     const std::uint32_t style =
       HashCoords32(x, y, m_gfxSeed32 ^ 0xB1D1B00Du ^ (static_cast<std::uint32_t>(t.variation) * 0x9E3779B9u));
 
