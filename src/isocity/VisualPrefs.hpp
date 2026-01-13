@@ -8,6 +8,30 @@
 
 namespace isocity {
 
+// Lightweight, persisted UI theme + font tuning.
+//
+// This is intentionally decoupled from the simulation/save-state so users can keep
+// their preferred UI look across worlds.
+struct UiThemePrefs {
+  // Accent selection.
+  bool accentFromSeed = true;
+  float accentHueDeg = 210.0f;     // 0..360 (used when accentFromSeed=false)
+  float accentSaturation = 0.55f;  // 0..1
+  float accentValue = 0.95f;       // 0..1
+
+  // Panel geometry + effects.
+  float roundness = 0.18f; // 0..1
+  int roundSegments = 8;
+
+  float noiseAlpha = 0.06f;          // 0..1
+  float noiseScale = 0.75f;          // 0.05..4
+  float headerSheenStrength = 0.35f; // 0..1
+
+  // Font atlas generation.
+  int fontAtlasScale = 3;       // 1..8
+  bool fontFilterPoint = false; // point vs bilinear
+};
+
 // User-facing persisted preferences for display + renderer visual settings.
 //
 // Goals:
@@ -24,6 +48,8 @@ struct VisualPrefs {
 
   bool uiScaleAuto = true;
   float uiScaleManual = 1.0f; // used when uiScaleAuto=false
+
+  UiThemePrefs uiTheme{};
 
   // --- World render resolution scaling (off-screen render target) ---
   bool worldRenderScaleAuto = false;
@@ -43,6 +69,10 @@ struct VisualPrefs {
   Renderer::ShadowSettings shadows{};
   Renderer::DayNightSettings dayNight{};
   Renderer::WeatherSettings weather{};
+
+  // Atmospheric ambience (optional). These are visual-only and do not affect simulation.
+  Renderer::CloudShadowSettings cloudShadows{};
+  Renderer::VolumetricCloudSettings volumetricClouds{};
 
   // Elevation rendering (visual-only).
   ElevationSettings elevation{};

@@ -52,6 +52,7 @@ add_library(isocity_core
   src/isocity/OsmImport.cpp
   src/isocity/Suite.cpp
   src/isocity/Blueprint.cpp
+  src/isocity/WorldTiling.cpp
   src/isocity/MeshExport.cpp
   src/isocity/WorldMeshBuilder.cpp
   src/isocity/RoadGraphExport.cpp
@@ -192,8 +193,11 @@ if (PROCISOCITY_BUILD_APP)
     src/isocity/EditHistory.hpp
 
     src/isocity/Renderer.hpp
+    src/isocity/GpuGeom.hpp
     src/isocity/VisualPrefs.hpp
     src/isocity/Renderer.cpp
+    src/isocity/GpuGeom.cpp
+    src/isocity/Ui.cpp
     src/isocity/VisualPrefs.cpp
   )
 

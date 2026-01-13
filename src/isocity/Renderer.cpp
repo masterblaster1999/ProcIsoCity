@@ -1,4 +1,6 @@
 #include "isocity/Renderer.hpp"
+#include "isocity/Ui.hpp"
+
 
 #include "isocity/Pathfinding.hpp"
 #include "isocity/ZoneAccess.hpp"
@@ -19,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace isocity {
@@ -240,21 +243,13 @@ inline WeatherState ComputeWeatherState(float timeSec, const Renderer::WeatherSe
   WeatherState w{};
   w.mode = s.mode;
 
-  const float inten = std::clamp(s.intensity, 0.0f, 1.0f);
-  if (s.mode == Renderer::WeatherSettings::Mode::Clear) {
-    return w;
-  }
-
-  w.intensity = inten;
-  w.overcast = std::clamp(s.overcast, 0.0f, 1.0f) * inten;
-  w.fog = std::clamp(s.fog, 0.0f, 1.0f) * inten;
-
+  // Wind is always computed (even in Clear mode) so other aesthetic systems (e.g. water waves) can use it.
   w.windSpeed = std::clamp(s.windSpeed, 0.05f, 6.0f);
 
   // Wind direction in degrees (screen-space): 0=right, 90=down.
   const float ang = (s.windAngleDeg) * (kPiF / 180.0f);
 
-  // Add a subtle time-varying gust wobble so precipitation doesn't look "stamped on".
+  // Add a subtle time-varying gust wobble so motion doesn't look "stamped on".
   const float gust = 0.25f * std::sin(timeSec * 0.35f) + 0.15f * std::sin(timeSec * 0.73f + 1.2f);
   const float ang2 = ang + gust * 0.25f;
 
@@ -285,6 +280,16 @@ inline WeatherState ComputeWeatherState(float timeSec, const Renderer::WeatherSe
   w.windX = wx;
   w.windY = wy;
 
+  const float inten = std::clamp(s.intensity, 0.0f, 1.0f);
+  if (s.mode == Renderer::WeatherSettings::Mode::Clear) {
+    // No precipitation effects in Clear mode.
+    return w;
+  }
+
+  w.intensity = inten;
+  w.overcast = std::clamp(s.overcast, 0.0f, 1.0f) * inten;
+  w.fog = std::clamp(s.fog, 0.0f, 1.0f) * inten;
+
   if (s.mode == Renderer::WeatherSettings::Mode::Rain) {
     w.wetness = inten;
     w.snow = 0.0f;
@@ -295,6 +300,214 @@ inline WeatherState ComputeWeatherState(float timeSec, const Renderer::WeatherSe
 
   return w;
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// Volumetric clouds shader
+// ---------------------------------------------------------------------------------------------
+//
+// We keep the shader embedded so the project remains asset-free.
+// The effect is intentionally stylized and fairly cheap: a small ray-march through a 3D FBM field.
+//
+// IMPORTANT: We render clouds directly in the world pass (BeginMode2D) instead of an off-screen
+// RenderTexture to avoid nested BeginTextureMode() calls (exports already render into an RT).
+
+static const char* kVolumetricCloudVS = R"GLSL(
+#version 330
+
+layout(location = 0) in vec3 vertexPosition;
+layout(location = 1) in vec2 vertexTexCoord;
+layout(location = 2) in vec4 vertexColor;
+
+uniform mat4 mvp;
+
+out vec2 fragTexCoord;
+out vec4 fragColor;
+out vec2 vWorldPos;
+
+void main()
+{
+    fragTexCoord = vertexTexCoord;
+    fragColor = vertexColor;
+    vWorldPos = vertexPosition.xy;
+    gl_Position = mvp*vec4(vertexPosition, 1.0);
+}
+GLSL";
+
+static const char* kVolumetricCloudFS = R"GLSL(
+#version 330
+
+in vec2 fragTexCoord;
+in vec4 fragColor;
+in vec2 vWorldPos;
+
+out vec4 finalColor;
+
+uniform sampler2D texture0;
+uniform vec4 colDiffuse;
+
+uniform vec2 u_viewMin;
+uniform vec2 u_viewSize;
+uniform float u_time;
+uniform vec2 u_windDir;
+uniform float u_windSpeed;
+uniform float u_scale;
+uniform float u_coverage;
+uniform float u_density;
+uniform float u_softness;
+uniform int u_steps;
+uniform float u_day;
+uniform float u_dusk;
+uniform float u_overcast;
+uniform float u_seed;
+uniform float u_bottomFade;
+
+float hash1(vec3 p)
+{
+    return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453123);
+}
+
+float noise3(vec3 p)
+{
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    vec3 u = f*f*(3.0 - 2.0*f);
+
+    float n000 = hash1(i + vec3(0.0, 0.0, 0.0));
+    float n100 = hash1(i + vec3(1.0, 0.0, 0.0));
+    float n010 = hash1(i + vec3(0.0, 1.0, 0.0));
+    float n110 = hash1(i + vec3(1.0, 1.0, 0.0));
+    float n001 = hash1(i + vec3(0.0, 0.0, 1.0));
+    float n101 = hash1(i + vec3(1.0, 0.0, 1.0));
+    float n011 = hash1(i + vec3(0.0, 1.0, 1.0));
+    float n111 = hash1(i + vec3(1.0, 1.0, 1.0));
+
+    float nx00 = mix(n000, n100, u.x);
+    float nx10 = mix(n010, n110, u.x);
+    float nx01 = mix(n001, n101, u.x);
+    float nx11 = mix(n011, n111, u.x);
+
+    float nxy0 = mix(nx00, nx10, u.y);
+    float nxy1 = mix(nx01, nx11, u.y);
+    return mix(nxy0, nxy1, u.z);
+}
+
+float fbm(vec3 p)
+{
+    float v = 0.0;
+    float a = 0.5;
+    for (int i = 0; i < 4; ++i) {
+        v += a * noise3(p);
+        p *= 2.02;
+        a *= 0.5;
+    }
+    return v;
+}
+
+float cloudDensity(vec3 p, float cov, float soft)
+{
+    // Domain warp to break up repetition.
+    float w1 = fbm(p + vec3(0.0, 0.0, 0.0));
+    float w2 = fbm(p + vec3(5.2, 1.3, 2.1));
+    vec3 q = p;
+    q.xy += (vec2(w1, w2) - 0.5) * 0.85;
+
+    float n = fbm(q);
+
+    // Higher coverage => lower threshold.
+    float thr = mix(0.78, 0.32, clamp(cov, 0.0, 1.0));
+    float edge = mix(0.04, 0.18, clamp(soft, 0.0, 1.0));
+    float m = smoothstep(thr - edge, thr + edge, n);
+
+    // Vertical shaping: strongest in the middle of the volume.
+    float h = smoothstep(0.0, 0.18, q.z) * (1.0 - smoothstep(0.72, 1.0, q.z));
+    m *= h;
+
+    // Thicker centers.
+    m *= (0.55 + 0.75 * n);
+    return clamp(m, 0.0, 1.0);
+}
+
+void main()
+{
+    vec2 uv = (vWorldPos - u_viewMin) / max(u_viewSize, vec2(0.001));
+
+    // World-space -> noise-space.
+    vec2 seedOff = vec2(u_seed * 0.00123, u_seed * 0.00173);
+    vec2 base = vWorldPos * u_scale + seedOff;
+    vec2 wind = u_windDir * (u_time * u_windSpeed);
+
+    // A small internal evolution so clouds "breathe" even if wind is still.
+    float evol = u_time * 0.05;
+
+    // Early-out: if a mid-slice is empty, skip the expensive ray-march.
+    float c0 = cloudDensity(vec3(base + wind, 0.45 + evol), u_coverage, u_softness);
+    if (c0 <= 0.01) {
+        finalColor = vec4(0.0);
+        return;
+    }
+
+    int steps = clamp(u_steps, 8, 64);
+    float stepSize = 1.0 / float(steps);
+
+    float alpha = 0.0;
+    vec3 col = vec3(0.0);
+
+    // Light direction in noise space (roughly "from upper-left" with a downward component).
+    vec3 lightDir = normalize(vec3(-0.55, -0.25, 0.90));
+
+    for (int i = 0; i < 64; ++i) {
+        if (i >= steps) break;
+
+        float z = (float(i) + 0.5) * stepSize;
+        vec3 p = vec3(base + wind, z + evol);
+
+        float d = cloudDensity(p, u_coverage, u_softness) * c0;
+        if (d <= 0.001) continue;
+
+        // Cheap self-shadowing: probe density toward the light.
+        float dl = cloudDensity(p + lightDir * 0.35, u_coverage, u_softness);
+        float light = clamp(0.35 + 0.65 * (1.0 - dl), 0.0, 1.0);
+
+        // Convert density to alpha contribution.
+        float a = clamp(d * u_density * stepSize * 1.45, 0.0, 1.0);
+
+        vec3 sampleCol = mix(vec3(0.55, 0.60, 0.68), vec3(1.0), light);
+        col += (1.0 - alpha) * sampleCol * a;
+        alpha += (1.0 - alpha) * a;
+
+        if (alpha > 0.985) break;
+    }
+
+    // Screen readability: fade clouds toward the bottom of the view.
+    float fade = 1.0 - smoothstep(0.55, 0.98, uv.y);
+    float fadeMix = mix(1.0, fade, clamp(u_bottomFade, 0.0, 1.0));
+    col *= fadeMix;
+    alpha *= fadeMix;
+
+    // Day/night tinting (keep subtle; night clouds are darker/less present).
+    float day = clamp(u_day, 0.0, 1.0);
+    float dusk = clamp(u_dusk, 0.0, 1.0);
+    float oc = clamp(u_overcast, 0.0, 1.0);
+
+    vec3 dayTint = vec3(1.02, 1.02, 1.05);
+    vec3 duskTint = vec3(1.12, 0.92, 0.78);
+    vec3 nightTint = vec3(0.38, 0.42, 0.55);
+
+    vec3 tint = mix(nightTint, dayTint, day);
+    tint = mix(tint, duskTint, dusk * 0.75);
+
+    // Overcast makes clouds denser/darker.
+    tint *= mix(1.08, 0.85, oc);
+    alpha *= mix(0.60, 1.00, oc);
+
+    col *= tint;
+
+    vec4 texel = texture(texture0, fragTexCoord);
+    finalColor = vec4(col, clamp(alpha, 0.0, 1.0)) * texel * colDiffuse * fragColor;
+}
+GLSL";
+
 
 inline int Popcount4(std::uint8_t v)
 {
@@ -307,9 +520,35 @@ inline int Popcount4(std::uint8_t v)
 
 inline void DrawGlow(const Vector2& p, float radius, Color outer, Color inner)
 {
-  // Poor-man's radial gradient using two circles; good enough for small emissive decals.
-  DrawCircleV(p, radius, outer);
-  DrawCircleV(p, radius * 0.55f, inner);
+  // Soft radial glow used by emissive lights (streetlights, windows, signage).
+  //
+  // We intentionally stay 100% procedural: no textures, no shaders. A small stack of
+  // circle gradients approximates a Gaussian falloff well enough for tiny light sprites.
+  if (radius <= 0.01f) return;
+  if (outer.a == 0 && inner.a == 0) return;
+
+  auto alphaMul = [](Color c, float k) -> Color {
+    c.a = ClampU8(static_cast<int>(std::round(static_cast<float>(c.a) * k)));
+    return c;
+  };
+
+  const int cx = static_cast<int>(std::round(p.x));
+  const int cy = static_cast<int>(std::round(p.y));
+
+  // Outer haze: broad and very faint.
+  const Color oWide = alphaMul(outer, 0.28f);
+  const Color oMid = alphaMul(outer, 0.55f);
+  const Color oFade = Color{outer.r, outer.g, outer.b, 0};
+
+  // Inner core: tighter and brighter.
+  const Color iMid = alphaMul(inner, 0.70f);
+  const Color iFade = Color{inner.r, inner.g, inner.b, 0};
+
+  // Two gradients + a small core disk.
+  DrawCircleGradient(cx, cy, radius * 2.15f, oWide, oFade);
+  DrawCircleGradient(cx, cy, radius * 1.15f, oMid, oFade);
+  DrawCircleGradient(cx, cy, radius * 0.65f, iMid, iFade);
+  DrawCircleV(p, radius * 0.32f, inner);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -494,15 +733,145 @@ inline Color ShadeDetail(Color c, float brightness, float mul, unsigned char alp
   return out;
 }
 
+inline float DotV(const Vector2& a, const Vector2& b) { return a.x * b.x + a.y * b.y; }
+
+inline Vector2 NormalizeV(Vector2 v)
+{
+  const float len2 = v.x * v.x + v.y * v.y;
+  if (len2 > 1.0e-6f) {
+    const float inv = 1.0f / std::sqrt(len2);
+    v.x *= inv;
+    v.y *= inv;
+  } else {
+    v = Vector2{0.0f, 1.0f};
+  }
+  return v;
+}
+
+inline float Dist2V(const Vector2& a, const Vector2& b)
+{
+  const float dx = a.x - b.x;
+  const float dy = a.y - b.y;
+  return dx * dx + dy * dy;
+}
+
+// Intersect the infinite line dot(p, dir) == d with a segment p0->p1 (in world space).
+static bool IntersectIsoLineWithSegment(const Vector2& p0, const Vector2& p1, const Vector2& dir, float d, Vector2& out)
+{
+  const float s0 = DotV(p0, dir);
+  const float s1 = DotV(p1, dir);
+
+  const float minS = std::min(s0, s1);
+  const float maxS = std::max(s0, s1);
+  if (d < minS || d > maxS) return false;
+
+  const float denom = (s1 - s0);
+  if (std::fabs(denom) < 1.0e-6f) return false;
+
+  const float t = (d - s0) / denom;
+  out = Vector2{p0.x + (p1.x - p0.x) * t, p0.y + (p1.y - p0.y) * t};
+  return true;
+}
+
+static int AddUniquePoint(Vector2* pts, int count, const Vector2& p, float eps2)
+{
+  for (int i = 0; i < count; ++i) {
+    if (Dist2V(pts[i], p) <= eps2) return count;
+  }
+  pts[count++] = p;
+  return count;
+}
+
+static bool FarthestPair(const Vector2* pts, int count, Vector2& a, Vector2& b)
+{
+  if (count < 2) return false;
+  float best = -1.0f;
+  for (int i = 0; i < count; ++i) {
+    for (int j = i + 1; j < count; ++j) {
+      const float d2 = Dist2V(pts[i], pts[j]);
+      if (d2 > best) {
+        best = d2;
+        a = pts[i];
+        b = pts[j];
+      }
+    }
+  }
+  return (best > 1.0e-8f);
+}
+
+static void DrawWaveFrontsInDiamond(const Vector2* corners, const Vector2& dir, float timeSec, float speed, float waveLen,
+                                   float invZoom, float alphaScale, float pulseSeed,
+                                   float brightness, float mul)
+{
+  // Project the tile polygon into 1D (along dir) so we can draw a few global, time-moving wave fronts.
+  float dMin = std::numeric_limits<float>::infinity();
+  float dMax = -std::numeric_limits<float>::infinity();
+  for (int i = 0; i < 4; ++i) {
+    const float d = DotV(corners[i], dir);
+    dMin = std::min(dMin, d);
+    dMax = std::max(dMax, d);
+  }
+
+  // Expand slightly so crests don't pop at exact boundaries.
+  const float L = std::max(4.0f, waveLen);
+  const float pad = L * 0.75f;
+  dMin -= pad;
+  dMax += pad;
+
+  const float phase = timeSec * speed;
+
+  const int n0 = static_cast<int>(std::floor((dMin + phase) / L));
+  const int n1 = static_cast<int>(std::ceil((dMax + phase) / L));
+
+  const float thickWide = std::clamp(1.65f * invZoom, 0.85f * invZoom, 2.8f * invZoom);
+  const float thickThin = std::clamp(0.95f * invZoom, 0.55f * invZoom, 2.0f * invZoom);
+
+  for (int n = n0; n <= n1; ++n) {
+    const float d = static_cast<float>(n) * L - phase;
+
+    Vector2 hits[4];
+    int hitCount = 0;
+    const float eps2 = (0.40f * invZoom) * (0.40f * invZoom);
+
+    for (int e = 0; e < 4; ++e) {
+      const Vector2 p0 = corners[e];
+      const Vector2 p1 = corners[(e + 1) & 3];
+      Vector2 p{};
+      if (IntersectIsoLineWithSegment(p0, p1, dir, d, p)) {
+        hitCount = AddUniquePoint(hits, hitCount, p, eps2);
+        if (hitCount >= 4) break;
+      }
+    }
+
+    Vector2 a{}, b{};
+    if (!FarthestPair(hits, hitCount, a, b)) continue;
+
+    // A little per-front pulsing keeps water from looking like perfectly rigid stripes.
+    const float p = 0.70f + 0.30f * std::sin(timeSec * 1.25f + static_cast<float>(n) * 1.37f + pulseSeed);
+
+    const unsigned char aWide = ClampU8(static_cast<int>(28.0f * alphaScale * p));
+    const unsigned char aThin = ClampU8(static_cast<int>(62.0f * alphaScale * p));
+
+    const Color wide = ShadeDetail(Color{175, 215, 255, 255}, brightness, mul * 0.98f, aWide);
+    const Color thin = ShadeDetail(Color{235, 248, 255, 255}, brightness, mul * 1.06f, aThin);
+
+    DrawLineEx(a, b, thickWide, wide);
+    DrawLineEx(a, b, thickThin, thin);
+  }
+}
+
 static void DrawProceduralTileDetails(const World& world, int x, int y, const Tile& t, const Vector2& center,
                                      float tileW, float tileH, float zoom, float brightness, std::uint32_t seed32,
-                                     float timeSec)
+                                     float timeSec, const WeatherState& weather)
 {
   // Purely aesthetic; roads already have their own markings pass.
   if (t.overlay == Overlay::Road) return;
 
   const float tileScreenW = tileW * zoom;
-  if (tileScreenW < 30.0f) return;
+
+  // Water benefits from motion even when slightly zoomed out; land micro-details stay more zoom-gated.
+  const float minDetailW = (t.terrain == Terrain::Water) ? 20.0f : 30.0f;
+  if (tileScreenW < minDetailW) return;
 
   const std::uint32_t base = seed32 ^ (static_cast<std::uint32_t>(t.variation) * 0x9E3779B9u);
   const std::uint32_t h0 = HashCoords32(x, y, base ^ 0xA5A5A5A5u);
@@ -860,22 +1229,70 @@ static void DrawProceduralTileDetails(const World& world, int x, int y, const Ti
                  ShadeDetail(Color{245, 240, 230, 255}, brightness, 1.10f, 120));
     }
   } else if (t.terrain == Terrain::Water) {
-    // Small specular sparkles; animate lightly so large bodies of water feel alive.
+    // Animated, fully procedural wave fronts (global continuous stripes) + a few sparkles.
     // Skip bridges for clarity.
     if (t.overlay == Overlay::Road) return;
 
-    const int sparkles = (tileScreenW >= 46.0f) ? 2 : 1;
-    for (int i = 0; i < sparkles; ++i) {
-      const Vector2 p = DeterministicDiamondPoint(x, y, base ^ 0x9A1B2C3Du, 20 + i, center, tileW, tileH, 0.80f);
-      const float phase = Frac01(HashCoords32(x + i * 41, y - i * 37, base ^ 0xC001D00Du)) * 6.2831853f;
-      const float pulse = 0.40f + 0.60f * (0.5f + 0.5f * std::sin(timeSec * (1.55f + 0.25f * static_cast<float>(i)) + phase));
-      const unsigned char a = ClampU8(static_cast<int>(18.0f + 95.0f * pulse));
+    // Fade in with zoom so distant water stays readable.
+    const float zT = std::clamp((tileScreenW - 20.0f) / 34.0f, 0.0f, 1.0f);
 
-      const float len = tileH * 0.10f;
-      Vector2 a0{p.x - len * 0.40f, p.y - len * 0.05f};
-      Vector2 a1{p.x + len * 0.40f, p.y + len * 0.05f};
+    // Attenuate waves near shore: the dedicated coastline foam pass already adds a lot of detail there.
+    auto isLandOrOob = [&](int px, int py) -> bool {
+      if (!world.inBounds(px, py)) return true;
+      return world.at(px, py).terrain != Terrain::Water;
+    };
+    const bool nearShore =
+      isLandOrOob(x, y - 1) || isLandOrOob(x + 1, y) || isLandOrOob(x, y + 1) || isLandOrOob(x - 1, y);
 
-      DrawLineEx(a0, a1, thick, ShadeDetail(Color{255, 255, 255, 255}, brightness, 1.10f, a));
+    // Wind-aligned wave travel direction (screen-space wind).
+    const Vector2 dir = NormalizeV(Vector2{weather.windX, weather.windY});
+
+    Vector2 corners[4];
+    TileDiamondCorners(center, tileW, tileH, corners);
+
+    const std::uint32_t hw = HashCoords32(x, y, base ^ 0xC0A57F1Du);
+    const float windAmp = std::clamp(0.55f + 0.20f * (weather.windSpeed - 1.0f), 0.25f, 1.10f);
+
+    float alphaScale = zT * windAmp;
+    if (nearShore) alphaScale *= 0.65f;
+
+    // Primary set: longer waves at low zoom (fewer lines), denser at high zoom.
+    const bool highDetail = (tileScreenW >= 38.0f);
+    const float waveLen0 = tileW * (highDetail ? 0.58f : 0.80f);
+    const float speed0 = 14.0f * std::clamp(weather.windSpeed, 0.25f, 3.0f);
+    const float seed0 = Frac01(hw ^ 0x9E3779B9u) * 6.2831853f;
+    DrawWaveFrontsInDiamond(corners, dir, timeSec, speed0, waveLen0,
+                            invZoom, alphaScale, seed0,
+                            brightness, /*mul=*/1.0f);
+
+    // Secondary angled set at high zoom for richer, more natural interference patterns.
+    if (tileScreenW >= 36.0f) {
+      const float rc = 0.8660254f; // cos(30deg)
+      const float rs = 0.5f;       // sin(30deg)
+      const Vector2 dir2 = NormalizeV(Vector2{dir.x * rc - dir.y * rs, dir.x * rs + dir.y * rc});
+      const float waveLen1 = tileW * 0.92f;
+      const float speed1 = speed0 * 0.72f;
+      const float seed1 = Frac01(hw ^ 0xBADC0DEu) * 6.2831853f;
+      DrawWaveFrontsInDiamond(corners, dir2, timeSec, speed1, waveLen1,
+                              invZoom, alphaScale * 0.65f, seed1,
+                              brightness, /*mul=*/0.95f);
+    }
+
+    // Small specular sparkles; animate lightly so large bodies of water feel alive.
+    if (tileScreenW >= 30.0f) {
+      const int sparkles = (tileScreenW >= 46.0f) ? 2 : 1;
+      for (int i = 0; i < sparkles; ++i) {
+        const Vector2 p = DeterministicDiamondPoint(x, y, base ^ 0x9A1B2C3Du, 20 + i, center, tileW, tileH, 0.80f);
+        const float phase = Frac01(HashCoords32(x + i * 41, y - i * 37, base ^ 0xC001D00Du)) * 6.2831853f;
+        const float pulse = 0.40f + 0.60f * (0.5f + 0.5f * std::sin(timeSec * (1.55f + 0.25f * static_cast<float>(i)) + phase));
+        const unsigned char a = ClampU8(static_cast<int>(18.0f + 95.0f * pulse));
+
+        const float len = tileH * 0.10f;
+        Vector2 a0{p.x - len * 0.40f, p.y - len * 0.05f};
+        Vector2 a1{p.x + len * 0.40f, p.y + len * 0.05f};
+
+        DrawLineEx(a0, a1, thick, ShadeDetail(Color{255, 255, 255, 255}, brightness, 1.10f, a));
+      }
     }
   }
 
@@ -1324,6 +1741,71 @@ static void DrawNightLightsPass(const World& world, const TileRect& vis,
 
   const float invZoom = 1.0f / std::max(0.001f, zoom);
 
+  // Additive blend reads much closer to "light" than standard alpha compositing.
+  BeginBlendMode(BLEND_ADDITIVE);
+
+  // Soft ground pool (a blurred diamond) to suggest light spilling onto the ground plane.
+  // Kept cheap (a few diamonds) and zoom-gated to cap overdraw on dense downtown areas.
+  auto drawLightPool = [&](Vector2 c, float scale, Color col) {
+    if (col.a == 0) return;
+    if (scale <= 0.05f) return;
+
+    const unsigned char a0 = col.a;
+    Color c0 = col;
+    c0.a = ClampU8(static_cast<int>(static_cast<float>(a0) * 0.55f));
+    Color c1 = col;
+    c1.a = ClampU8(static_cast<int>(static_cast<float>(a0) * 0.28f));
+    Color c2 = col;
+    c2.a = ClampU8(static_cast<int>(static_cast<float>(a0) * 0.14f));
+
+    DrawDiamond(c, tileW * scale, tileH * scale, c0);
+    DrawDiamond(c, tileW * scale * 1.55f, tileH * scale * 1.55f, c1);
+    if (tileScreenW >= 36.0f) {
+      DrawDiamond(c, tileW * scale * 2.25f, tileH * scale * 2.25f, c2);
+    }
+  };
+
+  // Faint water reflections for nearby lights.
+  auto drawWaterReflection = [&](int wx, int wy, Color outer, Color inner, float k) {
+    if (!world.inBounds(wx, wy)) return;
+    const Tile& wt = world.at(wx, wy);
+    if (wt.terrain != Terrain::Water) return;
+
+    Vector2 wc = TileToWorldCenter(wx, wy, tileW, tileH);
+    wc.y -= TileElevationPx(wt, elev);
+
+    const std::uint32_t hw = HashCoords32(wx, wy, seed32 ^ 0xB16B00B5u);
+    const float wobble =
+      std::sin(timeSec * (1.4f + 0.35f * Frac01(hw)) + Frac01(hw ^ 0x9E3779B9u) * 6.2831853f);
+    wc.x += wobble * tileW * 0.03f;
+
+    // Push toward cooler tones for water.
+    auto cool = [&](Color c, float t) -> Color {
+      const float it = 1.0f - t;
+      c.r = ClampU8(static_cast<int>(it * static_cast<float>(c.r) + t * 120.0f));
+      c.g = ClampU8(static_cast<int>(it * static_cast<float>(c.g) + t * 200.0f));
+      c.b = ClampU8(static_cast<int>(it * static_cast<float>(c.b) + t * 255.0f));
+      return c;
+    };
+
+    Color o = cool(outer, 0.60f);
+    Color i = cool(inner, 0.45f);
+
+    o.a = ClampU8(static_cast<int>(static_cast<float>(o.a) * k));
+    i.a = ClampU8(static_cast<int>(static_cast<float>(i.a) * k));
+    if (o.a == 0 && i.a == 0) return;
+
+    const float r = (3.4f + 2.0f * k) * invZoom;
+
+    Vector2 p0 = wc;
+    p0.y += tileH * 0.04f;
+    Vector2 p1 = p0;
+    p1.y += tileH * (0.18f + 0.06f * k);
+
+    DrawLineEx(p0, p1, r * 0.35f, o);
+    DrawGlow(Vector2{wc.x, wc.y + tileH * 0.10f}, r * 0.95f, o, i);
+  };
+
   const int minSum = vis.minX + vis.minY;
   const int maxSum = vis.maxX + vis.maxY;
 
@@ -1368,7 +1850,8 @@ static void DrawNightLightsPass(const World& world, const TileRect& vis,
                                                Frac01(hr) * 6.2831853f);
 
         const float aBase = (isIntersection ? 125.0f : 95.0f) + (isMajor ? 15.0f : 0.0f);
-        const int a = static_cast<int>(aBase * night * flicker);
+        // Additive blending is more energetic, so pull intensity down slightly.
+        const int a = static_cast<int>(aBase * night * flicker * 0.92f);
 
         const float r = (isIntersection ? 7.5f : 6.0f) * invZoom;
 
@@ -1379,6 +1862,28 @@ static void DrawNightLightsPass(const World& world, const TileRect& vis,
         if (t.terrain == Terrain::Water) {
           outer = Color{205, 235, 255, ClampU8(a)};
           inner = Color{235, 250, 255, ClampU8(a + 55)};
+        }
+
+        // Light spill on the ground plane.
+        {
+          Vector2 pool = center;
+          pool.y += tileH * 0.08f;
+
+          Color poolC = outer;
+          poolC.a = ClampU8(static_cast<int>(static_cast<float>(outer.a) * (isIntersection ? 0.34f : 0.28f)));
+
+          const float poolScale = (isIntersection ? 1.55f : 1.35f) + (isMajor ? 0.10f : 0.0f);
+          drawLightPool(pool, poolScale, poolC);
+        }
+
+        // Neighbor water reflections (shoreline / canals).
+        {
+          const float w = std::clamp(wetness, 0.0f, 1.0f);
+          const float k = 0.22f + 0.18f * w;
+          drawWaterReflection(x, y - 1, outer, inner, k);
+          drawWaterReflection(x + 1, y, outer, inner, k);
+          drawWaterReflection(x, y + 1, outer, inner, k);
+          drawWaterReflection(x - 1, y, outer, inner, k);
         }
 
         DrawGlow(p, r, outer, inner);
@@ -1427,6 +1932,31 @@ static void DrawNightLightsPass(const World& world, const TileRect& vis,
         const int baseCount = 1 + std::clamp(static_cast<int>(t.level), 1, 3) / 2;
         const int count = baseCount + ((t.overlay == Overlay::Commercial) ? 1 : 0);
 
+        // Building-level ambient spill (one per tile) so the city reads as actually illuminated.
+        if (tileScreenW >= 32.0f) {
+          const float w = std::clamp(wetness, 0.0f, 1.0f);
+          const float wetBoost = 0.80f + 0.20f * w;
+
+          const float base = night * (0.20f + 0.80f * occ) * wetBoost;
+          const unsigned char aPool = ClampU8(static_cast<int>(55.0f * base));
+          if (aPool != 0) {
+            Color poolC{255, 190, 120, aPool};
+            float poolScale = 1.20f;
+
+            if (t.overlay == Overlay::Commercial) {
+              poolC = Color{150, 225, 255, aPool};
+              poolScale = 1.30f;
+            } else if (t.overlay == Overlay::Industrial) {
+              poolC = Color{255, 170, 90, aPool};
+              poolScale = 1.25f;
+            }
+
+            Vector2 pool = center;
+            pool.y += tileH * 0.10f;
+            drawLightPool(pool, poolScale, poolC);
+          }
+        }
+
         for (int i = 0; i < count; ++i) {
           const std::uint32_t hi = HashCoords32(x + i * 97, y - i * 61, hb ^ 0x9E3779B9u);
           if (Frac01(hi) > litChance) continue;
@@ -1439,8 +1969,9 @@ static void DrawNightLightsPass(const World& world, const TileRect& vis,
                                 0.20f * std::sin(timeSec * (1.2f + 0.25f * static_cast<float>((hi >> 6) & 7u)) +
                                                  Frac01(hi) * 6.2831853f);
 
-          const float aBase = 85.0f + 140.0f * occ + 20.0f * static_cast<float>(t.level);
-          const int a = static_cast<int>(aBase * night * flicker);
+          const float aBase = 70.0f + 120.0f * occ + 18.0f * static_cast<float>(t.level);
+          // Similar to roads: keep emissives under control in additive blend mode.
+          const int a = static_cast<int>(aBase * night * flicker * 0.78f);
 
           float r = (4.2f + 1.0f * static_cast<float>((hi >> 3) & 3u)) * invZoom;
           if (t.overlay == Overlay::Commercial) r *= 1.10f;
@@ -1458,9 +1989,86 @@ static void DrawNightLightsPass(const World& world, const TileRect& vis,
 
           DrawGlow(p, r, outer, inner);
         }
+
+        // Occasional commercial neon strip signs at mid zoom. This adds visual life when we are
+        // not using the high-zoom building sprite system (which already has emissive textures).
+        if (t.overlay == Overlay::Commercial && tileScreenW >= 32.0f && tileScreenW < 54.0f) {
+          const std::uint32_t hs = HashCoords32(x, y, seed32 ^ 0x4E30A11Cu);
+          const float chance = 0.08f + 0.22f * occ;
+          if (Frac01(hs) < chance) {
+            Vector2 corners[4];
+            TileDiamondCorners(center, tileW, tileH, corners);
+
+            const Vector2 edgeA[4] = {corners[0], corners[1], corners[2], corners[3]};
+            const Vector2 edgeB[4] = {corners[1], corners[2], corners[3], corners[0]};
+
+            const int e = static_cast<int>((hs >> 3u) & 3u);
+
+            const float u0 = 0.22f + 0.10f * Frac01(hs ^ 0xA11CE5EDu);
+            const float u1 = 0.78f - 0.10f * Frac01(hs ^ 0xBADC0DEu);
+
+            Vector2 a0 = LerpV(edgeA[e], edgeB[e], u0);
+            Vector2 b0 = LerpV(edgeA[e], edgeB[e], u1);
+
+            const float height = tileH * (0.26f + 0.12f * Frac01(hs ^ 0xC0FFEEu));
+            a0.y -= height;
+            b0.y -= height;
+
+            auto neonColor = [&](int idx) -> Color {
+              switch (idx) {
+              case 0: return Color{80, 255, 255, 255};   // cyan
+              case 1: return Color{255, 80, 240, 255};   // magenta
+              case 2: return Color{255, 200, 60, 255};   // amber
+              case 3: return Color{120, 255, 120, 255};  // green
+              default: return Color{190, 90, 255, 255};  // purple
+              }
+            };
+
+            const int ci = static_cast<int>((hs >> 6u) % 5u);
+            Color neon = neonColor(ci);
+
+            const float flicker =
+              0.78f + 0.22f * std::sin(timeSec * (2.8f + 0.8f * Frac01(hs)) + Frac01(hs ^ 0x13579BDFu) * 6.2831853f);
+
+            const float speed = 4.0f + 3.0f * Frac01(hs ^ 0x2468ACE0u);
+            const int tick = static_cast<int>(std::floor(timeSec * speed));
+            const std::uint32_t hBlink = HashCoords32(x + tick * 13, y - tick * 7, hs ^ 0xDEADC0DEu);
+            const float blink = (Frac01(hBlink) < 0.03f) ? 0.0f : 1.0f;
+
+            const float inten = night * (0.35f + 0.65f * occ) * flicker * blink;
+            const unsigned char aN = ClampU8(static_cast<int>(210.0f * inten));
+            if (aN != 0) {
+              const float thick = (1.10f + 0.55f * Frac01(hs ^ 0x9E3779B9u)) * invZoom;
+
+              Color cWide = neon;
+              cWide.a = ClampU8(static_cast<int>(static_cast<float>(aN) * 0.22f));
+              Color cMid = neon;
+              cMid.a = ClampU8(static_cast<int>(static_cast<float>(aN) * 0.55f));
+              Color cCore = neon;
+              cCore.a = aN;
+              Color cHot{255, 255, 255, ClampU8(static_cast<int>(static_cast<float>(aN) * 0.85f))};
+
+              DrawLineEx(a0, b0, thick * 4.2f, cWide);
+              DrawLineEx(a0, b0, thick * 2.3f, cMid);
+              DrawLineEx(a0, b0, thick * 1.05f, cCore);
+              DrawLineEx(a0, b0, thick * 0.55f, cHot);
+
+              DrawCircleV(a0, thick * 0.55f, cHot);
+              DrawCircleV(b0, thick * 0.55f, cHot);
+
+              Vector2 pool = center;
+              pool.y += tileH * 0.10f;
+              Color poolC = neon;
+              poolC.a = ClampU8(static_cast<int>(static_cast<float>(aN) * 0.18f));
+              drawLightPool(pool, 1.18f, poolC);
+            }
+          }
+        }
       }
     }
   }
+
+  EndBlendMode();
 }
 
 
@@ -2777,6 +3385,12 @@ Renderer::~Renderer() { unloadTextures(); }
 
 void Renderer::unloadTextures()
 {
+  // Geometry-shader programs need to be released before the GL context is torn down.
+  m_gpuRibbon.shutdown();
+
+  // Shader-based volumetric clouds also rely on GL resources.
+  unloadVolumetricCloudResources();
+
   for (auto& tv : m_terrainTex) {
     for (auto& t : tv) {
       if (t.id != 0) UnloadTexture(t);
@@ -2832,6 +3446,131 @@ void Renderer::unloadTextures()
   unloadBaseCache();
 
   unloadMinimap();
+}
+
+
+void Renderer::unloadVolumetricCloudResources()
+{
+  if (m_volCloudShader.id != 0) {
+    UnloadShader(m_volCloudShader);
+    m_volCloudShader = Shader{};
+  }
+
+  m_volCloudShaderFailed = false;
+
+  m_volCloudLocViewMin = -1;
+  m_volCloudLocViewSize = -1;
+  m_volCloudLocTime = -1;
+  m_volCloudLocWindDir = -1;
+  m_volCloudLocWindSpeed = -1;
+  m_volCloudLocScale = -1;
+  m_volCloudLocCoverage = -1;
+  m_volCloudLocDensity = -1;
+  m_volCloudLocSoftness = -1;
+  m_volCloudLocSteps = -1;
+  m_volCloudLocDay = -1;
+  m_volCloudLocDusk = -1;
+  m_volCloudLocOvercast = -1;
+  m_volCloudLocSeed = -1;
+  m_volCloudLocBottomFade = -1;
+}
+
+void Renderer::ensureVolumetricCloudShader()
+{
+  if (m_volCloudShader.id != 0) return;
+  if (m_volCloudShaderFailed) return;
+
+  m_volCloudShader = LoadShaderFromMemory(kVolumetricCloudVS, kVolumetricCloudFS);
+  if (m_volCloudShader.id == 0) {
+    m_volCloudShaderFailed = true;
+    return;
+  }
+
+  m_volCloudLocViewMin = GetShaderLocation(m_volCloudShader, "u_viewMin");
+  m_volCloudLocViewSize = GetShaderLocation(m_volCloudShader, "u_viewSize");
+  m_volCloudLocTime = GetShaderLocation(m_volCloudShader, "u_time");
+  m_volCloudLocWindDir = GetShaderLocation(m_volCloudShader, "u_windDir");
+  m_volCloudLocWindSpeed = GetShaderLocation(m_volCloudShader, "u_windSpeed");
+  m_volCloudLocScale = GetShaderLocation(m_volCloudShader, "u_scale");
+  m_volCloudLocCoverage = GetShaderLocation(m_volCloudShader, "u_coverage");
+  m_volCloudLocDensity = GetShaderLocation(m_volCloudShader, "u_density");
+  m_volCloudLocSoftness = GetShaderLocation(m_volCloudShader, "u_softness");
+  m_volCloudLocSteps = GetShaderLocation(m_volCloudShader, "u_steps");
+  m_volCloudLocDay = GetShaderLocation(m_volCloudShader, "u_day");
+  m_volCloudLocDusk = GetShaderLocation(m_volCloudShader, "u_dusk");
+  m_volCloudLocOvercast = GetShaderLocation(m_volCloudShader, "u_overcast");
+  m_volCloudLocSeed = GetShaderLocation(m_volCloudShader, "u_seed");
+  m_volCloudLocBottomFade = GetShaderLocation(m_volCloudShader, "u_bottomFade");
+}
+
+void Renderer::drawVolumetricCloudLayer(const WorldRect& viewAABB, float tileW, float timeSec,
+                                       float day, float dusk, float overcast,
+                                       float windX, float windY, float windSpeed)
+{
+  if (!m_volClouds.enabled) return;
+
+  // Avoid doing work when cloudiness is essentially zero.
+  const float oc = std::clamp(overcast, 0.0f, 1.0f);
+  if (oc <= 0.001f) return;
+
+  ensureVolumetricCloudShader();
+  if (m_volCloudShader.id == 0) return;
+
+  const float pad = tileW * 2.0f;
+  const Rectangle dst{
+      viewAABB.minX - pad,
+      viewAABB.minY - pad,
+      (viewAABB.maxX - viewAABB.minX) + pad * 2.0f,
+      (viewAABB.maxY - viewAABB.minY) + pad * 2.0f};
+
+  const Vector2 viewMin{dst.x, dst.y};
+  const Vector2 viewSize{dst.width, dst.height};
+
+  // Shader parameters derived from world scale so the effect stays coherent across tile sizes.
+  const float scaleMul = std::clamp(m_volClouds.scale, 0.25f, 8.0f);
+  const float baseFreq = 1.0f / std::max(1.0f, tileW * 26.0f);
+  const float freq = baseFreq / scaleMul;
+
+  const float coverage = std::clamp(m_volClouds.coverage * (0.55f + 0.45f * oc), 0.0f, 1.0f);
+  const float density = std::clamp(m_volClouds.density * (0.65f + 0.70f * oc), 0.05f, 3.0f);
+  const float softness = std::clamp(m_volClouds.softness, 0.0f, 1.0f);
+  const float bottomFade = std::clamp(m_volClouds.bottomFade, 0.0f, 1.0f);
+
+  const int steps = std::clamp(m_volClouds.steps, 8, 64);
+
+  const Vector2 windDir{windX, windY};
+  const float speedMul = std::max(0.0f, m_volClouds.speed);
+  const float worldSpeed = tileW * 0.80f * speedMul * std::max(0.0f, windSpeed);
+  const float windNoiseSpeed = worldSpeed * freq;
+
+  // Overall opacity is controlled on the CPU via tint alpha so the shader can focus on shape.
+  const float op = std::clamp(m_volClouds.opacity, 0.0f, 1.0f);
+  const float dnMul = 0.45f + 0.55f * std::clamp(day, 0.0f, 1.0f);
+  const float alpha = std::clamp(op * (0.30f + 0.70f * oc) * dnMul, 0.0f, 1.0f);
+  const unsigned char a = static_cast<unsigned char>(std::round(255.0f * alpha));
+  if (a == 0) return;
+
+  const float seed = static_cast<float>(static_cast<std::uint32_t>(m_gfxSeed32) & 0xFFFFu);
+
+  SetShaderValue(m_volCloudShader, m_volCloudLocViewMin, &viewMin, SHADER_UNIFORM_VEC2);
+  SetShaderValue(m_volCloudShader, m_volCloudLocViewSize, &viewSize, SHADER_UNIFORM_VEC2);
+  SetShaderValue(m_volCloudShader, m_volCloudLocTime, &timeSec, SHADER_UNIFORM_FLOAT);
+  SetShaderValue(m_volCloudShader, m_volCloudLocWindDir, &windDir, SHADER_UNIFORM_VEC2);
+  SetShaderValue(m_volCloudShader, m_volCloudLocWindSpeed, &windNoiseSpeed, SHADER_UNIFORM_FLOAT);
+  SetShaderValue(m_volCloudShader, m_volCloudLocScale, &freq, SHADER_UNIFORM_FLOAT);
+  SetShaderValue(m_volCloudShader, m_volCloudLocCoverage, &coverage, SHADER_UNIFORM_FLOAT);
+  SetShaderValue(m_volCloudShader, m_volCloudLocDensity, &density, SHADER_UNIFORM_FLOAT);
+  SetShaderValue(m_volCloudShader, m_volCloudLocSoftness, &softness, SHADER_UNIFORM_FLOAT);
+  SetShaderValue(m_volCloudShader, m_volCloudLocSteps, &steps, SHADER_UNIFORM_INT);
+  SetShaderValue(m_volCloudShader, m_volCloudLocDay, &day, SHADER_UNIFORM_FLOAT);
+  SetShaderValue(m_volCloudShader, m_volCloudLocDusk, &dusk, SHADER_UNIFORM_FLOAT);
+  SetShaderValue(m_volCloudShader, m_volCloudLocOvercast, &oc, SHADER_UNIFORM_FLOAT);
+  SetShaderValue(m_volCloudShader, m_volCloudLocSeed, &seed, SHADER_UNIFORM_FLOAT);
+  SetShaderValue(m_volCloudShader, m_volCloudLocBottomFade, &bottomFade, SHADER_UNIFORM_FLOAT);
+
+  BeginShaderMode(m_volCloudShader);
+  DrawRectangleRec(dst, Color{255, 255, 255, a});
+  EndShaderMode();
 }
 
 
@@ -4403,6 +5142,9 @@ void Renderer::rebuildTextures(std::uint64_t seed)
 
   // World-space cloud shadow mask (procedural, tileable).
   rebuildCloudShadowTexture();
+
+  // Optional GPU geometry-shader effects (safe fallback if unsupported).
+  m_gpuRibbon.init();
 }
 
 namespace {
@@ -5242,7 +5984,7 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
       if (drawAestheticDetails) {
         // Procedural micro-detail pass (grass tufts, rocks, water sparkles, etc.)
         DrawProceduralTileDetails(world, x, y, tile, center, tileWf, tileHf,
-                                 camera.zoom, brightness, m_gfxSeed32, timeSec);
+                                 camera.zoom, brightness, m_gfxSeed32, timeSec, weather);
 
         // Permanent altitude-driven snow caps (independent of the active weather mode).
         // Kept subtle so it doesn't fight utility overlays; also fades out when it's actively snowing.
@@ -5343,8 +6085,15 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
             p1.x += dir.x * off;
             p1.y += dir.y * off;
 
-            Color foam = ShadeDetail(Color{255, 255, 255, 255}, brightness, 1.12f,
-                                     ClampU8(40 + static_cast<int>(60.0f * (1.0f - 0.35f * r0))));
+            const float pulse01 =
+              0.55f +
+              0.45f *
+                (0.5f + 0.5f * std::sin(timeSec * 2.20f + static_cast<float>(edge) * 1.40f +
+                                        Frac01(hs ^ 0xC3A5C85Cu) * 6.2831853f));
+
+            const int aFoam = static_cast<int>((40.0f + 60.0f * (1.0f - 0.35f * r0)) * pulse01);
+
+            Color foam = ShadeDetail(Color{255, 255, 255, 255}, brightness, 1.12f, ClampU8(aFoam));
             DrawLineEx(p0, p1, thick, foam);
 
             // Occasional bubbles.
@@ -6138,9 +6887,13 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
   // Cloud shadows (decals layer)
   // -----------------------------
   // Draw before grading so the day/night + overcast tint applies on top.
-  if (drawAestheticDetails && m_cloudShadows.enabled && m_cloudShadowTex.id != 0 &&
-      m_weather.mode != WeatherSettings::Mode::Clear) {
-    const float cloudiness = std::clamp(m_weather.overcast, 0.0f, 1.0f);
+  //
+  // Note: cloud shadows can optionally persist in Clear weather (controlled by
+  // CloudShadowSettings::clearAmount) so we can have drifting ambience without forcing rain/snow.
+  if (drawAestheticDetails && m_cloudShadows.enabled && m_cloudShadowTex.id != 0) {
+    const float cloudiness = (m_weather.mode == WeatherSettings::Mode::Clear)
+                                 ? std::clamp(m_cloudShadows.clearAmount, 0.0f, 1.0f)
+                                 : std::clamp(m_weather.overcast, 0.0f, 1.0f);
     if (cloudiness > 0.001f) {
       const float dnMul = (m_dayNight.enabled) ? std::clamp(dayNight.day, 0.0f, 1.0f) : 1.0f;
       const float alpha = std::clamp(m_cloudShadows.strength * cloudiness * dnMul, 0.0f, 1.0f);
@@ -6211,6 +6964,28 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
     }
     if (aDusk > 0) {
       DrawRectangleV(pos, size, Color{255, 120, 60, static_cast<unsigned char>(aDusk)});
+    }
+  }
+
+  // -----------------------------
+  // Volumetric clouds (visible overlay)
+  // -----------------------------
+  // Draw after grading so the clouds aren't double-tinted, but before emissive passes so
+  // city lights remain crisp at night.
+  if (drawAestheticDetails && m_volClouds.enabled) {
+    const float cloudiness = (m_weather.mode == WeatherSettings::Mode::Clear)
+                                 ? std::clamp(m_volClouds.clearAmount, 0.0f, 1.0f)
+                                 : std::clamp(m_weather.overcast, 0.0f, 1.0f);
+    if (cloudiness > 0.001f) {
+      drawVolumetricCloudLayer(viewAABB,
+                               tileWf,
+                               timeSec,
+                               dayNight.day,
+                               dayNight.dusk,
+                               cloudiness,
+                               weather.windX,
+                               weather.windY,
+                               weather.windSpeed);
     }
   }
 
@@ -6358,8 +7133,40 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
     };
 
     if (highlightPathEff && !highlightPathEff->empty()) {
-      for (const Point& p : *highlightPathEff) {
-        drawOutline(p.x, p.y, Color{255, 215, 0, 110});
+      // Prefer the GPU ribbon (geometry shader) for smoother, cheaper path highlights.
+      // Fallback to the legacy per-tile outline if the backend can't compile geometry shaders.
+      if (m_gpuRibbon.isReady() && highlightPathEff->size() >= 2) {
+        m_pathRibbonScratch.clear();
+        m_pathRibbonScratch.reserve(highlightPathEff->size());
+
+        for (const Point& p : *highlightPathEff) {
+          if (!world.inBounds(p.x, p.y)) continue;
+          const Tile& tt = world.at(p.x, p.y);
+          const float elevPx = TileElevationPx(tt, m_elev);
+          const Vector2 baseC = TileToWorldCenter(p.x, p.y, tileWf, tileHf);
+          m_pathRibbonScratch.push_back(Vector2{baseC.x, baseC.y - elevPx});
+        }
+
+        RibbonStyle st;
+        // Keep the ribbon thickness mostly stable in screen pixels, with a mild
+        // boost when zoomed out so it remains readable.
+        const float z = std::max(0.25f, camera.zoom);
+        const float t = std::clamp((z - 0.55f) / (1.60f - 0.55f), 0.0f, 1.0f);
+        st.coreThicknessPx = 9.0f - 4.0f * t; // ~9px @ zoomed-out, ~5px @ zoomed-in
+        st.glowThicknessPx = st.coreThicknessPx * 2.6f;
+        st.coreAlpha = 0.75f;
+        st.glowAlpha = 0.18f;
+        st.dashLengthPx = 32.0f;
+        st.dashSpeedPx = 78.0f;
+        st.dashDuty = 0.60f;
+        st.flowStrength = 0.35f;
+
+        m_gpuRibbon.drawPath(m_pathRibbonScratch, screenW, screenH, timeSec, Color{255, 215, 0, 255}, st,
+                             /*additiveBlend=*/true);
+      } else {
+        for (const Point& p : *highlightPathEff) {
+          drawOutline(p.x, p.y, Color{255, 215, 0, 110});
+        }
       }
     }
 
@@ -6500,15 +7307,20 @@ void Renderer::drawHUD(const World& world, const Camera2D& camera, Tool tool, in
   // Budget + demand + land value add two always-on HUD lines.
   const int extraLines = 2 + ((inspectInfo && inspectInfo[0] != '\0') ? 1 : 0) +
                          ((heatmapInfo && heatmapInfo[0] != '\0') ? 1 : 0);
-  const int panelH = (showHelp ? 360 : 228) + extraLines * 22;
+  int panelH = (showHelp ? 470 : 228) + extraLines * 22;
+  panelH = std::min(panelH, screenH - pad * 2);
 
-  DrawRectangle(pad, pad, panelW, panelH, Color{0, 0, 0, 150});
-  DrawRectangleLines(pad, pad, panelW, panelH, Color{255, 255, 255, 70});
+  const float uiTime = static_cast<float>(GetTime());
+  ui::DrawPanel(Rectangle{static_cast<float>(pad), static_cast<float>(pad), static_cast<float>(panelW),
+                          static_cast<float>(panelH)},
+                uiTime, /*active=*/true);
+
+  const ui::Theme& uiTh = ui::GetTheme();
 
   int y = pad + 10;
 
-  auto line = [&](const std::string& text) {
-    DrawText(text.c_str(), pad + 10, y, 18, RAYWHITE);
+  auto line = [&](std::string_view text, bool dim = false) {
+    ui::Text(pad + 10, y, 18, text, dim ? uiTh.textDim : uiTh.text, /*bold=*/false, /*shadow=*/true, 1);
     y += 22;
   };
 
@@ -6630,43 +7442,79 @@ void Renderer::drawHUD(const World& world, const Camera2D& camera, Tool tool, in
                   hovered->y, ToString(t.terrain), ToString(t.overlay), static_cast<int>(t.district & 7u),
                   static_cast<double>(t.height), static_cast<double>(TileElevationPx(t, m_elev)), t.level,
                   t.occupants);
-    DrawText(buf, pad + 10, y + 6, 16, Color{220, 220, 220, 255});
+    ui::Text(pad + 10, y + 6, 16, buf, uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
     y += 26;
   }
 
   if (heatmapInfo && heatmapInfo[0] != '\0') {
-    DrawText(heatmapInfo, pad + 10, y + 6, 16, Color{230, 230, 230, 255});
+    ui::Text(pad + 10, y + 6, 16, heatmapInfo, uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
     y += 26;
   }
 
   if (inspectInfo && inspectInfo[0] != '\0') {
-    DrawText(inspectInfo, pad + 10, y + 6, 16, Color{230, 230, 230, 255});
+    ui::Text(pad + 10, y + 6, 16, inspectInfo, uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
     y += 26;
   }
 
-  if (showHelp) {
-    DrawText("Right drag: pan | Wheel: zoom | R regen | G grid | H help | M minimap | E elev | O outside | L heatmap | C vehicles | P policy | F1 report | F2 cache | Shift+F2 day/night | F3 model | Shift+F3 weather | F7 districts | T graph | V traffic | B goods", pad + 10, y + 10, 16,
-             Color{220, 220, 220, 255});
-    y += 22;
-    DrawText("Ctrl+T transit | Ctrl+Shift+T transit export", pad + 10, y + 10, 16,
-             Color{220, 220, 220, 255});
-    y += 22;
-    DrawText("1 Road | 2 Res | 3 Com | 4 Ind | 5 Park | 0 Doze | 6 Raise | 7 Lower | 8 Smooth | 9 District | Q Inspect", pad + 10, y + 10, 16,
-             Color{220, 220, 220, 255});
-    y += 22;
-    DrawText("[/] brush | ,/. district | Space: pause | N: step | +/-: speed | U: road type", pad + 10, y + 10, 16,
-             Color{220, 220, 220, 255});
-    y += 22;
-    DrawText("F4 console | F5 save | F9 load | F6 slot | F10 saves | F12 shot | Ctrl+F12 map | Ctrl+Shift+F12 layers | Ctrl+Z undo | Ctrl+Y redo", pad + 10, y + 10, 16,
-             Color{220, 220, 220, 255});
-    y += 22;
-    DrawText("F8 video (Shift+F8 FX) | F11 fullscreen | Alt+Enter borderless | Ctrl+=/- UI scale | Ctrl+0 UI auto | Ctrl+Alt+=/- world scale", pad + 10, y + 10, 16,
-             Color{220, 220, 220, 255});
-    y += 22;
-    DrawText("Tip: re-place a zone to upgrade. Road: U selects class (paint to upgrade), Shift+drag builds path. Terraform: Shift=strong, Ctrl=fine. District: Alt+click pick, Shift+click fill.", pad + 10, y + 10, 16,
-             Color{220, 220, 220, 255});
-  }
-
+    if (showHelp) {
+      // Skinned help overlay (compact keycaps + wrapped tips).
+      const float panelBottom = static_cast<float>(pad + panelH);
+      const float helpX = static_cast<float>(pad + 10);
+      const float helpY = static_cast<float>(y + 10);
+      const float helpW = static_cast<float>(panelW - 20);
+      const float helpH = std::max(0.0f, panelBottom - helpY - 10.0f);
+  
+      if (helpH > 40.0f) {
+        const Rectangle helpR{helpX, helpY, helpW, helpH};
+        ui::DrawPanelInset(helpR, uiTime, /*active=*/true);
+  
+        const int hx = static_cast<int>(helpR.x) + 10;
+        int hy = static_cast<int>(helpR.y) + 8;
+  
+        ui::TextOutlined(hx, hy, 18, "HOTKEYS", uiTh.text, uiTh.accentDim, /*bold=*/true, /*shadow=*/true, 1);
+        hy += 24;
+  
+        const int keySize = 14;
+        const int rowStep = 24;
+  
+        const int colGap = 14;
+        const int colW = std::max(120, static_cast<int>(helpR.width) / 2 - colGap);
+        const int x0 = hx;
+        const int x1 = hx + colW + colGap;
+  
+        auto hotkey = [&](int x, int yRow, std::string_view combo, std::string_view desc) {
+          const int w = ui::DrawKeyCombo(x, yRow, combo, uiTime, /*strong=*/false, keySize);
+          ui::Text(x + w + 8, yRow + 4, 14, desc, uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
+        };
+  
+        const int y0 = hy;
+        hotkey(x0, y0 + 0 * rowStep, "RMB+Drag", "Pan camera");
+        hotkey(x0, y0 + 1 * rowStep, "Wheel", "Zoom");
+        hotkey(x0, y0 + 2 * rowStep, "R", "Regenerate");
+        hotkey(x0, y0 + 3 * rowStep, "Space", "Pause/Resume");
+        hotkey(x0, y0 + 4 * rowStep, "+/-", "Sim speed");
+  
+        hotkey(x1, y0 + 0 * rowStep, "1-5", "Zones");
+        hotkey(x1, y0 + 1 * rowStep, "6-8", "Terraform");
+        hotkey(x1, y0 + 2 * rowStep, "Q", "Inspect");
+        hotkey(x1, y0 + 3 * rowStep, "Ctrl+Z", "Undo");
+        hotkey(x1, y0 + 4 * rowStep, "Ctrl+Y", "Redo");
+  
+        const float tipY = static_cast<float>(y0 + 5 * rowStep + 6);
+        const Rectangle tipR{helpR.x + 10.0f, tipY, helpR.width - 20.0f,
+                             std::max(0.0f, helpR.y + helpR.height - tipY - 8.0f)};
+  
+        if (tipR.height > 12.0f) {
+          ui::TextBox(
+            tipR, 14,
+            "More: F4 console | F5 save/menu | M minimap | L heatmap | F1 report | F2 cache | F3 model | Shift+F3 weather | F11 fullscreen. "
+            "Tip: re-place a zone to upgrade. Road: U selects class (paint to upgrade), Shift+drag builds path. Terraform: Shift=strong, Ctrl=fine. "
+            "District: Alt+click pick, Shift+click fill.",
+            uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1, /*wrap=*/true, /*clip=*/true);
+        }
+      }
+    }
+  
   // Minimap overlay (bottom-right). One pixel per tile, scaled up.
   if (showMinimap) {
     ensureMinimapUpToDate(world);
@@ -6674,9 +7522,7 @@ void Renderer::drawHUD(const World& world, const Camera2D& camera, Tool tool, in
 
     if (mini.rect.width > 2.0f && mini.rect.height > 2.0f && m_minimapTex.id != 0) {
       // Background + border.
-      DrawRectangleRec(mini.rect, Color{0, 0, 0, 140});
-      DrawRectangleLines(static_cast<int>(mini.rect.x), static_cast<int>(mini.rect.y), static_cast<int>(mini.rect.width),
-                         static_cast<int>(mini.rect.height), Color{255, 255, 255, 70});
+      ui::DrawPanelInset(mini.rect, uiTime, /*active=*/true);
 
       // Draw the minimap texture scaled to the destination rectangle.
       const Rectangle src{0.0f, 0.0f, static_cast<float>(m_minimapW), static_cast<float>(m_minimapH)};
@@ -6719,14 +7565,14 @@ void Renderer::drawHUD(const World& world, const Camera2D& camera, Tool tool, in
 
       // Label.
       const int labelY = std::max(0, static_cast<int>(mini.rect.y) - 18);
-      DrawText("Minimap (click/drag)", static_cast<int>(mini.rect.x), labelY, 16, Color{230, 230, 230, 230});
+      ui::Text(static_cast<int>(mini.rect.x), labelY, 16, "Minimap (click/drag)", uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
     }
   }
 
   // FPS
   const int fps = GetFPS();
   std::snprintf(buf, sizeof(buf), "FPS: %d", fps);
-  DrawText(buf, screenW - 90, 12, 20, Color{255, 255, 255, 200});
+  ui::Text(screenW - 90, 12, 20, buf, uiTh.text, /*bold=*/true, /*shadow=*/true, 1);
 }
 
 } // namespace isocity

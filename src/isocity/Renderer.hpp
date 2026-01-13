@@ -27,6 +27,8 @@
 
 #include "raylib.h"
 
+#include "isocity/GpuGeom.hpp"
+
 // Some environments still define min/max even with NOMINMAX; undef defensively.
 #if defined(_WIN32)
   #ifdef min
@@ -172,6 +174,49 @@ public:
 
     // 0..1 edge softness (higher => blurrier edges).
     float softness = 0.70f;
+
+    // 0..1 baseline cloudiness used when the weather mode is Clear.
+    //
+    // If 0, cloud shadows only appear when precipitation weather is enabled (rain/snow).
+    float clearAmount = 0.0f;
+  };
+
+  // Visible volumetric cloud layer (procedural, shader-based).
+  //
+  // This draws a soft ray-marched cloud volume that is anchored in world space so it pans
+  // with the camera yet drifts over time with the wind. It is intentionally subtle and fades
+  // toward the bottom of the screen to keep gameplay readable.
+  struct VolumetricCloudSettings {
+    bool enabled = true;
+
+    // Overall opacity multiplier for the visible cloud layer.
+    float opacity = 0.55f;
+
+    // Approximate coverage amount (higher => more sky covered).
+    float coverage = 0.55f;
+
+    // Density/thickness multiplier (higher => thicker/more opaque clouds).
+    float density = 0.75f;
+
+    // World-space feature size multiplier (higher => larger cloud structures).
+    float scale = 1.75f;
+
+    // Speed multiplier applied to weather wind (higher => faster drift).
+    float speed = 0.25f;
+
+    // Edge softness (higher => softer boundaries).
+    float softness = 0.70f;
+
+    // Ray-march step count (higher => smoother, but slower).
+    int steps = 24;
+
+    // How strongly clouds fade near the bottom of the view (0=no fade, 1=strong fade).
+    float bottomFade = 0.85f;
+
+    // 0..1 baseline cloudiness used when the weather mode is Clear.
+    //
+    // If 0, volumetric clouds only appear when precipitation weather is enabled (rain/snow).
+    float clearAmount = 0.0f;
   };
 
   // Ground shadow casting from structures (buildings).
@@ -318,6 +363,13 @@ public:
   void setCloudShadowSettings(const CloudShadowSettings& s);
   const CloudShadowSettings& cloudShadowSettings() const { return m_cloudShadows; }
 
+  // Volumetric cloud controls (visible cloud layer).
+  void setVolumetricCloudSettings(const VolumetricCloudSettings& s) { m_volClouds = s; }
+  const VolumetricCloudSettings& volumetricCloudSettings() const { return m_volClouds; }
+
+  void setVolumetricCloudsEnabled(bool enabled) { m_volClouds.enabled = enabled; }
+  bool volumetricCloudsEnabled() const { return m_volClouds.enabled; }
+
   // Shadow controls (stylized building ground shadows).
   void setShadowSettings(const ShadowSettings& s) { m_shadows = s; }
   const ShadowSettings& shadowSettings() const { return m_shadows; }
@@ -410,6 +462,27 @@ private:
   CloudShadowSettings m_cloudShadows{};
   Texture2D m_cloudShadowTex{};
 
+  // Visible volumetric cloud overlay resources.
+  VolumetricCloudSettings m_volClouds{};
+  Shader m_volCloudShader{};
+  bool m_volCloudShaderFailed = false;
+
+  int m_volCloudLocViewMin = -1;
+  int m_volCloudLocViewSize = -1;
+  int m_volCloudLocTime = -1;
+  int m_volCloudLocWindDir = -1;
+  int m_volCloudLocWindSpeed = -1;
+  int m_volCloudLocScale = -1;
+  int m_volCloudLocCoverage = -1;
+  int m_volCloudLocDensity = -1;
+  int m_volCloudLocSoftness = -1;
+  int m_volCloudLocSteps = -1;
+  int m_volCloudLocDay = -1;
+  int m_volCloudLocDusk = -1;
+  int m_volCloudLocOvercast = -1;
+  int m_volCloudLocSeed = -1;
+  int m_volCloudLocBottomFade = -1;
+
   ShadowSettings m_shadows{};
 
   std::array<std::array<Texture2D, kTerrainVariants>, kTerrainTypes> m_terrainTex{};
@@ -475,6 +548,12 @@ private:
 
   void rebuildCloudShadowTexture();
 
+  void ensureVolumetricCloudShader();
+  void unloadVolumetricCloudResources();
+  void drawVolumetricCloudLayer(const WorldRect& viewAABB, float tileW, float timeSec,
+                                float day, float dusk, float overcast,
+                                float windX, float windY, float windSpeed);
+
 
   // 32-bit seed used for procedural render details (ties visual variety to world seed).
   std::uint32_t m_gfxSeed32 = 0;
@@ -513,6 +592,13 @@ private:
 
   // Scratch storage for merged zone-building parcels (reused every frame).
   ZoneBuildingParcels m_zoneParcelsScratch;
+
+  // Optional GPU ribbon renderer (uses a geometry shader when available).
+  // If unsupported, it stays disabled and we fall back to CPU overlays.
+  GpuRibbonPathRenderer m_gpuRibbon;
+
+  // Scratch buffer for GPU path ribbons (reused when rendering highlight paths).
+  std::vector<Vector2> m_pathRibbonScratch;
 
   void unloadTextures();
 

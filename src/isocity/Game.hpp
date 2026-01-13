@@ -108,6 +108,14 @@ private:
   bool saveToPath(const std::string& path, bool makeThumbnail, const char* toastLabel = nullptr);
   bool loadFromPath(const std::string& path, const char* toastLabel = nullptr);
 
+  // Replace the current in-memory world with a freshly loaded state (save/replay/etc)
+  // and reset all derived caches/UI state.
+  //
+  // If tickStats is provided, it is used to seed the City Report history (useful
+  // when applying a replay that contains many ticks).
+  void adoptLoadedWorld(World&& loaded, const ProcGenConfig& loadedProcCfg, const SimConfig& loadedSimCfg,
+                        const std::string& toastMessage, const std::vector<Stats>* tickStats = nullptr);
+
   // Save slot browser / manager UI (toggle with F10).
   void refreshSaveMenu();
   void unloadSaveMenuThumbnails();
@@ -131,8 +139,16 @@ private:
   void clearBlueprint();
   void updateBlueprintTransformed();
   bool stampBlueprintAt(const Point& anchorTile);
+  bool tileBlueprintRect(int x0, int y0, int x1, int y1, bool useLibraryTileset);
   void drawBlueprintOverlay();
   void drawBlueprintPanel(int uiW, int uiH);
+
+  // Blueprint "library": save/load blueprint stamps to disk from inside the app.
+  void refreshBlueprintLibrary();
+  void ensureBlueprintLibraryPreviewUpToDate();
+  bool saveBlueprintToLibrary();
+  bool loadBlueprintFromLibrarySelection();
+  bool deleteBlueprintFromLibrarySelection();
 
   // Road resilience overlay + bypass planner (Shift+T).
   void ensureRoadGraphUpToDate();
@@ -160,6 +176,10 @@ private:
   // Evacuation / disaster scenario analysis (hazards + evacuation-to-edge).
   void ensureEvacuationScenarioUpToDate();
   void exportEvacuationArtifacts();
+
+  // Flood + evacuation scenario analysis panel (toggle with F).
+  void adjustResiliencePanel(int dir, bool bigStep);
+
 
 
 
@@ -283,6 +303,13 @@ private:
   std::optional<Point> m_blueprintSelStart;
   Point m_blueprintSelEnd{0, 0};
 
+  // Stamp-mode tiling selection (Shift+drag). When `m_blueprintTileUseLibrary` is true,
+  // Ctrl+Shift+drag triggers procedural tiling using the blueprint library tileset.
+  bool m_blueprintTilingSelecting = false;
+  bool m_blueprintTileUseLibrary = false;
+  std::optional<Point> m_blueprintTileSelStart;
+  Point m_blueprintTileSelEnd{0, 0};
+
   bool m_hasBlueprint = false;
   Blueprint m_blueprint;
   BlueprintTransform m_blueprintTransform{};
@@ -290,6 +317,42 @@ private:
   Blueprint m_blueprintTransformed;
   BlueprintCaptureOptions m_blueprintCaptureOpt{};
   BlueprintApplyOptions m_blueprintApplyOpt{};
+
+  // Blueprint library: file-backed stamp collection.
+  // This is intentionally lightweight (simple folder scan + preview) so you can
+  // build your own tooling workflow around the binary .isobp format.
+  bool m_blueprintLibraryOpen = false;
+
+  struct BlueprintLibraryEntry {
+    std::string path;
+    std::string name;
+    std::string timeText;
+    std::int64_t sortKey = 0; // seconds since epoch (best-effort)
+
+    int width = 0;
+    int height = 0;
+    int deltas = 0;
+    std::uint32_t version = 0;
+
+    bool ok = false;
+    std::string err;
+  };
+
+  std::vector<BlueprintLibraryEntry> m_blueprintLibrary;
+  int m_blueprintLibrarySelection = 0;
+
+  // Scroll position (first visible row in the list panel).
+  int m_blueprintLibraryFirst = 0;
+
+  // Delete confirmation (press Del twice within a short window).
+  bool m_blueprintLibraryDeleteArmed = false;
+  float m_blueprintLibraryDeleteTimer = 0.0f;
+
+  // Preview cache (loaded from disk when selection changes).
+  int m_blueprintLibraryPreviewIndex = -1;
+  bool m_blueprintLibraryPreviewOk = false;
+  std::string m_blueprintLibraryPreviewError;
+  Blueprint m_blueprintLibraryPreview;
 
 
   // Quick save slot (1..kMaxSaveSlot). Slot 1 == legacy isocity_save.bin.
@@ -446,7 +509,11 @@ private:
   bool m_roadUpgradeSelectedMaskDirty = true;
   std::vector<std::uint8_t> m_roadUpgradeSelectedMask;
 
-  // Heatmap overlay: land value / amenities / pollution / traffic spill.
+    // Flood/evacuation analysis panel (toggle with F).
+  bool m_showResiliencePanel = false;
+  int m_resilienceSelection = 0;
+
+// Heatmap overlay: land value / amenities / pollution / traffic spill.
   enum class HeatmapOverlay : std::uint8_t {
     Off = 0,
     LandValue,
@@ -584,10 +651,12 @@ private:
   int m_worldRenderRTHeight = 0;
 
   bool m_showVideoSettings = false;
-  int m_videoPage = 0; // 0=Display, 1=Visual FX
+  int m_videoPage = 0; // 0=Display, 1=Visual FX, 2=Atmosphere, 3=UI Theme
   int m_videoSelection = 0;
   int m_videoSelectionDisplay = 0;
   int m_videoSelectionVisual = 0;
+  int m_videoSelectionAtmos = 0;
+  int m_videoSelectionUiTheme = 0;
 
   // Visual prefs persistence (autosave throttled).
   std::string m_visualPrefsPath = "isocity_visual.json";

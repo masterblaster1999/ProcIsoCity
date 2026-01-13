@@ -56,6 +56,10 @@ public:
 private:
   void executeLine(const std::string& line);
   void autocomplete();
+
+  void rebuildSuggestions();
+  void acceptSuggestion(std::size_t index);
+  std::string commandToken() const;
   void navigateHistory(int delta);
 
   static std::string trim(const std::string& s);
@@ -77,6 +81,16 @@ private:
   // Output log.
   std::vector<std::string> m_lines;
   int m_scroll = 0; // 0 = bottom, positive = scroll up
+
+  // Last known mouse position in UI coordinates (updated from update()).
+  float m_mouseUiX = 0.0f;
+  float m_mouseUiY = 0.0f;
+
+
+  // Autocomplete suggestion state (rebuilt lazily as the input line changes).
+  std::string m_suggestQuery;
+  std::vector<std::string> m_suggestions;
+  int m_suggestIndex = 0;
 
   // Registered commands.
   std::unordered_map<std::string, Command> m_commands; // lowercase key

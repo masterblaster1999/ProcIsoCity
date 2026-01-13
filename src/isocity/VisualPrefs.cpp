@@ -215,6 +215,19 @@ bool VisualPrefsEqual(const VisualPrefs& a, const VisualPrefs& b)
   if (a.uiScaleAuto != b.uiScaleAuto) return false;
   if (!NearlyEqual(a.uiScaleManual, b.uiScaleManual)) return false;
 
+  // UI theme
+  if (a.uiTheme.accentFromSeed != b.uiTheme.accentFromSeed) return false;
+  if (!NearlyEqual(a.uiTheme.accentHueDeg, b.uiTheme.accentHueDeg)) return false;
+  if (!NearlyEqual(a.uiTheme.accentSaturation, b.uiTheme.accentSaturation)) return false;
+  if (!NearlyEqual(a.uiTheme.accentValue, b.uiTheme.accentValue)) return false;
+  if (!NearlyEqual(a.uiTheme.roundness, b.uiTheme.roundness)) return false;
+  if (a.uiTheme.roundSegments != b.uiTheme.roundSegments) return false;
+  if (!NearlyEqual(a.uiTheme.noiseAlpha, b.uiTheme.noiseAlpha)) return false;
+  if (!NearlyEqual(a.uiTheme.noiseScale, b.uiTheme.noiseScale)) return false;
+  if (!NearlyEqual(a.uiTheme.headerSheenStrength, b.uiTheme.headerSheenStrength)) return false;
+  if (a.uiTheme.fontAtlasScale != b.uiTheme.fontAtlasScale) return false;
+  if (a.uiTheme.fontFilterPoint != b.uiTheme.fontFilterPoint) return false;
+
   if (a.worldRenderScaleAuto != b.worldRenderScaleAuto) return false;
   if (!NearlyEqual(a.worldRenderScale, b.worldRenderScale)) return false;
   if (!NearlyEqual(a.worldRenderScaleMin, b.worldRenderScaleMin)) return false;
@@ -255,6 +268,27 @@ bool VisualPrefsEqual(const VisualPrefs& a, const VisualPrefs& b)
   if (a.weather.drawParticles != b.weather.drawParticles) return false;
   if (a.weather.reflectLights != b.weather.reflectLights) return false;
 
+  // Cloud shadows
+  if (a.cloudShadows.enabled != b.cloudShadows.enabled) return false;
+  if (!NearlyEqual(a.cloudShadows.strength, b.cloudShadows.strength)) return false;
+  if (!NearlyEqual(a.cloudShadows.scale, b.cloudShadows.scale)) return false;
+  if (!NearlyEqual(a.cloudShadows.speed, b.cloudShadows.speed)) return false;
+  if (!NearlyEqual(a.cloudShadows.coverage, b.cloudShadows.coverage)) return false;
+  if (!NearlyEqual(a.cloudShadows.softness, b.cloudShadows.softness)) return false;
+  if (!NearlyEqual(a.cloudShadows.clearAmount, b.cloudShadows.clearAmount)) return false;
+
+  // Volumetric clouds
+  if (a.volumetricClouds.enabled != b.volumetricClouds.enabled) return false;
+  if (!NearlyEqual(a.volumetricClouds.opacity, b.volumetricClouds.opacity)) return false;
+  if (!NearlyEqual(a.volumetricClouds.coverage, b.volumetricClouds.coverage)) return false;
+  if (!NearlyEqual(a.volumetricClouds.density, b.volumetricClouds.density)) return false;
+  if (!NearlyEqual(a.volumetricClouds.scale, b.volumetricClouds.scale)) return false;
+  if (!NearlyEqual(a.volumetricClouds.speed, b.volumetricClouds.speed)) return false;
+  if (!NearlyEqual(a.volumetricClouds.softness, b.volumetricClouds.softness)) return false;
+  if (a.volumetricClouds.steps != b.volumetricClouds.steps) return false;
+  if (!NearlyEqual(a.volumetricClouds.bottomFade, b.volumetricClouds.bottomFade)) return false;
+  if (!NearlyEqual(a.volumetricClouds.clearAmount, b.volumetricClouds.clearAmount)) return false;
+
   // Elevation
   if (!NearlyEqual(a.elevation.maxPixels, b.elevation.maxPixels)) return false;
   if (a.elevation.quantizeSteps != b.elevation.quantizeSteps) return false;
@@ -286,6 +320,39 @@ std::string VisualPrefsToJson(const VisualPrefs& p, int indentSpaces)
   oss << ",\n";
   Indent(oss, indent * 2);
   oss << "\"ui_scale_manual\": " << FloatToJson(p.uiScaleManual) << "\n";
+
+  // UI theme
+  oss << ",\n";
+  Indent(oss, indent * 2);
+  oss << "\"ui_theme\": {\n";
+  Indent(oss, indent * 3);
+  oss << "\"accent_from_seed\": ";
+  WriteBool(oss, p.uiTheme.accentFromSeed);
+  oss << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"accent_hue_deg\": " << FloatToJson(p.uiTheme.accentHueDeg) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"accent_saturation\": " << FloatToJson(p.uiTheme.accentSaturation) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"accent_value\": " << FloatToJson(p.uiTheme.accentValue) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"roundness\": " << FloatToJson(p.uiTheme.roundness) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"round_segments\": " << p.uiTheme.roundSegments << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"noise_alpha\": " << FloatToJson(p.uiTheme.noiseAlpha) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"noise_scale\": " << FloatToJson(p.uiTheme.noiseScale) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"header_sheen\": " << FloatToJson(p.uiTheme.headerSheenStrength) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"font_atlas_scale\": " << p.uiTheme.fontAtlasScale << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"font_filter_point\": ";
+  WriteBool(oss, p.uiTheme.fontFilterPoint);
+  oss << "\n";
+  Indent(oss, indent * 2);
+  oss << "}\n";
   Indent(oss, indent);
   oss << "},\n";
 
@@ -428,6 +495,56 @@ std::string VisualPrefsToJson(const VisualPrefs& p, int indentSpaces)
   WriteBool(oss, p.weather.reflectLights);
   oss << "\n";
   Indent(oss, indent * 2);
+  oss << "},\n";
+
+  // Cloud shadows (procedural, world-space).
+  Indent(oss, indent * 2);
+  oss << "\"cloud_shadows\": {\n";
+  Indent(oss, indent * 3);
+  oss << "\"enabled\": ";
+  WriteBool(oss, p.cloudShadows.enabled);
+  oss << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"strength\": " << FloatToJson(p.cloudShadows.strength) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"scale\": " << FloatToJson(p.cloudShadows.scale) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"speed\": " << FloatToJson(p.cloudShadows.speed) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"coverage\": " << FloatToJson(p.cloudShadows.coverage) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"softness\": " << FloatToJson(p.cloudShadows.softness) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"clear_amount\": " << FloatToJson(p.cloudShadows.clearAmount) << "\n";
+  Indent(oss, indent * 2);
+  oss << "},\n";
+
+  // Volumetric clouds (shader-based).
+  Indent(oss, indent * 2);
+  oss << "\"volumetric_clouds\": {\n";
+  Indent(oss, indent * 3);
+  oss << "\"enabled\": ";
+  WriteBool(oss, p.volumetricClouds.enabled);
+  oss << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"opacity\": " << FloatToJson(p.volumetricClouds.opacity) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"coverage\": " << FloatToJson(p.volumetricClouds.coverage) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"density\": " << FloatToJson(p.volumetricClouds.density) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"scale\": " << FloatToJson(p.volumetricClouds.scale) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"speed\": " << FloatToJson(p.volumetricClouds.speed) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"softness\": " << FloatToJson(p.volumetricClouds.softness) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"steps\": " << p.volumetricClouds.steps << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"bottom_fade\": " << FloatToJson(p.volumetricClouds.bottomFade) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"clear_amount\": " << FloatToJson(p.volumetricClouds.clearAmount) << "\n";
+  Indent(oss, indent * 2);
   oss << "}\n";
 
   Indent(oss, indent);
@@ -450,6 +567,21 @@ bool ApplyVisualPrefsJson(const JsonValue& root, VisualPrefs& ioPrefs, std::stri
     if (!ApplyBool(*display, "vsync", ioPrefs.vsync, outError)) return false;
     if (!ApplyBool(*display, "ui_scale_auto", ioPrefs.uiScaleAuto, outError)) return false;
     if (!ApplyF32(*display, "ui_scale_manual", ioPrefs.uiScaleManual, outError)) return false;
+
+    const JsonValue* uiTheme = nullptr;
+    if (GetObj(*display, "ui_theme", &uiTheme)) {
+      if (!ApplyBool(*uiTheme, "accent_from_seed", ioPrefs.uiTheme.accentFromSeed, outError)) return false;
+      if (!ApplyF32(*uiTheme, "accent_hue_deg", ioPrefs.uiTheme.accentHueDeg, outError)) return false;
+      if (!ApplyF32(*uiTheme, "accent_saturation", ioPrefs.uiTheme.accentSaturation, outError)) return false;
+      if (!ApplyF32(*uiTheme, "accent_value", ioPrefs.uiTheme.accentValue, outError)) return false;
+      if (!ApplyF32(*uiTheme, "roundness", ioPrefs.uiTheme.roundness, outError)) return false;
+      if (!ApplyI32(*uiTheme, "round_segments", ioPrefs.uiTheme.roundSegments, outError)) return false;
+      if (!ApplyF32(*uiTheme, "noise_alpha", ioPrefs.uiTheme.noiseAlpha, outError)) return false;
+      if (!ApplyF32(*uiTheme, "noise_scale", ioPrefs.uiTheme.noiseScale, outError)) return false;
+      if (!ApplyF32(*uiTheme, "header_sheen", ioPrefs.uiTheme.headerSheenStrength, outError)) return false;
+      if (!ApplyI32(*uiTheme, "font_atlas_scale", ioPrefs.uiTheme.fontAtlasScale, outError)) return false;
+      if (!ApplyBool(*uiTheme, "font_filter_point", ioPrefs.uiTheme.fontFilterPoint, outError)) return false;
+    }
   }
 
   // world_render
@@ -519,6 +651,33 @@ bool ApplyVisualPrefsJson(const JsonValue& root, VisualPrefs& ioPrefs, std::stri
       if (!ApplyBool(*we, "draw_particles", ioPrefs.weather.drawParticles, outError)) return false;
       if (!ApplyBool(*we, "reflect_lights", ioPrefs.weather.reflectLights, outError)) return false;
     }
+
+    // cloud_shadows
+    const JsonValue* cs = nullptr;
+    if (GetObj(*ren, "cloud_shadows", &cs)) {
+      if (!ApplyBool(*cs, "enabled", ioPrefs.cloudShadows.enabled, outError)) return false;
+      if (!ApplyF32(*cs, "strength", ioPrefs.cloudShadows.strength, outError)) return false;
+      if (!ApplyF32(*cs, "scale", ioPrefs.cloudShadows.scale, outError)) return false;
+      if (!ApplyF32(*cs, "speed", ioPrefs.cloudShadows.speed, outError)) return false;
+      if (!ApplyF32(*cs, "coverage", ioPrefs.cloudShadows.coverage, outError)) return false;
+      if (!ApplyF32(*cs, "softness", ioPrefs.cloudShadows.softness, outError)) return false;
+      if (!ApplyF32(*cs, "clear_amount", ioPrefs.cloudShadows.clearAmount, outError)) return false;
+    }
+
+    // volumetric_clouds
+    const JsonValue* vc = nullptr;
+    if (GetObj(*ren, "volumetric_clouds", &vc)) {
+      if (!ApplyBool(*vc, "enabled", ioPrefs.volumetricClouds.enabled, outError)) return false;
+      if (!ApplyF32(*vc, "opacity", ioPrefs.volumetricClouds.opacity, outError)) return false;
+      if (!ApplyF32(*vc, "coverage", ioPrefs.volumetricClouds.coverage, outError)) return false;
+      if (!ApplyF32(*vc, "density", ioPrefs.volumetricClouds.density, outError)) return false;
+      if (!ApplyF32(*vc, "scale", ioPrefs.volumetricClouds.scale, outError)) return false;
+      if (!ApplyF32(*vc, "speed", ioPrefs.volumetricClouds.speed, outError)) return false;
+      if (!ApplyF32(*vc, "softness", ioPrefs.volumetricClouds.softness, outError)) return false;
+      if (!ApplyI32(*vc, "steps", ioPrefs.volumetricClouds.steps, outError)) return false;
+      if (!ApplyF32(*vc, "bottom_fade", ioPrefs.volumetricClouds.bottomFade, outError)) return false;
+      if (!ApplyF32(*vc, "clear_amount", ioPrefs.volumetricClouds.clearAmount, outError)) return false;
+    }
   }
 
   // Clamp a few common-sense ranges so bad JSON can't completely break the scene.
@@ -545,6 +704,23 @@ bool ApplyVisualPrefsJson(const JsonValue& root, VisualPrefs& ioPrefs, std::stri
   ioPrefs.weather.windSpeed = std::clamp(ioPrefs.weather.windSpeed, 0.0f, 10.0f);
   ioPrefs.weather.overcast = std::clamp(ioPrefs.weather.overcast, 0.0f, 1.0f);
   ioPrefs.weather.fog = std::clamp(ioPrefs.weather.fog, 0.0f, 1.0f);
+
+  ioPrefs.cloudShadows.strength = std::clamp(ioPrefs.cloudShadows.strength, 0.0f, 1.0f);
+  ioPrefs.cloudShadows.scale = std::clamp(ioPrefs.cloudShadows.scale, 0.25f, 8.0f);
+  ioPrefs.cloudShadows.speed = std::clamp(ioPrefs.cloudShadows.speed, 0.0f, 5.0f);
+  ioPrefs.cloudShadows.coverage = std::clamp(ioPrefs.cloudShadows.coverage, 0.0f, 1.0f);
+  ioPrefs.cloudShadows.softness = std::clamp(ioPrefs.cloudShadows.softness, 0.0f, 1.0f);
+  ioPrefs.cloudShadows.clearAmount = std::clamp(ioPrefs.cloudShadows.clearAmount, 0.0f, 1.0f);
+
+  ioPrefs.volumetricClouds.opacity = std::clamp(ioPrefs.volumetricClouds.opacity, 0.0f, 1.0f);
+  ioPrefs.volumetricClouds.coverage = std::clamp(ioPrefs.volumetricClouds.coverage, 0.0f, 1.0f);
+  ioPrefs.volumetricClouds.density = std::clamp(ioPrefs.volumetricClouds.density, 0.0f, 2.0f);
+  ioPrefs.volumetricClouds.scale = std::clamp(ioPrefs.volumetricClouds.scale, 0.25f, 8.0f);
+  ioPrefs.volumetricClouds.speed = std::clamp(ioPrefs.volumetricClouds.speed, 0.0f, 5.0f);
+  ioPrefs.volumetricClouds.softness = std::clamp(ioPrefs.volumetricClouds.softness, 0.0f, 1.0f);
+  ioPrefs.volumetricClouds.steps = std::clamp(ioPrefs.volumetricClouds.steps, 8, 64);
+  ioPrefs.volumetricClouds.bottomFade = std::clamp(ioPrefs.volumetricClouds.bottomFade, 0.0f, 1.0f);
+  ioPrefs.volumetricClouds.clearAmount = std::clamp(ioPrefs.volumetricClouds.clearAmount, 0.0f, 1.0f);
 
   ioPrefs.elevation.maxPixels = std::clamp(ioPrefs.elevation.maxPixels, 0.0f, 1024.0f);
   ioPrefs.elevation.quantizeSteps = std::clamp(ioPrefs.elevation.quantizeSteps, 0, 128);
