@@ -17,6 +17,7 @@
 #include "isocity/RoadGraph.hpp"
 #include "isocity/RoadGraphRouting.hpp"
 #include "isocity/RoadGraphResilience.hpp"
+#include "isocity/RoadResilienceBypass.hpp"
 #include "isocity/RoadUpgradePlanner.hpp"
 #include "isocity/SaveLoad.hpp"
 #include "isocity/Traffic.hpp"
@@ -416,23 +417,9 @@ private:
   bool m_resilienceDirty = true;
   RoadGraphResilienceResult m_roadResilience;
 
-  struct ResilienceBypassSuggestion {
-    int bridgeEdge = -1;
-    int cutSize = 0;     // min(sideA, sideB) in node count
-    int primaryCost = 0; // either money or newTiles depending on plan settings
-    int moneyCost = 0;   // always computed for application
-    int newTiles = 0;
-    int steps = 0;
-
-    int targetLevel = 1;
-    bool allowBridges = false;
-    bool moneyObjective = true;
-
-    std::vector<Point> path;
-  };
 
   bool m_resilienceBypassesDirty = true;
-  std::vector<ResilienceBypassSuggestion> m_resilienceBypasses;
+  std::vector<RoadResilienceBypassSuggestion> m_resilienceBypasses;
 
   // Default bypass planner settings (tweak via dev console `res ...`).
   int m_resilienceBypassTop = 5;

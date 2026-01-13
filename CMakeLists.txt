@@ -113,6 +113,7 @@ add_library(isocity_core
   src/isocity/RoadGraphRouting.cpp
   src/isocity/RoadGraphTraffic.cpp
   src/isocity/RoadGraphResilience.cpp
+  src/isocity/RoadResilienceBypass.cpp
   src/isocity/RoadGraphCentrality.cpp
   src/isocity/RoadGraphCentralityExport.cpp
   src/isocity/RoadUpgradePlanner.cpp

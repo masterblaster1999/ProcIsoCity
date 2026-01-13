@@ -501,20 +501,18 @@ bool BuildWorldMeshQuads(const World& world, const MeshExportConfig& cfg, IMeshS
           continue;
         }
 
-        // Only merge when the parcel has a flat base (after quantization).
-        const float base = baseHAt(p.x0, p.y0);
-        bool flat = true;
-        for (int yy = p.y0; yy < p.y0 + p.h && flat; ++yy) {
+        // Only merge when the parcel's base height range (after quantization) stays within a tolerance.
+        float minBase = baseHAt(p.x0, p.y0);
+        float maxBase = minBase;
+        for (int yy = p.y0; yy < p.y0 + p.h; ++yy) {
           for (int xx = p.x0; xx < p.x0 + p.w; ++xx) {
-            if (std::fabs(baseHAt(xx, yy) - base) > 1e-6f) {
-              flat = false;
-              break;
-            }
+            const float h = baseHAt(xx, yy);
+            minBase = std::min(minBase, h);
+            maxBase = std::max(maxBase, h);
           }
         }
-        if (!flat) continue;
-
-        const float baseY = base + overlayOff + 0.001f;
+        if ((maxBase - minBase) > (cfg.mergeBuildingsMaxBaseHeightRange + 1e-6f)) continue;
+        const float baseY = minBase + overlayOff + 0.001f;
         const float var01 = static_cast<float>((p.styleSeed >> 4) & 0x0Fu) / 15.0f;
         emitBuildingBox(p.x0, p.y0, p.w, p.h, p.overlay, p.level,
                         p.occupants, p.capacity, baseY, var01, p.area());

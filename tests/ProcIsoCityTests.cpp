@@ -6,6 +6,7 @@
 #include "isocity/RoadGraphExport.hpp"
 #include "isocity/RoadGraphTraffic.hpp"
 #include "isocity/RoadGraphResilience.hpp"
+#include "isocity/RoadResilienceBypass.hpp"
 #include "isocity/RoadGraphCentrality.hpp"
 #include "isocity/RoadUpgradePlanner.hpp"
 #include "isocity/PolicyOptimizer.hpp"
@@ -4735,6 +4736,94 @@ static void TestAutoBuildDeterminism()
   EXPECT_TRUE(h1 != h3);
 }
 
+static void TestAutoBuildZoneClusterGrowsFromSeed()
+{
+  using namespace isocity;
+
+  const SimConfig sc{};
+  AutoBuildConfig bc{};
+  bc.zonesPerDay = 4;
+  bc.zoneClusterMaxTiles = 4;
+  bc.roadsPerDay = 0;
+  bc.parksPerDay = 0;
+  bc.landValueRecalcDays = 1;
+  bc.minMoneyReserve = 0;
+  bc.useRoadPlanner = false;
+  bc.useParkOptimizer = false;
+
+  World w(24, 24, 123);
+  w.stats().money = 2000;
+
+  // Seed a small road cross so zoning has immediate access.
+  const int cx = w.width() / 2;
+  const int cy = w.height() / 2;
+  (void)w.applyRoad(cx, cy, 1);
+  (void)w.applyRoad(cx + 1, cy, 1);
+  (void)w.applyRoad(cx - 1, cy, 1);
+  (void)w.applyRoad(cx, cy + 1, 1);
+  (void)w.applyRoad(cx, cy - 1, 1);
+
+  Simulator sim(sc);
+  sim.refreshDerivedStats(w);
+  const AutoBuildReport rep = RunAutoBuild(w, sim, bc, 1);
+
+  // With clustering enabled, the first seed placement should grow into at
+  // least one additional tile (in an empty world).
+  EXPECT_TRUE(rep.zonesBuilt >= 2);
+}
+
+static void TestAutoBuildRoadPlannerBuildsCorridors()
+{
+  using namespace isocity;
+
+  const SimConfig sc{};
+  AutoBuildConfig bc{};
+  bc.zonesPerDay = 0;
+  bc.roadsPerDay = 1;
+  bc.parksPerDay = 0;
+  bc.maxRoadSpurLength = 10;
+  bc.landValueRecalcDays = 1;
+  bc.minMoneyReserve = 0;
+  bc.useRoadPlanner = true;
+  bc.useParkOptimizer = false;
+
+  World w(24, 24, 321);
+  w.stats().money = 2000;
+
+  const int cx = w.width() / 2;
+  const int cy = w.height() / 2;
+  (void)w.applyRoad(cx, cy, 1);
+  (void)w.applyRoad(cx + 1, cy, 1);
+  (void)w.applyRoad(cx - 1, cy, 1);
+  (void)w.applyRoad(cx, cy + 1, 1);
+  (void)w.applyRoad(cx, cy - 1, 1);
+  const int roadsBefore = w.stats().roads;
+
+  Simulator sim(sc);
+  sim.refreshDerivedStats(w);
+  const AutoBuildReport rep = RunAutoBuild(w, sim, bc, 1);
+
+  EXPECT_TRUE(rep.roadsBuilt > 0);
+  EXPECT_TRUE(w.stats().roads > roadsBefore);
+}
+
+static void TestAutoBuildKeyParsingNewFields()
+{
+  using namespace isocity;
+
+  AutoBuildConfig bc{};
+  std::string err;
+
+  EXPECT_TRUE(ParseAutoBuildKey("zoneClusterMaxTiles", "7", bc, err));
+  EXPECT_EQ(bc.zoneClusterMaxTiles, 7);
+
+  EXPECT_TRUE(ParseAutoBuildKey("useParkOptimizer", "0", bc, err));
+  EXPECT_TRUE(!bc.useParkOptimizer);
+
+  EXPECT_TRUE(ParseAutoBuildKey("useRoadPlanner", "0", bc, err));
+  EXPECT_TRUE(!bc.useRoadPlanner);
+}
+
 static void TestScriptRunnerBasic()
 {
   using namespace isocity;
@@ -6046,44 +6135,61 @@ void TestRoadResilienceBypassPlannerFindsShortBypass()
   EXPECT_TRUE(bridgeEdge >= 0);
   EXPECT_TRUE(res.isBridgeEdge[static_cast<std::size_t>(bridgeEdge)] == 1);
 
-  RoadGraphBridgeCut cut;
-  EXPECT_TRUE(ComputeRoadGraphBridgeCut(rg, bridgeEdge, cut));
-  EXPECT_TRUE(!cut.sideA.empty());
-  EXPECT_TRUE(!cut.sideB.empty());
-
-  // Choose smaller side as starts.
-  const std::vector<int>* startSide = &cut.sideA;
-  const std::vector<int>* goalSide = &cut.sideB;
-  if (startSide->size() > goalSide->size()) std::swap(startSide, goalSide);
-
-  std::vector<Point> starts;
-  std::vector<Point> goals;
-  for (int ni : *startSide) starts.push_back(rg.nodes[static_cast<std::size_t>(ni)].pos);
-  for (int ni : *goalSide) goals.push_back(rg.nodes[static_cast<std::size_t>(ni)].pos);
-
-  const std::vector<std::uint64_t> blockedMoves = BuildBlockedMovesForRoadGraphEdge(rg, bridgeEdge, world.width());
-
-  RoadBuildPathConfig cfg;
-  cfg.allowBridges = false;
-  cfg.costModel = RoadBuildPathConfig::CostModel::NewTiles;
+  RoadResilienceBypassConfig cfg;
+  cfg.top = 16;             // includes all bridges in this tiny graph
+  cfg.moneyObjective = false; // new-tiles objective
   cfg.targetLevel = 1;
+  cfg.allowBridges = false;
+  cfg.maxPrimaryCost = 0; // no cap
+  cfg.maxNodesPerSide = 64;
+  cfg.rankByTraffic = false;
 
-  std::vector<Point> path;
-  int primaryCost = 0;
-  const bool ok = FindRoadBuildPathBetweenSets(world, starts, goals, path, &primaryCost, cfg, &blockedMoves, -1);
-  EXPECT_TRUE(ok);
+  const std::vector<RoadResilienceBypassSuggestion> suggestions =
+      SuggestRoadResilienceBypasses(world, rg, res, cfg, nullptr);
+
+  EXPECT_TRUE(!suggestions.empty());
+
+  const RoadResilienceBypassSuggestion* found = nullptr;
+  for (const RoadResilienceBypassSuggestion& s : suggestions) {
+    if (s.bridgeEdge == bridgeEdge) {
+      found = &s;
+      break;
+    }
+  }
+
+  EXPECT_TRUE(found != nullptr);
+  if (!found) return;
 
   // Cheapest bypass should require building exactly one new tile.
-  EXPECT_TRUE(primaryCost == 1);
+  EXPECT_TRUE(found->primaryCost == 1);
+  EXPECT_TRUE(found->newTiles == 1);
 
   // Ensure the computed path does not traverse the blocked bridge move.
-  for (std::size_t i = 1; i < path.size(); ++i) {
-    const Point& a = path[i - 1];
-    const Point& b = path[i];
-    const bool usesBridge =
-        (a.x == 0 && a.y == 1 && b.x == 1 && b.y == 1) || (a.x == 1 && a.y == 1 && b.x == 0 && b.y == 1);
-    EXPECT_TRUE(!usesBridge);
+  const std::vector<std::uint64_t> blockedMoves = BuildBlockedMovesForRoadGraphEdge(rg, bridgeEdge, world.width());
+  auto pack = [&](int ax, int ay, int bx, int by) -> std::uint64_t {
+    const int ia = ay * world.width() + ax;
+    const int ib = by * world.width() + bx;
+    return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(ia)) << 32) |
+           static_cast<std::uint64_t>(static_cast<std::uint32_t>(ib));
+  };
+
+  for (std::size_t i = 1; i < found->path.size(); ++i) {
+    const Point& a = found->path[i - 1];
+    const Point& b = found->path[i];
+    const std::uint64_t key = pack(a.x, a.y, b.x, b.y);
+    const bool blocked = std::binary_search(blockedMoves.begin(), blockedMoves.end(), key);
+    EXPECT_TRUE(!blocked);
   }
+
+  // And we should be able to apply the bypass (charges money) in a headless world.
+  world.stats().money = 100000;
+  const RoadResilienceBypassApplyReport ar = ApplyRoadResilienceBypass(world, *found, 0);
+  EXPECT_TRUE(ar.result == RoadResilienceBypassApplyResult::Applied);
+  EXPECT_TRUE(ar.builtTiles == 1);
+  EXPECT_TRUE(ar.upgradedTiles == 0);
+
+  // The bypass tile (0,0) becomes a road.
+  EXPECT_TRUE(world.at(0, 0).overlay == Overlay::Road);
 }
 
 void TestRoadGraphCentralityStarGraph()
@@ -7295,6 +7401,9 @@ int main()
   TestRoadBuildPathBetweenSetsRespectsBlockedMoves();
   TestParkOptimizerSuggestsParksInUnderservedAreas();
   TestAutoBuildDeterminism();
+  TestAutoBuildZoneClusterGrowsFromSeed();
+  TestAutoBuildRoadPlannerBuildsCorridors();
+  TestAutoBuildKeyParsingNewFields();
   TestScriptRunnerBasic();
   TestScriptRunnerVarsAndExpr();
   TestScriptRunnerControlFlowRepeatIfElse();

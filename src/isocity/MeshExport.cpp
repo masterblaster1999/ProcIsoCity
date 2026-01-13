@@ -177,4 +177,15 @@ bool ExportWorldObjMtl(const std::string& objPath, const std::string& mtlPath, c
   return WriteWorldObjMtl(objFile, mtlFile, world, local, outStats, outError);
 }
 
+
+void ApplyLegacyMeshExportDefaults(MeshExportConfig& cfg)
+{
+  // Preserve file naming; only revert geometry-related defaults.
+  cfg.mergeTopSurfaces = false;
+  cfg.heightQuantization = 0.0f;
+  cfg.mergeBuildings = false;
+  cfg.mergeBuildingsMaxBaseHeightRange = 0.0f;
+  cfg.buildingFootprint = 0.60f;
+}
+
 } // namespace isocity

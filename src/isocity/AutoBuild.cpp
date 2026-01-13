@@ -1,9 +1,13 @@
 #include "isocity/AutoBuild.hpp"
 
 #include "isocity/LandValue.hpp"
+#include "isocity/ParkOptimizer.hpp"
 #include "isocity/Pathfinding.hpp"
 #include "isocity/Random.hpp"
 #include "isocity/Road.hpp"
+#include "isocity/RoadGraph.hpp"
+#include "isocity/RoadGraphResilience.hpp"
+#include "isocity/RoadResilienceBypass.hpp"
 #include "isocity/Traffic.hpp"
 #include "isocity/ZoneAccess.hpp"
 
@@ -336,6 +340,78 @@ static bool PickBestZoneCandidate(const World& world, Tool zoneTool, const SimCo
   return found;
 }
 
+static int GrowZoneCluster(World& world, Tool zoneTool, Overlay zoneOverlay, int seedX, int seedY, int day,
+                           int maxExtraTiles, int minMoneyReserve)
+{
+  if (maxExtraTiles <= 0) return 0;
+
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return 0;
+
+  auto idxOf = [&](int x, int y) -> int { return y * w + x; };
+
+  std::vector<std::uint8_t> seen(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), 0);
+  std::vector<Point> frontier;
+  frontier.reserve(static_cast<std::size_t>(maxExtraTiles) + 8u);
+
+  if (!world.inBounds(seedX, seedY)) return 0;
+  {
+    const int si = idxOf(seedX, seedY);
+    if (si < 0 || static_cast<std::size_t>(si) >= seen.size()) return 0;
+    seen[static_cast<std::size_t>(si)] = 1;
+  }
+  frontier.push_back(Point{seedX, seedY});
+
+  constexpr int dirs[4][2] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}}; // N,E,S,W
+
+  const std::uint32_t seedBase = DaySeed(world, day, 0x424C4F4Bu); // "BLOK"
+
+  int placed = 0;
+  std::size_t head = 0;
+  while (head < frontier.size() && placed < maxExtraTiles) {
+    if (world.stats().money <= minMoneyReserve) break;
+
+    const Point cur = frontier[head++];
+    const std::uint32_t h0 = HashCoords32(cur.x, cur.y, seedBase);
+    const int rot = static_cast<int>(h0 & 3u);
+
+    for (int k = 0; k < 4 && placed < maxExtraTiles; ++k) {
+      if (world.stats().money <= minMoneyReserve) break;
+
+      const int d = (rot + k) & 3;
+      const int nx = cur.x + dirs[d][0];
+      const int ny = cur.y + dirs[d][1];
+      if (!world.inBounds(nx, ny)) continue;
+
+      const int ni = idxOf(nx, ny);
+      if (ni < 0) continue;
+      const std::size_t ui = static_cast<std::size_t>(ni);
+      if (ui >= seen.size()) continue;
+      if (seen[ui]) continue;
+      seen[ui] = 1;
+
+      const Tile& t = world.at(nx, ny);
+      if (t.overlay != Overlay::None) continue;
+      if (t.terrain == Terrain::Water) continue;
+
+      // Only attempt tiles that would be reachable via the connected-component
+      // zoning rule.
+      if (!world.wouldZoneHaveRoadAccess(zoneOverlay, nx, ny)) continue;
+
+      ToolApplyResult r = ToolApplyResult::Noop;
+      if (!ApplyZoneTile(world, zoneTool, nx, ny, 1, &r) || r != ToolApplyResult::Applied) {
+        continue;
+      }
+
+      ++placed;
+      frontier.push_back(Point{nx, ny});
+    }
+  }
+
+  return placed;
+}
+
 static bool PickBestParkCandidate(const World& world, const SimConfig& simCfg, const AutoBuildConfig& cfg,
                                  const std::vector<std::uint8_t>* roadToEdge, const LandValueResult* lv,
                                  int day, int& outX, int& outY)
@@ -504,6 +580,243 @@ static int BuildRoadSpur(World& world, const AutoBuildConfig& cfg, int startX, i
   return placed;
 }
 
+struct RoadDistanceField {
+  int w = 0;
+  int h = 0;
+
+  // Manhattan steps from the nearest source road tile, or -1 if unreachable.
+  std::vector<int> dist;
+
+  // Flattened index of the nearest source road tile, or -1.
+  std::vector<int> nearestRoadIdx;
+};
+
+static RoadDistanceField ComputeRoadDistanceField(const World& world, const AutoBuildConfig& cfg,
+                                                  const std::vector<std::uint8_t>* roadToEdge,
+                                                  const SimConfig& simCfg)
+{
+  RoadDistanceField f;
+  f.w = world.width();
+  f.h = world.height();
+  const int w = f.w;
+  const int h = f.h;
+  if (w <= 0 || h <= 0) return f;
+
+  const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+  f.dist.assign(n, -1);
+  f.nearestRoadIdx.assign(n, -1);
+
+  const bool useEdgeMask = (simCfg.requireOutsideConnection && cfg.respectOutsideConnection && roadToEdge &&
+                            roadToEdge->size() == n && AnyEdgeConnectedRoad(*roadToEdge));
+
+  auto idxOf = [&](int x, int y) -> int { return y * w + x; };
+
+  auto canTraverse = [&](int x, int y) -> bool {
+    if (!world.inBounds(x, y)) return false;
+    const Tile& t = world.at(x, y);
+    if (t.overlay != Overlay::None && t.overlay != Overlay::Road) return false;
+
+    // Existing roads are always traversable, even if they are bridges or placed
+    // on currently "unbuildable" steep terrain.
+    if (t.overlay == Overlay::Road) return true;
+
+    // For new road placement, respect the bot's bridge/buildability constraints.
+    if (t.terrain == Terrain::Water) return cfg.allowBridges;
+    return world.isBuildable(x, y);
+  };
+
+  std::vector<int> q;
+  q.reserve(n);
+
+  // Seed the BFS with existing road tiles.
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const Tile& t = world.at(x, y);
+      if (t.overlay != Overlay::Road) continue;
+      const int idx = idxOf(x, y);
+      if (idx < 0) continue;
+      const std::size_t ui = static_cast<std::size_t>(idx);
+      if (ui >= n) continue;
+      if (useEdgeMask && (*roadToEdge)[ui] == 0) continue;
+      f.dist[ui] = 0;
+      f.nearestRoadIdx[ui] = idx;
+      q.push_back(idx);
+    }
+  }
+
+  constexpr int dirs[4][2] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}};
+
+  std::size_t head = 0;
+  while (head < q.size()) {
+    const int cur = q[head++];
+    const int cx = cur % w;
+    const int cy = cur / w;
+    if (!world.inBounds(cx, cy)) continue;
+    const std::size_t cIdx = static_cast<std::size_t>(cur);
+    if (cIdx >= n) continue;
+
+    const int cd = f.dist[cIdx];
+    const int src = f.nearestRoadIdx[cIdx];
+
+    for (const auto& d : dirs) {
+      const int nx = cx + d[0];
+      const int ny = cy + d[1];
+      if (!world.inBounds(nx, ny)) continue;
+      if (!canTraverse(nx, ny)) continue;
+      const int ni = idxOf(nx, ny);
+      if (ni < 0) continue;
+      const std::size_t ui = static_cast<std::size_t>(ni);
+      if (ui >= n) continue;
+      if (f.dist[ui] >= 0) continue;
+      f.dist[ui] = cd + 1;
+      f.nearestRoadIdx[ui] = src;
+      q.push_back(ni);
+    }
+  }
+
+  return f;
+}
+
+static bool PickPlannedRoadGoal(const World& world, const AutoBuildConfig& cfg, Tool zoneTool,
+                                const RoadDistanceField& f, const LandValueResult* lv,
+                                int day, int& outX, int& outY)
+{
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return false;
+  if (f.w != w || f.h != h) return false;
+  if (f.dist.size() != static_cast<std::size_t>(w) * static_cast<std::size_t>(h)) return false;
+
+  const bool lvOk = (lv && lv->w == w && lv->h == h && lv->value.size() == f.dist.size());
+
+  // Avoid micro-spurs: try to expand at least a few steps out from the current network.
+  const int minDist = std::max(3, std::max(1, cfg.maxRoadSpurLength) / 2);
+  const int distClamp = std::max(8, std::max(1, cfg.maxRoadSpurLength) * 3);
+
+  int bestScore = std::numeric_limits<int>::min();
+  std::uint32_t bestTie = 0xFFFFFFFFu;
+  bool found = false;
+
+  const std::uint32_t salt =
+      (zoneTool == Tool::Residential) ? 0x00524553u :  // "RES"
+      (zoneTool == Tool::Commercial)  ? 0x00434F4Du :  // "COM"
+      (zoneTool == Tool::Industrial)  ? 0x00494E44u :  // "IND"
+                                       0x00524F44u;   // "ROD"
+  const std::uint32_t seedBase = DaySeed(world, day, salt ^ 0x524F4144u); // mix "ROAD" in
+
+  for (int y = 1; y < h - 1; ++y) {
+    for (int x = 1; x < w - 1; ++x) {
+      const Tile& t = world.at(x, y);
+      if (t.overlay != Overlay::None) continue;
+      if (t.terrain == Terrain::Water && !cfg.allowBridges) continue;
+      if (t.terrain != Terrain::Water && !world.isBuildable(x, y)) continue;
+
+      const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+      if (idx >= f.dist.size()) continue;
+      const int d0 = f.dist[idx];
+      if (d0 < minDist) continue;
+      if (f.nearestRoadIdx[idx] < 0) continue;
+
+      const int d = std::min(d0, distClamp);
+
+      float lv01 = 0.5f;
+      if (lvOk) {
+        lv01 = std::clamp((*lv).value[idx], 0.0f, 1.0f);
+      }
+
+      const AdjCounts adj = CountAdj(world, x, y);
+
+      float potential = 0.5f;
+      if (zoneTool == Tool::Residential || zoneTool == Tool::Commercial) {
+        potential = lv01;
+      } else if (zoneTool == Tool::Industrial) {
+        potential = 1.0f - lv01;
+      }
+
+      int score = 0;
+      score += d * 160;
+      score += static_cast<int>(potential * 1000.0f);
+
+      // Bias corridors to grow near existing development of the target type.
+      if (zoneTool == Tool::Residential) {
+        score += (adj.res + adj.parks) * 45;
+        score -= adj.ind * 60;
+      } else if (zoneTool == Tool::Commercial) {
+        score += (adj.res + adj.com) * 40;
+        score -= adj.ind * 40;
+      } else if (zoneTool == Tool::Industrial) {
+        score += adj.ind * 55;
+        score -= (adj.res + adj.parks) * 60;
+      }
+
+      const std::uint32_t tie = HashCoords32(x, y, seedBase);
+      score += static_cast<int>(tie & 0x3Fu);
+
+      if (!found || score > bestScore || (score == bestScore && tie < bestTie)) {
+        found = true;
+        bestScore = score;
+        bestTie = tie;
+        outX = x;
+        outY = y;
+      }
+    }
+  }
+
+  return found;
+}
+
+static int BuildPlannedRoadCorridor(World& world, const SimConfig& simCfg, const AutoBuildConfig& cfg,
+                                    const std::vector<std::uint8_t>* roadToEdge,
+                                    const LandValueResult* lv, Tool preferredZoneTool,
+                                    int day, int* outPlaced)
+{
+  if (outPlaced) *outPlaced = 0;
+  const int maxSteps = std::max(1, cfg.maxRoadSpurLength);
+
+  const RoadDistanceField f = ComputeRoadDistanceField(world, cfg, roadToEdge, simCfg);
+  if (f.dist.empty()) return 0;
+
+  int gx = 0, gy = 0;
+  if (!PickPlannedRoadGoal(world, cfg, preferredZoneTool, f, lv, day, gx, gy)) {
+    return 0;
+  }
+
+  const std::size_t gIdx = static_cast<std::size_t>(gy) * static_cast<std::size_t>(world.width()) + static_cast<std::size_t>(gx);
+  if (gIdx >= f.nearestRoadIdx.size()) return 0;
+  const int startIdx = f.nearestRoadIdx[gIdx];
+  if (startIdx < 0) return 0;
+  const int sx = startIdx % world.width();
+  const int sy = startIdx / world.width();
+  if (!world.inBounds(sx, sy)) return 0;
+
+  RoadBuildPathConfig pathCfg;
+  pathCfg.targetLevel = std::clamp(cfg.roadLevel, 1, 3);
+  pathCfg.allowBridges = cfg.allowBridges;
+  pathCfg.costModel = RoadBuildPathConfig::CostModel::Money;
+
+  std::vector<Point> path;
+  int cost = 0;
+  if (!FindRoadBuildPath(world, Point{sx, sy}, Point{gx, gy}, path, &cost, pathCfg)) {
+    return 0;
+  }
+
+  int placed = 0;
+  const int steps = std::min<int>(static_cast<int>(path.size()) - 1, maxSteps);
+  for (int i = 1; i <= steps; ++i) {
+    if (world.stats().money <= cfg.minMoneyReserve) break;
+    const Point& p = path[static_cast<std::size_t>(i)];
+    ToolApplyResult r = ToolApplyResult::Noop;
+    if (!ApplyRoadTile(world, p.x, p.y, cfg.roadLevel, cfg.allowBridges, &r)) {
+      break;
+    }
+    if (r == ToolApplyResult::Applied) ++placed;
+    if (r == ToolApplyResult::InsufficientFunds) break;
+  }
+
+  if (outPlaced) *outPlaced = placed;
+  return placed;
+}
+
 static bool EnsureOutsideRoadConnection(World& world, const SimConfig& simCfg, const AutoBuildConfig& cfg,
                                        std::vector<std::uint8_t>& roadToEdge)
 {
@@ -588,6 +901,88 @@ static bool EnsureOutsideRoadConnection(World& world, const SimConfig& simCfg, c
 
   ComputeRoadsConnectedToEdge(world, roadToEdge);
   return AnyEdgeConnectedRoad(roadToEdge);
+}
+
+static void BuildResilienceBypasses(World& world, const SimConfig& simCfg, const AutoBuildConfig& cfg,
+                                   const std::vector<std::uint8_t>* roadToEdge, int day,
+                                   int* ioBuilt, int* ioUpgraded, int* ioFailed)
+{
+  if (!ioBuilt || !ioUpgraded || !ioFailed) return;
+  if (!cfg.autoBuildResilienceBypasses) return;
+  if (cfg.resilienceBypassesPerDay <= 0) return;
+
+  (void)day; // reserved for future deterministic tuning hooks
+
+  const Stats& s = world.stats();
+  if (s.trafficCongestion < cfg.resilienceBypassCongestionThreshold) return;
+  if (world.stats().money <= cfg.minMoneyReserve) return;
+  if (!HasAnyRoad(world)) return;
+
+  // Build road graph + resilience.
+  const RoadGraph roadGraph = BuildRoadGraph(world);
+  if (roadGraph.nodes.empty() || roadGraph.edges.empty()) return;
+  const RoadGraphResilienceResult resilience = ComputeRoadGraphResilience(roadGraph);
+  if (resilience.bridgeEdges.empty()) return;
+
+  // Optional traffic field for ranking: prioritize bridges that are both heavily
+  // used and structurally vulnerable (large cut size).
+  TrafficResult traffic;
+  const TrafficResult* trafficPtr = nullptr;
+  if (s.population > 0 && s.employed > 0) {
+    const float employedShare =
+        static_cast<float>(s.employed) / std::max(1.0f, static_cast<float>(s.population));
+    if (employedShare > 0.0f) {
+      TrafficConfig tc;
+      tc.requireOutsideConnection = simCfg.requireOutsideConnection;
+      tc.roadTileCapacity = 28;
+      tc.congestionAwareRouting = true;
+      tc.congestionIterations = 2; // bot can be a bit cheaper than the in-game overlay
+
+      const std::vector<std::uint8_t>* maskPtr = nullptr;
+      if (tc.requireOutsideConnection && roadToEdge &&
+          roadToEdge->size() == static_cast<std::size_t>(world.width()) * static_cast<std::size_t>(world.height())) {
+        maskPtr = roadToEdge;
+      }
+
+      traffic = ComputeCommuteTraffic(world, tc, employedShare, maskPtr);
+      if (!traffic.roadTraffic.empty()) {
+        trafficPtr = &traffic;
+      }
+    }
+  }
+
+  RoadResilienceBypassConfig pcfg;
+  pcfg.top = std::max(0, cfg.resilienceBypassTop);
+  pcfg.moneyObjective = cfg.resilienceBypassMoneyObjective;
+  pcfg.targetLevel = std::clamp(cfg.resilienceBypassTargetLevel, 1, 3);
+  pcfg.allowBridges = cfg.resilienceBypassAllowBridges;
+  pcfg.maxPrimaryCost = cfg.resilienceBypassMaxCost;
+  pcfg.maxNodesPerSide = std::max(1, cfg.resilienceBypassMaxNodesPerSide);
+  pcfg.rankByTraffic = true;
+
+  const std::vector<RoadResilienceBypassSuggestion> suggestions =
+      SuggestRoadResilienceBypasses(world, roadGraph, resilience, pcfg, trafficPtr);
+
+  if (suggestions.empty()) return;
+
+  int builtBypasses = 0;
+  bool anyAttempted = false;
+  for (const RoadResilienceBypassSuggestion& sug : suggestions) {
+    if (builtBypasses >= cfg.resilienceBypassesPerDay) break;
+    if (world.stats().money <= cfg.minMoneyReserve) break;
+
+    anyAttempted = true;
+    const RoadResilienceBypassApplyReport ar = ApplyRoadResilienceBypass(world, sug, cfg.minMoneyReserve);
+    if (ar.result == RoadResilienceBypassApplyResult::Applied) {
+      *ioBuilt += ar.builtTiles;
+      *ioUpgraded += ar.upgradedTiles;
+      ++builtBypasses;
+    }
+  }
+
+  if (builtBypasses == 0 && anyAttempted) {
+    ++(*ioFailed);
+  }
 }
 
 static void UpgradeMostCongestedRoads(World& world, const SimConfig& simCfg, const AutoBuildConfig& cfg,
@@ -693,6 +1088,12 @@ bool ParseAutoBuildKey(const std::string& key, const std::string& value, AutoBui
     cfg.zonesPerDay = v;
     return true;
   }
+  if (k == "zoneclustermaxtiles" || k == "zone_cluster_max_tiles" || k == "zonecluster" || k == "zone_cluster") {
+    int v = 0;
+    if (!ParseI32(value, &v) || v < 1) return bad("zoneClusterMaxTiles expects int >= 1");
+    cfg.zoneClusterMaxTiles = v;
+    return true;
+  }
   if (k == "roadsperday" || k == "roads_per_day") {
     int v = 0;
     if (!ParseI32(value, &v) || v < 0) return bad("roadsPerDay expects non-negative int");
@@ -705,10 +1106,22 @@ bool ParseAutoBuildKey(const std::string& key, const std::string& value, AutoBui
     cfg.parksPerDay = v;
     return true;
   }
+  if (k == "useparkoptimizer" || k == "use_park_optimizer" || k == "park_optimizer") {
+    bool b = false;
+    if (!ParseBool01(value, &b)) return bad("useParkOptimizer expects 0|1");
+    cfg.useParkOptimizer = b;
+    return true;
+  }
   if (k == "roadlevel" || k == "road_level") {
     int v = 0;
     if (!ParseI32(value, &v)) return bad("roadLevel expects int");
     cfg.roadLevel = std::clamp(v, 1, 3);
+    return true;
+  }
+  if (k == "useroadplanner" || k == "use_road_planner" || k == "road_planner") {
+    bool b = false;
+    if (!ParseBool01(value, &b)) return bad("useRoadPlanner expects 0|1");
+    cfg.useRoadPlanner = b;
     return true;
   }
   if (k == "allowbridges" || k == "allow_bridges") {
@@ -745,6 +1158,68 @@ bool ParseAutoBuildKey(const std::string& key, const std::string& value, AutoBui
     int v = 0;
     if (!ParseI32(value, &v) || v < 0) return bad("roadUpgradesPerDay expects non-negative int");
     cfg.roadUpgradesPerDay = v;
+    return true;
+  }
+  if (k == "autobuildresiliencebypasses" || k == "auto_build_resilience_bypasses" ||
+      k == "autoresiliencebypasses" || k == "auto_resilience_bypasses") {
+    bool b = false;
+    if (!ParseBool01(value, &b)) return bad("autoBuildResilienceBypasses expects 0|1");
+    cfg.autoBuildResilienceBypasses = b;
+    return true;
+  }
+  if (k == "resiliencebypasscongestionthreshold" || k == "resilience_bypass_congestion_threshold" ||
+      k == "resiliencebypasscongestion" || k == "resilience_bypass_congestion" ||
+      k == "bypasscongestion" || k == "bypass_congestion") {
+    float f = 0.0f;
+    if (!ParseF32(value, &f)) return bad("resilienceBypassCongestionThreshold expects float");
+    cfg.resilienceBypassCongestionThreshold = std::clamp(f, 0.0f, 1.0f);
+    return true;
+  }
+  if (k == "resiliencebypassesperday" || k == "resilience_bypasses_per_day" ||
+      k == "bypassesperday" || k == "bypasses_per_day") {
+    int v = 0;
+    if (!ParseI32(value, &v) || v < 0) return bad("resilienceBypassesPerDay expects non-negative int");
+    cfg.resilienceBypassesPerDay = v;
+    return true;
+  }
+  if (k == "resiliencebypasstop" || k == "resilience_bypass_top" || k == "bypasstop") {
+    int v = 0;
+    if (!ParseI32(value, &v) || v < 0) return bad("resilienceBypassTop expects non-negative int");
+    cfg.resilienceBypassTop = v;
+    return true;
+  }
+  if (k == "resiliencebypassmoneyobjective" || k == "resilience_bypass_money_objective" ||
+      k == "resiliencebypassmoney" || k == "resilience_bypass_money") {
+    bool b = false;
+    if (!ParseBool01(value, &b)) return bad("resilienceBypassMoneyObjective expects 0|1");
+    cfg.resilienceBypassMoneyObjective = b;
+    return true;
+  }
+  if (k == "resiliencebypasstargetlevel" || k == "resilience_bypass_target_level" ||
+      k == "bypasstargetlevel" || k == "bypass_target_level") {
+    int v = 0;
+    if (!ParseI32(value, &v)) return bad("resilienceBypassTargetLevel expects int");
+    cfg.resilienceBypassTargetLevel = std::clamp(v, 1, 3);
+    return true;
+  }
+  if (k == "resiliencebypassallowbridges" || k == "resilience_bypass_allow_bridges" ||
+      k == "bypassallowbridges" || k == "bypass_allow_bridges") {
+    bool b = false;
+    if (!ParseBool01(value, &b)) return bad("resilienceBypassAllowBridges expects 0|1");
+    cfg.resilienceBypassAllowBridges = b;
+    return true;
+  }
+  if (k == "resiliencebypassmaxcost" || k == "resilience_bypass_max_cost" || k == "bypassmaxcost") {
+    int v = 0;
+    if (!ParseI32(value, &v) || v < 0) return bad("resilienceBypassMaxCost expects non-negative int");
+    cfg.resilienceBypassMaxCost = v;
+    return true;
+  }
+  if (k == "resiliencebypassmaxnodesperside" || k == "resilience_bypass_max_nodes_per_side" ||
+      k == "bypassmaxnodesperside" || k == "bypass_max_nodes_per_side") {
+    int v = 0;
+    if (!ParseI32(value, &v) || v < 1) return bad("resilienceBypassMaxNodesPerSide expects int >= 1");
+    cfg.resilienceBypassMaxNodesPerSide = v;
     return true;
   }
   if (k == "landvaluerecalcdays" || k == "land_value_recalc_days") {
@@ -830,20 +1305,68 @@ AutoBuildReport RunAutoBuild(World& world, Simulator& sim, const AutoBuildConfig
 
     int parksPlacedToday = 0;
     if (wantPark) {
-      for (int p = 0; p < cfg.parksPerDay; ++p) {
-        if (world.stats().money <= cfg.minMoneyReserve) break;
-        int px = 0, py = 0;
-        if (!PickBestParkCandidate(world, simCfg, cfg, simCfg.requireOutsideConnection ? &roadToEdge : nullptr, &lv, day, px,
-                                   py)) {
-          break;
+      if (cfg.useParkOptimizer) {
+        ParkOptimizerConfig pc;
+        pc.requireOutsideConnection = (simCfg.requireOutsideConnection && cfg.respectOutsideConnection);
+        pc.weightMode = IsochroneWeightMode::TravelTime;
+        pc.demandMode = ParkDemandMode::Tiles;
+        pc.includeResidential = true;
+        pc.includeCommercial = true;
+        pc.includeIndustrial = true;
+        pc.parksToAdd = std::max(0, cfg.parksPerDay);
+        pc.targetCostMilli = std::max(0, simCfg.parkInfluenceRadius) * 1000;
+
+        const ParkOptimizerResult pr = SuggestParkPlacements(world, pc, nullptr,
+                                                            simCfg.requireOutsideConnection ? &roadToEdge : nullptr);
+        for (const ParkPlacement& pp : pr.placements) {
+          if (parksPlacedToday >= cfg.parksPerDay) break;
+          if (world.stats().money <= cfg.minMoneyReserve) break;
+          ToolApplyResult r = ToolApplyResult::Noop;
+          if (!ApplyParkTile(world, pp.parkTile.x, pp.parkTile.y, &r) || r != ToolApplyResult::Applied) {
+            ++rep.failedBuilds;
+            if (r == ToolApplyResult::InsufficientFunds) break;
+          } else {
+            ++rep.parksBuilt;
+            ++parksPlacedToday;
+          }
         }
-        ToolApplyResult r = ToolApplyResult::Noop;
-        if (!ApplyParkTile(world, px, py, &r) || r != ToolApplyResult::Applied) {
-          ++rep.failedBuilds;
-          if (r == ToolApplyResult::InsufficientFunds) break;
-        } else {
-          ++rep.parksBuilt;
-          ++parksPlacedToday;
+
+        // If planning produced nothing (eg. no eligible demand yet), fall back to
+        // the local heuristic so early worlds can still get a few parks.
+        if (parksPlacedToday == 0) {
+          for (int p = 0; p < cfg.parksPerDay; ++p) {
+            if (world.stats().money <= cfg.minMoneyReserve) break;
+            int px = 0, py = 0;
+            if (!PickBestParkCandidate(world, simCfg, cfg, simCfg.requireOutsideConnection ? &roadToEdge : nullptr, &lv, day,
+                                       px, py)) {
+              break;
+            }
+            ToolApplyResult r = ToolApplyResult::Noop;
+            if (!ApplyParkTile(world, px, py, &r) || r != ToolApplyResult::Applied) {
+              ++rep.failedBuilds;
+              if (r == ToolApplyResult::InsufficientFunds) break;
+            } else {
+              ++rep.parksBuilt;
+              ++parksPlacedToday;
+            }
+          }
+        }
+      } else {
+        for (int p = 0; p < cfg.parksPerDay; ++p) {
+          if (world.stats().money <= cfg.minMoneyReserve) break;
+          int px = 0, py = 0;
+          if (!PickBestParkCandidate(world, simCfg, cfg, simCfg.requireOutsideConnection ? &roadToEdge : nullptr, &lv, day, px,
+                                     py)) {
+            break;
+          }
+          ToolApplyResult r = ToolApplyResult::Noop;
+          if (!ApplyParkTile(world, px, py, &r) || r != ToolApplyResult::Applied) {
+            ++rep.failedBuilds;
+            if (r == ToolApplyResult::InsufficientFunds) break;
+          } else {
+            ++rep.parksBuilt;
+            ++parksPlacedToday;
+          }
         }
       }
     }
@@ -877,19 +1400,41 @@ AutoBuildReport RunAutoBuild(World& world, Simulator& sim, const AutoBuildConfig
 
     // Place zones.
     if (canSpend && cfg.zonesPerDay > 0) {
-      for (int z = 0; z < cfg.zonesPerDay; ++z) {
+      int remaining = cfg.zonesPerDay;
+      int zIter = 0;
+      const Overlay zoneOv = ZoneOverlayForTool(zoneTool);
+
+      while (remaining > 0) {
         if (world.stats().money <= cfg.minMoneyReserve) break;
+
         int zx = 0, zy = 0;
-        if (!PickBestZoneCandidate(world, zoneTool, simCfg, cfg, simCfg.requireOutsideConnection ? &roadToEdge : nullptr,
-                                   &lv, day + z, zx, zy)) {
+        if (!PickBestZoneCandidate(world, zoneTool, simCfg, cfg,
+                                   simCfg.requireOutsideConnection ? &roadToEdge : nullptr,
+                                   &lv, day + zIter, zx, zy)) {
           break;
         }
+        ++zIter;
+
         ToolApplyResult r = ToolApplyResult::Noop;
         if (!ApplyZoneTile(world, zoneTool, zx, zy, 1, &r) || r != ToolApplyResult::Applied) {
           ++rep.failedBuilds;
           if (r == ToolApplyResult::InsufficientFunds) break;
-        } else {
-          ++rep.zonesBuilt;
+          // Try a different candidate.
+          continue;
+        }
+
+        ++rep.zonesBuilt;
+        --remaining;
+
+        // Opportunistically grow a small contiguous block from the seed tile.
+        if (remaining <= 0) break;
+        const int maxBlock = std::max(1, cfg.zoneClusterMaxTiles);
+        if (maxBlock > 1) {
+          const int maxExtra = std::min(remaining, maxBlock - 1);
+          const int grown = GrowZoneCluster(world, zoneTool, zoneOv, zx, zy, day + zIter,
+                                            maxExtra, cfg.minMoneyReserve);
+          rep.zonesBuilt += grown;
+          remaining -= grown;
         }
       }
     }
@@ -898,7 +1443,6 @@ AutoBuildReport RunAutoBuild(World& world, Simulator& sim, const AutoBuildConfig
     if (canSpend && cfg.roadsPerDay > 0) {
       for (int r = 0; r < cfg.roadsPerDay; ++r) {
         if (world.stats().money <= cfg.minMoneyReserve) break;
-        int sx = 0, sy = 0, dir = 0;
         if (!HasAnyRoad(world)) {
           // Seed an initial cross at center.
           const int cx = world.width() / 2;
@@ -912,18 +1456,38 @@ AutoBuildReport RunAutoBuild(World& world, Simulator& sim, const AutoBuildConfig
           rep.roadsBuilt += 5;
           break;
         }
-        if (!PickRoadExpansionStart(world, simCfg, cfg, simCfg.requireOutsideConnection ? &roadToEdge : nullptr, day + r,
-                                   sx, sy, dir)) {
-          break;
-        }
         int placed = 0;
-        BuildRoadSpur(world, cfg, sx, sy, dir, day + r, &placed);
+        if (cfg.useRoadPlanner) {
+          BuildPlannedRoadCorridor(world, simCfg, cfg,
+                                   simCfg.requireOutsideConnection ? &roadToEdge : nullptr,
+                                   &lv, zoneTool, day + r, &placed);
+        } else {
+          int sx = 0, sy = 0, dir = 0;
+          if (!PickRoadExpansionStart(world, simCfg, cfg,
+                                     simCfg.requireOutsideConnection ? &roadToEdge : nullptr,
+                                     day + r, sx, sy, dir)) {
+            break;
+          }
+          BuildRoadSpur(world, cfg, sx, sy, dir, day + r, &placed);
+        }
         rep.roadsBuilt += placed;
         if (placed == 0) {
           ++rep.failedBuilds;
           break;
         }
       }
+    }
+
+    // Optional resilience bypasses: build redundant connections around bridge edges.
+    if (cfg.autoBuildResilienceBypasses && canSpend && s.trafficCongestion >= cfg.resilienceBypassCongestionThreshold &&
+        cfg.resilienceBypassesPerDay > 0) {
+      int built = 0;
+      int upgraded = 0;
+      int failed = 0;
+      BuildResilienceBypasses(world, simCfg, cfg, simCfg.requireOutsideConnection ? &roadToEdge : nullptr, day, &built, &upgraded, &failed);
+      rep.roadsBuilt += built;
+      rep.roadsUpgraded += upgraded;
+      rep.failedBuilds += failed;
     }
 
     // Optional road upgrades when congestion spikes.

@@ -48,14 +48,14 @@ struct MeshExportConfig {
   //
   // Units are OBJ/glTF units (after applying heightScale).
   // Set to 0 to disable quantization (default).
-  float heightQuantization = 0.0f;
+  float heightQuantization = 0.25f;
 
   // If true, merge adjacent top-surface tiles that share the same exported
   // material and quantized height into larger quads.
   //
   // This can dramatically reduce vertex/triangle count for flat regions.
   // It does not currently merge cliffs or buildings.
-  bool mergeTopSurfaces = false;
+  bool mergeTopSurfaces = true;
 
   // Include the per-tile top surfaces (terrain and/or overlays).
   bool includeTopSurfaces = true;
@@ -72,16 +72,19 @@ struct MeshExportConfig {
   //
   // Notes:
   //  - Only parcels that are fully inside the export bounds are merged.
-  //  - Parcels are merged only when their base terrain height is flat after
-  //    applying heightScale and optional heightQuantization.
+  //  - Parcels are merged only when their base terrain height range is within
+  //    mergeBuildingsMaxBaseHeightRange after applying heightScale and optional heightQuantization.
   //  - Parcels that cannot be merged fall back to per-tile boxes.
   //
   // This reduces vertex/triangle counts dramatically for dense neighborhoods
   // and makes exported buildings match the renderer's parcelization behavior.
-  bool mergeBuildings = false;
+  bool mergeBuildings = true;
+  // Maximum allowed difference between the highest and lowest tile base heights within a merged parcel.
+  // A value of 0 requires a perfectly flat base. Values > 0 allow gentle slopes (useful on rolling terrain).
+  float mergeBuildingsMaxBaseHeightRange = 1.0f;
 
   // Building footprint as a fraction of tileSize (0..1).
-  float buildingFootprint = 0.60f;
+  float buildingFootprint = 0.70f;
 
   // Building height components (in multiples of tileSize).
   float buildingBaseHeight = 0.35f;
@@ -120,5 +123,12 @@ bool WriteWorldObjMtl(std::ostream& objOut, std::ostream& mtlOut, const World& w
 // Convenience wrapper that writes two files.
 bool ExportWorldObjMtl(const std::string& objPath, const std::string& mtlPath, const World& world,
                        const MeshExportConfig& cfg, MeshExportStats* outStats, std::string* outError);
+
+// Set the mesh export config to the legacy (pre-merging) defaults.
+//
+// Notes:
+//  - Intended for scripts/CLI tools that want stable backwards-compatible exports.
+//  - Does NOT modify cfg.mtlFileName or cfg.objectName.
+void ApplyLegacyMeshExportDefaults(MeshExportConfig& cfg);
 
 } // namespace isocity

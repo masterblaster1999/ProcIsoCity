@@ -3754,7 +3754,7 @@ void Game::setupDevConsole()
             return;
           }
           for (std::size_t i = 0; i < m_resilienceBypasses.size(); ++i) {
-            const ResilienceBypassSuggestion& s = m_resilienceBypasses[i];
+            const RoadResilienceBypassSuggestion& s = m_resilienceBypasses[i];
             c.print(TextFormat("[%d] bridgeEdge=%d cut=%d cost=%d (%s) money=%d new=%d steps=%d lvl=%d bridges=%d",
                                static_cast<int>(i), s.bridgeEdge, s.cutSize, s.primaryCost,
                                s.moneyObjective ? "money" : "tiles", s.moneyCost, s.newTiles, s.steps,
@@ -7394,36 +7394,6 @@ void Game::ensureRoadResilienceUpToDate()
   m_resilienceDirty = false;
 }
 
-static int CountNewRoadTilesInPath(const isocity::World& world, const std::vector<isocity::Point>& path)
-{
-  int out = 0;
-  for (const isocity::Point& p : path) {
-    if (!world.inBounds(p.x, p.y)) continue;
-    if (world.at(p.x, p.y).overlay != isocity::Overlay::Road) ++out;
-  }
-  return out;
-}
-
-static int EstimateMoneyCostForRoadPath(const isocity::World& world, const std::vector<isocity::Point>& path,
-                                       int targetLevel)
-{
-  using namespace isocity;
-
-  int outCost = 0;
-  for (const Point& p : path) {
-    if (!world.inBounds(p.x, p.y)) continue;
-    const Tile& t = world.at(p.x, p.y);
-    const bool isBridge = (t.terrain == Terrain::Water);
-    if (t.overlay == Overlay::Road) {
-      const int cur = ClampRoadLevel(static_cast<int>(t.level));
-      outCost += RoadPlacementCost(cur, targetLevel, /*alreadyRoad=*/true, isBridge);
-    } else {
-      outCost += RoadPlacementCost(1, targetLevel, /*alreadyRoad=*/false, isBridge);
-    }
-  }
-  return outCost;
-}
-
 void Game::rebuildRoadResilienceBypasses()
 {
   ensureRoadResilienceUpToDate();
@@ -7441,144 +7411,17 @@ void Game::rebuildRoadResilienceBypasses()
   const bool haveTraffic = (!m_trafficDirty && !m_traffic.roadTraffic.empty() &&
                             static_cast<int>(m_traffic.roadTraffic.size()) == mapW * mapH);
 
-  struct RankedBridge {
-    int ei = -1;
-    double score = 0.0;
-    int cutSize = 0;
-  };
+  RoadResilienceBypassConfig cfg;
+  cfg.top = m_resilienceBypassTop;
+  cfg.moneyObjective = m_resilienceBypassMoney;
+  cfg.targetLevel = ClampRoadLevel(m_resilienceBypassTargetLevel);
+  cfg.allowBridges = m_resilienceBypassAllowBridges;
+  cfg.maxPrimaryCost = m_resilienceBypassMaxCost;
+  cfg.maxNodesPerSide = m_resilienceBypassMaxNodesPerSide;
+  cfg.rankByTraffic = true;
 
-  std::vector<RankedBridge> ranked;
-  ranked.reserve(m_roadResilience.bridgeEdges.size());
-
-  for (int ei : m_roadResilience.bridgeEdges) {
-    if (ei < 0 || ei >= static_cast<int>(m_roadGraph.edges.size())) continue;
-    const int sub = (ei < static_cast<int>(m_roadResilience.bridgeSubtreeNodes.size()))
-                        ? m_roadResilience.bridgeSubtreeNodes[static_cast<std::size_t>(ei)]
-                        : 0;
-    const int oth = (ei < static_cast<int>(m_roadResilience.bridgeOtherNodes.size()))
-                        ? m_roadResilience.bridgeOtherNodes[static_cast<std::size_t>(ei)]
-                        : 0;
-    const int cut = std::min(sub, oth);
-
-    double score = static_cast<double>(cut);
-    if (haveTraffic) {
-      const RoadGraphEdge& e = m_roadGraph.edges[static_cast<std::size_t>(ei)];
-      int maxTraffic = 0;
-      for (const Point& p : e.tiles) {
-        const int idx = p.y * mapW + p.x;
-        if (idx < 0 || idx >= static_cast<int>(m_traffic.roadTraffic.size())) continue;
-        maxTraffic = std::max(maxTraffic, static_cast<int>(m_traffic.roadTraffic[static_cast<std::size_t>(idx)]));
-      }
-      // Prioritize heavily used bridges, breaking ties by cut size.
-      score = static_cast<double>(maxTraffic) + static_cast<double>(cut) * 0.001;
-    }
-
-    ranked.push_back(RankedBridge{ei, score, cut});
-  }
-
-  std::sort(ranked.begin(), ranked.end(), [](const RankedBridge& a, const RankedBridge& b) {
-    if (a.score != b.score) return a.score > b.score;
-    if (a.cutSize != b.cutSize) return a.cutSize > b.cutSize;
-    return a.ei < b.ei;
-  });
-
-  const int want = std::min(m_resilienceBypassTop, static_cast<int>(ranked.size()));
-  m_resilienceBypasses.reserve(static_cast<std::size_t>(want));
-
-  auto sampleNodePositions = [&](const std::vector<int>& nodes, int mustInclude, std::uint64_t seed,
-                                 std::vector<Point>& out) {
-    out.clear();
-    if (nodes.empty()) return;
-
-    // Always include the bridge-side endpoint if provided.
-    if (mustInclude >= 0 && mustInclude < static_cast<int>(m_roadGraph.nodes.size())) {
-      out.push_back(m_roadGraph.nodes[static_cast<std::size_t>(mustInclude)].pos);
-    }
-
-    const int maxN = std::max(1, m_resilienceBypassMaxNodesPerSide);
-    if (static_cast<int>(nodes.size()) <= maxN) {
-      for (int ni : nodes) {
-        if (ni == mustInclude) continue;
-        out.push_back(m_roadGraph.nodes[static_cast<std::size_t>(ni)].pos);
-      }
-      return;
-    }
-
-    // Deterministic hashed sampling so we don't explode the multi-source frontier.
-    std::vector<std::pair<std::uint64_t, int>> scored;
-    scored.reserve(nodes.size());
-    std::uint64_t st = seed;
-    for (int ni : nodes) {
-      if (ni == mustInclude) continue;
-      st ^= static_cast<std::uint64_t>(static_cast<std::uint32_t>(ni)) + 0x9E3779B97F4A7C15ULL;
-      const std::uint64_t key = SplitMix64Next(st);
-      scored.emplace_back(key, ni);
-    }
-    const int take = maxN - static_cast<int>(out.size());
-    if (take <= 0) return;
-    std::nth_element(scored.begin(), scored.begin() + take, scored.end(),
-                     [](const auto& a, const auto& b) { return a.first < b.first; });
-    scored.resize(static_cast<std::size_t>(take));
-    for (const auto& kv : scored) {
-      out.push_back(m_roadGraph.nodes[static_cast<std::size_t>(kv.second)].pos);
-    }
-  };
-
-  for (int i = 0; i < want; ++i) {
-    const int bridgeEi = ranked[static_cast<std::size_t>(i)].ei;
-
-    RoadGraphBridgeCut cut;
-    if (!ComputeRoadGraphBridgeCut(m_roadGraph, bridgeEi, cut)) continue;
-
-    // Start from the smaller side so the multi-source frontier stays manageable.
-    const std::vector<int>* sideS = &cut.sideA;
-    const std::vector<int>* sideG = &cut.sideB;
-    int mustS = m_roadGraph.edges[static_cast<std::size_t>(bridgeEi)].a;
-    int mustG = m_roadGraph.edges[static_cast<std::size_t>(bridgeEi)].b;
-    if (cut.sideB.size() < cut.sideA.size()) {
-      sideS = &cut.sideB;
-      sideG = &cut.sideA;
-      mustS = m_roadGraph.edges[static_cast<std::size_t>(bridgeEi)].b;
-      mustG = m_roadGraph.edges[static_cast<std::size_t>(bridgeEi)].a;
-    }
-
-    std::vector<Point> starts;
-    std::vector<Point> goals;
-
-    const std::uint64_t seed = (m_world.seed() ^ (static_cast<std::uint64_t>(bridgeEi) * 0xD6E8FEB86659FD93ULL));
-    sampleNodePositions(*sideS, mustS, seed ^ 0xA5A5A5A5A5A5A5A5ULL, starts);
-    sampleNodePositions(*sideG, mustG, seed ^ 0x5A5A5A5A5A5A5A5AULL, goals);
-    if (starts.empty() || goals.empty()) continue;
-
-    const std::vector<std::uint64_t> blocked = BuildBlockedMovesForRoadGraphEdge(m_roadGraph, bridgeEi, mapW);
-
-    RoadBuildPathConfig cfg;
-    cfg.targetLevel = ClampRoadLevel(m_resilienceBypassTargetLevel);
-    cfg.allowBridges = m_resilienceBypassAllowBridges;
-    cfg.costModel = m_resilienceBypassMoney ? RoadBuildPathConfig::CostModel::Money
-                                            : RoadBuildPathConfig::CostModel::NewTiles;
-
-    std::vector<Point> path;
-    int primaryCost = 0;
-
-    const int maxCost = (m_resilienceBypassMaxCost > 0) ? m_resilienceBypassMaxCost : -1;
-    const bool ok = FindRoadBuildPathBetweenSets(m_world, starts, goals, path, &primaryCost, cfg, &blocked, maxCost);
-    if (!ok || path.size() < 2) continue;
-
-    ResilienceBypassSuggestion s;
-    s.bridgeEdge = bridgeEi;
-    s.cutSize = ranked[static_cast<std::size_t>(i)].cutSize;
-    s.primaryCost = primaryCost;
-    s.newTiles = CountNewRoadTilesInPath(m_world, path);
-    s.moneyCost = EstimateMoneyCostForRoadPath(m_world, path, cfg.targetLevel);
-    s.steps = static_cast<int>(path.size()) - 1;
-    s.targetLevel = cfg.targetLevel;
-    s.allowBridges = cfg.allowBridges;
-    s.moneyObjective = m_resilienceBypassMoney;
-    s.path = std::move(path);
-
-    m_resilienceBypasses.push_back(std::move(s));
-  }
+  m_resilienceBypasses = SuggestRoadResilienceBypasses(m_world, m_roadGraph, m_roadResilience, cfg,
+                                                       haveTraffic ? &m_traffic : nullptr);
 }
 
 bool Game::applyRoadResilienceBypass(std::size_t idx)
@@ -7588,7 +7431,7 @@ bool Game::applyRoadResilienceBypass(std::size_t idx)
     return false;
   }
 
-  const ResilienceBypassSuggestion& s = m_resilienceBypasses[idx];
+  const RoadResilienceBypassSuggestion& s = m_resilienceBypasses[idx];
   if (s.path.size() < 2) {
     showToast("Bypass path is empty");
     return false;
@@ -7743,7 +7586,7 @@ void Game::drawRoadResilienceOverlay()
   }
 
   // Draw bypass suggestions as translucent polylines.
-  for (const ResilienceBypassSuggestion& s : m_resilienceBypasses) {
+  for (const RoadResilienceBypassSuggestion& s : m_resilienceBypasses) {
     if (s.path.size() < 2) continue;
     const Color c = Color{80, 255, 140, 140};
     for (std::size_t i = 1; i < s.path.size(); ++i) {

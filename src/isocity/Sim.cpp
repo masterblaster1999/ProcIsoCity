@@ -474,7 +474,7 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
         }
       }
 
-      // Coverage of commute demand.
+      // Coverage of commute demand along served corridors (edge-based).
       std::uint64_t commuteTotal = 0ull;
       std::uint64_t commuteCovered = 0ull;
       for (std::size_t ei = 0; ei < commuteEdgeDemand.size(); ++ei) {
@@ -482,9 +482,11 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
         if (served[ei]) commuteCovered += commuteEdgeDemand[ei];
       }
 
-      const float coverage = (commuteTotal > 0)
-                               ? std::clamp(static_cast<float>(static_cast<double>(commuteCovered) / static_cast<double>(commuteTotal)), 0.0f, 1.0f)
-                               : 0.0f;
+      const float corridorCoverage =
+          (commuteTotal > 0)
+              ? std::clamp(static_cast<float>(static_cast<double>(commuteCovered) / static_cast<double>(commuteTotal)),
+                           0.0f, 1.0f)
+              : 0.0f;
 
       // Unique served road tiles (for cost accounting).
       std::vector<std::uint8_t> servedTileMask(nTiles, 0u);
@@ -492,29 +494,135 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
         if (!served[ei]) continue;
         for (const Point& p : g.edges[ei].tiles) {
           if (!world.inBounds(p.x, p.y)) continue;
-          const std::size_t idx = static_cast<std::size_t>(p.y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(p.x);
+          const std::size_t idx = static_cast<std::size_t>(p.y) * static_cast<std::size_t>(w) +
+                                  static_cast<std::size_t>(p.x);
           if (idx < servedTileMask.size()) servedTileMask[idx] = 1u;
         }
       }
       int servedTileCount = 0;
       for (std::uint8_t b : servedTileMask) servedTileCount += (b != 0);
 
-      // Stops: deterministically sample each line and count unique stop tiles.
+      // Stops: deterministically sample each line and collect unique stop road tiles.
       const int stopSpacing = std::max(2, m_transitModel.stopSpacingTiles);
-      std::vector<std::uint8_t> stopMask(nTiles, 0u);
+      std::vector<int> stopRoadIdx;
+      stopRoadIdx.reserve(256);
+      std::vector<std::uint8_t> stopSeen(nTiles, 0u);
       std::vector<Point> tmpStops;
       tmpStops.reserve(256);
+
+      auto addStop = [&](const Point& p) {
+        if (!world.inBounds(p.x, p.y)) return;
+        const std::size_t idx = static_cast<std::size_t>(p.y) * static_cast<std::size_t>(w) +
+                                static_cast<std::size_t>(p.x);
+        if (idx >= stopSeen.size() || stopSeen[idx]) return;
+
+        const Tile& t = world.at(p.x, p.y);
+        if (t.overlay != Overlay::Road) return;
+
+        stopSeen[idx] = 1u;
+        stopRoadIdx.push_back(static_cast<int>(idx));
+      };
+
       for (const TransitLine& line : plan.lines) {
         tmpStops.clear();
         if (!BuildTransitLineStopTiles(g, line, stopSpacing, tmpStops)) continue;
-        for (const Point& p : tmpStops) {
-          if (!world.inBounds(p.x, p.y)) continue;
-          const std::size_t idx = static_cast<std::size_t>(p.y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(p.x);
-          if (idx < stopMask.size()) stopMask[idx] = 1u;
-        }
+        for (const Point& p : tmpStops) addStop(p);
       }
-      int stopCount = 0;
-      for (std::uint8_t b : stopMask) stopCount += (b != 0);
+
+      const int stopCount = static_cast<int>(stopRoadIdx.size());
+
+      // Stop-access coverage: share of residents and jobs within walking distance of any stop.
+      //
+      // We approximate walking distance using *unweighted road steps* to the nearest stop (isochrone Steps mode).
+      // A commuter needs access at both ends, so we combine origin/destination accessibility with a geometric mean.
+      // kWalkRadiusSteps is a rule-of-thumb walk-to-stop radius (similar to the common ~400m / 5-minute
+      // transit service area), and matches the 10-step bucket used by the transitplan CLI access summary.
+      constexpr int kWalkRadiusSteps = 10;
+
+      std::uint64_t resTotal = 0ull;
+      std::uint64_t resServed = 0ull;
+      std::uint64_t jobsTotal = 0ull;
+      std::uint64_t jobsServed = 0ull;
+
+      // Average walk distance to the nearest stop for served tiles (steps).
+      double resWalkAvg = 0.0;
+      double jobsWalkAvg = 0.0;
+
+      float accessCoverage = 0.0f;
+
+      if (!stopRoadIdx.empty()) {
+        RoadIsochroneConfig icfg;
+        icfg.requireOutsideConnection = (roadToEdge != nullptr);
+        icfg.weightMode = IsochroneWeightMode::Steps;
+        icfg.computeOwner = false;
+
+        const RoadIsochroneField stopField =
+            BuildRoadIsochroneField(world, stopRoadIdx, icfg, roadToEdge, nullptr);
+
+        std::uint64_t resWalkSum = 0ull;
+        std::uint64_t resWalkW = 0ull;
+        std::uint64_t jobsWalkSum = 0ull;
+        std::uint64_t jobsWalkW = 0ull;
+
+        for (int y = 0; y < h; ++y) {
+          for (int x = 0; x < w; ++x) {
+            const std::size_t tidx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
+                                     static_cast<std::size_t>(x);
+            if (tidx >= zoneAccess->roadIdx.size()) continue;
+
+            const int ridx = zoneAccess->roadIdx[tidx];
+            if (ridx < 0) continue;
+
+            const Tile& t = world.at(x, y);
+            if (t.occupants <= 0) continue;
+            const std::uint64_t wgt = static_cast<std::uint64_t>(t.occupants);
+
+            const int steps = (static_cast<std::size_t>(ridx) < stopField.steps.size())
+                                ? stopField.steps[static_cast<std::size_t>(ridx)]
+                                : -1;
+            const bool served = (steps >= 0 && steps <= kWalkRadiusSteps);
+
+            if (t.overlay == Overlay::Residential) {
+              resTotal += wgt;
+              if (served) {
+                resServed += wgt;
+                resWalkSum += static_cast<std::uint64_t>(steps) * wgt;
+                resWalkW += wgt;
+              }
+            } else if (t.overlay == Overlay::Commercial || t.overlay == Overlay::Industrial) {
+              jobsTotal += wgt;
+              if (served) {
+                jobsServed += wgt;
+                jobsWalkSum += static_cast<std::uint64_t>(steps) * wgt;
+                jobsWalkW += wgt;
+              }
+            }
+          }
+        }
+
+        const float resShare =
+            (resTotal > 0)
+                ? std::clamp(static_cast<float>(static_cast<double>(resServed) / static_cast<double>(resTotal)),
+                             0.0f, 1.0f)
+                : 0.0f;
+        const float jobsShare =
+            (jobsTotal > 0)
+                ? std::clamp(static_cast<float>(static_cast<double>(jobsServed) / static_cast<double>(jobsTotal)),
+                             0.0f, 1.0f)
+                : 0.0f;
+
+        accessCoverage =
+            std::clamp(static_cast<float>(std::sqrt(static_cast<double>(resShare) * static_cast<double>(jobsShare))),
+                       0.0f, 1.0f);
+
+        if (resWalkW > 0) resWalkAvg = static_cast<double>(resWalkSum) / static_cast<double>(resWalkW);
+        if (jobsWalkW > 0) jobsWalkAvg = static_cast<double>(jobsWalkSum) / static_cast<double>(jobsWalkW);
+      }
+
+      // Final commute coverage used by the transit mode-shift model combines:
+      //  - corridorCoverage: are we serving the high-demand road corridors?
+      //  - accessCoverage: can residents/jobs actually walk to a stop?
+      const float coverage = std::clamp(corridorCoverage * accessCoverage, 0.0f, 1.0f);
 
       // Ridership model.
       const float service = std::max(0.0f, m_transitModel.serviceLevel);
@@ -557,8 +665,16 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
 
         // Transit adds a small wait/dwell penalty that decreases with service.
         const float waitPenalty = 3.0f / std::max(0.25f, service);
-        const float transitAvgTime = trafficBase.avgCommuteTime * tMult + waitPenalty;
-        const float transitP95Time = trafficBase.p95CommuteTime * tMult + waitPenalty * 1.5f;
+
+        // Walking to/from stops: average steps-to-nearest-stop at origins + destinations.
+        // We scale it modestly: RoadTravelTimeMilliForLevel models vehicle speeds, but this is meant
+        // as a lightweight accessibility penalty in the same "street-step" units as avgCommuteTime.
+        constexpr float kWalkTimeMultiplier = 1.5f;
+        const float walkPenalty =
+            static_cast<float>(std::max(0.0, resWalkAvg) + std::max(0.0, jobsWalkAvg)) * kWalkTimeMultiplier;
+
+        const float transitAvgTime = trafficBase.avgCommuteTime * tMult + waitPenalty + walkPenalty;
+        const float transitP95Time = trafficBase.p95CommuteTime * tMult + waitPenalty * 1.5f + walkPenalty * 1.5f;
 
         avgCommuteAll = trafficRoad.avgCommute * wCar + trafficBase.avgCommute * wT;
         avgCommuteTimeAll = trafficRoad.avgCommuteTime * wCar + transitAvgTime * wT;
