@@ -555,20 +555,27 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
     }
 
     // Import any remaining demand from the edge if allowed.
+    //
+    // The import capacity throttle allows the simulation to model partial
+    // availability (trade disruptions) while keeping the goods model itself
+    // deterministic and lightweight.
     if (remaining > 0 && cfg.allowImports) {
       const int ed = (!edgeField.cost.empty()) ? edgeField.cost[static_cast<std::size_t>(c.roadIdx)] : -1;
       if (ed >= 0) {
-        const int imp = remaining;
-        remaining = 0;
-        delivered += imp;
-        out.goodsImported += imp;
+        const int pct = std::clamp(cfg.importCapacityPct, 0, 100);
+        const int imp = std::min(remaining, (remaining * pct) / 100);
+        if (imp > 0) {
+          remaining -= imp;
+          delivered += imp;
+          out.goodsImported += imp;
 
-        // Debug OD: edge access road -> consumer access road.
-        const int root = (!edgeField.parent.empty()) ? traceRoot(c.roadIdx, edgeField.parent) : -1;
-        const int steps = (!edgeField.dist.empty()) ? edgeField.dist[static_cast<std::size_t>(c.roadIdx)] : -1;
-        addOd(root, c.roadIdx, imp, steps, ed, GoodsOdType::Import);
+          // Debug OD: edge access road -> consumer access road.
+          const int root = (!edgeField.parent.empty()) ? traceRoot(c.roadIdx, edgeField.parent) : -1;
+          const int steps = (!edgeField.dist.empty()) ? edgeField.dist[static_cast<std::size_t>(c.roadIdx)] : -1;
+          addOd(root, c.roadIdx, imp, steps, ed, GoodsOdType::Import);
 
-        addAlongParentChain(c.roadIdx, edgeField.parent, imp);
+          addAlongParentChain(c.roadIdx, edgeField.parent, imp);
+        }
       }
     }
 
@@ -590,19 +597,23 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
 
   // --- Export any surplus supply ---
   if (cfg.allowExports && !sources.empty()) {
+    const int pct = std::clamp(cfg.exportCapacityPct, 0, 100);
     for (const Source& src : sources) {
       if (src.remaining <= 0) continue;
       const int ed = (!edgeField.cost.empty()) ? edgeField.cost[static_cast<std::size_t>(src.roadIdx)] : -1;
       if (ed < 0) continue;
 
-      out.goodsExported += src.remaining;
+      const int exp = std::max(0, (src.remaining * pct) / 100);
+      if (exp <= 0) continue;
+
+      out.goodsExported += exp;
 
       // Debug OD: producer access road -> edge access road.
       const int root = (!edgeField.parent.empty()) ? traceRoot(src.roadIdx, edgeField.parent) : -1;
       const int steps = (!edgeField.dist.empty()) ? edgeField.dist[static_cast<std::size_t>(src.roadIdx)] : -1;
-      addOd(src.roadIdx, root, src.remaining, steps, ed, GoodsOdType::Export);
+      addOd(src.roadIdx, root, exp, steps, ed, GoodsOdType::Export);
 
-      addAlongParentChain(src.roadIdx, edgeField.parent, src.remaining);
+      addAlongParentChain(src.roadIdx, edgeField.parent, exp);
     }
   }
 

@@ -120,6 +120,15 @@ std::uint64_t HashStats(const Stats& s)
   HashF32(h, s.goodsSatisfaction);
   HashI32(h, s.maxRoadGoodsTraffic);
 
+  // Trade/market.
+  HashI32(h, s.tradeImportPartner);
+  HashI32(h, s.tradeExportPartner);
+  HashI32(h, s.tradeImportCapacityPct);
+  HashI32(h, s.tradeExportCapacityPct);
+  HashByte(h, static_cast<std::uint8_t>(s.tradeImportDisrupted ? 1 : 0));
+  HashByte(h, static_cast<std::uint8_t>(s.tradeExportDisrupted ? 1 : 0));
+  HashF32(h, s.tradeMarketIndex);
+
   // Economy snapshot.
   HashI32(h, s.income);
   HashI32(h, s.expenses);

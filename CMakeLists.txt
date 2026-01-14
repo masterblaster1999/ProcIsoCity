@@ -83,9 +83,11 @@ add_library(isocity_core
   src/isocity/TransitPlanner.cpp
   src/isocity/TransitPlannerExport.cpp
   src/isocity/Sim.cpp
+  src/isocity/Services.cpp
   src/isocity/FlowField.cpp
   src/isocity/Traffic.cpp
   src/isocity/Goods.cpp
+  src/isocity/TradeMarket.cpp
   src/isocity/ParkOptimizer.cpp
   src/isocity/LandValue.cpp
   src/isocity/DistrictStats.cpp
@@ -190,6 +192,7 @@ if (PROCISOCITY_BUILD_APP)
     src/isocity/World.hpp
     src/isocity/ProcGen.hpp
     src/isocity/Sim.hpp
+    src/isocity/TradeMarket.hpp
     src/isocity/SaveLoad.hpp
     src/isocity/EditHistory.hpp
 
@@ -200,6 +203,9 @@ if (PROCISOCITY_BUILD_APP)
     src/isocity/GpuGeom.cpp
     src/isocity/Ui.cpp
     src/isocity/VisualPrefs.cpp
+    src/isocity/PostFxSettings.hpp
+    src/isocity/PostFx.hpp
+    src/isocity/PostFx.cpp
   )
 
   target_include_directories(proc_isocity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

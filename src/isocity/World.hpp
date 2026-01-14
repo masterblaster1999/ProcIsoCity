@@ -127,6 +127,17 @@ struct Stats {
   float goodsSatisfaction = 1.0f; // delivered/demand, clamped to [0,1]
   int maxRoadGoodsTraffic = 0;
 
+  // --- Derived trade/market stats (recomputed by the simulator; not persisted in saves) ---
+  //
+  // These summarize the procedural trade market for the current day.
+  int tradeImportPartner = -1; // -1 = none/legacy
+  int tradeExportPartner = -1;
+  int tradeImportCapacityPct = 100; // 0..100
+  int tradeExportCapacityPct = 100; // 0..100
+  bool tradeImportDisrupted = false;
+  bool tradeExportDisrupted = false;
+  float tradeMarketIndex = 1.0f; // ~1.0 baseline
+
   // --- Derived economy snapshot (recomputed by the simulator; not persisted in saves) ---
   // These fields describe the *last simulated tick's* budget effects.
   int income = 0;          // total income added this tick (taxes + export revenue)

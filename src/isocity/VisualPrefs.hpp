@@ -2,6 +2,7 @@
 
 #include "isocity/Json.hpp"
 #include "isocity/Renderer.hpp"
+#include "isocity/PostFxSettings.hpp"
 
 #include <cstdint>
 #include <string>
@@ -73,6 +74,9 @@ struct VisualPrefs {
   // Atmospheric ambience (optional). These are visual-only and do not affect simulation.
   Renderer::CloudShadowSettings cloudShadows{};
   Renderer::VolumetricCloudSettings volumetricClouds{};
+
+  // Stylized post-processing when compositing the world render target.
+  PostFxSettings postFx{};
 
   // Elevation rendering (visual-only).
   ElevationSettings elevation{};

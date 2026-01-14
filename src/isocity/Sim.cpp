@@ -385,9 +385,31 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
   float avgCommuteTimeAll = trafficBase.avgCommuteTime;
   float p95CommuteTimeAll = trafficBase.p95CommuteTime;
 
+  // Procedural trade market: decide today's outside trade conditions.
+  //
+  // The resulting import/export capacity throttles are fed into the goods model.
+  TradeMarketSummary tradePlan;
+  if (m_tradeModel.enabled) {
+    tradePlan = PlanTradeMarket(world, s.day, m_tradeModel);
+  } else {
+    // Legacy behavior: full availability at a fixed exchange rate.
+    tradePlan.day = s.day;
+    tradePlan.chosenImportPartner = -1;
+    tradePlan.chosenExportPartner = -1;
+    tradePlan.importCapacityPct = m_tradeModel.allowImports ? 100 : 0;
+    tradePlan.exportCapacityPct = m_tradeModel.allowExports ? 100 : 0;
+    tradePlan.importDisrupted = false;
+    tradePlan.exportDisrupted = false;
+    tradePlan.marketIndex = 1.0f;
+  }
+
   // Goods/logistics model: route industrial output to commercial demand along roads.
   GoodsConfig gc;
   gc.requireOutsideConnection = m_cfg.requireOutsideConnection;
+  gc.allowImports = m_tradeModel.allowImports;
+  gc.allowExports = m_tradeModel.allowExports;
+  gc.importCapacityPct = std::clamp(tradePlan.importCapacityPct, 0, 100);
+  gc.exportCapacityPct = std::clamp(tradePlan.exportCapacityPct, 0, 100);
   const GoodsResult goods = ComputeGoodsFlow(world, gc, roadToEdge, zoneAccess);
   s.goodsProduced = goods.goodsProduced;
   s.goodsDemand = goods.goodsDemand;
@@ -784,10 +806,37 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
 
   const int maintenance = roadMaint + parkMaint;
 
-  // Trade: imports cost money, exports earn money. Keep the exchange rate mild so it
-  // doesn't dominate the early game.
-  const int importCost = goods.goodsImported / 20;
-  const int exportRevenue = goods.goodsExported / 25;
+  // Trade: compute import cost + export revenue.
+  //
+  // When the trade market is disabled, fall back to the legacy fixed exchange
+  // rates.
+  int importCost = goods.goodsImported / 20;
+  int exportRevenue = goods.goodsExported / 25;
+
+  // Populate trade snapshot fields (for UI/debug) regardless of the chosen model.
+  s.tradeImportPartner = tradePlan.chosenImportPartner;
+  s.tradeExportPartner = tradePlan.chosenExportPartner;
+  s.tradeImportCapacityPct = std::clamp(tradePlan.importCapacityPct, 0, 100);
+  s.tradeExportCapacityPct = std::clamp(tradePlan.exportCapacityPct, 0, 100);
+  s.tradeImportDisrupted = tradePlan.importDisrupted;
+  s.tradeExportDisrupted = tradePlan.exportDisrupted;
+  s.tradeMarketIndex = tradePlan.marketIndex;
+
+  if (m_tradeModel.enabled) {
+    const TradeMarketResult tr = ComputeTradeMarket(world, s.day, m_tradeModel, goods, tradePlan);
+    importCost = tr.importCost;
+    exportRevenue = tr.exportRevenue;
+
+    // Copy the realized daily plan (should match tradePlan, but we treat the trade
+    // module as the source of truth for derived UI fields).
+    s.tradeImportPartner = tr.summary.chosenImportPartner;
+    s.tradeExportPartner = tr.summary.chosenExportPartner;
+    s.tradeImportCapacityPct = std::clamp(tr.summary.importCapacityPct, 0, 100);
+    s.tradeExportCapacityPct = std::clamp(tr.summary.exportCapacityPct, 0, 100);
+    s.tradeImportDisrupted = tr.summary.importDisrupted;
+    s.tradeExportDisrupted = tr.summary.exportDisrupted;
+    s.tradeMarketIndex = tr.summary.marketIndex;
+  }
 
   s.taxRevenue = taxRevenue;
   s.maintenanceCost = maintenance;

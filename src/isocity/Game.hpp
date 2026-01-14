@@ -14,6 +14,7 @@
 #include "isocity/ProcGen.hpp"
 #include "isocity/Renderer.hpp"
 #include "isocity/VisualPrefs.hpp"
+#include "isocity/PostFx.hpp"
 #include "isocity/RoadGraph.hpp"
 #include "isocity/RoadGraphRouting.hpp"
 #include "isocity/RoadGraphResilience.hpp"
@@ -161,6 +162,7 @@ private:
   // Transit planner (auto "bus line" suggestions) + overlay.
   void ensureTransitPlanUpToDate();
   void ensureTransitVizUpToDate();
+  void ensureTradeMarketUpToDate();
   void drawTransitOverlay();
   void drawTransitPanel(int x0, int y0);
   void adjustTransitPanel(int dir, bool bigStep);
@@ -439,6 +441,12 @@ private:
   bool m_goodsDirty = true;
   GoodsResult m_goods;
 
+  // Procedural trade market cache (used by the policy panel).
+  bool m_tradeDirty = true;
+  int m_tradeCachedDay = -1;
+  TradeModelSettings m_tradeCachedSettings{};
+  TradeMarketResult m_tradeMarket{};
+
   // Transit planner overlay (auto bus line suggestions).
   // Toggle panel with Ctrl+T. Export artifacts with Ctrl+Shift+T.
   // Planner + simulation tuning lives in Simulator::transitModel().
@@ -624,6 +632,10 @@ private:
   float m_worldRenderScaleMax = 1.00f;
   int m_worldRenderTargetFps = 60;
   bool m_worldRenderFilterPoint = false;
+
+  // Stylized post-processing when compositing the world render target.
+  PostFxSettings m_postFx{};
+  PostFxPipeline m_postFxPipeline{};
   bool m_mergedZoneBuildings = true;
 
   // Smoothed CPU frame time (for the video/settings panel + auto world scaling).

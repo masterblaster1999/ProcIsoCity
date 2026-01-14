@@ -27,8 +27,17 @@ struct GoodsConfig {
   // If true, unmet commercial demand is imported from the map edge (if reachable).
   bool allowImports = true;
 
+  // Import capacity throttle (percentage in [0,100]).
+  //
+  // When < 100, even reachable edge imports may be partially unavailable.
+  // This is used by the procedural trade system to model disruptions.
+  int importCapacityPct = 100;
+
   // If true, surplus industrial production is exported to the map edge (if reachable).
   bool allowExports = true;
+
+  // Export capacity throttle (percentage in [0,100]).
+  int exportCapacityPct = 100;
 
   // Scale factors applied to base zone production/consumption.
   // Base industrial supply is 12 * level (mirrors industrial job capacity).

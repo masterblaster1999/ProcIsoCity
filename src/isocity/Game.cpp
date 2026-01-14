@@ -61,7 +61,7 @@ constexpr int kUiPanelTopY = 96;
 
 // Standard right-docked panel sizes.
 constexpr int kPolicyPanelW = 420;
-constexpr int kPolicyPanelH = 280;
+constexpr int kPolicyPanelH = 430;
 constexpr int kTrafficPanelW = 420;
 constexpr int kTrafficPanelH = 314;
 constexpr int kResiliencePanelW = 460;
@@ -458,6 +458,7 @@ void Game::adoptLoadedWorld(World&& loaded, const ProcGenConfig& loadedProcCfg, 
   m_roadGraphDirty = true;
   m_trafficDirty = true;
   m_goodsDirty = true;
+  m_tradeDirty = true;
   m_landValueDirty = true;
   m_transitPlanDirty = true;
   m_transitVizDirty = true;
@@ -574,6 +575,7 @@ Game::~Game()
   }
 
   unloadWorldRenderTarget();
+  m_postFxPipeline.shutdown();
   unloadSaveMenuThumbnails();
 
   ui::Shutdown();
@@ -638,6 +640,9 @@ Game::Game(Config cfg)
   m_elevDefault.flattenWater = true;
   m_elev = m_elevDefault;
   m_renderer.setElevationSettings(m_elev);
+
+  // Post FX shaders are tiny; initialize once so toggling is instant.
+  m_postFxPipeline.init();
 
   // Load persisted display/visual preferences if present (defaults to isocity_visual.json).
   if (std::filesystem::exists(m_visualPrefsPath)) {
@@ -4180,6 +4185,7 @@ void Game::updateWorldRenderFilter()
 
 bool Game::wantsWorldRenderTarget() const
 {
+  if (m_postFx.enabled) return true;
   if (m_worldRenderScaleAuto) return true;
   return std::fabs(m_worldRenderScale - 1.0f) > 0.001f;
 }
@@ -4840,6 +4846,63 @@ void Game::adjustVideoSettings(int dir)
       showToast(wx.reflectLights ? "Reflect lights: ON" : "Reflect lights: OFF");
     } break;
 
+    case 26: {
+      m_postFx.enabled = !m_postFx.enabled;
+      if (m_postFx.enabled) {
+        showToast(m_postFxPipeline.isReady() ? "Post FX: ON" : "Post FX: ON (shader fallback)");
+      } else {
+        showToast("Post FX: OFF");
+        if (!wantsWorldRenderTarget()) unloadWorldRenderTarget();
+      }
+    } break;
+
+    case 27: {
+      const int step = shift ? 2 : 1;
+      m_postFx.colorBits = std::clamp(m_postFx.colorBits + (d * step), 2, 8);
+      showToast(TextFormat("Post FX: bits %d", m_postFx.colorBits));
+    } break;
+
+    case 28: {
+      const float step = shift ? 0.10f : 0.03f;
+      m_postFx.ditherStrength = clamp01(m_postFx.ditherStrength + (static_cast<float>(d) * step));
+      showToast(TextFormat("Post FX: dither %.0f%%", m_postFx.ditherStrength * 100.0f));
+    } break;
+
+    case 29: {
+      const float step = shift ? 0.10f : 0.03f;
+      m_postFx.grain = clamp01(m_postFx.grain + (static_cast<float>(d) * step));
+      showToast(TextFormat("Post FX: grain %.0f%%", m_postFx.grain * 100.0f));
+    } break;
+
+    case 30: {
+      const float step = shift ? 0.10f : 0.03f;
+      m_postFx.vignette = clamp01(m_postFx.vignette + (static_cast<float>(d) * step));
+      showToast(TextFormat("Post FX: vignette %.0f%%", m_postFx.vignette * 100.0f));
+    } break;
+
+    case 31: {
+      const float step = shift ? 0.10f : 0.03f;
+      m_postFx.chroma = clamp01(m_postFx.chroma + (static_cast<float>(d) * step));
+      showToast(TextFormat("Post FX: chroma %.0f%%", m_postFx.chroma * 100.0f));
+    } break;
+
+    case 32: {
+      const float step = shift ? 0.10f : 0.03f;
+      m_postFx.scanlines = clamp01(m_postFx.scanlines + (static_cast<float>(d) * step));
+      showToast(TextFormat("Post FX: scanlines %.0f%%", m_postFx.scanlines * 100.0f));
+    } break;
+
+    case 33:
+      m_postFx.includeWeather = !m_postFx.includeWeather;
+      showToast(m_postFx.includeWeather ? "Post FX: include weather" : "Post FX: weather separate");
+      break;
+
+    case 34:
+      m_postFx = PostFxSettings{};
+      showToast("Post FX: RESET");
+      if (!wantsWorldRenderTarget()) unloadWorldRenderTarget();
+      break;
+
     default:
       break;
   }
@@ -4958,6 +5021,9 @@ VisualPrefs Game::captureVisualPrefs() const
   p.weather = m_renderer.weatherSettings();
   p.cloudShadows = m_renderer.cloudShadowSettings();
   p.volumetricClouds = m_renderer.volumetricCloudSettings();
+
+  // Post FX
+  p.postFx = m_postFx;
   p.elevation = m_elev;
   return p;
 }
@@ -5009,6 +5075,16 @@ void Game::applyVisualPrefs(const VisualPrefs& prefs)
 
   m_worldRenderTargetFps = std::clamp(prefs.worldRenderTargetFps, 15, 240);
   m_worldRenderFilterPoint = prefs.worldRenderFilterPoint;
+
+  // Post FX
+  m_postFx = prefs.postFx;
+  m_postFx.colorBits = std::clamp(m_postFx.colorBits, 2, 8);
+  m_postFx.ditherStrength = std::clamp(m_postFx.ditherStrength, 0.0f, 1.0f);
+  m_postFx.grain = std::clamp(m_postFx.grain, 0.0f, 1.0f);
+  m_postFx.vignette = std::clamp(m_postFx.vignette, 0.0f, 1.0f);
+  m_postFx.chroma = std::clamp(m_postFx.chroma, 0.0f, 1.0f);
+  m_postFx.scanlines = std::clamp(m_postFx.scanlines, 0.0f, 1.0f);
+
 
   if (m_worldRenderScaleAuto) {
     m_worldRenderScale = std::clamp(m_worldRenderScale, m_worldRenderScaleMin, m_worldRenderScaleMax);
@@ -7710,6 +7786,15 @@ void Game::ensureTransitPlanUpToDate()
     if (m_goodsDirty || static_cast<int>(m_goods.roadGoodsTraffic.size()) != n) {
       GoodsConfig gc;
       gc.requireOutsideConnection = requireOutside;
+
+      const Stats& st = m_world.stats();
+      const TradeModelSettings& ts = m_sim.tradeModel();
+      if (ts.enabled) {
+        gc.allowImports = ts.allowImports;
+        gc.allowExports = ts.allowExports;
+        gc.importCapacityPct = std::clamp(st.tradeImportCapacityPct, 0, 100);
+        gc.exportCapacityPct = std::clamp(st.tradeExportCapacityPct, 0, 100);
+      }
       const std::vector<std::uint8_t>* pre = (gc.requireOutsideConnection ? roadToEdgeMask : nullptr);
       m_goods = ComputeGoodsFlow(m_world, gc, pre);
       m_goodsDirty = false;
@@ -7786,6 +7871,30 @@ void Game::ensureTransitVizUpToDate()
   }
 
   m_transitVizDirty = false;
+}
+
+void Game::ensureTradeMarketUpToDate()
+{
+  const Stats& st = m_world.stats();
+  const TradeModelSettings& ts = m_sim.tradeModel();
+
+  // World edits that affect goods flow should also invalidate the trade breakdown.
+  if (m_goodsDirty) m_tradeDirty = true;
+
+  if (!m_tradeDirty && m_tradeCachedDay == st.day && ts == m_tradeCachedSettings) return;
+
+  m_tradeCachedDay = st.day;
+  m_tradeCachedSettings = ts;
+
+  // The trade breakdown UI only needs the aggregate imported/exported totals.
+  GoodsResult gg;
+  gg.goodsImported = st.goodsImported;
+  gg.goodsExported = st.goodsExported;
+
+  const TradeMarketSummary plan = PlanTradeMarket(m_world, st.day, ts);
+  m_tradeMarket = ComputeTradeMarket(m_world, st.day, ts, gg, plan);
+
+  m_tradeDirty = false;
 }
 
 void Game::drawTransitOverlay()
@@ -8599,6 +8708,15 @@ void Game::ensureRoadUpgradePlanUpToDate()
     if (m_goodsDirty || static_cast<int>(m_goods.roadGoodsTraffic.size()) != n) {
       GoodsConfig gc;
       gc.requireOutsideConnection = requireOutside;
+
+      const Stats& st = m_world.stats();
+      const TradeModelSettings& ts = m_sim.tradeModel();
+      if (ts.enabled) {
+        gc.allowImports = ts.allowImports;
+        gc.allowExports = ts.allowExports;
+        gc.importCapacityPct = std::clamp(st.tradeImportCapacityPct, 0, 100);
+        gc.exportCapacityPct = std::clamp(st.tradeExportCapacityPct, 0, 100);
+      }
       const std::vector<std::uint8_t>* pre = (gc.requireOutsideConnection ? roadToEdgeMask : nullptr);
       m_goods = ComputeGoodsFlow(m_world, gc, pre);
       m_goodsDirty = false;
@@ -10594,7 +10712,7 @@ void Game::handleInput(float dt)
       constexpr int kPages = 5;
       m_reportPage = (m_reportPage + delta + kPages) % kPages;
     } else if (m_showPolicy) {
-      const int count = 11;
+      const int count = 13;
       m_policySelection = (m_policySelection + delta + count) % count;
     } else if (m_showTrafficModel) {
       const int count = 9;
@@ -10613,7 +10731,7 @@ void Game::handleInput(float dt)
       m_roadUpgradeSelection = (m_roadUpgradeSelection + delta + count) % count;
     } else if (m_showVideoSettings) {
       const int count = (m_videoPage == 0)   ? 11
-                        : (m_videoPage == 1) ? 26
+                        : (m_videoPage == 1) ? 35
                         : (m_videoPage == 2) ? 18
                                              : 11;
       m_videoSelection = (m_videoSelection + delta + count) % count;
@@ -10802,6 +10920,17 @@ void Game::handleInput(float dt)
       GoodsConfig gc;
       gc.requireOutsideConnection = m_sim.config().requireOutsideConnection;
 
+      // Reflect the trade market's current day capacities so the overlay matches
+      // the active simulation rules.
+      const Stats& st = m_world.stats();
+      const TradeModelSettings& ts = m_sim.tradeModel();
+      if (ts.enabled) {
+        gc.allowImports = ts.allowImports;
+        gc.allowExports = ts.allowExports;
+        gc.importCapacityPct = std::clamp(st.tradeImportCapacityPct, 0, 100);
+        gc.exportCapacityPct = std::clamp(st.tradeExportCapacityPct, 0, 100);
+      }
+
       // Goods overlay should respect the sim's outside-connection rule even
       // if the connectivity overlay itself is not being drawn.
       std::vector<std::uint8_t> roadToEdge;
@@ -10899,6 +11028,7 @@ void Game::handleInput(float dt)
       // Policy adjustments
       const int delta = shift ? -5 : -1;
       SimConfig& cfg = m_sim.config();
+      TradeModelSettings& tm = m_sim.tradeModel();
 
       auto clampInt = [&](int v, int lo, int hi) -> int { return std::clamp(v, lo, hi); };
 
@@ -10910,6 +11040,26 @@ void Game::handleInput(float dt)
       case 4: cfg.maintenancePark = clampInt(cfg.maintenancePark + (shift ? -2 : -1), 0, 5); break;
       case 5: cfg.requireOutsideConnection = !cfg.requireOutsideConnection; break;
       case 6: cfg.parkInfluenceRadius = clampInt(cfg.parkInfluenceRadius + (shift ? -2 : -1), 0, 20); break;
+      case 7: tm.enabled = !tm.enabled; break;
+      case 8: tm.allowImports = !tm.allowImports; break;
+      case 9: tm.allowExports = !tm.allowExports; break;
+      case 10: tm.tariffPct = clampInt(tm.tariffPct + delta, 0, 30); break;
+      case 11: {
+        const int count = kDefaultTradePartnerCount;
+        int v = tm.importPartner;
+        if (v < -1) v = -1;
+        v -= 1;
+        if (v < -1) v = count - 1;
+        tm.importPartner = v;
+      } break;
+      case 12: {
+        const int count = kDefaultTradePartnerCount;
+        int v = tm.exportPartner;
+        if (v < -1) v = -1;
+        v -= 1;
+        if (v < -1) v = count - 1;
+        tm.exportPartner = v;
+      } break;
       default: break;
       }
 
@@ -10917,6 +11067,7 @@ void Game::handleInput(float dt)
       m_sim.refreshDerivedStats(m_world);
       m_trafficDirty = true;
       m_goodsDirty = true;
+      m_tradeDirty = true;
       m_landValueDirty = true;
       m_vehiclesDirty = true;
       m_transitPlanDirty = true;
@@ -10949,6 +11100,7 @@ void Game::handleInput(float dt)
       m_sim.refreshDerivedStats(m_world);
       m_trafficDirty = true;
       m_goodsDirty = true;
+      m_tradeDirty = true;
       m_landValueDirty = true;
       m_vehiclesDirty = true;
       m_transitPlanDirty = true;
@@ -11026,6 +11178,7 @@ void Game::handleInput(float dt)
     if (m_showPolicy) {
       const int delta = shift ? 5 : 1;
       SimConfig& cfg = m_sim.config();
+      TradeModelSettings& tm = m_sim.tradeModel();
 
       auto clampInt = [&](int v, int lo, int hi) -> int { return std::clamp(v, lo, hi); };
 
@@ -11037,12 +11190,33 @@ void Game::handleInput(float dt)
       case 4: cfg.maintenancePark = clampInt(cfg.maintenancePark + (shift ? 2 : 1), 0, 5); break;
       case 5: cfg.requireOutsideConnection = !cfg.requireOutsideConnection; break;
       case 6: cfg.parkInfluenceRadius = clampInt(cfg.parkInfluenceRadius + (shift ? 2 : 1), 0, 20); break;
+      case 7: tm.enabled = !tm.enabled; break;
+      case 8: tm.allowImports = !tm.allowImports; break;
+      case 9: tm.allowExports = !tm.allowExports; break;
+      case 10: tm.tariffPct = clampInt(tm.tariffPct + delta, 0, 30); break;
+      case 11: {
+        const int count = kDefaultTradePartnerCount;
+        int v = tm.importPartner;
+        if (v < -1) v = -1;
+        v += 1;
+        if (v >= count) v = -1;
+        tm.importPartner = v;
+      } break;
+      case 12: {
+        const int count = kDefaultTradePartnerCount;
+        int v = tm.exportPartner;
+        if (v < -1) v = -1;
+        v += 1;
+        if (v >= count) v = -1;
+        tm.exportPartner = v;
+      } break;
       default: break;
       }
 
       m_sim.refreshDerivedStats(m_world);
       m_trafficDirty = true;
       m_goodsDirty = true;
+      m_tradeDirty = true;
       m_landValueDirty = true;
       m_vehiclesDirty = true;
       m_transitPlanDirty = true;
@@ -11075,6 +11249,7 @@ void Game::handleInput(float dt)
       m_sim.refreshDerivedStats(m_world);
       m_trafficDirty = true;
       m_goodsDirty = true;
+      m_tradeDirty = true;
       m_landValueDirty = true;
       m_vehiclesDirty = true;
       m_transitPlanDirty = true;
@@ -12339,7 +12514,7 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
   const int panelW = std::max(std::min(panelMaxW, availW), std::min(panelMinW, availW));
   const int rowH = 22;
   const int rows = (m_videoPage == 0)   ? 11
-                   : (m_videoPage == 1) ? 26
+                   : (m_videoPage == 1) ? 35
                    : (m_videoPage == 2) ? 18
                                         : 11;
   const int panelH = 64 + rows * rowH + 28;
@@ -12477,6 +12652,19 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
     drawRow(24, "Ground effects", onOff(wx.affectGround), wx.mode == Renderer::WeatherSettings::Mode::Clear);
     drawRow(25, "Reflect lights", onOff(wx.reflectLights),
             (wx.mode != Renderer::WeatherSettings::Mode::Rain) || (wx.mode == Renderer::WeatherSettings::Mode::Clear));
+
+    // Post FX (stylized)
+    const char* postFxStatus =
+      (!m_postFx.enabled) ? "Off" : (m_postFxPipeline.isReady() ? "On" : "On (fallback)");
+    drawRow(26, "Post FX", postFxStatus);
+    drawRow(27, "Color bits", TextFormat("%d", m_postFx.colorBits), !m_postFx.enabled);
+    drawRow(28, "Dither strength", TextFormat("%.0f%%", m_postFx.ditherStrength * 100.0f), !m_postFx.enabled);
+    drawRow(29, "Film grain", TextFormat("%.0f%%", m_postFx.grain * 100.0f), !m_postFx.enabled);
+    drawRow(30, "Vignette", TextFormat("%.0f%%", m_postFx.vignette * 100.0f), !m_postFx.enabled);
+    drawRow(31, "Chroma aberration", TextFormat("%.0f%%", m_postFx.chroma * 100.0f), !m_postFx.enabled);
+    drawRow(32, "Scanlines", TextFormat("%.0f%%", m_postFx.scanlines * 100.0f), !m_postFx.enabled);
+    drawRow(33, "Include weather", onOff(m_postFx.includeWeather), !m_postFx.enabled);
+    drawRow(34, "Reset Post FX", "Click / ]");
   } else if (m_videoPage == 2) {
     // ----------------------------
     // Atmosphere page
@@ -12851,6 +13039,15 @@ void Game::draw()
       GoodsConfig gc;
       gc.requireOutsideConnection = requireOutside;
 
+      const Stats& st = m_world.stats();
+      const TradeModelSettings& ts = m_sim.tradeModel();
+      if (ts.enabled) {
+        gc.allowImports = ts.allowImports;
+        gc.allowExports = ts.allowExports;
+        gc.importCapacityPct = std::clamp(st.tradeImportCapacityPct, 0, 100);
+        gc.exportCapacityPct = std::clamp(st.tradeExportCapacityPct, 0, 100);
+      }
+
       const std::vector<std::uint8_t>* pre = (gc.requireOutsideConnection ? roadToEdgeMask : nullptr);
       m_goods = ComputeGoodsFlow(m_world, gc, pre);
       m_goodsDirty = false;
@@ -13020,10 +13217,18 @@ void Game::draw()
   const int highlightDistrict = showDistrictOverlay ? std::clamp(m_activeDistrict, 0, kDistrictCount - 1) : -1;
   const bool showDistrictBorders = showDistrictOverlay && m_showDistrictBorders;
 
-  // World pass: optionally render to an offscreen target for resolution scaling.
+  // Screen-space weather (fog/precip). Suppressed in utility overlays for readability.
+  // (Vehicles are drawn inside the world pass so they're affected by day/night + wetness grading.)
+  const bool allowWeatherFx =
+    (outsideMask == nullptr) && (trafficMask == nullptr) && (goodsTrafficMask == nullptr) && (commercialGoodsFill == nullptr) &&
+    (heatmap == nullptr);
+
+  // World pass: optionally render to an offscreen target for resolution scaling (and Post FX).
   if (wantsWorldRenderTarget()) {
     ensureWorldRenderTarget(screenW, screenH);
   }
+
+  bool weatherFxDrawnInWorldRT = false;
 
   auto drawWorldDirect = [&]() {
     std::vector<Renderer::WorldSprite> sprites;
@@ -13069,20 +13274,29 @@ void Game::draw()
                          /*drawAfterFx=*/{},
                          /*sprites=*/sprites.empty() ? nullptr : &sprites);
 
+    // Optional: fold the screen-space weather into the world RT so Post FX affects it.
+    if (m_postFx.enabled && m_postFx.includeWeather) {
+      m_renderer.drawWeatherScreenFX(m_worldRenderRTWidth, m_worldRenderRTHeight, m_timeSec, allowWeatherFx);
+      weatherFxDrawnInWorldRT = true;
+    }
+
     EndTextureMode();
 
     const Rectangle src = {0.0f, 0.0f, static_cast<float>(m_worldRenderRTWidth),
                            -static_cast<float>(m_worldRenderRTHeight)};
     const Rectangle dst = {0.0f, 0.0f, static_cast<float>(screenW), static_cast<float>(screenH)};
-    DrawTexturePro(m_worldRenderRT.texture, src, dst, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+
+    if (m_postFx.enabled && m_postFxPipeline.isReady()) {
+      m_postFxPipeline.drawTexture(
+          m_worldRenderRT.texture, src, dst, m_postFx, m_timeSec, static_cast<std::uint32_t>(m_world.seed()));
+    } else {
+      DrawTexturePro(m_worldRenderRT.texture, src, dst, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+    }
   }
 
-  // Screen-space weather (fog/precip). Suppressed in utility overlays for readability.
-  // (Vehicles are drawn inside the world pass so they're affected by day/night + wetness grading.)
-  const bool allowWeatherFx =
-    (outsideMask == nullptr) && (trafficMask == nullptr) && (goodsTrafficMask == nullptr) && (commercialGoodsFill == nullptr) &&
-    (heatmap == nullptr);
-  m_renderer.drawWeatherScreenFX(screenW, screenH, m_timeSec, allowWeatherFx);
+  if (!weatherFxDrawnInWorldRT) {
+    m_renderer.drawWeatherScreenFX(screenW, screenH, m_timeSec, allowWeatherFx);
+  }
 
   drawBlueprintOverlay();
 
@@ -13276,7 +13490,11 @@ void Game::draw()
   // Policy / budget panel.
   if (m_showPolicy) {
     SimConfig& cfg = m_sim.config();
+    TradeModelSettings& tm = m_sim.tradeModel();
     const Stats& st = m_world.stats();
+
+    // Used for partner names + commodity breakdown.
+    ensureTradeMarketUpToDate();
 
     const int panelW = kPolicyPanelW;
     const int panelH = kPolicyPanelH;
@@ -13296,7 +13514,7 @@ void Game::draw()
     y += 22;
 
     const int rowH = 22;
-    const int rows = 7;
+    const int rows = 13;
     const Rectangle listR{static_cast<float>(x0 + 12), static_cast<float>(y), static_cast<float>(panelW - 24),
                           static_cast<float>(rows * rowH + 8)};
     ui::DrawPanelInset(listR, uiTime, /*active=*/true);
@@ -13371,6 +13589,30 @@ void Game::draw()
       rowY += rowH;
     };
 
+    auto drawCycleRow = [&](int idx, std::string_view label, std::string_view value, auto onClick) {
+      const Rectangle rr = rowRectFor(rowY);
+      if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouseUi, rr)) {
+        m_policySelection = idx;
+      }
+      const bool selected = (m_policySelection == idx);
+      if (selected) ui::DrawSelectionHighlight(rr, uiTime, /*strong=*/true);
+
+      const Color c = selected ? uiTh.text : uiTh.textDim;
+      ui::Text(x, rowY, 16, label, c, /*bold=*/false, /*shadow=*/true, 1);
+
+      const int bw = std::max(110, ui::MeasureTextWidth(value, 16, /*bold=*/true, 1) + 18);
+      const Rectangle br{static_cast<float>(xValueRight - bw),
+                         static_cast<float>(rowY + (rowH - 18) / 2),
+                         static_cast<float>(bw),
+                         18.0f};
+      if (ui::Button(2200 + idx, br, value, mouseUi, uiTime, /*enabled=*/true, /*primary=*/false)) {
+        onClick();
+        changed = true;
+      }
+
+      rowY += rowH;
+    };
+
     drawIntSliderRow(0, "Residential tax", cfg.taxResidential, 0, 10, 1);
     drawIntSliderRow(1, "Commercial tax", cfg.taxCommercial, 0, 10, 1);
     drawIntSliderRow(2, "Industrial tax", cfg.taxIndustrial, 0, 10, 1);
@@ -13378,6 +13620,39 @@ void Game::draw()
     drawIntSliderRow(4, "Park maintenance", cfg.maintenancePark, 0, 5, 1);
     drawToggleRow(5, "Outside connection", cfg.requireOutsideConnection);
     drawIntSliderRow(6, "Park radius", cfg.parkInfluenceRadius, 0, 20, 1);
+
+    drawToggleRow(7, "Trade market", tm.enabled);
+    drawToggleRow(8, "Allow imports", tm.allowImports);
+    drawToggleRow(9, "Allow exports", tm.allowExports);
+    drawIntSliderRow(10, "Tariff %", tm.tariffPct, 0, 30, 1);
+
+    const int partnerCount = static_cast<int>(m_tradeMarket.partners.size());
+    auto partnerName = [&](int p) -> std::string {
+      if (p < 0) return "Auto";
+      if (p >= 0 && p < partnerCount) return m_tradeMarket.partners[static_cast<std::size_t>(p)].name;
+      return "Auto";
+    };
+
+    std::string importLabel = partnerName(tm.importPartner);
+    std::string exportLabel = partnerName(tm.exportPartner);
+
+    drawCycleRow(11, "Import partner", importLabel, [&]() {
+      const int count = std::max(1, partnerCount);
+      int v = tm.importPartner;
+      if (v < -1) v = -1;
+      v += 1;
+      if (v >= count) v = -1;
+      tm.importPartner = v;
+    });
+
+    drawCycleRow(12, "Export partner", exportLabel, [&]() {
+      const int count = std::max(1, partnerCount);
+      int v = tm.exportPartner;
+      if (v < -1) v = -1;
+      v += 1;
+      if (v >= count) v = -1;
+      tm.exportPartner = v;
+    });
 
     if (changed) {
       // Policies affect derived stats and several overlays.
@@ -13409,6 +13684,35 @@ void Game::draw()
     y += 18;
     ui::Text(x, y, 16, TextFormat("Land %.0f%%  Demand %.0f%%  Tax/cap %.2f", st.avgLandValue * 100.0f,
                                   st.demandResidential * 100.0f, static_cast<double>(st.avgTaxPerCapita)),
+             uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
+
+    y += 18;
+    // Trade market snapshot (procedural partners + daily pricing).
+    const int impIdx = st.tradeImportPartner;
+    const int expIdx = st.tradeExportPartner;
+    auto partnerByIdx = [&](int idx) -> std::string {
+      if (idx < 0) return "None";
+      if (idx >= 0 && idx < static_cast<int>(m_tradeMarket.partners.size())) {
+        std::string n = m_tradeMarket.partners[static_cast<std::size_t>(idx)].name;
+        if (n.size() > 14) {
+          n = n.substr(0, 14);
+          n += "...";
+        }
+        return n;
+      }
+      return "None";
+    };
+
+    std::string impName = partnerByIdx(impIdx);
+    std::string expName = partnerByIdx(expIdx);
+    if (st.tradeImportDisrupted) impName += " !";
+    if (st.tradeExportDisrupted) expName += " !";
+
+    ui::Text(x, y, 16,
+             TextFormat("Mkt %.0f%%  Cap %d/%d  I:%s  E:%s",
+                        static_cast<double>(st.tradeMarketIndex * 100.0f),
+                        st.tradeImportCapacityPct, st.tradeExportCapacityPct,
+                        impName.c_str(), expName.c_str()),
              uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
   }
 
@@ -14501,6 +14805,15 @@ void Game::draw()
       if (m_goodsDirty) {
         GoodsConfig gc;
         gc.requireOutsideConnection = render3d_requireOutside;
+
+        const Stats& st = m_world.stats();
+        const TradeModelSettings& ts = m_sim.tradeModel();
+        if (ts.enabled) {
+          gc.allowImports = ts.allowImports;
+          gc.allowExports = ts.allowExports;
+          gc.importCapacityPct = std::clamp(st.tradeImportCapacityPct, 0, 100);
+          gc.exportCapacityPct = std::clamp(st.tradeExportCapacityPct, 0, 100);
+        }
         const std::vector<std::uint8_t>* pre = (gc.requireOutsideConnection ? render3d_roadToEdgeMask : nullptr);
         m_goods = ComputeGoodsFlow(m_world, gc, pre);
         m_goodsDirty = false;
