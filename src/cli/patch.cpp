@@ -1,9 +1,12 @@
 #include "isocity/Hash.hpp"
 #include "isocity/SaveLoad.hpp"
 #include "isocity/WorldPatch.hpp"
+#include "isocity/WorldPatchJson.hpp"
 
 #include <cstdint>
 #include <cstdlib>
+#include <cctype>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -24,13 +27,16 @@ std::string HexU64(std::uint64_t v)
 void PrintHelp()
 {
   std::cout
-      << "proc_isocity_patch (binary save patch tool)\n\n"
+      << "proc_isocity_patch (save patch tool: binary .patch or JSON .patch.json)\n\n"
       << "Usage:\n"
-      << "  proc_isocity_patch make    <base.bin> <target.bin> <out.patch> [options]\n"
-      << "  proc_isocity_patch apply   <base.bin> <patch>      <out.bin>   [options]\n"
-      << "  proc_isocity_patch invert  <base.bin> <patch>      <out.patch> [options]\n"
-      << "  proc_isocity_patch compose <base.bin> <patchA> <patchB> ... <out.patch> [options]\n"
-      << "  proc_isocity_patch info    <patch>\n\n"
+      << "  proc_isocity_patch make    <base.bin> <target.bin> <out.patch|out.patch.json> [options]\n"
+      << "  proc_isocity_patch apply   <base.bin> <patch(.patch|.json)> <out.bin>          [options]\n"
+      << "  proc_isocity_patch invert  <base.bin> <patch(.patch|.json)> <out.patch|.json> [options]\n"
+      << "  proc_isocity_patch compose <base.bin> <patchA> <patchB> ... <out.patch|.json> [options]\n"
+      << "  proc_isocity_patch info    <patch(.patch|.json)>\n\n"
+      << "Notes:\n"
+      << "  - Input patch format is auto-detected (extension and/or file sniff).\n"
+      << "  - Output patch format is chosen by the output filename extension ('.json' => JSON).\n\n"
       << "Make/Compose options:\n"
       << "  --no-proc         Do not embed ProcGenConfig in the output patch.\n"
       << "  --no-sim          Do not embed SimConfig in the output patch.\n"
@@ -50,6 +56,62 @@ void PrintHelp()
 bool IsOption(const std::string& a)
 {
   return !a.empty() && a[0] == '-';
+}
+
+bool EndsWithCaseInsensitive(const std::string& s, const std::string& suffix)
+{
+  if (suffix.size() > s.size()) return false;
+  const std::size_t off = s.size() - suffix.size();
+  for (std::size_t i = 0; i < suffix.size(); ++i) {
+    const unsigned char a = static_cast<unsigned char>(s[off + i]);
+    const unsigned char b = static_cast<unsigned char>(suffix[i]);
+    if (std::tolower(a) != std::tolower(b)) return false;
+  }
+  return true;
+}
+
+bool LooksLikeJsonPatchPath(const std::string& path)
+{
+  // We intentionally keep this simple: any .json output will be JSON.
+  return EndsWithCaseInsensitive(path, ".json");
+}
+
+bool LooksLikeJsonPatchFile(const std::string& path)
+{
+  // Extension is the strongest signal.
+  if (LooksLikeJsonPatchPath(path)) return true;
+
+  // Otherwise sniff first non-whitespace char.
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return false;
+  char c = 0;
+  while (f.get(c)) {
+    if (std::isspace(static_cast<unsigned char>(c)) != 0) continue;
+    return c == '{' || c == '[';
+  }
+  return false;
+}
+
+WorldPatchCompression CompressionFromFlag(bool compress)
+{
+  return compress ? WorldPatchCompression::SLLZ : WorldPatchCompression::None;
+}
+
+bool LoadWorldPatchAuto(WorldPatch& outPatch, const std::string& path, std::string& outError)
+{
+  if (LooksLikeJsonPatchFile(path)) {
+    return LoadWorldPatchJson(outPatch, path, outError);
+  }
+  return LoadWorldPatchBinary(outPatch, path, outError);
+}
+
+bool SaveWorldPatchAuto(const WorldPatch& patch, const std::string& path, std::string& outError,
+                        WorldPatchCompression compression)
+{
+  if (LooksLikeJsonPatchPath(path)) {
+    return SaveWorldPatchJson(patch, path, outError);
+  }
+  return SaveWorldPatchBinary(patch, path, outError, compression);
 }
 
 } // namespace
@@ -131,8 +193,8 @@ int main(int argc, char** argv)
       return 3;
     }
 
-    const WorldPatchCompression comp = compress ? WorldPatchCompression::SLLZ : WorldPatchCompression::None;
-    if (!SaveWorldPatchBinary(patch, outPatchPath, err, comp)) {
+    const WorldPatchCompression comp = CompressionFromFlag(compress);
+    if (!SaveWorldPatchAuto(patch, outPatchPath, err, comp)) {
       std::cerr << "Save patch failed: " << err << "\n";
       return 3;
     }
@@ -188,7 +250,7 @@ int main(int argc, char** argv)
     }
 
     WorldPatch patch;
-    if (!LoadWorldPatchBinary(patch, patchPath, err)) {
+    if (!LoadWorldPatchAuto(patch, patchPath, err)) {
       std::cerr << "Load patch failed: " << err << "\n";
       return 2;
     }
@@ -257,7 +319,7 @@ int main(int argc, char** argv)
     }
 
     WorldPatch fwd;
-    if (!LoadWorldPatchBinary(fwd, patchPath, err)) {
+    if (!LoadWorldPatchAuto(fwd, patchPath, err)) {
       std::cerr << "Load patch failed: " << err << "\n";
       return 2;
     }
@@ -268,8 +330,8 @@ int main(int argc, char** argv)
       return 3;
     }
 
-    const WorldPatchCompression comp = compress ? WorldPatchCompression::SLLZ : WorldPatchCompression::None;
-    if (!SaveWorldPatchBinary(inv, outPatchPath, err, comp)) {
+    const WorldPatchCompression comp = CompressionFromFlag(compress);
+    if (!SaveWorldPatchAuto(inv, outPatchPath, err, comp)) {
       std::cerr << "Save inverted patch failed: " << err << "\n";
       return 3;
     }
@@ -362,7 +424,7 @@ int main(int argc, char** argv)
 
     for (const std::string& p : files) {
       WorldPatch wp;
-      if (!LoadWorldPatchBinary(wp, p, err)) {
+      if (!LoadWorldPatchAuto(wp, p, err)) {
         std::cerr << "Load patch failed (" << p << "): " << err << "\n";
         return 2;
       }
@@ -376,8 +438,8 @@ int main(int argc, char** argv)
       return 3;
     }
 
-    const WorldPatchCompression comp = compress ? WorldPatchCompression::SLLZ : WorldPatchCompression::None;
-    if (!SaveWorldPatchBinary(composed, outPatchPath, err, comp)) {
+    const WorldPatchCompression comp = CompressionFromFlag(compress);
+    if (!SaveWorldPatchAuto(composed, outPatchPath, err, comp)) {
       std::cerr << "Save composed patch failed: " << err << "\n";
       return 3;
     }
@@ -405,7 +467,7 @@ int main(int argc, char** argv)
     const std::string patchPath = argv[2];
     WorldPatch patch;
     std::string err;
-    if (!LoadWorldPatchBinary(patch, patchPath, err)) {
+    if (!LoadWorldPatchAuto(patch, patchPath, err)) {
       std::cerr << "Load patch failed: " << err << "\n";
       return 2;
     }

@@ -53,9 +53,10 @@ bool ParseProcGenDistrictingMode(const std::string& s, ProcGenDistrictingMode& o
 // This influences how hubs are connected at the macro scale before the
 // street subdivision and road hierarchy upgrade passes run.
 enum class ProcGenRoadLayout : std::uint8_t {
-  Organic = 0, // Existing default: MST backbone + local loops.
-  Grid = 1,    // Manhattan-like arterial grid with hubs snapped onto it.
-  Radial = 2   // Hub-and-spoke with an outer ring / beltway bias.
+  Organic = 0,           // Existing default: MST backbone + local loops.
+  Grid = 1,              // Manhattan-like arterial grid with hubs snapped onto it.
+  Radial = 2,            // Hub-and-spoke with an outer ring / beltway bias.
+  SpaceColonization = 3, // Branching arterial growth guided by attractor points ("space colonization" style).
 };
 
 // Human-readable name (stable for saves/CLI).

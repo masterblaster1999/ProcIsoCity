@@ -1541,7 +1541,7 @@ static bool CmdProc(ScriptRunnerState& ctx, ScriptRunner& runner, const std::vec
   if (key == "roadlayout" || key == "road_layout") {
     ProcGenRoadLayout layout{};
     if (!ParseProcGenRoadLayout(val, layout)) {
-      return runner.fail(path, lineNo, "unknown road_layout (try: organic|grid|radial)");
+      return runner.fail(path, lineNo, "unknown road_layout (try: organic|grid|radial|space_colonization)");
     }
     ctx.procCfg.roadLayout = layout;
     return true;

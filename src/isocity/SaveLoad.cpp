@@ -531,7 +531,7 @@ void FromBinV12(ProcGenConfig& cfg, const ProcGenConfigBinV12& b)
   cfg.districtingMode = static_cast<ProcGenDistrictingMode>(modeU8);
 
   std::uint8_t layoutU8 = b.roadLayout;
-  if (layoutU8 > static_cast<std::uint8_t>(ProcGenRoadLayout::Radial)) {
+  if (layoutU8 > static_cast<std::uint8_t>(ProcGenRoadLayout::SpaceColonization)) {
     layoutU8 = static_cast<std::uint8_t>(ProcGenRoadLayout::Organic);
   }
   cfg.roadLayout = static_cast<ProcGenRoadLayout>(layoutU8);

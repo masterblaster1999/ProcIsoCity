@@ -53,6 +53,7 @@
 #include "isocity/Road.hpp"
 #include "isocity/WorldDiff.hpp"
 #include "isocity/WorldPatch.hpp"
+#include "isocity/WorldPatchJson.hpp"
 #include "isocity/WorldTransform.hpp"
 #include "isocity/FloodFill.hpp"
 #include "isocity/World.hpp"
@@ -911,6 +912,70 @@ void TestSaveV8UsesCompressionForLargeDeltaPayload()
   EXPECT_EQ(loaded.at(loaded.width() - 1, loaded.height() - 1).overlay, Overlay::Road);
 }
 
+
+
+void TestProcGenRoadLayoutSpaceColonizationDeterminismAndConnectivity()
+{
+  using namespace isocity;
+
+  ProcGenRoadLayout m{};
+  EXPECT_TRUE(ParseProcGenRoadLayout("space_colonization", m));
+  EXPECT_EQ(m, ProcGenRoadLayout::SpaceColonization);
+  EXPECT_EQ(std::string(ToString(m)), std::string("space_colonization"));
+
+  ProcGenConfig cfg{};
+  cfg.hubs = 6;
+  cfg.extraConnections = 2;
+  cfg.roadLayout = ProcGenRoadLayout::SpaceColonization;
+
+  const std::uint64_t seed = 0x12345678u;
+
+  World w = GenerateWorld(48, 48, seed, cfg);
+  World w2 = GenerateWorld(48, 48, seed, cfg);
+
+  EXPECT_EQ(HashWorld(w, true), HashWorld(w2, true));
+
+  int roadTiles = 0;
+  for (int y = 0; y < w.height(); ++y) {
+    for (int x = 0; x < w.width(); ++x) {
+      if (w.at(x, y).overlay == Overlay::Road) ++roadTiles;
+    }
+  }
+  EXPECT_TRUE(roadTiles > 50);
+
+  RoadGraph g = BuildRoadGraph(w);
+  EXPECT_TRUE(!g.nodes.empty());
+
+  // Connectivity check on the road graph.
+  const int n = static_cast<int>(g.nodes.size());
+  std::vector<char> vis(static_cast<std::size_t>(n), 0);
+  int comps = 0;
+
+  for (int i = 0; i < n; ++i) {
+    if (vis[static_cast<std::size_t>(i)]) continue;
+    ++comps;
+    std::vector<int> stack;
+    stack.push_back(i);
+    vis[static_cast<std::size_t>(i)] = 1;
+
+    while (!stack.empty()) {
+      const int cur = stack.back();
+      stack.pop_back();
+
+      for (const int eIdx : g.nodes[static_cast<std::size_t>(cur)].edges) {
+        if (eIdx < 0 || eIdx >= static_cast<int>(g.edges.size())) continue;
+        const RoadGraphEdge& e = g.edges[static_cast<std::size_t>(eIdx)];
+        const int other = (e.a == cur) ? e.b : e.a;
+        if (other < 0 || other >= n) continue;
+        if (vis[static_cast<std::size_t>(other)]) continue;
+        vis[static_cast<std::size_t>(other)] = 1;
+        stack.push_back(other);
+      }
+    }
+  }
+
+  EXPECT_EQ(comps, 1);
+}
 
 void TestSaveLoadBytesRoundTrip()
 {
@@ -3738,6 +3803,7 @@ void TestWorldPatchRoundTrip()
   // Also change configs so the patch can transport them.
   ProcGenConfig targetProc = baseProc;
   targetProc.hubs = 7;
+  targetProc.roadLayout = ProcGenRoadLayout::Grid;
   SimConfig targetSim = baseSim;
   targetSim.taxResidential = 9;
   targetSim.districtPoliciesEnabled = true;
@@ -3774,9 +3840,92 @@ void TestWorldPatchRoundTrip()
 
   // Metadata should have been transported (since included).
   EXPECT_EQ(appliedProc.hubs, targetProc.hubs);
+  EXPECT_EQ(appliedProc.roadLayout, targetProc.roadLayout);
   EXPECT_EQ(appliedSim.taxResidential, targetSim.taxResidential);
   EXPECT_TRUE(appliedSim.districtPoliciesEnabled == targetSim.districtPoliciesEnabled);
   EXPECT_TRUE(appliedSim.districtPolicies[1].taxResidentialMult == targetSim.districtPolicies[1].taxResidentialMult);
+}
+
+void TestWorldPatchJsonRoundTrip()
+{
+  using namespace isocity;
+
+  // Deterministic base world.
+  World base(16, 16, 123u);
+  base.stats().money = 50000;
+
+  ProcGenConfig baseProc{};
+  SimConfig baseSim{};
+  baseSim.requireOutsideConnection = false;
+
+  Simulator simBase(baseSim);
+  simBase.refreshDerivedStats(base);
+
+  // Create a target state with a few edits.
+  World target = base;
+  target.stats().money = 60000;
+
+  // Road + zoning + district paint.
+  target.applyRoad(2, 2, 1);
+  target.applyRoad(3, 2, 1);
+  target.applyRoad(4, 2, 1);
+  target.setOverlay(Overlay::Commercial, 3, 3);
+  target.applyDistrict(1, 1, 2);
+  target.at(0, 0).height = 0.25f;
+
+  ProcGenConfig targetProc = baseProc;
+  targetProc.hubs = 5;
+  targetProc.roadLayout = ProcGenRoadLayout::Grid;
+
+  SimConfig targetSim = baseSim;
+  targetSim.taxIndustrial = 11;
+  targetSim.districtPoliciesEnabled = true;
+  targetSim.districtPolicies[2].taxCommercialMult = 0.85f;
+
+  Simulator simTarget(targetSim);
+  simTarget.refreshDerivedStats(target);
+
+  WorldPatch patch;
+  std::string err;
+  EXPECT_TRUE(MakeWorldPatch(base, baseProc, baseSim, target, targetProc, targetSim, patch, err, true, true, true));
+  EXPECT_TRUE(err.empty());
+  EXPECT_TRUE(!patch.tiles.empty());
+
+  // JSON file round-trip.
+  const fs::path tmpPatchJson = fs::temp_directory_path() / "isocity_patch_roundtrip.isopatch.json";
+  EXPECT_TRUE(SaveWorldPatchJson(patch, tmpPatchJson.string(), err));
+  EXPECT_TRUE(err.empty());
+
+  WorldPatch loaded;
+  EXPECT_TRUE(LoadWorldPatchJson(loaded, tmpPatchJson.string(), err));
+  EXPECT_TRUE(err.empty());
+
+  World applied = base;
+  ProcGenConfig appliedProc = baseProc;
+  SimConfig appliedSim = baseSim;
+  EXPECT_TRUE(ApplyWorldPatch(applied, appliedProc, appliedSim, loaded, err, false));
+  EXPECT_TRUE(err.empty());
+
+  EXPECT_EQ(HashWorld(applied, true), HashWorld(target, true));
+  const WorldDiffStats d = DiffWorldTiles(applied, target, 0.0f);
+  EXPECT_EQ(d.tilesDifferent, 0);
+
+  EXPECT_EQ(appliedProc.hubs, targetProc.hubs);
+  EXPECT_EQ(appliedProc.roadLayout, targetProc.roadLayout);
+  EXPECT_EQ(appliedSim.taxIndustrial, targetSim.taxIndustrial);
+  EXPECT_TRUE(appliedSim.districtPoliciesEnabled == targetSim.districtPoliciesEnabled);
+  EXPECT_TRUE(appliedSim.districtPolicies[2].taxCommercialMult == targetSim.districtPolicies[2].taxCommercialMult);
+
+  // In-memory round-trip.
+  std::string json;
+  EXPECT_TRUE(SerializeWorldPatchJson(patch, json, err));
+  EXPECT_TRUE(err.empty());
+  WorldPatch loaded2;
+  EXPECT_TRUE(DeserializeWorldPatchJson(loaded2, json, err));
+  EXPECT_TRUE(err.empty());
+  EXPECT_EQ(loaded2.baseHash, patch.baseHash);
+  EXPECT_EQ(loaded2.targetHash, patch.targetHash);
+  EXPECT_EQ(loaded2.tiles.size(), patch.tiles.size());
 }
 
 void TestWorldPatchRejectsMismatchedBaseHash()
@@ -7301,6 +7450,7 @@ int main()
   TestTrafficCongestionRespectsRoadClassCapacity();
   TestTrafficCongestionAwareSplitsParallelRoutes();
   TestSaveLoadRoundTrip();
+  TestProcGenRoadLayoutSpaceColonizationDeterminismAndConnectivity();
   TestSaveLoadBytesRoundTrip();
   TestSLLZCompressionRoundTrip();
   TestJsonUnicodeEscapesAndStringify();
@@ -7350,6 +7500,7 @@ int main()
   TestSimulationDeterministicHashAfterTicks();
   TestWorldDiffCounts();
   TestWorldPatchRoundTrip();
+  TestWorldPatchJsonRoundTrip();
   TestWorldPatchRejectsMismatchedBaseHash();
   TestWorldPatchInvertAndCompose();
   TestConfigJsonIO();

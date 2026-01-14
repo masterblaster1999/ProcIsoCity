@@ -185,15 +185,17 @@ inline bool MaskHas(std::uint8_t mask, TileFieldMask bit)
 
 bool WriteProcCfg(ByteWriter& w, const ProcGenConfig& cfg, std::uint32_t patchVersion)
 {
-  if (!(w.writeF32(cfg.terrainScale) &&
-        w.writeF32(cfg.waterLevel) &&
-        w.writeF32(cfg.sandLevel) &&
-        w.writeI32(static_cast<std::int32_t>(cfg.hubs)) &&
-        w.writeI32(static_cast<std::int32_t>(cfg.extraConnections)) &&
-        w.writeF32(cfg.zoneChance) &&
-        w.writeF32(cfg.parkChance))) {
-    return false;
+  if (!w.writeF32(cfg.terrainScale)) return false;
+  if (!w.writeF32(cfg.waterLevel)) return false;
+  if (!w.writeF32(cfg.sandLevel)) return false;
+  if (!w.writeI32(static_cast<std::int32_t>(cfg.hubs))) return false;
+  if (!w.writeI32(static_cast<std::int32_t>(cfg.extraConnections))) return false;
+  // v5+: include road layout (was accidentally omitted from prior patch versions).
+  if (patchVersion >= 5) {
+    if (!w.writeU8(static_cast<std::uint8_t>(cfg.roadLayout))) return false;
   }
+  if (!w.writeF32(cfg.zoneChance)) return false;
+  if (!w.writeF32(cfg.parkChance)) return false;
 
   // v2+: include erosion settings so delta saves/patches can deterministically regenerate the same terrain.
   if (patchVersion >= 2) {
@@ -242,6 +244,15 @@ bool ReadProcCfg(ByteReader& r, ProcGenConfig& cfg, std::uint32_t patchVersion)
   if (!r.readI32(extra)) return false;
   cfg.hubs = static_cast<int>(hubs);
   cfg.extraConnections = static_cast<int>(extra);
+  if (patchVersion >= 5) {
+    std::uint8_t roadLayout = 0;
+    if (!r.readU8(roadLayout)) return false;
+    // Defensive clamp so corrupted/unknown patches don't produce UB when the enum grows.
+    if (roadLayout > static_cast<std::uint8_t>(ProcGenRoadLayout::SpaceColonization)) {
+      roadLayout = static_cast<std::uint8_t>(ProcGenRoadLayout::Organic);
+    }
+    cfg.roadLayout = static_cast<ProcGenRoadLayout>(roadLayout);
+  }
   if (!r.readF32(cfg.zoneChance)) return false;
   if (!r.readF32(cfg.parkChance)) return false;
 
@@ -526,7 +537,7 @@ bool ReadStats(ByteReader& r, Stats& s)
 //   u8  compressionMethod (WorldPatchCompression)
 //   u32 payloadSize (uncompressed)
 //   u32 payloadSizeCompressed
-inline constexpr std::uint32_t kPatchVersion = 4;
+inline constexpr std::uint32_t kPatchVersion = 5;
 inline constexpr std::uint8_t kMagic[8] = { 'I','S','O','P','A','T','C','H' };
 
 enum PatchFlags : std::uint32_t {

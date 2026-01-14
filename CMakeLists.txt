@@ -68,6 +68,7 @@ add_library(isocity_core
   src/isocity/Replay.cpp
   src/isocity/ReplayCapture.cpp
   src/isocity/WorldPatch.cpp
+  src/isocity/WorldPatchJson.cpp
   src/isocity/World.cpp
   src/isocity/WorldDiff.cpp
   src/isocity/WorldTransform.cpp

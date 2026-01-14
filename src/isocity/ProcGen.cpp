@@ -122,6 +122,7 @@ const char* ToString(ProcGenRoadLayout m)
   case ProcGenRoadLayout::Organic: return "organic";
   case ProcGenRoadLayout::Grid: return "grid";
   case ProcGenRoadLayout::Radial: return "radial";
+  case ProcGenRoadLayout::SpaceColonization: return "space_colonization";
   default: return "organic";
   }
 }
@@ -146,6 +147,13 @@ bool ParseProcGenRoadLayout(const std::string& s, ProcGenRoadLayout& out)
   if (eq("radial") || eq("ring") || eq("spoke") || eq("spokes") || eq("hubspoke") || eq("hub_spoke") ||
       eq("hub-and-spoke") || eq("hub_and_spoke")) {
     out = ProcGenRoadLayout::Radial;
+    return true;
+  }
+
+
+  if (eq("space_colonization") || eq("space-colonization") || eq("spacecolonization") || eq("space") ||
+      eq("colonization") || eq("colonisation") || eq("sca") || eq("sc")) {
+    out = ProcGenRoadLayout::SpaceColonization;
     return true;
   }
 
@@ -303,6 +311,7 @@ static bool WorldHasAnyWater(const World& world)
   }
   return false;
 }
+
 
 // Add a small number of inland lakes by flooding large drainage basins.
 //
@@ -1361,6 +1370,283 @@ static void CarveHubConnectionsRadial(World& world, RNG& rng, const std::vector<
     }
   }
 }
+
+// Space-colonization-style arterial growth.
+//
+// This mode uses an "attractor point" growth process (inspired by the space
+// colonization algorithm used for biological branching) to grow arterial roads
+// outward from the initial hub network.
+//
+// High-level goals:
+//  - produce branching, tree-like arterial spines that explore the map
+//  - remain deterministic and terrain-aware (reusing the existing road router)
+//  - keep road density bounded (small number of attractors + fixed step)
+static void CarveHubConnectionsSpaceColonization(World& world, RNG& rng, const std::vector<P>& hubPts,
+                                                std::uint32_t seed32, const ProcGenConfig& cfg)
+{
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return;
+  if (hubPts.empty()) return;
+
+  // First, ensure global hub connectivity with the "organic" backbone.
+  // (MST backbone + a few deterministic loops).
+  CarveHubConnectionsOrganic(world, rng, hubPts, seed32 ^ 0x5C010C01u, cfg);
+
+  const int minDim = std::min(w, h);
+
+  // --- Parameters (heuristic, but deterministic) ---
+  const int influenceR = std::clamp(minDim / 2, 18, 52);
+  const int killR = std::clamp(minDim / 32, 3, 6);
+  const int step = std::clamp(minDim / 24, 3, 6);
+
+  // Attractor density: keep it sparse so the road network stays readable.
+  const int area = w * h;
+  const int targetAttractors = std::clamp(area / 160, 40, 240);
+  const int minAttractorSep = std::clamp(minDim / 14, 4, 9);
+
+  auto hasRoadInRadius = [&](int x, int y, int r) {
+    for (int dy = -r; dy <= r; ++dy) {
+      for (int dx = -r; dx <= r; ++dx) {
+        const int nx = x + dx;
+        const int ny = y + dy;
+        if (!world.inBounds(nx, ny)) continue;
+        if (std::abs(dx) + std::abs(dy) > r) continue;
+        if (world.at(nx, ny).overlay == Overlay::Road) return true;
+      }
+    }
+    return false;
+  };
+
+  // --- Sample attractor points on buildable, currently-empty land away from existing roads ---
+  std::vector<P> attractors;
+  attractors.reserve(static_cast<std::size_t>(targetAttractors));
+
+  const int avoidRoadR = 2;
+  const int maxTries = std::max(4000, targetAttractors * 120);
+
+  for (int tries = 0; tries < maxTries && static_cast<int>(attractors.size()) < targetAttractors; ++tries) {
+    const int x = rng.rangeInt(0, w - 1);
+    const int y = rng.rangeInt(0, h - 1);
+
+    if (!world.isBuildable(x, y)) continue;
+    const Tile& t = world.at(x, y);
+    if (t.overlay != Overlay::None) continue;
+
+    // Avoid the map edge so arterials don't just "hug" the boundary.
+    const int edgeDist = std::min(std::min(x, w - 1 - x), std::min(y, h - 1 - y));
+    if (edgeDist < 2) continue;
+
+    // Avoid sampling directly adjacent to roads so growth explores new areas.
+    if (hasRoadInRadius(x, y, avoidRoadR)) continue;
+
+    // Lightweight Poisson-disc-ish spacing.
+    bool ok = true;
+    for (const P& a : attractors) {
+      if (std::abs(a.x - x) + std::abs(a.y - y) < minAttractorSep) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) continue;
+
+    attractors.push_back({x, y});
+  }
+
+  if (attractors.empty()) {
+    // Nothing to grow toward.
+    return;
+  }
+
+  // --- Initial growth nodes: hubs + a downsampled set of existing arterials ---
+  std::vector<P> nodes;
+  nodes.reserve(static_cast<std::size_t>(hubPts.size()) + 256u);
+
+  auto addNodeIfFar = [&](P p, int minSep) {
+    if (!world.inBounds(p.x, p.y)) return;
+    for (const P& n : nodes) {
+      if (std::abs(n.x - p.x) + std::abs(n.y - p.y) <= minSep) return;
+    }
+    nodes.push_back(p);
+  };
+
+  for (const P& h0 : hubPts) {
+    addNodeIfFar(h0, /*minSep=*/1);
+  }
+
+  // Sample existing avenue/highway tiles as additional branching seeds.
+  // This makes growth able to branch from the backbone, not only from hubs.
+  const int sampleDiv = std::clamp(minDim / 6, 9, 16);
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const Tile& t = world.at(x, y);
+      if (t.overlay != Overlay::Road) continue;
+      if (ClampRoadLevel(static_cast<int>(t.level)) < 2) continue;
+      const std::uint32_t hh = HashCoords32(x, y, seed32 ^ 0x5EED5EEDu);
+      if ((hh % static_cast<std::uint32_t>(sampleDiv)) != 0u) continue;
+      addNodeIfFar({x, y}, /*minSep=*/step);
+    }
+  }
+
+  if (nodes.empty()) {
+    return;
+  }
+
+  struct Vec2 {
+    float x = 0.0f;
+    float y = 0.0f;
+  };
+
+  auto dist2 = [](P a, P b) {
+    const int dx = a.x - b.x;
+    const int dy = a.y - b.y;
+    return dx * dx + dy * dy;
+  };
+
+  const int influenceR2 = influenceR * influenceR;
+  const int killR2 = killR * killR;
+
+  // --- Growth loop ---
+  const int maxIters = std::clamp(area / 64, 200, 1400);
+
+  for (int iter = 0; iter < maxIters && !attractors.empty(); ++iter) {
+    std::vector<Vec2> acc(nodes.size());
+    std::vector<int> cnt(nodes.size(), 0);
+
+    bool anyAssigned = false;
+
+    // Assign each attractor to its nearest node (within influence radius).
+    for (const P& a : attractors) {
+      int bestIdx = -1;
+      int bestD2 = std::numeric_limits<int>::max();
+
+      for (int i = 0; i < static_cast<int>(nodes.size()); ++i) {
+        const P n = nodes[static_cast<std::size_t>(i)];
+        const int dx = a.x - n.x;
+        const int dy = a.y - n.y;
+        const int d2 = dx * dx + dy * dy;
+        if (d2 > influenceR2) continue;
+        if (d2 < bestD2) {
+          bestD2 = d2;
+          bestIdx = i;
+        }
+      }
+
+      if (bestIdx >= 0 && bestD2 > 0) {
+        anyAssigned = true;
+        const P n = nodes[static_cast<std::size_t>(bestIdx)];
+        const float fx = static_cast<float>(a.x - n.x);
+        const float fy = static_cast<float>(a.y - n.y);
+        const float len = std::sqrt(fx * fx + fy * fy);
+        if (len > 0.0001f) {
+          acc[static_cast<std::size_t>(bestIdx)].x += fx / len;
+          acc[static_cast<std::size_t>(bestIdx)].y += fy / len;
+          cnt[static_cast<std::size_t>(bestIdx)] += 1;
+        }
+      }
+    }
+
+    if (!anyAssigned) {
+      break;
+    }
+
+    std::vector<P> newNodes;
+    newNodes.reserve(nodes.size() / 2 + 8u);
+
+    // Spawn one growth step from each influenced node.
+    for (int i = 0; i < static_cast<int>(nodes.size()); ++i) {
+      const int c = cnt[static_cast<std::size_t>(i)];
+      if (c <= 0) continue;
+
+      Vec2 dir = acc[static_cast<std::size_t>(i)];
+      dir.x /= static_cast<float>(c);
+      dir.y /= static_cast<float>(c);
+
+      // Convert to a grid step.
+      const float ax = std::fabs(dir.x);
+      const float ay = std::fabs(dir.y);
+
+      int sx = 0;
+      int sy = 0;
+
+      if (ax > ay) {
+        sx = (dir.x > 0.0f) ? 1 : -1;
+      } else if (ay > ax) {
+        sy = (dir.y > 0.0f) ? 1 : -1;
+      } else {
+        // Deterministic tiebreak when the direction is near-diagonal.
+        const std::uint32_t t = HashCoords32(nodes[static_cast<std::size_t>(i)].x, nodes[static_cast<std::size_t>(i)].y,
+                                             seed32 ^ static_cast<std::uint32_t>(iter) ^ 0x51AB1E5u);
+        if (t & 1u) {
+          sx = (dir.x >= 0.0f) ? 1 : -1;
+        } else {
+          sy = (dir.y >= 0.0f) ? 1 : -1;
+        }
+      }
+
+      if (sx == 0 && sy == 0) continue;
+
+      const P cur = nodes[static_cast<std::size_t>(i)];
+      P target{cur.x + sx * step, cur.y + sy * step};
+      target.x = std::clamp(target.x, 1, std::max(1, w - 2));
+      target.y = std::clamp(target.y, 1, std::max(1, h - 2));
+
+      // Snap to a nearby suitable tile (land + empty/road).
+      P snapped = target;
+      if (!FindNearestWaypointTile(world, target.x, target.y, /*maxR=*/3, /*allowWater=*/false,
+                                  seed32 ^ HashCoords32(cur.x, cur.y, static_cast<std::uint32_t>(iter) ^ 0xC01A1E5u),
+                                  snapped)) {
+        continue;
+      }
+
+      // Avoid spawning duplicate / extremely close nodes.
+      bool dup = false;
+      for (const P& n : nodes) {
+        if (std::abs(n.x - snapped.x) + std::abs(n.y - snapped.y) <= 1) {
+          dup = true;
+          break;
+        }
+      }
+      if (dup) continue;
+
+      // Carve a new avenue-class arterial segment.
+      CarveRoadCurvy(world, rng, cur, snapped, /*level=*/2, /*allowBridges=*/false,
+                    seed32 ^ HashCoords32(cur.x, cur.y, static_cast<std::uint32_t>(iter) ^ 0x5CA1E5u));
+
+      // Only accept the node if the carve actually created a road at the target.
+      if (world.inBounds(snapped.x, snapped.y) && world.at(snapped.x, snapped.y).overlay == Overlay::Road) {
+        newNodes.push_back(snapped);
+      }
+    }
+
+    if (newNodes.empty()) {
+      break;
+    }
+
+    // Commit new nodes.
+    for (const P& p : newNodes) {
+      addNodeIfFar(p, /*minSep=*/1);
+    }
+
+    // Prune attractors that have been reached.
+    std::vector<P> kept;
+    kept.reserve(attractors.size());
+
+    for (const P& a : attractors) {
+      bool reached = false;
+      for (const P& n : nodes) {
+        if (dist2(a, n) <= killR2) {
+          reached = true;
+          break;
+        }
+      }
+      if (!reached) kept.push_back(a);
+    }
+
+    attractors.swap(kept);
+  }
+}
+
 
 
 // -----------------------------
@@ -4363,13 +4649,16 @@ World GenerateWorld(int width, int height, std::uint64_t seed, const ProcGenConf
     CarveHubGrid(world, rng, h);
   }
 
-    // Connect hubs using the selected macro road layout.
+  // Connect hubs using the selected macro road layout.
   switch (cfg.roadLayout) {
   case ProcGenRoadLayout::Grid:
     CarveHubConnectionsGrid(world, rng, hubPts, seed32, cfg);
     break;
   case ProcGenRoadLayout::Radial:
     CarveHubConnectionsRadial(world, rng, hubPts, seed32, cfg);
+    break;
+  case ProcGenRoadLayout::SpaceColonization:
+    CarveHubConnectionsSpaceColonization(world, rng, hubPts, seed32, cfg);
     break;
   case ProcGenRoadLayout::Organic:
   default:
