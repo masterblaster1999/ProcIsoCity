@@ -1127,7 +1127,7 @@ void Game::setupDevConsole()
           return;
         }
 
-        m_wayfindingRoute = RouteBetweenEndpoints(m_world, m_wayfindingStreets, from.addr, to.addr);
+        m_wayfindingRoute = RouteBetweenEndpoints(m_world, m_wayfindingStreets, from.endpoint, to.endpoint);
         m_wayfindingFocusManeuver = -1;
         m_wayfindingFocusPath.clear();
         m_wayfindingManeuverFirst = 0;
@@ -1209,7 +1209,7 @@ void Game::setupDevConsole()
             const bool ok = m_pov.startFromPath(
                 m_world, m_wayfindingRoute.pathTiles, markers,
                 static_cast<float>(m_cfg.tileWidth), static_cast<float>(m_cfg.tileHeight), m_elev,
-                m_camera, GetScreenWidth(), GetScreenHeight(), static_cast<std::uint32_t>(m_world.seed));
+                m_camera, GetScreenWidth(), GetScreenHeight(), static_cast<std::uint32_t>(m_world.seed()));
             if (ok) {
               showToast("POV ride started", 2.0f);
             } else {
@@ -1286,7 +1286,7 @@ void Game::setupDevConsole()
           const bool ok = m_pov.startFromPath(
               m_world, m_wayfindingRoute.pathTiles, markers,
               static_cast<float>(m_cfg.tileWidth), static_cast<float>(m_cfg.tileHeight), m_elev,
-              m_camera, GetScreenWidth(), GetScreenHeight(), static_cast<std::uint32_t>(m_world.seed));
+              m_camera, GetScreenWidth(), GetScreenHeight(), static_cast<std::uint32_t>(m_world.seed()));
           showToast(ok ? "POV route started" : "POV failed", 2.0f);
           return;
         }
@@ -1306,7 +1306,7 @@ void Game::setupDevConsole()
           const bool ok = m_pov.startFromTour(
               m_world, tour,
               static_cast<float>(m_cfg.tileWidth), static_cast<float>(m_cfg.tileHeight), m_elev,
-              m_camera, GetScreenWidth(), GetScreenHeight(), static_cast<std::uint32_t>(tour.seed ? tour.seed : m_world.seed));
+              m_camera, GetScreenWidth(), GetScreenHeight(), static_cast<std::uint32_t>(tour.seed ? tour.seed : m_world.seed()));
           showToast(ok ? "POV tour started" : "POV tour failed", 2.4f);
           return;
         }
@@ -10932,10 +10932,12 @@ void Game::drawWayfindingOverlay() {
   const ParcelAddress& from = m_wayfindingRoute.from;
   const ParcelAddress& to = m_wayfindingRoute.to;
 
-  const Vector2 fromWs = TileToWorldCenterElevated(from.roadTile.x, from.roadTile.y, m_world, static_cast<float>(m_cfg.tileWidth),
-                                                  static_cast<float>(m_cfg.tileHeight), m_elev);
-  const Vector2 toWs = TileToWorldCenterElevated(to.roadTile.x, to.roadTile.y, m_world, static_cast<float>(m_cfg.tileWidth),
-                                                static_cast<float>(m_cfg.tileHeight), m_elev);
+  const Vector2 fromWs = TileToWorldCenterElevated(
+      m_world, from.roadTile.x, from.roadTile.y,
+      static_cast<float>(m_cfg.tileWidth), static_cast<float>(m_cfg.tileHeight), m_elev);
+  const Vector2 toWs = TileToWorldCenterElevated(
+      m_world, to.roadTile.x, to.roadTile.y,
+      static_cast<float>(m_cfg.tileWidth), static_cast<float>(m_cfg.tileHeight), m_elev);
 
   BeginMode2D(m_camera);
 
@@ -10983,7 +10985,9 @@ void Game::drawWayfindingPanel(int x0, int y0) {
     const char* tip = "No active route.\n"
                       "Try: route \"x,y\" \"x,y\"\n"
                       "Or: route \"street1 & street2\" \"street3 & street4\"";
-    ui::TextBox(x, y, panelW - 24, 54, 14, tip, uiTh.text, false, true, 1.0f, true);
+    ui::TextBox(Rectangle{static_cast<float>(x), static_cast<float>(y), static_cast<float>(panelW - 24), 54.0f},
+                14, tip, uiTh.text, /*bold=*/false, /*shadow=*/true, /*spacingPx=*/1,
+                /*wrap=*/true, /*clip=*/true);
     y += 62;
   }
 
@@ -10992,13 +10996,17 @@ void Game::drawWayfindingPanel(int x0, int y0) {
     const std::string summary = TextFormat("From: %s\nTo: %s\nSteps: %d    Tiles: %d", m_wayfindingRoute.from.full.c_str(),
                                            m_wayfindingRoute.to.full.c_str(), static_cast<int>(m_wayfindingRoute.maneuvers.size()),
                                            static_cast<int>(m_wayfindingRoute.pathTiles.size()));
-    ui::TextBox(x, y, panelW - 24, 56, 14, summary, uiTh.text, false, true, 1.0f, true);
+    ui::TextBox(Rectangle{static_cast<float>(x), static_cast<float>(y), static_cast<float>(panelW - 24), 56.0f},
+                14, summary, uiTh.text, /*bold=*/false, /*shadow=*/true, /*spacingPx=*/1,
+                /*wrap=*/true, /*clip=*/true);
     y += 64;
   }
 
   // Procedural POV controls (works even without a route).
   {
-    const int boxH = 238;
+    // This panel is intentionally "dense"; we keep it self-contained so the
+    // maneuver list below remains stable.
+    const int boxH = 300;
     const Rectangle boxR{static_cast<float>(x0 + 10), static_cast<float>(y), static_cast<float>(panelW - 20), static_cast<float>(boxH)};
     ui::DrawPanelInset(boxR, uiTime);
 
@@ -11043,7 +11051,7 @@ void Game::drawWayfindingPanel(int x0, int y0) {
         const bool ok = m_pov.startFromPath(
             m_world, m_wayfindingRoute.pathTiles, markers, static_cast<float>(m_cfg.tileWidth),
             static_cast<float>(m_cfg.tileHeight), m_elev, m_camera, GetScreenWidth(), GetScreenHeight(),
-            static_cast<std::uint32_t>(m_world.seed));
+            static_cast<std::uint32_t>(m_world.seed()));
 
         showToast(ok ? "POV ride started" : "POV failed to start", 2.0f);
       }
@@ -11060,7 +11068,7 @@ void Game::drawWayfindingPanel(int x0, int y0) {
 
       const bool ok = m_pov.startFromTour(
           m_world, tour, static_cast<float>(m_cfg.tileWidth), static_cast<float>(m_cfg.tileHeight), m_elev,
-          m_camera, GetScreenWidth(), GetScreenHeight(), static_cast<std::uint32_t>(tour.seed ? tour.seed : m_world.seed));
+          m_camera, GetScreenWidth(), GetScreenHeight(), static_cast<std::uint32_t>(tour.seed ? tour.seed : m_world.seed()));
 
       showToast(ok ? "POV tour started" : "POV tour could not be generated", 2.0f);
     }
@@ -11100,9 +11108,33 @@ void Game::drawWayfindingPanel(int x0, int y0) {
     ui::SliderFloat(7617, scenicR, m_povRoamCfg.scenicBias, 0.0f, 1.0f, mouseUi, uiTime, true);
     sy += 34;
 
+    // Revisit penalty.
+    ui::Text(sx, sy, 13, TextFormat("Revisit penalty: %.2f", m_povRoamCfg.revisitPenalty), uiTh.textDim, false, true, 1);
+    const Rectangle revisitR{static_cast<float>(sx), static_cast<float>(sy + 16), static_cast<float>(sw), 14.0f};
+    ui::SliderFloat(7618, revisitR, m_povRoamCfg.revisitPenalty, 0.0f, 1.25f, mouseUi, uiTime, true);
+    sy += 34;
+
+    // Dead-end avoidance toggle.
+    const Rectangle deadR{static_cast<float>(sx), static_cast<float>(sy), 34.0f, 16.0f};
+    const Rectangle deadLabelR{deadR.x + deadR.width + 6.0f, deadR.y, 120.0f, deadR.height};
+    const bool deadChanged = ui::Toggle(7619, deadR, m_povRoamCfg.avoidDeadEnds, mouseUi, uiTime, true);
+    ui::Text(static_cast<int>(std::lround(deadLabelR.x)), static_cast<int>(std::lround(deadLabelR.y + 1.0f)),
+             13, "Avoid dead ends", uiTh.textDim, false, true, 1);
+    if (!deadChanged && CheckCollisionPointRec(mouseUi, deadLabelR) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+      m_povRoamCfg.avoidDeadEnds = !m_povRoamCfg.avoidDeadEnds;
+    }
+    sy += 22;
+
     // 3D preview toggle.
-    const Rectangle togR{static_cast<float>(sx), static_cast<float>(sy), 120.0f, 16.0f};
-    ui::Toggle(7613, togR, m_povDrive3DPreview, "3D preview", mouseUi, uiTime, true);
+    // ui::Toggle is a "switch" widget; we draw a label alongside it and make the label clickable.
+    const Rectangle togR{static_cast<float>(sx), static_cast<float>(sy), 34.0f, 16.0f};
+    const Rectangle togLabelR{togR.x + togR.width + 6.0f, togR.y, 86.0f, togR.height};
+    const bool togChanged = ui::Toggle(7613, togR, m_povDrive3DPreview, mouseUi, uiTime, true);
+    ui::Text(static_cast<int>(std::lround(togLabelR.x)), static_cast<int>(std::lround(togLabelR.y + 1.0f)),
+             13, "3D preview", uiTh.textDim, false, true, 1);
+    if (!togChanged && CheckCollisionPointRec(mouseUi, togLabelR) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+      m_povDrive3DPreview = !m_povDrive3DPreview;
+    }
 
     y += boxH + 10;
   }
@@ -11134,7 +11166,7 @@ void Game::drawWayfindingPanel(int x0, int y0) {
 
   // Scrollbar.
   const Rectangle scrollR{static_cast<float>(listX + listW - 12), static_cast<float>(listY), 12.0f, static_cast<float>(listH)};
-  (void)ui::ScrollbarV(7602, scrollR, total, view, &m_wayfindingManeuverFirst, mouseUi, uiTime);
+  (void)ui::ScrollbarV(7602, scrollR, total, view, m_wayfindingManeuverFirst, mouseUi, uiTime);
 
   const int textW = listW - 14;
   for (int i = 0; i < view; ++i) {
@@ -11197,8 +11229,8 @@ bool Game::startRoamPov(std::uint32_t seed, int lengthTiles)
 
   // Use selected tile if possible, otherwise use the camera target tile.
   Point hint{m_world.width() / 2, m_world.height() / 2};
-  if (m_selected) {
-    hint = *m_selected;
+  if (m_inspectSelected) {
+    hint = *m_inspectSelected;
   } else {
     if (const auto camTile =
             WorldToTileElevated(m_camera.target, m_world, static_cast<float>(m_cfg.tileWidth),
@@ -11395,7 +11427,7 @@ void Game::updatePov3DPreview(float dt)
   const float yawRad = std::atan2(odz, odx);
   const float pitchRad = std::asin(std::clamp(ody, -1.0f, 1.0f));
 
-  m_3dPreviewCfg.projection = Projection3D::Perspective;
+  m_3dPreviewCfg.projection = Render3DConfig::Projection::Perspective;
   m_3dPreviewCfg.autoFit = false;
   m_3dPreviewCfg.fovYDeg = 75.0f;
   m_3dPreviewCfg.targetX = targetX;

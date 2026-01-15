@@ -44,6 +44,14 @@ struct AddressIndexConfig {
 struct AddressIndex {
   AddressIndexConfig cfg{};
 
+  // Status for callers that want a simple "did the index build" check.
+  //
+  // Notes:
+  //  - An index can be "ok" and still be empty (e.g. a roadless world or a very small map).
+  //  - Geocoding of coordinate endpoints ("x,y") does not require any addresses.
+  bool ok = false;
+  std::string error;
+
   // All parcel addresses (as produced by BuildParcelAddresses()).
   std::vector<ParcelAddress> addresses;
 
@@ -61,6 +69,8 @@ struct AddressIndex {
 
   void clear()
   {
+    ok = false;
+    error.clear();
     addresses.clear();
     streetKeys.clear();
     streetDisplay.clear();

@@ -6038,9 +6038,9 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
           const float alphaF = m_organicSettings.alpha * coverage;
           if (alphaF > 0.01f) {
             const std::uint32_t h = HashCoords32(x, y, m_gfxSeed32 ^ 0xB10u);
-            const int vcount = std::max(1, m_organicMaterial.variants());
+            const int vcount = std::max(1, OrganicMaterial::kVariants);
             const int variant = static_cast<int>(h % static_cast<std::uint32_t>(vcount));
-            const Texture2D& tex = m_organicMaterial.texture(variant);
+            const Texture2D& tex = m_organicMaterial.variantTex(variant);
 
             Color tint = WHITE;
             switch (m_organicSettings.style) {
@@ -6052,7 +6052,7 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
 
             const float wetBoost = 0.90f + 0.25f * weather.wetness;
             float brightnessK = 0.65f + 0.35f * dayNight.sun;
-            if (m_organicSettings.bioluminescentAtNight && (dayNight.nightLights > 0.001f)) {
+            if (m_organicSettings.glowAtNight && (dayNight.nightLights > 0.001f)) {
               brightnessK += dayNight.nightLights * m_organicSettings.glowStrength;
             }
             tint = Mul(tint, wetBoost * brightnessK);
@@ -6065,9 +6065,9 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
 
             tint.a = ClampU8(static_cast<int>(alphaF * 255.0f));
 
-            const Rectangle src = {0.0f, 0.0f, static_cast<float>(tex.width), static_cast<float>(tex.height)};
-            const Rectangle dst = {center.x - 0.5f * tileWf, center.y - 0.5f * tileHf, tileWf, tileHf};
-            DrawTexturePro(tex, src, dst, Vector2{0, 0}, 0.0f, tint);
+            const Rectangle srcR = {0.0f, 0.0f, static_cast<float>(tex.width), static_cast<float>(tex.height)};
+            const Rectangle dstR = {center.x - 0.5f * tileWf, center.y - 0.5f * tileHf, tileWf, tileHf};
+            DrawTexturePro(tex, srcR, dstR, Vector2{0, 0}, 0.0f, tint);
           }
         }
 

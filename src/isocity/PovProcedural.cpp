@@ -34,7 +34,7 @@ int RoadDegree4(const World& world, Point p) {
 float ScenicScore8(const World& world, Point p) {
   // Simple local heuristic:
   //  - nearby water is highly scenic
-  //  - parks and civic buildings are mildly scenic
+  //  - parks and lively zones (commercial/residential frontage) are mildly scenic
   //  - higher local elevation variation is scenic
   float s = 0.0f;
 
@@ -60,9 +60,18 @@ float ScenicScore8(const World& world, Point p) {
       if (t.overlay == Overlay::Park) {
         s += 1.0f;
       }
-      if (t.overlay == Overlay::Market || t.overlay == Overlay::School || t.overlay == Overlay::Hospital ||
-          t.overlay == Overlay::Stadium) {
+
+      // Land-use scenicness.
+      //
+      // The simulation's overlay set is currently zone-focused (Residential/Commercial/Industrial/Park)
+      // rather than explicit "poi" types (market/school/hospital/etc). We still want the roam
+      // generator to prefer "lively" areas over purely industrial corridors.
+      if (t.overlay == Overlay::Commercial) {
         s += 0.6f;
+      } else if (t.overlay == Overlay::Residential) {
+        s += 0.25f;
+      } else if (t.overlay == Overlay::Industrial) {
+        s -= 0.35f;
       }
 
       const int dh = std::abs(static_cast<int>(t.height) - h0);
@@ -111,7 +120,7 @@ int ChooseIndexWeighted(const std::vector<float>& weights, RNG& rng) {
     return 0;
   }
 
-  float r = rng.uniform01() * sum;
+  float r = rng.nextF01() * sum;
   for (int i = 0; i < static_cast<int>(weights.size()); ++i) {
     r -= std::max(0.0f, weights[i]);
     if (r <= 0.0f) {
@@ -174,6 +183,27 @@ std::vector<Point> GeneratePovRoamPath(const World& world, Point startHint, cons
 
   RNG rng(seed);
 
+  // Lightweight visit counting so long cruises prefer exploring new territory.
+  const int w = world.width();
+  const int h = world.height();
+  const std::size_t area = static_cast<std::size_t>(std::max(0, w)) * static_cast<std::size_t>(std::max(0, h));
+  std::vector<std::uint8_t> visit(area, 0);
+  auto idxOf = [&](Point p) -> std::size_t {
+    return static_cast<std::size_t>(p.y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(p.x);
+  };
+  int uniqueCount = 0;
+  auto markVisit = [&](Point p) {
+    const std::size_t idx = idxOf(p);
+    if (idx < visit.size()) {
+      if (visit[idx] == 0) {
+        ++uniqueCount;
+      }
+      if (visit[idx] < 255) {
+        ++visit[idx];
+      }
+    }
+  };
+
   Point start = startHint;
   if (!FindNearestRoadTile(world, startHint, std::max(1, cfg.findRoadRadius), start)) {
     start = RandomRoadTile(world, rng);
@@ -186,6 +216,7 @@ std::vector<Point> GeneratePovRoamPath(const World& world, Point startHint, cons
 
   path.reserve(static_cast<std::size_t>(cfg.length));
   path.push_back(start);
+  markVisit(start);
 
   Point prev = start;
   Point cur = start;
@@ -195,6 +226,9 @@ std::vector<Point> GeneratePovRoamPath(const World& world, Point startHint, cons
 
   int restarts = 0;
   int failIters = 0;
+  int uTurns = 0;
+  int deadEndSteps = 0;
+  double scenicSum = 0.0;
 
   const auto considerRestart = [&]() {
     ++restarts;
@@ -202,6 +236,7 @@ std::vector<Point> GeneratePovRoamPath(const World& world, Point startHint, cons
     prev = cur;
     prevDir = Point{0, 0};
     path.push_back(cur);
+    markVisit(cur);
     failIters = 0;
   };
 
@@ -266,13 +301,21 @@ std::vector<Point> GeneratePovRoamPath(const World& world, Point startHint, cons
       // Scenic bias.
       score += c.scenic * (2.0f * cfg.scenicBias);
 
+      // Revisit penalty (encourages exploration on long loops).
+      if (cfg.revisitPenalty > 0.0f && !visit.empty()) {
+        const std::uint8_t v = visit[idxOf(c.p)];
+        if (v > 0) {
+          score -= cfg.revisitPenalty * std::min(8.0f, std::sqrt(static_cast<float>(v)));
+        }
+      }
+
       // Dead-end avoidance.
       if (cfg.avoidDeadEnds && c.deg <= 1) {
         score -= 3.0f;
       }
 
       // Mild noise so we don't get stuck in deterministic patterns.
-      score += (rng.uniform01() - 0.5f) * 0.35f;
+      score += (rng.nextF01() - 0.5f) * 0.35f;
 
       // Convert score -> weight. Clamp to avoid overflow.
       const float w = std::exp(std::max(-8.0f, std::min(8.0f, score)));
@@ -280,20 +323,28 @@ std::vector<Point> GeneratePovRoamPath(const World& world, Point startHint, cons
     }
 
     const int idx = ChooseIndexWeighted(weights, rng);
-    const Point next = cand[static_cast<std::size_t>(idx)].p;
-    const Point nextDir = cand[static_cast<std::size_t>(idx)].dir;
+    const Cand& chosen = cand[static_cast<std::size_t>(idx)];
+    const Point next = chosen.p;
+    const Point nextDir = chosen.dir;
 
     // Track failures: if we keep ping-ponging, restart.
     if (next.x == prev.x && next.y == prev.y) {
       ++failIters;
+      ++uTurns;
     } else {
       failIters = 0;
+    }
+
+    scenicSum += static_cast<double>(chosen.scenic);
+    if (chosen.deg <= 1) {
+      ++deadEndSteps;
     }
 
     prev = cur;
     cur = next;
     prevDir = nextDir;
     path.push_back(cur);
+    markVisit(cur);
 
     if (failIters > cfg.maxFailIters) {
       considerRestart();
@@ -302,8 +353,22 @@ std::vector<Point> GeneratePovRoamPath(const World& world, Point startHint, cons
 
   if (outDebug) {
     std::ostringstream oss;
-    oss << "RoamPath: tiles=" << path.size() << " start=(" << start.x << "," << start.y << ")"
-        << " seed=" << seed << " restarts=" << restarts;
+    const int tiles = static_cast<int>(path.size());
+    const float uniquePct = (tiles > 0) ? (100.0f * static_cast<float>(uniqueCount) / static_cast<float>(tiles)) : 0.0f;
+    const float avgScenic = (tiles > 1)
+                                ? static_cast<float>(scenicSum / static_cast<double>(std::max(1, tiles - 1)))
+                                : 0.0f;
+
+    oss.setf(std::ios::fixed);
+    oss.precision(2);
+    oss << "RoamPath: tiles=" << tiles
+        << " unique=" << uniqueCount << " (" << uniquePct << "%)"
+        << " start=(" << start.x << "," << start.y << ")"
+        << " seed=" << seed
+        << " restarts=" << restarts
+        << " uturns=" << uTurns
+        << " deadEnds=" << deadEndSteps
+        << " avgScenic=" << avgScenic;
     *outDebug = oss.str();
   }
 

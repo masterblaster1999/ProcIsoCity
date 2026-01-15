@@ -24,6 +24,12 @@ struct PovRoamConfig {
   // How strongly to bias towards scenic tiles [0..1].
   float scenicBias = 0.35f;
 
+  // Penalize revisiting the same tiles to keep long cruises exploratory.
+  //
+  // This is applied as a soft score penalty proportional to the square-root of a tile's
+  // visit count (0 disables the behavior).
+  float revisitPenalty = 0.20f;
+
   // Penalize candidates that would lead into dead-ends.
   bool avoidDeadEnds = true;
 
