@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <type_traits>
 
 // Some build configurations may not expose GL_GEOMETRY_SHADER even though the
 // runtime driver supports it (it is core in OpenGL 3.2+). Define it defensively.
@@ -113,9 +114,29 @@ static GLuint BuildProgramWithGeometry(const char* vsCode, const char* gsCode, c
 static Shader MakeRaylibShaderFromProgram(GLuint programId)
 {
   Shader sh{};
+  if (programId == 0) return sh;
+
   sh.id = programId;
 
-  // Mark all built-in locations as invalid; then fill the one we need.
+  // raylib has used two different representations for Shader::locs over time:
+  //   - older: a fixed array embedded directly in the Shader struct
+  //   - newer: an `int*` heap allocation owned/freed by raylib (UnloadShader)
+  //
+  // This helper must work with either, otherwise we risk a nullptr write and an
+  // immediate access violation during init.
+  if constexpr (std::is_pointer_v<std::remove_reference_t<decltype(sh.locs)>>) {
+    if (sh.locs == nullptr) {
+      sh.locs = static_cast<int*>(MemAlloc(RL_MAX_SHADER_LOCATIONS * sizeof(int)));
+    }
+    if (sh.locs == nullptr) {
+      // Out of memory: avoid leaking the raw GL program.
+      glDeleteProgram(programId);
+      sh.id = 0;
+      return sh;
+    }
+  }
+
+  // Mark all built-in locations as invalid; then fill the ones we need.
   for (int i = 0; i < RL_MAX_SHADER_LOCATIONS; ++i) {
     sh.locs[i] = -1;
   }
@@ -294,16 +315,50 @@ void GpuRibbonPathRenderer::init()
 {
   shutdown();
 
+  // Avoid touching OpenGL entry points if init is called before raylib has
+  // created a graphics context.
+  if (!IsWindowReady()) {
+    m_ready = false;
+    TraceLog(LOG_WARNING, "[GpuRibbon] init() called before window/context is ready (disabled).");
+    return;
+  }
+
+  // Geometry shaders are core in OpenGL 3.2+. If the current context is older,
+  // don't even try to compile the program.
+  GLint major = 0;
+  GLint minor = 0;
+  glGetIntegerv(GL_MAJOR_VERSION, &major);
+  glGetIntegerv(GL_MINOR_VERSION, &minor);
+  if (major > 0 && (major < 3 || (major == 3 && minor < 2))) {
+    m_ready = false;
+    TraceLog(LOG_WARNING, "[GpuRibbon] OpenGL %d.%d < 3.2 (no geometry shader support).", major, minor);
+    return;
+  }
+
+
   // Attempt to compile the geometry-shader program. If it fails, we keep the
   // renderer disabled (safe fallback to CPU path highlights).
   std::string log;
   const GLuint prog = BuildProgramWithGeometry(kRibbonVS, kRibbonGS, kRibbonFS, log);
   if (prog == 0) {
     m_ready = false;
+    if (!log.empty()) {
+      TraceLog(LOG_WARNING, "[GpuRibbon] Geometry shader program failed to compile/link:\n%s", log.c_str());
+    } else {
+      TraceLog(LOG_WARNING, "[GpuRibbon] Geometry shader program failed to compile/link (no log).");
+    }
     return;
   }
 
   m_shader = MakeRaylibShaderFromProgram(prog);
+
+  // If we couldn't create a valid raylib Shader wrapper (e.g. Shader::locs
+  // allocation failed), disable gracefully.
+  if (m_shader.id == 0) {
+    m_ready = false;
+    TraceLog(LOG_WARNING, "[GpuRibbon] Failed to wrap GL program into raylib Shader (disabled).");
+    return;
+  }
 
   m_locScreenSize = GetShaderLocation(m_shader, "u_screenSize");
   m_locThickness = GetShaderLocation(m_shader, "u_thickness");
@@ -315,9 +370,26 @@ void GpuRibbonPathRenderer::init()
   m_locDashDuty = GetShaderLocation(m_shader, "u_dashDuty");
   m_locFlowStrength = GetShaderLocation(m_shader, "u_flowStrength");
 
-  // We use vertex color for tinting; ensure the pipeline provides something
-  // meaningful by default.
+  bool ok = true;
+  const auto requireLoc = [&](int loc, const char* name) {
+    if (loc < 0) {
+      TraceLog(LOG_ERROR, "[GpuRibbon] Missing uniform '%s' (shader disabled).", name);
+      ok = false;
+    }
+  };
+
+  // These uniforms are required for correct positioning and animation.
+  requireLoc(m_locScreenSize, "u_screenSize");
+  requireLoc(m_locThickness, "u_thickness");
+  requireLoc(m_locTime, "u_time");
+
+  if (!ok) {
+    shutdown();
+    return;
+  }
+
   m_ready = true;
+  TraceLog(LOG_INFO, "[GpuRibbon] Enabled (geometry shader path ribbons).");
 }
 
 void GpuRibbonPathRenderer::shutdown()

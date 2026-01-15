@@ -7221,21 +7221,97 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
       DrawLineEx(corners[3], corners[0], thick, c);
     };
 
-    if (highlightPathEff && !highlightPathEff->empty()) {
-      // Prefer the GPU ribbon (geometry shader) for smoother, cheaper path highlights.
-      // Fallback to the legacy per-tile outline if the backend can't compile geometry shaders.
-      if (m_gpuRibbon.isReady() && highlightPathEff->size() >= 2) {
-        m_pathRibbonScratch.clear();
-        m_pathRibbonScratch.reserve(highlightPathEff->size());
+    const auto drawPolylineRibbonFallback = [&](const std::vector<Vector2>& pts, Color base, const RibbonStyle& st) {
+      if (pts.size() < 2) return;
 
-        for (const Point& p : *highlightPathEff) {
-          if (!world.inBounds(p.x, p.y)) continue;
-          const Tile& tt = world.at(p.x, p.y);
-          const float elevPx = TileElevationPx(tt, m_elev);
-          const Vector2 baseC = TileToWorldCenter(p.x, p.y, tileWf, tileHf);
-          m_pathRibbonScratch.push_back(Vector2{baseC.x, baseC.y - elevPx});
+      // In Mode2D, coordinates are in world-space pixels. To keep the ribbon
+      // thickness stable in screen pixels we scale by 1/zoom.
+      const float z = std::max(0.25f, camera.zoom);
+      const float invZ = 1.0f / z;
+
+      const auto withAlphaMul = [](Color c, float mul) -> Color {
+        mul = std::clamp(mul, 0.0f, 1.0f);
+        const float a = (static_cast<float>(c.a) / 255.0f) * mul;
+        int ia = static_cast<int>(std::lround(a * 255.0f));
+        ia = std::clamp(ia, 0, 255);
+        c.a = static_cast<unsigned char>(ia);
+        return c;
+      };
+
+      // --- Glow pass (additive) ---
+      if (st.glowAlpha > 0.001f && st.glowThicknessPx > 0.01f) {
+        BeginBlendMode(BLEND_ADDITIVE);
+        const float thick = st.glowThicknessPx * invZ;
+        const Color glow = withAlphaMul(base, st.glowAlpha);
+
+        for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
+          DrawLineEx(pts[i], pts[i + 1], thick, glow);
         }
 
+        EndBlendMode();
+      }
+
+      // --- Core pass (dashed) ---
+      if (st.coreAlpha <= 0.001f || st.coreThicknessPx <= 0.01f) return;
+
+      const float thick = st.coreThicknessPx * invZ;
+      const float dashLen = std::max(2.0f, st.dashLengthPx) * invZ;
+      const float dashSpeed = st.dashSpeedPx * invZ;
+      const float duty = std::clamp(st.dashDuty, 0.0f, 1.0f);
+      const float onLen = dashLen * duty;
+
+      const Color coreOn = withAlphaMul(base, st.coreAlpha);
+      const Color coreOff = withAlphaMul(base, st.coreAlpha * 0.25f);
+
+      const float phase = (dashLen > 1e-3f) ? std::fmod(timeSec * dashSpeed, dashLen) : 0.0f;
+      float pos = -phase;
+
+      for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
+        const Vector2 a = pts[i];
+        const Vector2 b = pts[i + 1];
+        const float dx = b.x - a.x;
+        const float dy = b.y - a.y;
+        const float segLen = std::sqrt(dx * dx + dy * dy);
+        if (segLen < 1e-3f) continue;
+
+        const float invLen = 1.0f / segLen;
+        const Vector2 dir = Vector2{dx * invLen, dy * invLen};
+
+        Vector2 cur = a;
+        float remaining = segLen;
+
+        while (remaining > 1e-3f) {
+          float mod = std::fmod(pos, dashLen);
+          if (mod < 0.0f) mod += dashLen;
+
+          const float periodRemain = dashLen - mod;
+          const float step = std::min(remaining, periodRemain);
+          const Vector2 next = Vector2{cur.x + dir.x * step, cur.y + dir.y * step};
+
+          const bool on = (mod < onLen);
+          DrawLineEx(cur, next, thick, on ? coreOn : coreOff);
+
+          cur = next;
+          remaining -= step;
+          pos += step;
+        }
+      }
+    };
+
+    if (highlightPathEff && !highlightPathEff->empty()) {
+      // Build a world-space polyline for the highlighted path.
+      m_pathRibbonScratch.clear();
+      m_pathRibbonScratch.reserve(highlightPathEff->size());
+
+      for (const Point& p : *highlightPathEff) {
+        if (!world.inBounds(p.x, p.y)) continue;
+        const Tile& tt = world.at(p.x, p.y);
+        const float elevPx = TileElevationPx(tt, m_elev);
+        const Vector2 baseC = TileToWorldCenter(p.x, p.y, tileWf, tileHf);
+        m_pathRibbonScratch.push_back(Vector2{baseC.x, baseC.y - elevPx});
+      }
+
+      if (m_pathRibbonScratch.size() >= 2) {
         RibbonStyle st;
         // Keep the ribbon thickness mostly stable in screen pixels, with a mild
         // boost when zoomed out so it remains readable.
@@ -7250,9 +7326,16 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
         st.dashDuty = 0.60f;
         st.flowStrength = 0.35f;
 
-        m_gpuRibbon.drawPath(m_pathRibbonScratch, screenW, screenH, timeSec, Color{255, 215, 0, 255}, st,
-                             /*additiveBlend=*/true);
+        // Prefer the GPU ribbon (geometry shader) for smoother, cheaper path highlights.
+        // Fallback to a CPU-drawn dashed polyline if the backend can't compile geometry shaders.
+        if (m_gpuRibbon.isReady()) {
+          m_gpuRibbon.drawPath(m_pathRibbonScratch, screenW, screenH, timeSec, Color{255, 215, 0, 255}, st,
+                               /*additiveBlend=*/true);
+        } else {
+          drawPolylineRibbonFallback(m_pathRibbonScratch, Color{255, 215, 0, 255}, st);
+        }
       } else {
+        // Degenerate path: fall back to tile outlines (keeps behavior consistent with old builds).
         for (const Point& p : *highlightPathEff) {
           drawOutline(p.x, p.y, Color{255, 215, 0, 110});
         }
