@@ -2,6 +2,7 @@
 
 #include "isocity/Random.hpp"
 #include "isocity/GfxBuildings.hpp"
+#include "isocity/GfxFacilities.hpp"
 #include "isocity/GfxProps.hpp"
 #include "isocity/GfxPacker.hpp"
 
@@ -1013,6 +1014,47 @@ bool GenerateGfxTileset(const GfxTilesetConfig& cfg, GfxTilesetResult& out, std:
     if (!addKind(GfxBuildingKind::Residential, "res")) return false;
     if (!addKind(GfxBuildingKind::Commercial, "com")) return false;
     if (!addKind(GfxBuildingKind::Industrial, "ind")) return false;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Civic / service facility sprites (schools / clinics / police / fire).
+  // ---------------------------------------------------------------------------
+
+  if (cfg.includeFacilities && cfg.facilityVariants > 0) {
+    GfxFacilitiesConfig fcfg;
+    fcfg.tileW = cfg.tileW;
+    fcfg.tileH = cfg.tileH;
+    fcfg.spriteH = cfg.facilitySpriteH;
+    fcfg.includeEmissive = cfg.includeEmissive;
+
+    const int variants = std::clamp(cfg.facilityVariants, 1, 64);
+
+    auto addKind = [&](GfxFacilityKind kind, const char* name) {
+      for (int lvl = 1; lvl <= 3; ++lvl) {
+        for (int v = 0; v < variants; ++v) {
+          GfxFacilitySprite fs;
+          std::string err;
+          if (!GenerateGfxFacilitySprite(kind, lvl, v, cfg.seed, fcfg, pal, fs, err)) {
+            outError = "facility sprite generation failed: " + err;
+            return false;
+          }
+
+          Item it;
+          it.name = std::string("facility_") + name + "_L" + std::to_string(lvl) + "_v" + std::to_string(v);
+          it.img = std::move(fs.color);
+          it.emit = std::move(fs.emissive);
+          it.pivotX = fs.pivotX;
+          it.pivotY = fs.pivotY;
+          items.push_back(std::move(it));
+        }
+      }
+      return true;
+    };
+
+    if (!addKind(GfxFacilityKind::Education, "edu")) return false;
+    if (!addKind(GfxFacilityKind::Health, "health")) return false;
+    if (!addKind(GfxFacilityKind::Police, "police")) return false;
+    if (!addKind(GfxFacilityKind::Fire, "fire")) return false;
   }
 
   // ---------------------------------------------------------------------------

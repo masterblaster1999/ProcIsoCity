@@ -131,6 +131,7 @@ void PrintHelp()
       << "  - bridge auto-tiles: levels 1..3, masks 0..15, variants 0..3\n"
       << "  - overlay diamonds: residential/commercial/industrial/park\n"
       << "  - optional building sprites: (kind x level x variants), with pivots\n"
+      << "  - optional facility sprites: education/health/police/fire, with pivots\n"
       << "  - optional prop sprites: trees + streetlights, with pivots\n"
       << "  - optional vehicle sprites: cars + trucks, tile-sized with pivots\n\n"
       << "Usage:\n"
@@ -142,6 +143,7 @@ void PrintHelp()
       << "                       [--tile <WxH>] [--pack <mode>] [--cols <n>] [--pack-width <px>] [--pow2 <0|1>] [--trim <0|1>] [--trim-border <px>] [--pad <n>] [--extrude <px>]\n"
       << "                       [--transitions <0|1>] [--transition-variants <n>]\n"
       << "                       [--buildings <0|1>] [--building-variants <n>] [--building-sprite-h <px>]\n"
+      << "                       [--facilities <0|1>] [--facility-variants <n>] [--facility-sprite-h <px>]\n"
       << "                       [--props <0|1>] [--prop-variants <n>] [--prop-sprite-h <px>]\n"
       << "                       [--vehicles <0|1>] [--vehicle-variants <n>]\n"
       << "                       [--height-from <mode>] [--normal-strength <f>]\n"
@@ -183,6 +185,9 @@ void PrintHelp()
       << "  --buildings <0|1>    Include taller building sprites (default: 0).\n"
       << "  --building-variants <n>  Variants per (kind, level) pair (default: 12).\n"
       << "  --building-sprite-h <px> Fixed sprite canvas height for buildings (default: auto).\n"
+      << "  --facilities <0|1>   Include civic/service facility sprites (default: 0).\n"
+      << "  --facility-variants <n> Variants per (kind, level) pair (default: 8).\n"
+      << "  --facility-sprite-h <px> Fixed sprite canvas height for facilities (default: auto).\n"
       << "  --props <0|1>        Include prop sprites (trees + streetlights) (default: 0).\n"
       << "  --prop-variants <n>  Variants per prop kind (default: 16).\n"
       << "  --prop-sprite-h <px> Fixed canvas height for tall props (default: auto).\n"
@@ -440,6 +445,10 @@ int main(int argc, char** argv)
   int buildingVariants = 12;
   int buildingSpriteH = 0;
 
+  bool facilities = false;
+  int facilityVariants = 8;
+  int facilitySpriteH = 0;
+
   bool props = false;
   int propVariants = 16;
   int propSpriteH = 0;
@@ -684,6 +693,21 @@ int main(int argc, char** argv)
         std::cerr << "Bad --building-sprite-h value\n";
         return 2;
       }
+    } else if (a == "--facilities") {
+      if (!ParseBool01(need("--facilities"), &facilities)) {
+        std::cerr << "Bad --facilities value (expected 0 or 1)\n";
+        return 2;
+      }
+    } else if (a == "--facility-variants") {
+      if (!ParseI32(need("--facility-variants"), &facilityVariants) || facilityVariants < 0) {
+        std::cerr << "Bad --facility-variants value\n";
+        return 2;
+      }
+    } else if (a == "--facility-sprite-h") {
+      if (!ParseI32(need("--facility-sprite-h"), &facilitySpriteH) || facilitySpriteH < 0) {
+        std::cerr << "Bad --facility-sprite-h value\n";
+        return 2;
+      }
     } else if (a == "--props") {
       if (!ParseBool01(need("--props"), &props)) {
         std::cerr << "Bad --props value (expected 0 or 1)\n";
@@ -790,6 +814,10 @@ int main(int argc, char** argv)
   cfg.includeBuildings = buildings;
   cfg.buildingVariants = buildingVariants;
   cfg.buildingSpriteH = buildingSpriteH;
+
+  cfg.includeFacilities = facilities;
+  cfg.facilityVariants = facilityVariants;
+  cfg.facilitySpriteH = facilitySpriteH;
 
   cfg.includeProps = props;
   cfg.propVariants = propVariants;

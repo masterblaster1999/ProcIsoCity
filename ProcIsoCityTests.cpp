@@ -17,6 +17,7 @@
 #include "isocity/Traffic.hpp"
 #include "isocity/Goods.hpp"
 #include "isocity/ParkOptimizer.hpp"
+#include "isocity/ServiceOptimizer.hpp"
 #include "isocity/LandValue.hpp"
 #include "isocity/Replay.hpp"
 #include "isocity/Hash.hpp"
@@ -6869,6 +6870,68 @@ void TestParkOptimizerSuggestsParksInUnderservedAreas()
   EXPECT_EQ(r.placements[0].parkTile.y, 3);
 }
 
+void TestServiceOptimizerSuggestsFacilitiesDeterministic()
+{
+  using namespace isocity;
+
+  // Minimal sanity+determinism test: a simple road spine with a residential demand cluster.
+  // With no existing facilities, the optimizer should propose a single education facility near
+  // the demand and do so deterministically.
+
+  World world(7, 5, 123);
+  world.stats().money = 100000;
+
+  // Road spine at y=2 from x=0..6 (touches the map edge).
+  for (int x = 0; x < world.width(); ++x) {
+    EXPECT_EQ(world.applyRoad(x, 2, 1), ToolApplyResult::Applied);
+  }
+
+  // Residential demand near the right.
+  EXPECT_EQ(world.applyTool(Tool::Residential, 4, 1), ToolApplyResult::Applied);
+  EXPECT_EQ(world.applyTool(Tool::Residential, 5, 1), ToolApplyResult::Applied);
+  world.at(4, 1).occupants = 100;
+  world.at(5, 1).occupants = 100;
+
+  ServicesModelSettings m;
+  m.enabled = true;
+  m.requireOutsideConnection = true;
+  m.weightMode = IsochroneWeightMode::Steps;
+  m.demandMode = ServiceDemandMode::Occupants;
+  m.demandResidential = true;
+  m.demandCommercial = false;
+  m.demandIndustrial = false;
+  m.catchmentRadiusSteps = 12;
+  m.targetAccess = 1.0f;
+
+  ServiceOptimizerConfig cfg;
+  cfg.modelCfg = m;
+  cfg.type = ServiceType::Education;
+  cfg.facilitiesToAdd = 1;
+  cfg.facilityLevel = 2;
+  cfg.candidateLimit = 128;
+  cfg.requireEmptyLand = true;
+  cfg.requireStableAccessRoad = true;
+
+  const ServiceOptimizerResult a = SuggestServiceFacilities(world, cfg);
+  const ServiceOptimizerResult b = SuggestServiceFacilities(world, cfg);
+
+  EXPECT_EQ(a.placements.size(), static_cast<std::size_t>(1));
+  EXPECT_EQ(b.placements.size(), static_cast<std::size_t>(1));
+
+  EXPECT_EQ(a.placements[0].facility.tile.x, b.placements[0].facility.tile.x);
+  EXPECT_EQ(a.placements[0].facility.tile.y, b.placements[0].facility.tile.y);
+  EXPECT_EQ(a.placements[0].accessRoad.x, b.placements[0].accessRoad.x);
+  EXPECT_EQ(a.placements[0].accessRoad.y, b.placements[0].accessRoad.y);
+  EXPECT_TRUE(a.placements[0].marginalGain >= 0.0);
+
+  // Deterministic tie-break places the facility adjacent to the first (lowest-index) road tile
+  // serving the demand cluster.
+  EXPECT_EQ(a.placements[0].accessRoad.x, 4);
+  EXPECT_EQ(a.placements[0].accessRoad.y, 2);
+  EXPECT_EQ(a.placements[0].facility.tile.x, 4);
+  EXPECT_EQ(a.placements[0].facility.tile.y, 3);
+}
+
 
 void TestPolicyOptimizerExhaustivePrefersLowMaintenanceWhenNoRevenue()
 {
@@ -7895,6 +7958,7 @@ int main()
   TestRoadGraphCentralityStarGraph();
   TestRoadBuildPathBetweenSetsRespectsBlockedMoves();
   TestParkOptimizerSuggestsParksInUnderservedAreas();
+  TestServiceOptimizerSuggestsFacilitiesDeterministic();
   TestAutoBuildDeterminism();
   TestAutoBuildZoneClusterGrowsFromSeed();
   TestAutoBuildRoadPlannerBuildsCorridors();

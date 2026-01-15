@@ -83,6 +83,17 @@ struct GfxTilesetConfig {
   // If >0, fixed sprite canvas height for buildings. If 0, derived from tileH.
   int buildingSpriteH = 0;
 
+  // Optional civic/service facility sprites (schools/clinics/police/fire stations).
+  // These are taller, recognizable silhouettes intended to complement simulation tools
+  // like the service optimizer.
+  bool includeFacilities = false;
+
+  // How many deterministic variants to generate for each (kind, level) pair.
+  int facilityVariants = 8;
+
+  // If >0, fixed sprite canvas height for facilities. If 0, derived from tileH.
+  int facilitySpriteH = 0;
+
   // If true, generate an emissive atlas (same layout) with window/sign lighting.
   bool includeEmissive = false;
 

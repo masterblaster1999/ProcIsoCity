@@ -85,6 +85,7 @@ add_library(isocity_core
   src/isocity/TransitPlannerExport.cpp
   src/isocity/Sim.cpp
   src/isocity/Services.cpp
+  src/isocity/ServiceOptimizer.cpp
   src/isocity/FlowField.cpp
   src/isocity/Traffic.cpp
   src/isocity/Goods.cpp
@@ -106,6 +107,7 @@ add_library(isocity_core
   src/isocity/GfxTilesetAtlas.cpp
   src/isocity/GfxPalette.cpp
   src/isocity/GfxBuildings.cpp
+  src/isocity/GfxFacilities.cpp
   src/isocity/GfxProps.cpp
   src/isocity/GfxTileset.cpp
   src/isocity/Heightmap.cpp
@@ -124,6 +126,10 @@ add_library(isocity_core
   src/isocity/PolicyOptimizer.cpp
   src/isocity/PolicyOptimizerExport.cpp
   src/isocity/ZoneParcels.cpp
+  src/isocity/StreetNames.cpp
+  src/isocity/Cartography.cpp
+  src/isocity/TourPlanner.cpp
+  src/isocity/Wayfinding.cpp
   src/isocity/Json.cpp
   src/isocity/ConfigIO.cpp
 )
@@ -411,6 +417,47 @@ if (PROCISOCITY_BUILD_CLI)
 
   procisocity_set_strict_warnings(proc_isocity_roadgraph)
 
+  # Street naming + parcel addressing (headless): deterministic street names and addresses.
+  add_executable(proc_isocity_streetnames
+    src/cli/streetnames.cpp
+  )
+
+  target_include_directories(proc_isocity_streetnames PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_streetnames PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_streetnames)
+
+  # Cartography poster exporter: labeled isometric overview (streets + districts) -> PNG/JSON.
+  add_executable(proc_isocity_cartography
+    src/cli/cartography.cpp
+  )
+
+  target_include_directories(proc_isocity_cartography PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_cartography PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_cartography)
+
+  # Wayfinding tool (headless): geocode addresses/intersections and emit turn-by-turn routes.
+  add_executable(proc_isocity_wayfind
+    src/cli/wayfind.cpp
+  )
+
+  target_include_directories(proc_isocity_wayfind PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_wayfind PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_wayfind)
+
+  # Tour guide tool (headless): synthesize POIs and generate a walkable itinerary + poster.
+  add_executable(proc_isocity_tour
+    src/cli/tour.cpp
+  )
+
+  target_include_directories(proc_isocity_tour PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_tour PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_tour)
+
+
   # Pathfinding tool (headless): query paths on the road/land grid and road-build planner.
   add_executable(proc_isocity_path
     src/cli/path.cpp
@@ -471,6 +518,16 @@ if (PROCISOCITY_BUILD_CLI)
   target_link_libraries(proc_isocity_parkopt PRIVATE isocity_core)
 
   procisocity_set_strict_warnings(proc_isocity_parkopt)
+
+  # Civic services placement tool (headless): suggest education/health/safety facilities.
+  add_executable(proc_isocity_servicesopt
+    src/cli/servicesopt.cpp
+  )
+
+  target_include_directories(proc_isocity_servicesopt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_servicesopt PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_servicesopt)
 
 
   # Flood/ponding tool (headless): sea-level inundation + Priority-Flood depression depth.

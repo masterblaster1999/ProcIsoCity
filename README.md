@@ -48,7 +48,7 @@ ctest --test-dir build-tests --output-on-failure
 
 - `PROCISOCITY_BUILD_APP` (default: ON) — build the interactive raylib app (`proc_isocity`).
 - `PROCISOCITY_BUILD_TESTS` (default: OFF) — build `proc_isocity_tests` and enable `ctest`.
-- `PROCISOCITY_BUILD_CLI` (default: ON) — build headless command-line tools (`proc_isocity_cli`, `proc_isocity_diff`, `proc_isocity_imagediff`, `proc_isocity_inspect`, `proc_isocity_config`, `proc_isocity_patch`, `proc_isocity_script`, `proc_isocity_replay`, `proc_isocity_blueprint`, `proc_isocity_suite`, `proc_isocity_transform`, `proc_isocity_roadgraph`, `proc_isocity_roadcentrality`, `proc_isocity_blocks`, `proc_isocity_mesh`, `proc_isocity_timelapse`, `proc_isocity_mapexport`, `proc_isocity_osmimport`, `proc_isocity_tileset`).
+- `PROCISOCITY_BUILD_CLI` (default: ON) — build headless command-line tools (`proc_isocity_cli`, `proc_isocity_diff`, `proc_isocity_imagediff`, `proc_isocity_inspect`, `proc_isocity_config`, `proc_isocity_patch`, `proc_isocity_script`, `proc_isocity_replay`, `proc_isocity_blueprint`, `proc_isocity_suite`, `proc_isocity_transform`, `proc_isocity_roadgraph`, `proc_isocity_roadcentrality`, `proc_isocity_blocks`, `proc_isocity_mesh`, `proc_isocity_timelapse`, `proc_isocity_streetnames`, `proc_isocity_cartography`, `proc_isocity_wayfind`, `proc_isocity_tour`, `proc_isocity_mapexport`, `proc_isocity_osmimport`, `proc_isocity_tileset`).
 - `PROCISOCITY_USE_SYSTEM_RAYLIB` (default: OFF) — when building the app, use a system raylib instead of FetchContent.
 
 ### Headless CLI tools (optional)
@@ -96,6 +96,49 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
   ```bash
   ./build/proc_isocity_timelapse --seed 1 --size 128x128 --out frames \
     --days 120 --every 2 --layers overlay,landvalue --format png
+  ```
+
+- `proc_isocity_streetnames`: deterministic **street naming** + simple **parcel addressing** derived from the road network.
+  Exports streets as JSON (good for GIS) and addresses as CSV (good for scripts/spreadsheets).
+
+  ```bash
+  ./build/proc_isocity_streetnames --seed 1 --size 128x128 \
+    --streets-json streets.json --addresses-csv addresses.csv
+  ```
+
+- `proc_isocity_cartography`: render a "shareable" labeled **isometric poster** (PNG) with district + street labels.
+  Optionally dumps placed label boxes as JSON for external toolchains.
+
+  ```bash
+  ./build/proc_isocity_cartography --seed 1 --size 128x128 --out poster.png --labels-json labels.json
+  ```
+
+- `proc_isocity_wayfind`: **geocode** a procedural address (or street intersection) and compute a road route with
+  turn-by-turn style **maneuvers**. Optionally writes a JSON route and a debug image with the route overlaid.
+
+  ```bash
+  # Route between two procedural addresses
+  ./build/proc_isocity_wayfind --seed 1 --size 128x128 \
+    --from "120 Asterwood Ave" --to "450 3rd St" --out-json route.json --out-image route.png --image-scale 4
+
+  # Route between intersections
+  ./build/proc_isocity_wayfind --seed 1 --size 128x128 \
+    --from "Asterwood Ave & 3rd St" --to "Juniper Rd @ 7th Ave"
+  ```
+
+- `proc_isocity_tour`: generate a procedural **walking tour** by synthesizing a handful of interesting POIs
+  (parks, peaks, structural bottlenecks, markets...) and connecting them with turn-by-turn **itinerary legs**.
+  Optionally renders a Cartography-style poster with the **tour route** and numbered stop markers.
+
+  ```bash
+  # Generate a tour + poster from a fresh procedural world
+  ./build/proc_isocity_tour --seed 1 --size 128x128 --out-json tour.json --out-md tour.md --out-image tour.png
+
+  # Start the tour from a specific procedural address
+  ./build/proc_isocity_tour --seed 1 --size 128x128 --start "120 Asterwood Ave" --stops 8 --out-image tour.png
+
+  # Same city, different tour (tie-break salt)
+  ./build/proc_isocity_tour --seed 1 --size 128x128 --seed-salt 42 --out-image tour_alt.png
   ```
 
 - `proc_isocity_osmimport`: import an **OpenStreetMap (OSM XML)** extract into a new ProcIsoCity save.
@@ -155,7 +198,8 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
   ```
 
 - `proc_isocity_tileset`: generate a dependency-free, deterministic **sprite atlas** of the project's procedural
-  textures (terrain, terrain transitions, roads, bridges, overlays) with optional **taller building sprites**, plus optional **emissive**,
+  textures (terrain, terrain transitions, roads, bridges, overlays) with optional **taller building sprites** and optional **civic facility sprites**
+  (education/health/police/fire), plus optional **emissive**,
   **height**, **normal**, **shadow**, and **SDF** atlases (all sharing the exact same layout/metadata). This makes it easy to
   plug the generator into external renderers or mod pipelines without needing any extra art.
 
@@ -209,6 +253,7 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
     --mip-alpha-coverage 1 --mip-alpha-threshold 0.5 --mip-alpha-iters 12 \
     --transitions 1 --transition-variants 4 \
     --buildings 1 --building-variants 12 \
+    --facilities 1 --facility-variants 8 \
     --indexed 1 --indexed-colors 256 --indexed-dither 0 \
     --emit tileset_emissive.png \
     --height tileset_height.png --normal tileset_normal.png --shadow tileset_shadow.png --sdf tileset_sdf.png \
@@ -279,6 +324,27 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
 
   # Improve an existing save and write a new save file with parks placed
   ./build/proc_isocity_parkopt --load save.bin --add 8 --save save_more_parks.bin
+  ```
+
+
+- `proc_isocity_servicesopt`: suggest **civic service facilities** (Education/Health/Safety)
+  to improve a SimCity-style "coverage" model. Under the hood it uses a greedy, capacity-aware
+  E2SFCA-style heuristic (two-step floating catchment area) on the road network (distance can be
+  raw road steps or travel-time) and then reports the detailed satisfaction using the full
+  `ComputeServices` evaluator.
+
+  It exports a ranked JSON/CSV list of facility placements (tile + access road), plus optional
+  before/after satisfaction heatmaps (PPM/PNG by extension).
+
+  ```bash
+  # Generate a world, simulate 120 days, then propose 8 education facilities and export a heatmap
+  ./build/proc_isocity_servicesopt --seed 1 --size 128x128 --days 120 \
+    --type education --add 8 --level 2 \
+    --json services_edu.json --csv services_edu.csv --heat-after edu_sat.png --scale 4
+
+  # Plan all 3 services in one run and export overall satisfaction heatmap
+  ./build/proc_isocity_servicesopt --load save.bin --type all --add 6 --level 2 \
+    --json services_all.json --heat-after services_overall.png
   ```
 
 
