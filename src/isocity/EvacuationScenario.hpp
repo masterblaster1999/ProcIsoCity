@@ -77,6 +77,9 @@ struct EvacuationScenarioHeatmaps {
 
   // Normalized evacuation road flow for road tiles.
   std::vector<float> evacFlow;
+
+  // Road congestion ratio: evacFlow / capacity (can exceed 1.0).
+  std::vector<float> roadCongestionFrac;
 };
 
 EvacuationScenarioResult ComputeEvacuationScenario(const World& world, const EvacuationScenarioConfig& cfg);

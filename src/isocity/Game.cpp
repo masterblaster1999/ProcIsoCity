@@ -7012,9 +7012,9 @@ bool Game::tileBlueprintRect(int x0, int y0, int x1, int y1, bool useLibraryTile
   m_roadGraphDirty = true;
   m_resilienceDirty = true;
   m_resilienceBypassesDirty = true;
-  m_transitDirty = true;
+  m_transitPlanDirty = true;
   m_transitVizDirty = true;
-  m_roadUpgradesDirty = true;
+  m_roadUpgradePlanDirty = true;
   m_evacDirty = true;
   m_roadUpgradeSelectedMaskDirty = true;
   invalidateHydrology();
@@ -7392,7 +7392,6 @@ void Game::drawBlueprintPanel(int uiW, int uiH)
 
     auto colorForOverlay = [](Overlay o) -> Color {
       switch (o) {
-      case Overlay::Water: return Color{70, 120, 220, 255};
       case Overlay::Road: return Color{130, 130, 130, 255};
       case Overlay::Residential: return Color{80, 200, 120, 255};
       case Overlay::Commercial: return Color{90, 160, 255, 255};
@@ -8765,6 +8764,23 @@ void Game::ensureRoadUpgradePlanUpToDate()
   }
 
   m_roadUpgradePlan = PlanRoadUpgrades(m_world, m_roadGraph, roadFlow, cfg);
+
+  // Determine if the planned upgrades are already reflected in the current world.
+  m_roadUpgradePlanApplied = true;
+  const auto& tiles = m_world.tiles();
+  if (static_cast<int>(m_roadUpgradePlan.tileTargetLevel.size()) == n && static_cast<int>(tiles.size()) == n) {
+    for (int i = 0; i < n; ++i) {
+      const Tile& t = tiles[static_cast<std::size_t>(i)];
+      if (t.overlay != Overlay::Road) continue;
+      const int target = static_cast<int>(m_roadUpgradePlan.tileTargetLevel[static_cast<std::size_t>(i)]);
+      if (target > t.level) {
+        m_roadUpgradePlanApplied = false;
+        break;
+      }
+    }
+  } else {
+    m_roadUpgradePlanApplied = false;
+  }
   m_roadUpgradePlanDirty = false;
   m_roadUpgradeSelectedMaskDirty = true;
 
@@ -9083,11 +9099,11 @@ void Game::drawRoadUpgradePanel(int x0, int y0)
   drawToggleRow(0, "Overlay", m_showRoadUpgradeOverlay, /*affectsPlan=*/false);
 
   // 1 demand mode
-  drawCycleRow(1, "Demand", TransitDemandModeName(m_roadUpgradeCfg.demandMode), [&]() {
-    const int idx = static_cast<int>(m_roadUpgradeCfg.demandMode);
+  drawCycleRow(1, "Demand", TransitDemandModeName(m_roadUpgradeDemandMode), [&]() {
+    const int idx = static_cast<int>(m_roadUpgradeDemandMode);
     const int next = (idx + 1 + 3) % 3;
-    m_roadUpgradeCfg.demandMode = static_cast<TransitDemandMode>(next);
-    showToast(std::string("Road upgrade demand: ") + TransitDemandModeName(m_roadUpgradeCfg.demandMode), 2.0f);
+    m_roadUpgradeDemandMode = static_cast<TransitDemandMode>(next);
+    showToast(std::string("Road upgrade demand: ") + TransitDemandModeName(m_roadUpgradeDemandMode), 2.0f);
   });
 
   // 2 objective
@@ -9151,9 +9167,9 @@ void Game::drawRoadUpgradePanel(int x0, int y0)
 
   // 5 min util
   {
-    float v = static_cast<float>(m_roadUpgradeCfg.minUtilizationConsider);
+    float v = static_cast<float>(m_roadUpgradeCfg.minUtilConsider);
     drawFloatSliderRow(5, "Min util", v, 0.0f, 5.0f, /*affectsPlan=*/true, "%.2f");
-    m_roadUpgradeCfg.minUtilizationConsider = static_cast<double>(v);
+    m_roadUpgradeCfg.minUtilConsider = static_cast<double>(v);
   }
 
   // 6 endpoints
@@ -9508,6 +9524,7 @@ bool Game::applyRoadUpgradePlan()
 
   const int spent = moneyBefore - m_world.stats().money;
   showToast(TextFormat("Road upgrades applied: %d tiles, spent %d", static_cast<int>(changed.size()), spent));
+  m_roadUpgradePlanApplied = true;
   return true;
 }
 
@@ -11602,8 +11619,9 @@ void Game::handleInput(float dt)
   // Zoom around mouse cursor (raylib example style).
   // If a modal UI is open (e.g. the blueprint library list), let the UI own the wheel.
   const bool uiWantsWheel = (m_blueprintLibraryOpen || m_showVideoSettings);
+  float wheel = 0.0f;
   if (!uiWantsWheel) {
-    const float wheel = GetMouseWheelMove();
+    wheel = GetMouseWheelMove();
     if (wheel != 0.0f) {
       const Vector2 mouseWorldPos = GetScreenToWorld2D(GetMousePosition(), m_camera);
       m_camera.offset = GetMousePosition();
@@ -12320,6 +12338,8 @@ void DrawHistoryGraph(const std::vector<CityHistorySample>& samples, Rectangle r
   ui::Text(static_cast<int>(r.x) + pad, static_cast<int>(r.y + r.height) - 22, fontSmall, buf, th.textDim,
            /*bold=*/false, /*shadow=*/true, 1);
 }
+
+constexpr int kReportPages = 5;
 
 const char* ReportPageName(int page)
 {
@@ -14519,9 +14539,9 @@ void Game::draw()
     const int pad = 10;
     const int lineH = fontSize + 4;
 
-    const int tiles = static_cast<int>(m_roadDragTiles.size());
-    const int level = m_roadDragLevel;
-    const int cost = m_roadDragCost;
+    const int tiles = static_cast<int>(m_roadDragUpgradeTiles.size());
+    const int level = m_roadDragUpgradeLevel;
+    const int cost = static_cast<int>(std::llround(m_roadDragMoneyCost));
     const bool affordable = (m_world.stats().money >= cost);
 
     const std::string line1 = "Road drag";

@@ -1,5 +1,6 @@
 #include "isocity/EvacuationScenario.hpp"
 
+#include "isocity/Road.hpp"
 #include <algorithm>
 #include <cmath>
 
@@ -124,6 +125,9 @@ EvacuationScenarioHeatmaps BuildEvacuationScenarioHeatmaps(const World& world, c
   out.evacTime.assign(n, 0.0f);
   out.evacUnreachable.assign(n, 0.0f);
   out.evacFlow.assign(n, 0.0f);
+  out.roadCongestionFrac.assign(n, 0.0f);
+
+  constexpr int kBaseRoadTileCapacity = 28;
 
   // Normalize evacuation time by p95 (robust) with a fallback to max.
   int maxCostMilli = 0;
@@ -153,6 +157,10 @@ EvacuationScenarioHeatmaps BuildEvacuationScenarioHeatmaps(const World& world, c
 
       if (t.overlay == Overlay::Road) {
         const std::uint32_t flow = (i < r.evac.evacRoadFlow.size()) ? r.evac.evacRoadFlow[i] : 0u;
+        const int cap = RoadCapacityForLevel(kBaseRoadTileCapacity, t.level);
+        if (cap > 0) {
+          out.roadCongestionFrac[i] = static_cast<float>(flow) / static_cast<float>(cap);
+        }
         if (flow > 0u) {
           const float denomFlow = static_cast<float>(std::max<std::uint32_t>(1u, r.evac.maxEvacRoadFlow));
           out.evacFlow[i] = std::clamp(static_cast<float>(flow) / denomFlow, 0.0f, 1.0f);

@@ -33,6 +33,8 @@ public:
   void shutdown();
 
   bool ready() const { return m_ready; }
+  // Compatibility alias (older code expected isReady()).
+  bool isReady() const { return ready(); }
   bool failed() const { return m_failed; }
 
   // Draw `tex` with post FX if enabled + shader is ready.
@@ -40,6 +42,13 @@ public:
   void drawTexturePro(const Texture2D& tex, const Rectangle& src, const Rectangle& dst,
                       const PostFxSettings& settings, float timeSec, std::uint32_t seed,
                       Color tint = WHITE);
+
+  // Compatibility alias (older code expected drawTexture()).
+  void drawTexture(const Texture2D& tex, const Rectangle& src, const Rectangle& dst,
+                   const PostFxSettings& settings, float timeSec, std::uint32_t seed,
+                   Color tint = WHITE) {
+    drawTexturePro(tex, src, dst, settings, timeSec, seed, tint);
+  }
 
 private:
   Shader m_shader{};

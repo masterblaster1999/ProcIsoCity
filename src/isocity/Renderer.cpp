@@ -332,7 +332,7 @@ void main()
     vWorldPos = vertexPosition.xy;
     gl_Position = mvp*vec4(vertexPosition, 1.0);
 }
-GLSL";
+)GLSL";
 
 static const char* kVolumetricCloudFS = R"GLSL(
 #version 330
@@ -506,7 +506,7 @@ void main()
     vec4 texel = texture(texture0, fragTexCoord);
     finalColor = vec4(col, clamp(alpha, 0.0, 1.0)) * texel * colDiffuse * fragColor;
 }
-GLSL";
+)GLSL";
 
 
 inline int Popcount4(std::uint8_t v)
@@ -2303,13 +2303,6 @@ TileRect ComputeVisibleTileRect(const Camera2D& camera, int screenW, int screenH
   r.maxY = std::clamp(maxTY + margin, 0, mapH - 1);
   return r;
 }
-
-struct WorldRect {
-  float minX = 0.0f;
-  float minY = 0.0f;
-  float maxX = 0.0f;
-  float maxY = 0.0f;
-};
 
 WorldRect ComputeCameraWorldAABB(const Camera2D& camera, int screenW, int screenH, float expandX, float expandY)
 {

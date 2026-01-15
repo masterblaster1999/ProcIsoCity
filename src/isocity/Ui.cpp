@@ -142,6 +142,17 @@ static void RegenTheme(std::uint64_t seed)
   g.theme.accent = accent;
   g.theme.accentDim = WithAlpha(accent, 90);
 
+  // Semantic accents (used for status badges, charts, warnings).
+  // Keep these stable regardless of user accent hue, so green/red always
+  // mean good/bad.
+  const float semanticSat = std::max(0.35f, s.accentSaturation);
+  const float semanticVal = std::max(0.70f, s.accentValue);
+  g.theme.accentOk = ColorFromHSV(130.0f, semanticSat, semanticVal);
+  g.theme.accentOk.a = 255;
+  g.theme.accentBad = ColorFromHSV(5.0f, semanticSat, semanticVal);
+  g.theme.accentBad.a = 255;
+
+
   // Derive subtle top/bottom panel colors from the accent so each seed feels different,
   // but keep things dark enough for readability.
   const float tint = 0.08f;
@@ -155,6 +166,9 @@ static void RegenTheme(std::uint64_t seed)
       ClampU8(static_cast<int>(12 + tint * accent.g * 0.6f)),
       ClampU8(static_cast<int>(16 + tint * accent.b * 0.6f)),
       235};
+
+  // Subtle chart/table gridline color.
+  g.theme.grid = WithAlpha(Lerp(g.theme.panelBgTop, g.theme.text, 0.25f), 55);
 
   // Apply other tunables.
   g.theme.roundness = s.roundness;
@@ -628,7 +642,7 @@ static void DrawTextAtlas(const FontAtlas& fa, int x, int y, int sizePx, std::st
   if (useSdf) EndShaderMode();
 }
 
-static Rectangle Shrink(Rectangle r, float px)
+[[maybe_unused]] static Rectangle Shrink(Rectangle r, float px)
 {
   r.x += px;
   r.y += px;
@@ -889,6 +903,7 @@ void DrawPanelInset(Rectangle r, float timeSec, bool active)
 
 void DrawPanelHeader(Rectangle panel, std::string_view title, float timeSec, bool active, int titleSizePx)
 {
+  (void)timeSec;
   const Theme& t = g.theme;
 
   // Small accent bar.
@@ -1275,6 +1290,7 @@ int DrawKeyCombo(int x, int y, std::string_view combo, float timeSec, bool stron
 bool Toggle(int id, Rectangle r, bool& ioValue, Vector2 mouseUi, float timeSec, bool enabled)
 {
   (void)timeSec;
+  (void)id;
   const Theme& t = g.theme;
 
   const bool hovered = CheckCollisionPointRec(mouseUi, r);

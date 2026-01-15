@@ -496,6 +496,7 @@ private:
 
   RoadUpgradePlan m_roadUpgradePlan{};
   bool m_roadUpgradePlanDirty = true;
+  bool m_roadUpgradePlanApplied = false;
 
   int m_roadUpgradeSelection = 0;
   bool m_roadUpgradeShowOnlySelectedEdge = false;

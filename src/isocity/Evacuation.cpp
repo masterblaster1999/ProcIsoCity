@@ -453,6 +453,7 @@ EvacuationResult ComputeEvacuationToEdge(const World& world, const EvacuationCon
     out.congestion = 0.0f;
   }
 
+  out.congestionFrac = static_cast<float>(out.congestion);
   return out;
 }
 

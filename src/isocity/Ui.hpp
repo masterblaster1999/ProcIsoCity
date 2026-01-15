@@ -31,6 +31,14 @@ struct Theme {
   Color accent = Color{120, 220, 255, 255};
   Color accentDim = Color{120, 220, 255, 90};
 
+  // Semantic accents used by charts and status badges.
+  // These are intentionally not user-editable (they communicate meaning).
+  Color accentOk = Color{90, 220, 150, 255};
+  Color accentBad = Color{230, 90, 90, 255};
+
+  // Subtle gridline color (used for charts/tables).
+  Color grid = Color{255, 255, 255, 30};
+
   // Geometry.
   float roundness = 0.18f;  // 0..1
   int roundSegments = 8;

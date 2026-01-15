@@ -77,6 +77,9 @@ struct RoadUpgradePlan {
   std::uint64_t totalTimeSaved = 0;
   std::uint64_t totalExcessReduced = 0;
 
+  // Planning runtime (wall-clock). Primarily for UI/profiling.
+  double runtimeSec = 0.0;
+
   // Chosen upgrades (one per edge).
   std::vector<RoadUpgradeEdge> edges;
 

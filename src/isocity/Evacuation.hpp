@@ -65,6 +65,8 @@ struct EvacuationResult {
   // over road tiles with flow>0. Range [0..1].
   int congestedRoadTiles = 0;
   float congestion = 0.0f;
+  // Compatibility alias for UI (percent).
+  float congestionFrac = 0.0f;
 
   // Residential accessibility summary (tile counts).
   int residentialTiles = 0;

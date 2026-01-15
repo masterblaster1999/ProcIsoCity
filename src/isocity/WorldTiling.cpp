@@ -124,7 +124,7 @@ static std::uint64_t HashBlueprintContent(const Blueprint& bp)
     const std::uint8_t height = static_cast<std::uint8_t>(d.value.height);
     const std::uint8_t variation = d.value.variation;
     const std::uint8_t level = d.value.level;
-    const std::uint8_t occupants = d.value.occupants;
+    const std::uint16_t occupants = d.value.occupants;
     const std::uint8_t district = d.value.district;
     h = Fnv1a64(&terrain, sizeof(terrain), h);
     h = Fnv1a64(&overlay, sizeof(overlay), h);

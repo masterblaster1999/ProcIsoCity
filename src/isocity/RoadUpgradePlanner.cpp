@@ -3,6 +3,7 @@
 #include "isocity/Road.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -131,6 +132,13 @@ RoadUpgradePlan PlanRoadUpgrades(const World& world, const RoadGraph& g,
                                  const std::vector<std::uint32_t>& roadFlow,
                                  const RoadUpgradePlannerConfig& cfg)
 {
+  const auto t0 = std::chrono::steady_clock::now();
+  auto finalize = [&](RoadUpgradePlan& plan) {
+    plan.runtimeSec = std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - t0)
+                         .count();
+  };
+
   RoadUpgradePlan plan;
   plan.w = world.width();
   plan.h = world.height();
@@ -138,11 +146,17 @@ RoadUpgradePlan PlanRoadUpgrades(const World& world, const RoadGraph& g,
 
   const int w = plan.w;
   const int h = plan.h;
-  if (w <= 0 || h <= 0) return plan;
+  if (w <= 0 || h <= 0) {
+    finalize(plan);
+    return plan;
+  }
 
   const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
   plan.tileTargetLevel.assign(n, 0);
-  if (roadFlow.size() != n) return plan;
+  if (roadFlow.size() != n) {
+    finalize(plan);
+    return plan;
+  }
 
   const int baseCap = std::max(1, cfg.baseTileCapacity);
   const bool useRoadLevels = cfg.useRoadLevelCapacity;
@@ -287,6 +301,7 @@ RoadUpgradePlan PlanRoadUpgrades(const World& world, const RoadGraph& g,
     return a.targetLevel < b.targetLevel;
   });
 
+  finalize(plan);
   return plan;
 }
 

@@ -5,6 +5,13 @@
 // and to emit GL_LINES primitives that get expanded into thick ribbons.
 #include "rlgl.h"
 
+// Raylib uses modern OpenGL, but platform headers (notably Windows GL) do not
+// declare shader/program entry points by default. Raylib bundles GLAD in
+// src/external/glad.h; include it if shader constants are missing.
+#ifndef GL_VERTEX_SHADER
+  #include "external/glad.h"
+#endif
+
 #include <array>
 #include <algorithm>
 #include <cstring>

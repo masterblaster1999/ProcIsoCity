@@ -8,7 +8,7 @@
 
 namespace isocity {
 
-struct World;
+class World;
 struct ZoneAccessMap;
 struct ZoneBuildingParcels;
 
