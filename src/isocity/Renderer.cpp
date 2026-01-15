@@ -3436,6 +3436,8 @@ void Renderer::unloadTextures()
 
   unloadPropSprites();
 
+  m_organicMaterial.shutdown();
+
   unloadBaseCache();
 
   unloadMinimap();
@@ -3838,6 +3840,18 @@ void Renderer::setCloudShadowSettings(const CloudShadowSettings& s)
   if (regen || m_cloudShadowTex.id == 0) {
     rebuildCloudShadowTexture();
   }
+}
+
+void Renderer::resetOrganicMaterial(std::uint32_t seed)
+{
+  m_organicHasLastTime = false;
+
+  if (!m_organicMaterial.isReady()) {
+    m_organicMaterial.init(m_tileW, m_tileH, seed);
+    return;
+  }
+
+  m_organicMaterial.reset(seed);
 }
 
 void Renderer::rebuildCloudShadowTexture()
@@ -5136,6 +5150,10 @@ void Renderer::rebuildTextures(std::uint64_t seed)
   // World-space cloud shadow mask (procedural, tileable).
   rebuildCloudShadowTexture();
 
+  // Animated procedural organic material overlay uses its own internal textures.
+  m_organicHasLastTime = false;
+  m_organicMaterial.init(m_tileW, m_tileH, m_gfxSeed32);
+
   // Optional GPU geometry-shader effects (safe fallback if unsupported).
   m_gpuRibbon.init();
 }
@@ -5568,6 +5586,23 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
   }
   const WeatherState weather = (drawAestheticDetails) ? ComputeWeatherState(timeSec, m_weather) : WeatherState{};
 
+  // Animated procedural organic material (reaction-diffusion). We drive it even when
+  // aesthetic details are suppressed so the simulation keeps evolving.
+  if (m_organicSettings.enabled) {
+    float dtSec = 1.0f / 60.0f;
+    if (m_organicHasLastTime) {
+      dtSec = static_cast<float>(timeSec - static_cast<double>(m_organicLastTimeSec));
+    }
+    m_organicLastTimeSec = static_cast<float>(timeSec);
+    m_organicHasLastTime = true;
+
+    // Clamp to avoid huge jumps when stepping through breakpoints, pausing, etc.
+    dtSec = std::clamp(dtSec, 0.0f, 0.25f);
+    m_organicMaterial.update(dtSec, static_cast<float>(timeSec), m_organicSettings);
+  } else {
+    m_organicHasLastTime = false;
+  }
+
   // -----------------------------
   // Outside connectivity overlay
   // -----------------------------
@@ -5975,6 +6010,67 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
       // Decals (procedural details + ground weather)
       // -----------------------------
       if (drawAestheticDetails) {
+        // Animated, procedural organic material overlay (reaction-diffusion texture).
+        if (m_organicSettings.enabled && m_organicMaterial.isReady()) {
+          const TerrainMacroVisual macroV = ComputeTerrainMacroVisual(world, x, y, tile, m_gfxSeed32);
+
+          float coverage = 0.0f;
+          // Keep it mostly on land tiles and parks; avoid roads and zone overlays.
+          const bool allow = (tile.terrain != Terrain::Water) &&
+                             (tile.overlay == Overlay::None || tile.overlay == Overlay::Park);
+          if (allow) {
+            coverage = (tile.overlay == Overlay::Park) ? 1.0f : ((tile.terrain == Terrain::Grass) ? 0.65f : 0.35f);
+            coverage *= (1.0f - macroV.snow);
+            coverage *= (0.45f + 0.55f * weather.wetness);
+
+            const bool waterAdj = ((x > 0) && (world.at(x - 1, y).terrain == Terrain::Water)) ||
+                                  ((x < mapW - 1) && (world.at(x + 1, y).terrain == Terrain::Water)) ||
+                                  ((y > 0) && (world.at(x, y - 1).terrain == Terrain::Water)) ||
+                                  ((y < mapH - 1) && (world.at(x, y + 1).terrain == Terrain::Water));
+            if (waterAdj) coverage *= 1.25f;
+
+            const std::uint32_t h = HashCoords32(x, y, m_gfxSeed32 ^ 0xA53u);
+            const float rnd = static_cast<float>(h & 0xFFFFu) * (1.0f / 65535.0f);
+            coverage *= (0.55f + 0.45f * rnd);
+            coverage = std::clamp(coverage, 0.0f, 1.0f);
+          }
+
+          const float alphaF = m_organicSettings.alpha * coverage;
+          if (alphaF > 0.01f) {
+            const std::uint32_t h = HashCoords32(x, y, m_gfxSeed32 ^ 0xB10u);
+            const int vcount = std::max(1, m_organicMaterial.variants());
+            const int variant = static_cast<int>(h % static_cast<std::uint32_t>(vcount));
+            const Texture2D& tex = m_organicMaterial.texture(variant);
+
+            Color tint = WHITE;
+            switch (m_organicSettings.style) {
+              case OrganicMaterial::Style::Moss: tint = Color{90, 220, 140, 255}; break;
+              case OrganicMaterial::Style::Slime: tint = Color{70, 230, 220, 255}; break;
+              case OrganicMaterial::Style::Mycelium: tint = Color{225, 215, 190, 255}; break;
+              case OrganicMaterial::Style::Bioluminescent: tint = Color{45, 255, 190, 255}; break;
+            }
+
+            const float wetBoost = 0.90f + 0.25f * weather.wetness;
+            float brightnessK = 0.65f + 0.35f * dayNight.sun;
+            if (m_organicSettings.bioluminescentAtNight && (dayNight.nightLights > 0.001f)) {
+              brightnessK += dayNight.nightLights * m_organicSettings.glowStrength;
+            }
+            tint = Mul(tint, wetBoost * brightnessK);
+
+            if (m_organicSettings.style == OrganicMaterial::Style::Bioluminescent && dayNight.nightLights > 0.001f) {
+              const float phase = static_cast<float>(h & 0xFFFFu) * (6.2831853f / 65535.0f);
+              const float pulse = 0.85f + 0.15f * std::sin(static_cast<float>(timeSec) * 2.2f + phase);
+              tint = Mul(tint, pulse);
+            }
+
+            tint.a = ClampU8(static_cast<int>(alphaF * 255.0f));
+
+            const Rectangle src = {0.0f, 0.0f, static_cast<float>(tex.width), static_cast<float>(tex.height)};
+            const Rectangle dst = {center.x - 0.5f * tileWf, center.y - 0.5f * tileHf, tileWf, tileHf};
+            DrawTexturePro(tex, src, dst, Vector2{0, 0}, 0.0f, tint);
+          }
+        }
+
         // Procedural micro-detail pass (grass tufts, rocks, water sparkles, etc.)
         DrawProceduralTileDetails(world, x, y, tile, center, tileWf, tileHf,
                                  camera.zoom, brightness, m_gfxSeed32, timeSec, weather);

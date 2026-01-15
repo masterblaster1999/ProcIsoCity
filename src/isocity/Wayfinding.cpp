@@ -482,6 +482,10 @@ AddressIndex BuildAddressIndex(const std::vector<ParcelAddress>& addresses, cons
     });
   }
 
+  // The index is now usable. Note that it may legitimately be empty for very small or roadless
+  // worlds; callers should still handle the "no matches" case when geocoding.
+  idx.ok = true;
+
   return idx;
 }
 

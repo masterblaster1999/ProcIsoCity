@@ -206,8 +206,14 @@ if (PROCISOCITY_BUILD_APP)
     src/isocity/Renderer.hpp
     src/isocity/GpuGeom.hpp
     src/isocity/VisualPrefs.hpp
+    src/isocity/OrganicMaterial.hpp
+    src/isocity/PovController.hpp
+    src/isocity/PovProcedural.hpp
     src/isocity/Renderer.cpp
     src/isocity/GpuGeom.cpp
+    src/isocity/OrganicMaterial.cpp
+    src/isocity/PovController.cpp
+    src/isocity/PovProcedural.cpp
     src/isocity/Ui.cpp
     src/isocity/VisualPrefs.cpp
     src/isocity/PostFxSettings.hpp

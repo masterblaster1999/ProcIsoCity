@@ -16,6 +16,7 @@
 #include "isocity/SaveLoad.hpp"
 #include "isocity/Script.hpp"
 #include "isocity/TransitPlannerExport.hpp"
+#include "isocity/TourPlanner.hpp"
 #include "isocity/WorldTiling.hpp"
 #include "isocity/Ui.hpp"
 #include "isocity/ZoneAccess.hpp"
@@ -72,6 +73,8 @@ constexpr int kTransitPanelW = 420;
 constexpr int kTransitPanelH = 480;
 constexpr int kRoadUpgradePanelW = 460;
 constexpr int kRoadUpgradePanelH = 360;
+constexpr int kWayfindingPanelW = 420;
+constexpr int kWayfindingPanelH = 386;
 
 // Simple flow-dock for stacking panels on the right. When vertical space runs out it wraps to a new
 // column to the left, keeping panels on-screen without overlap.
@@ -953,6 +956,10 @@ void Game::setupDevConsole()
           m_inspectPathCost = 0;
           m_inspectInfo.clear();
 
+          // Clear any previously computed navigation route.
+          m_wayfindingDirty = true;
+          clearWayfindingRoute();
+
           // Clear any in-progress road drag preview.
           m_roadDragActive = false;
           m_roadDragStart.reset();
@@ -1015,6 +1022,334 @@ void Game::setupDevConsole()
         } else {
           commitState(runner.state(), "Script applied");
         }
+      });
+
+  // --- turn-by-turn navigation / wayfinding ---
+  //
+  // This bridges the headless `StreetNames` + `Wayfinding` modules into the interactive app.
+  // Routes are computed via the dev console and rendered as a path overlay.
+  m_console.registerCommand(
+    "route",
+    "route <from> <to> | route clear | route panel | route overlay [on|off] | route rebuild",
+    [this, toLower](DevConsole& c, const DevConsole::Args& args)
+      {
+        auto printUsage = [&c]()
+          {
+            c.print("Usage:");
+            c.print("  route \"from\" \"to\"");
+            c.print("  route clear");
+            c.print("  route panel");
+            c.print("  route overlay [on|off]");
+            c.print("  route rebuild");
+            c.print("\nEndpoints can be:");
+            c.print("  - \"x,y\" tile coordinates");
+            c.print("  - an address (e.g. \"120 Oak St\")");
+            c.print("  - an intersection (e.g. \"Oak St & Pine Ave\")");
+            c.print("Use quotes if your endpoint contains spaces.");
+          };
+
+        if (args.empty()) {
+          printUsage();
+          return;
+        }
+
+        const std::string sub = toLower(args[0]);
+        if (sub == "clear") {
+          clearWayfindingRoute();
+          showToast("Route cleared", 2.0f);
+          return;
+        }
+        if (sub == "panel") {
+          m_showWayfindingPanel = !m_showWayfindingPanel;
+          showToast(m_showWayfindingPanel ? "Navigator panel shown" : "Navigator panel hidden", 2.0f);
+          return;
+        }
+        if (sub == "overlay") {
+          if (args.size() >= 2) {
+            const std::string v = toLower(args[1]);
+            if (v == "on" || v == "1" || v == "true") {
+              m_showWayfindingOverlay = true;
+            } else if (v == "off" || v == "0" || v == "false") {
+              m_showWayfindingOverlay = false;
+            } else {
+              c.print("route overlay: expected on/off");
+              return;
+            }
+          } else {
+            m_showWayfindingOverlay = !m_showWayfindingOverlay;
+          }
+          showToast(m_showWayfindingOverlay ? "Route overlay ON" : "Route overlay OFF", 2.0f);
+          return;
+        }
+        if (sub == "rebuild") {
+          m_wayfindingDirty = true;
+          ensureWayfindingUpToDate();
+          c.print(TextFormat("Wayfinding cache rebuilt: %zu addresses, %zu index street keys.",
+                             m_wayfindingAddresses.size(),
+                             m_wayfindingIndex.streetKeys.size()));
+          showToast("Navigator cache rebuilt", 2.0f);
+          return;
+        }
+
+        if (args.size() < 2) {
+          printUsage();
+          return;
+        }
+
+        m_wayfindingFromQuery = args[0];
+        m_wayfindingToQuery = args[1];
+
+        ensureWayfindingUpToDate();
+
+        if (!m_wayfindingIndex.ok) {
+          c.print(std::string("Address index error: ") + m_wayfindingIndex.error);
+          showToast("Navigator index error", 4.0f);
+          return;
+        }
+
+        const GeocodeMatch from = GeocodeEndpoint(m_world, m_wayfindingStreets, m_wayfindingIndex, m_wayfindingFromQuery);
+        if (!from.ok) {
+          c.print(std::string("From endpoint error: ") + from.error);
+          for (size_t i = 0; i < std::min<size_t>(from.suggestions.size(), 8); ++i) {
+            c.print(std::string("  suggestion: ") + from.suggestions[i]);
+          }
+          showToast("From geocode failed", 4.0f);
+          return;
+        }
+
+        const GeocodeMatch to = GeocodeEndpoint(m_world, m_wayfindingStreets, m_wayfindingIndex, m_wayfindingToQuery);
+        if (!to.ok) {
+          c.print(std::string("To endpoint error: ") + to.error);
+          for (size_t i = 0; i < std::min<size_t>(to.suggestions.size(), 8); ++i) {
+            c.print(std::string("  suggestion: ") + to.suggestions[i]);
+          }
+          showToast("To geocode failed", 4.0f);
+          return;
+        }
+
+        m_wayfindingRoute = RouteBetweenEndpoints(m_world, m_wayfindingStreets, from.addr, to.addr);
+        m_wayfindingFocusManeuver = -1;
+        m_wayfindingFocusPath.clear();
+        m_wayfindingManeuverFirst = 0;
+
+        if (!m_wayfindingRoute.ok) {
+          c.print(std::string("Route error: ") + m_wayfindingRoute.error);
+          showToast("Route failed", 4.0f);
+          return;
+        }
+
+        m_showWayfindingOverlay = true;
+        m_showWayfindingPanel = true;
+
+        c.print("Route computed:");
+        c.print(std::string("  From: ") + m_wayfindingRoute.from.full);
+        c.print(std::string("  To:   ") + m_wayfindingRoute.to.full);
+        c.print(TextFormat("  Tiles: %zu, Maneuvers: %zu", m_wayfindingRoute.pathTiles.size(), m_wayfindingRoute.maneuvers.size()));
+
+        const size_t maxPrint = 60;
+        for (size_t i = 0; i < std::min(maxPrint, m_wayfindingRoute.maneuvers.size()); ++i) {
+          c.print(TextFormat("  %2zu. %s", i + 1, m_wayfindingRoute.maneuvers[i].instruction.c_str()));
+        }
+        if (m_wayfindingRoute.maneuvers.size() > maxPrint) {
+          c.print(TextFormat("  ... (%zu more)", m_wayfindingRoute.maneuvers.size() - maxPrint));
+        }
+
+        showToast("Route computed", 2.0f);
+      });
+
+  // --- procedural POV camera ---
+  //
+  // A cinematic ride-along camera that can follow the current route, or generate
+  // a small procedural tour (TourPlanner) and ride it.
+  m_console.registerCommand(
+      "pov",
+      "POV camera. Usage: pov [route|tour|roam|off|speed <v>|3d on|3d off]",
+      [this, toLower](DevConsole& c, const DevConsole::Args& args) {
+        auto printUsage = [&c]() {
+          c.print("pov route            - ride along the current route (if any)");
+          c.print("pov tour [start]     - generate a procedural tour and ride it");
+          c.print("pov roam [len] [seed] - generate a procedural cruising drive");
+          c.print("pov off              - stop and restore camera");
+          c.print("pov speed <tiles/s>  - set ride speed");
+          c.print("pov 3d on|off        - drive the software 3D preview camera");
+        };
+
+        if (args.empty()) {
+          // Toggle route POV.
+          if (m_pov.isActive()) {
+            stopPov();
+            showToast("POV stopped", 1.6f);
+          } else {
+            if (!m_wayfindingRoute.ok) {
+              c.print("No route to ride. Compute one via: route \"from\" \"to\"");
+              showToast("No route", 2.0f);
+              return;
+            }
+
+            std::vector<PovMarker> markers;
+            markers.reserve(m_wayfindingRoute.maneuvers.size());
+            for (const RouteManeuver& man : m_wayfindingRoute.maneuvers) {
+              if (man.type == "turn") {
+                PovMarker mk;
+                mk.pathIndex = std::clamp(man.pathStart, 0, static_cast<int>(m_wayfindingRoute.pathTiles.size()) - 1);
+                mk.label = man.instruction;
+                mk.holdSec = 0.35f;
+                markers.push_back(std::move(mk));
+              } else if (man.type == "arrive") {
+                PovMarker mk;
+                mk.pathIndex = std::clamp(man.pathStart, 0, static_cast<int>(m_wayfindingRoute.pathTiles.size()) - 1);
+                mk.label = man.instruction;
+                mk.holdSec = 0.8f;
+                markers.push_back(std::move(mk));
+              }
+            }
+
+            m_pov.setTitle("Route");
+
+            const bool ok = m_pov.startFromPath(
+                m_world, m_wayfindingRoute.pathTiles, markers,
+                static_cast<float>(m_cfg.tileWidth), static_cast<float>(m_cfg.tileHeight), m_elev,
+                m_camera, GetScreenWidth(), GetScreenHeight(), static_cast<std::uint32_t>(m_world.seed));
+            if (ok) {
+              showToast("POV ride started", 2.0f);
+            } else {
+              showToast("POV failed", 3.0f);
+            }
+          }
+          return;
+        }
+
+        const std::string sub = toLower(args[0]);
+        if (sub == "help" || sub == "?" || sub == "h") {
+          printUsage();
+          return;
+        }
+
+        if (sub == "off" || sub == "stop") {
+          stopPov();
+          showToast("POV stopped", 1.6f);
+          return;
+        }
+
+        if (sub == "speed" && args.size() >= 2) {
+          try {
+            const float v = std::stof(args[1]);
+            m_pov.config().speedTilesPerSec = std::clamp(v, 0.5f, 120.0f);
+            c.print(TextFormat("POV speed set: %.2f tiles/s", m_pov.config().speedTilesPerSec));
+          } catch (...) {
+            c.print("Invalid speed value");
+          }
+          return;
+        }
+
+        if (sub == "3d" && args.size() >= 2) {
+          const std::string v = toLower(args[1]);
+          if (v == "on" || v == "1" || v == "true") {
+            m_povDrive3DPreview = true;
+            c.print("POV 3D preview drive: ON");
+          } else if (v == "off" || v == "0" || v == "false") {
+            m_povDrive3DPreview = false;
+            c.print("POV 3D preview drive: OFF");
+          } else {
+            c.print("Usage: pov 3d on|off");
+          }
+          return;
+        }
+
+        if (sub == "route") {
+          if (!m_wayfindingRoute.ok) {
+            c.print("No route to ride. Compute one via: route \"from\" \"to\"");
+            showToast("No route", 2.0f);
+            return;
+          }
+
+          std::vector<PovMarker> markers;
+          markers.reserve(m_wayfindingRoute.maneuvers.size());
+          for (const RouteManeuver& man : m_wayfindingRoute.maneuvers) {
+            if (man.type == "turn") {
+              PovMarker mk;
+              mk.pathIndex = std::clamp(man.pathStart, 0, static_cast<int>(m_wayfindingRoute.pathTiles.size()) - 1);
+              mk.label = man.instruction;
+              mk.holdSec = 0.35f;
+              markers.push_back(std::move(mk));
+            } else if (man.type == "arrive") {
+              PovMarker mk;
+              mk.pathIndex = std::clamp(man.pathStart, 0, static_cast<int>(m_wayfindingRoute.pathTiles.size()) - 1);
+              mk.label = man.instruction;
+              mk.holdSec = 0.8f;
+              markers.push_back(std::move(mk));
+            }
+          }
+
+          stopPov();
+          m_pov.setTitle("Route");
+          const bool ok = m_pov.startFromPath(
+              m_world, m_wayfindingRoute.pathTiles, markers,
+              static_cast<float>(m_cfg.tileWidth), static_cast<float>(m_cfg.tileHeight), m_elev,
+              m_camera, GetScreenWidth(), GetScreenHeight(), static_cast<std::uint32_t>(m_world.seed));
+          showToast(ok ? "POV route started" : "POV failed", 2.0f);
+          return;
+        }
+
+        if (sub == "tour") {
+          stopPov();
+
+          TourConfig cfg;
+          cfg.maxStops = 6;
+
+          std::string start = m_wayfindingFromQuery;
+          if (args.size() >= 2) {
+            start = args[1];
+          }
+
+          const TourPlan tour = BuildProceduralTour(m_world, start, cfg);
+          const bool ok = m_pov.startFromTour(
+              m_world, tour,
+              static_cast<float>(m_cfg.tileWidth), static_cast<float>(m_cfg.tileHeight), m_elev,
+              m_camera, GetScreenWidth(), GetScreenHeight(), static_cast<std::uint32_t>(tour.seed ? tour.seed : m_world.seed));
+          showToast(ok ? "POV tour started" : "POV tour failed", 2.4f);
+          return;
+        }
+
+        if (sub == "roam") {
+          stopPov();
+
+          int len = m_povRoamCfg.length;
+          if (args.size() >= 2) {
+            try {
+              len = std::stoi(args[1]);
+            } catch (...) {
+              c.print("pov roam: invalid length");
+              return;
+            }
+          }
+
+          // Optional explicit seed for reproducible runs. Otherwise, we increment an internal seed.
+          std::uint32_t seed = m_povRoamSeed + 1u;
+          if (args.size() >= 3) {
+            try {
+              seed = static_cast<std::uint32_t>(std::stoul(args[2]));
+            } catch (...) {
+              c.print("pov roam: invalid seed");
+              return;
+            }
+          }
+          if (seed == 0) {
+            seed = 1u;
+          }
+
+          const bool ok = startRoamPov(seed, len);
+          if (ok) {
+            c.print(std::string("pov roam: ") + m_povRoamDebug);
+          } else {
+            c.print("pov roam: failed to generate a path (no roads?)");
+          }
+          showToast(ok ? "POV roam started" : "POV roam failed", 2.4f);
+          return;
+        }
+
+
+        printUsage();
       });
 
   // --- deterministic replay capture/playback ---
@@ -2909,6 +3244,246 @@ void Game::setupDevConsole()
         c.print("  weather ground <on|off>");
         c.print("  weather particles <on|off>");
         c.print("  weather reflect <on|off>");
+      });
+
+
+  // --- organic material (animated procedural decal) ---
+  m_console.registerCommand(
+      "organic",
+      "organic [on|off|toggle] | organic style <moss|slime|mycelium|bio> | organic alpha <0..1> | organic speed <0..4> | "
+      "organic steps <1..16> | organic scale <0.25..4> | organic feed <0..0.1> | organic kill <0..0.1> | organic du <0..1> | "
+      "organic dv <0..1> | organic glow <0..1> | organic reset [seed]",
+      [this, toLower, parseF32](DevConsole& c, const DevConsole::Args& args) {
+        auto s = m_renderer.organicMaterialSettings();
+
+        auto clamp01 = [&](float v) { return std::max(0.0f, std::min(1.0f, v)); };
+
+        auto printStatus = [&]() {
+          const char* styleStr = "moss";
+          switch (s.style) {
+            case OrganicMaterial::Style::Moss: styleStr = "moss"; break;
+            case OrganicMaterial::Style::Slime: styleStr = "slime"; break;
+            case OrganicMaterial::Style::Mycelium: styleStr = "mycelium"; break;
+            case OrganicMaterial::Style::Bioluminescent: styleStr = "bio"; break;
+          }
+
+          c.print(TextFormat(
+              "Organic: %s  style=%s  alpha=%.2f  speed=%.2f  steps=%d  scale=%.2f  feed=%.4f  kill=%.4f  du=%.3f  dv=%.3f  glow=%.2f",
+              s.enabled ? "ON" : "OFF", styleStr, s.alpha, s.speed, s.stepsPerFrame, s.patternScale, s.feed, s.kill, s.diffusionU,
+              s.diffusionV, s.glowStrength));
+        };
+
+        auto parseOnOffToggle = [&](const std::string& v, bool cur, bool& out) -> bool {
+          const std::string t = toLower(v);
+          if (t == "on" || t == "1" || t == "true" || t == "yes") {
+            out = true;
+            return true;
+          }
+          if (t == "off" || t == "0" || t == "false" || t == "no") {
+            out = false;
+            return true;
+          }
+          if (t == "toggle") {
+            out = !cur;
+            return true;
+          }
+          return false;
+        };
+
+        if (args.empty()) {
+          printStatus();
+          return;
+        }
+
+        const std::string a0 = toLower(args[0]);
+
+        // on/off/toggle
+        {
+          bool v = s.enabled;
+          if (parseOnOffToggle(a0, s.enabled, v)) {
+            s.enabled = v;
+            m_renderer.setOrganicMaterialSettings(s);
+            printStatus();
+            showToast(TextFormat("Organic material: %s", s.enabled ? "ON" : "OFF"), 1.5f);
+            return;
+          }
+        }
+
+        if ((a0 == "style" || a0 == "preset") && args.size() >= 2) {
+          const std::string st = toLower(args[1]);
+
+          // A couple of pleasing Gray-Scott parameter presets.
+          auto applyPreset = [&](OrganicMaterial::Style style, float f, float k, float du, float dv) {
+            s.style = style;
+            s.feed = f;
+            s.kill = k;
+            s.diffusionU = du;
+            s.diffusionV = dv;
+          };
+
+          if (st == "moss") {
+            applyPreset(OrganicMaterial::Style::Moss, 0.035f, 0.065f, 0.16f, 0.08f);
+          } else if (st == "slime") {
+            applyPreset(OrganicMaterial::Style::Slime, 0.022f, 0.051f, 0.16f, 0.08f);
+          } else if (st == "mycelium" || st == "myc") {
+            applyPreset(OrganicMaterial::Style::Mycelium, 0.037f, 0.060f, 0.16f, 0.08f);
+          } else if (st == "bio" || st == "biolume" || st == "bioluminescent") {
+            applyPreset(OrganicMaterial::Style::Bioluminescent, 0.0367f, 0.0649f, 0.16f, 0.08f);
+          } else {
+            c.print("Unknown style. Use: moss | slime | mycelium | bio");
+            return;
+          }
+
+          m_renderer.setOrganicMaterialSettings(s);
+          // Reseed so the new preset feels immediately different.
+          const std::uint32_t seed32 = static_cast<std::uint32_t>(m_cfg.seed) ^ static_cast<std::uint32_t>(m_cfg.seed >> 32) ^
+                                      static_cast<std::uint32_t>(GetTime() * 1000.0);
+          m_renderer.resetOrganicMaterial(seed32);
+          printStatus();
+          return;
+        }
+
+        if ((a0 == "alpha" || a0 == "a") && args.size() >= 2) {
+          float v = 0.0f;
+          if (!parseF32(args[1], v)) {
+            c.print("Bad alpha.");
+            return;
+          }
+          s.alpha = clamp01(v);
+          m_renderer.setOrganicMaterialSettings(s);
+          printStatus();
+          return;
+        }
+
+        if ((a0 == "speed" || a0 == "spd") && args.size() >= 2) {
+          float v = 1.0f;
+          if (!parseF32(args[1], v)) {
+            c.print("Bad speed.");
+            return;
+          }
+          s.speed = std::clamp(v, 0.0f, 4.0f);
+          m_renderer.setOrganicMaterialSettings(s);
+          printStatus();
+          return;
+        }
+
+        if ((a0 == "steps" || a0 == "iters" || a0 == "iter") && args.size() >= 2) {
+          int v = 4;
+          try {
+            v = std::stoi(args[1]);
+          } catch (...) {
+            c.print("Bad steps.");
+            return;
+          }
+          s.stepsPerFrame = std::clamp(v, 1, 16);
+          m_renderer.setOrganicMaterialSettings(s);
+          printStatus();
+          return;
+        }
+
+        if ((a0 == "scale" || a0 == "freq") && args.size() >= 2) {
+          float v = 1.0f;
+          if (!parseF32(args[1], v)) {
+            c.print("Bad scale.");
+            return;
+          }
+          s.patternScale = std::clamp(v, 0.25f, 4.0f);
+          m_renderer.setOrganicMaterialSettings(s);
+          printStatus();
+          return;
+        }
+
+        if ((a0 == "feed" || a0 == "f") && args.size() >= 2) {
+          float v = s.feed;
+          if (!parseF32(args[1], v)) {
+            c.print("Bad feed.");
+            return;
+          }
+          s.feed = std::clamp(v, 0.0f, 0.1f);
+          m_renderer.setOrganicMaterialSettings(s);
+          printStatus();
+          return;
+        }
+
+        if ((a0 == "kill" || a0 == "k") && args.size() >= 2) {
+          float v = s.kill;
+          if (!parseF32(args[1], v)) {
+            c.print("Bad kill.");
+            return;
+          }
+          s.kill = std::clamp(v, 0.0f, 0.1f);
+          m_renderer.setOrganicMaterialSettings(s);
+          printStatus();
+          return;
+        }
+
+        if ((a0 == "du" || a0 == "diffu") && args.size() >= 2) {
+          float v = s.diffusionU;
+          if (!parseF32(args[1], v)) {
+            c.print("Bad du.");
+            return;
+          }
+          s.diffusionU = std::clamp(v, 0.0f, 1.0f);
+          m_renderer.setOrganicMaterialSettings(s);
+          printStatus();
+          return;
+        }
+
+        if ((a0 == "dv" || a0 == "diffv") && args.size() >= 2) {
+          float v = s.diffusionV;
+          if (!parseF32(args[1], v)) {
+            c.print("Bad dv.");
+            return;
+          }
+          s.diffusionV = std::clamp(v, 0.0f, 1.0f);
+          m_renderer.setOrganicMaterialSettings(s);
+          printStatus();
+          return;
+        }
+
+        if ((a0 == "glow" || a0 == "g") && args.size() >= 2) {
+          float v = s.glowStrength;
+          if (!parseF32(args[1], v)) {
+            c.print("Bad glow.");
+            return;
+          }
+          s.glowStrength = clamp01(v);
+          m_renderer.setOrganicMaterialSettings(s);
+          printStatus();
+          return;
+        }
+
+        if (a0 == "reset") {
+          std::uint32_t seed32 = static_cast<std::uint32_t>(m_cfg.seed) ^ static_cast<std::uint32_t>(m_cfg.seed >> 32) ^
+                                static_cast<std::uint32_t>(GetTime() * 1000.0);
+          if (args.size() >= 2) {
+            try {
+              const std::uint64_t parsed = static_cast<std::uint64_t>(std::stoull(args[1]));
+              seed32 = static_cast<std::uint32_t>(parsed) ^ static_cast<std::uint32_t>(parsed >> 32);
+            } catch (...) {
+              c.print("Bad seed.");
+              return;
+            }
+          }
+          m_renderer.resetOrganicMaterial(seed32);
+          c.print(TextFormat("Organic reset (seed=%u)", seed32));
+          return;
+        }
+
+        c.print("Usage:");
+        c.print("  organic                              (show status)");
+        c.print("  organic <on|off|toggle>");
+        c.print("  organic style <moss|slime|mycelium|bio>");
+        c.print("  organic alpha <0..1>");
+        c.print("  organic speed <0..4>");
+        c.print("  organic steps <1..16>");
+        c.print("  organic scale <0.25..4>");
+        c.print("  organic feed <0..0.1>");
+        c.print("  organic kill <0..0.1>");
+        c.print("  organic du <0..1>");
+        c.print("  organic dv <0..1>");
+        c.print("  organic glow <0..1>");
+        c.print("  organic reset [seed]");
       });
 
 
@@ -6497,6 +7072,11 @@ void Game::endPaintStroke()
   m_transitVizDirty = true;
   m_evacDirty = true;
 
+  // Street naming + address geocoding depend on roads/parcels; invalidate them and clear any
+  // existing navigation route so we never render stale turn-by-turn guidance.
+  m_wayfindingDirty = true;
+  clearWayfindingRoute();
+
   // Provide one toast per stroke for common build failures (no money, no road access, etc.).
   if (m_strokeFeedback.any()) {
     std::string msg = "Some placements failed: ";
@@ -8766,11 +9346,15 @@ void Game::ensureRoadUpgradePlanUpToDate()
   m_roadUpgradePlan = PlanRoadUpgrades(m_world, m_roadGraph, roadFlow, cfg);
 
   // Determine if the planned upgrades are already reflected in the current world.
+  //
+  // Note: World intentionally keeps its tile storage private; we use at(x,y) here instead of
+  // exposing a raw tile array just for this comparison.
   m_roadUpgradePlanApplied = true;
-  const auto& tiles = m_world.tiles();
-  if (static_cast<int>(m_roadUpgradePlan.tileTargetLevel.size()) == n && static_cast<int>(tiles.size()) == n) {
+  if (static_cast<int>(m_roadUpgradePlan.tileTargetLevel.size()) == n && w > 0 && h > 0) {
     for (int i = 0; i < n; ++i) {
-      const Tile& t = tiles[static_cast<std::size_t>(i)];
+      const int x = i % w;
+      const int y = i / w;
+      const Tile& t = m_world.at(x, y);
       if (t.overlay != Overlay::Road) continue;
       const int target = static_cast<int>(m_roadUpgradePlan.tileTargetLevel[static_cast<std::size_t>(i)]);
       if (target > t.level) {
@@ -10043,6 +10627,10 @@ void Game::resetWorld(std::uint64_t newSeed)
   m_inspectPathCost = 0;
   m_inspectInfo.clear();
 
+  // Any loaded world invalidates cached geocoding/wayfinding state.
+  m_wayfindingDirty = true;
+  clearWayfindingRoute();
+
   // Clear any in-progress road drag preview.
   m_roadDragActive = false;
   m_roadDragStart.reset();
@@ -10279,6 +10867,547 @@ void Game::floodFillTool(Point start, bool includeRoads)
       showToast(TextFormat("%s fill: %d tiles", labelForTool(), static_cast<int>(targets.size())));
     }
   }
+}
+
+void Game::ensureWayfindingUpToDate() {
+  if (!m_wayfindingDirty) {
+    return;
+  }
+
+  // NOTE: This is intentionally derived, not persisted. It can be moderately expensive on huge
+  // maps, so we compute it lazily and invalidate it on any edit stroke.
+  m_wayfindingStreets = BuildStreetNames(m_world);
+  m_wayfindingAddresses = BuildParcelAddresses(m_world, m_wayfindingStreets);
+  m_wayfindingIndex = BuildAddressIndex(m_wayfindingAddresses);
+
+  m_wayfindingDirty = false;
+}
+
+void Game::clearWayfindingRoute() {
+  m_wayfindingFromQuery.clear();
+  m_wayfindingToQuery.clear();
+
+  m_wayfindingRoute = {};
+  m_wayfindingFocusManeuver = -1;
+  m_wayfindingFocusPath.clear();
+  m_wayfindingManeuverFirst = 0;
+
+  // Keep panel state, but hide the overlay by default so a cleared route doesn't leave artifacts.
+  m_showWayfindingOverlay = false;
+}
+
+void Game::rebuildWayfindingFocusPath() {
+  m_wayfindingFocusPath.clear();
+
+  if (!m_wayfindingRoute.ok) {
+    return;
+  }
+  if (m_wayfindingRoute.pathTiles.empty()) {
+    return;
+  }
+
+  const int n = static_cast<int>(m_wayfindingRoute.maneuvers.size());
+  if (m_wayfindingFocusManeuver < 0 || m_wayfindingFocusManeuver >= n) {
+    return;
+  }
+
+  const RouteManeuver& m = m_wayfindingRoute.maneuvers[m_wayfindingFocusManeuver];
+  const int last = static_cast<int>(m_wayfindingRoute.pathTiles.size()) - 1;
+
+  int a = std::clamp(m.pathStart, 0, last);
+  int b = std::clamp(m.pathEnd, 0, last);
+  if (a > b) {
+    std::swap(a, b);
+  }
+
+  // Inclusive range [a, b].
+  m_wayfindingFocusPath.assign(m_wayfindingRoute.pathTiles.begin() + a, m_wayfindingRoute.pathTiles.begin() + b + 1);
+}
+
+void Game::drawWayfindingOverlay() {
+  if (!m_showWayfindingOverlay || !m_wayfindingRoute.ok) {
+    return;
+  }
+
+  const ParcelAddress& from = m_wayfindingRoute.from;
+  const ParcelAddress& to = m_wayfindingRoute.to;
+
+  const Vector2 fromWs = TileToWorldCenterElevated(from.roadTile.x, from.roadTile.y, m_world, static_cast<float>(m_cfg.tileWidth),
+                                                  static_cast<float>(m_cfg.tileHeight), m_elev);
+  const Vector2 toWs = TileToWorldCenterElevated(to.roadTile.x, to.roadTile.y, m_world, static_cast<float>(m_cfg.tileWidth),
+                                                static_cast<float>(m_cfg.tileHeight), m_elev);
+
+  BeginMode2D(m_camera);
+
+  // Keep marker size roughly stable relative to zoom.
+  const float r = std::clamp(6.0f / m_camera.zoom, 2.0f, 12.0f);
+
+  DrawCircleV(fromWs, r, Color{0, 220, 120, 220});
+  DrawCircleV(toWs, r, Color{255, 80, 80, 220});
+
+  EndMode2D();
+}
+
+void Game::drawWayfindingPanel(int x0, int y0) {
+  const ui::Theme& uiTh = ui::GetTheme();
+  const float uiTime = static_cast<float>(GetTime());
+  const Vector2 mouseUi = mouseUiPosition(m_uiScale);
+
+  const int panelW = kWayfindingPanelW;
+  const int panelH = kWayfindingPanelH;
+  const Rectangle panelR{static_cast<float>(x0), static_cast<float>(y0), static_cast<float>(panelW), static_cast<float>(panelH)};
+
+  ui::DrawPanel(panelR, uiTime, m_showWayfindingPanel);
+  ui::DrawPanelHeader(panelR, "Navigator", uiTime, m_showWayfindingPanel);
+
+  // Header buttons.
+  const bool hasRoute = m_wayfindingRoute.ok;
+  if (ui::Button(7600, Rectangle{static_cast<float>(x0 + panelW - 162), static_cast<float>(y0 + 40), 72.0f, 18.0f}, "Clear", mouseUi, uiTime, hasRoute, false)) {
+    clearWayfindingRoute();
+    showToast("Route cleared", 2.0f);
+  }
+
+  const bool canToggleOverlay = hasRoute || m_showWayfindingOverlay;
+  if (ui::Button(7601, Rectangle{static_cast<float>(x0 + panelW - 82), static_cast<float>(y0 + 40), 72.0f, 18.0f},
+                 m_showWayfindingOverlay ? "Hide" : "Show", mouseUi, uiTime, canToggleOverlay, false)) {
+    m_showWayfindingOverlay = !m_showWayfindingOverlay;
+  }
+
+  int x = x0 + 12;
+  int y = y0 + 42;
+
+  ui::Text(x, y, 15, "Console: route \"from\" \"to\"   |   route panel", uiTh.textDim, false, true, 1);
+  y += 22;
+
+  if (!hasRoute) {
+    const char* tip = "No active route.\n"
+                      "Try: route \"x,y\" \"x,y\"\n"
+                      "Or: route \"street1 & street2\" \"street3 & street4\"";
+    ui::TextBox(x, y, panelW - 24, 54, 14, tip, uiTh.text, false, true, 1.0f, true);
+    y += 62;
+  }
+
+  // Summary.
+  if (hasRoute) {
+    const std::string summary = TextFormat("From: %s\nTo: %s\nSteps: %d    Tiles: %d", m_wayfindingRoute.from.full.c_str(),
+                                           m_wayfindingRoute.to.full.c_str(), static_cast<int>(m_wayfindingRoute.maneuvers.size()),
+                                           static_cast<int>(m_wayfindingRoute.pathTiles.size()));
+    ui::TextBox(x, y, panelW - 24, 56, 14, summary, uiTh.text, false, true, 1.0f, true);
+    y += 64;
+  }
+
+  // Procedural POV controls (works even without a route).
+  {
+    const int boxH = 238;
+    const Rectangle boxR{static_cast<float>(x0 + 10), static_cast<float>(y), static_cast<float>(panelW - 20), static_cast<float>(boxH)};
+    ui::DrawPanelInset(boxR, uiTime);
+
+    int bx = x0 + 18;
+    int by = y + 8;
+
+    ui::Text(bx, by, 15, "Procedural POV", uiTh.textDim, true, true, 1);
+
+    const bool povOn = m_pov.isActive();
+    const float btnH = 20.0f;
+    const float btnW = (boxR.width - 10.0f) * 0.5f;
+
+    const std::string rideLabel = povOn ? "Stop POV" : (hasRoute ? "Ride route" : "Ride route (no route)");
+
+    const Rectangle rideBtn{boxR.x + 8.0f, boxR.y + 26.0f, btnW, btnH};
+    const Rectangle tourBtn{boxR.x + 8.0f + btnW + 6.0f, boxR.y + 26.0f, btnW, btnH};
+    const Rectangle roamBtn{boxR.x + 8.0f, boxR.y + 26.0f + btnH + 6.0f, boxR.width - 16.0f, btnH};
+
+    if (ui::Button(7610, rideBtn, rideLabel, mouseUi, uiTime, povOn || hasRoute, povOn)) {
+      if (povOn) {
+        stopPov();
+      } else if (hasRoute) {
+        std::vector<PovMarker> markers;
+        markers.reserve(m_wayfindingRoute.maneuvers.size());
+        for (const RouteManeuver& man : m_wayfindingRoute.maneuvers) {
+          if (man.type == "turn") {
+            PovMarker mk;
+            mk.pathIndex = std::clamp(man.pathStart, 0, static_cast<int>(m_wayfindingRoute.pathTiles.size()) - 1);
+            mk.label = man.instruction;
+            mk.holdSec = 0.35f;
+            markers.push_back(std::move(mk));
+          } else if (man.type == "arrive") {
+            PovMarker mk;
+            mk.pathIndex = std::clamp(man.pathStart, 0, static_cast<int>(m_wayfindingRoute.pathTiles.size()) - 1);
+            mk.label = man.instruction;
+            mk.holdSec = 0.8f;
+            markers.push_back(std::move(mk));
+          }
+        }
+
+        m_pov.setTitle("Route");
+        const bool ok = m_pov.startFromPath(
+            m_world, m_wayfindingRoute.pathTiles, markers, static_cast<float>(m_cfg.tileWidth),
+            static_cast<float>(m_cfg.tileHeight), m_elev, m_camera, GetScreenWidth(), GetScreenHeight(),
+            static_cast<std::uint32_t>(m_world.seed));
+
+        showToast(ok ? "POV ride started" : "POV failed to start", 2.0f);
+      }
+    }
+
+    if (ui::Button(7611, tourBtn, "Tour POV", mouseUi, uiTime, !povOn, false)) {
+      stopPov();
+
+      // Build a small procedural tour and ride it.
+      TourConfig cfg;
+      cfg.maxStops = 6;
+      const std::string startQuery = m_wayfindingFromQuery.empty() ? std::string{} : m_wayfindingFromQuery;
+      const TourPlan tour = BuildProceduralTour(m_world, startQuery, cfg);
+
+      const bool ok = m_pov.startFromTour(
+          m_world, tour, static_cast<float>(m_cfg.tileWidth), static_cast<float>(m_cfg.tileHeight), m_elev,
+          m_camera, GetScreenWidth(), GetScreenHeight(), static_cast<std::uint32_t>(tour.seed ? tour.seed : m_world.seed));
+
+      showToast(ok ? "POV tour started" : "POV tour could not be generated", 2.0f);
+    }
+
+    if (ui::Button(7614, roamBtn, "Roam POV", mouseUi, uiTime, !povOn, false)) {
+      stopPov();
+      const bool ok = startRoamPov(m_povRoamSeed + 1u, m_povRoamCfg.length);
+      showToast(ok ? "POV roam started" : "POV roam failed", 2.0f);
+    }
+
+    // Sliders.
+    const int sx = x0 + 18;
+    const int sw = panelW - 44;
+    int sy = y + 78;
+
+    // Speed.
+    ui::Text(sx, sy, 13, TextFormat("Speed: %.1f tiles/s", m_pov.config().speedTilesPerSec), uiTh.textDim, false, true, 1);
+    const Rectangle speedR{static_cast<float>(sx), static_cast<float>(sy + 16), static_cast<float>(sw), 14.0f};
+    ui::SliderFloat(7612, speedR, m_pov.config().speedTilesPerSec, 2.0f, 40.0f, mouseUi, uiTime, true);
+    sy += 34;
+
+    // Roam length.
+    ui::Text(sx, sy, 13, TextFormat("Roam length: %d tiles", m_povRoamCfg.length), uiTh.textDim, false, true, 1);
+    const Rectangle lenR{static_cast<float>(sx), static_cast<float>(sy + 16), static_cast<float>(sw), 14.0f};
+    ui::SliderInt(7615, lenR, m_povRoamCfg.length, 200, 2500, 50, mouseUi, uiTime, true);
+    sy += 34;
+
+    // Straight bias.
+    ui::Text(sx, sy, 13, TextFormat("Straight bias: %.2f", m_povRoamCfg.straightBias), uiTh.textDim, false, true, 1);
+    const Rectangle straightR{static_cast<float>(sx), static_cast<float>(sy + 16), static_cast<float>(sw), 14.0f};
+    ui::SliderFloat(7616, straightR, m_povRoamCfg.straightBias, 0.0f, 1.0f, mouseUi, uiTime, true);
+    sy += 34;
+
+    // Scenic bias.
+    ui::Text(sx, sy, 13, TextFormat("Scenic bias: %.2f", m_povRoamCfg.scenicBias), uiTh.textDim, false, true, 1);
+    const Rectangle scenicR{static_cast<float>(sx), static_cast<float>(sy + 16), static_cast<float>(sw), 14.0f};
+    ui::SliderFloat(7617, scenicR, m_povRoamCfg.scenicBias, 0.0f, 1.0f, mouseUi, uiTime, true);
+    sy += 34;
+
+    // 3D preview toggle.
+    const Rectangle togR{static_cast<float>(sx), static_cast<float>(sy), 120.0f, 16.0f};
+    ui::Toggle(7613, togR, m_povDrive3DPreview, "3D preview", mouseUi, uiTime, true);
+
+    y += boxH + 10;
+  }
+
+  if (!hasRoute) {
+    return;
+  }
+
+  // Maneuver list with scrolling.
+  const int rowH = 20;
+  const int listX = x0 + 10;
+  const int listY = y;
+  const int listW = panelW - 20;
+  const int listH = panelH - (listY - y0) - 12;
+  const Rectangle listR{static_cast<float>(listX), static_cast<float>(listY), static_cast<float>(listW), static_cast<float>(listH)};
+  ui::DrawPanelInset(listR, uiTime);
+
+  const int total = static_cast<int>(m_wayfindingRoute.maneuvers.size());
+  const int view = std::max(1, listH / rowH);
+  const int maxFirst = std::max(0, total - view);
+  m_wayfindingManeuverFirst = std::clamp(m_wayfindingManeuverFirst, 0, maxFirst);
+
+  if (CheckCollisionPointRec(mouseUi, listR) && total > view) {
+    const float wheel = GetMouseWheelMove();
+    if (wheel != 0.0f) {
+      m_wayfindingManeuverFirst = std::clamp(m_wayfindingManeuverFirst - static_cast<int>(wheel), 0, maxFirst);
+    }
+  }
+
+  // Scrollbar.
+  const Rectangle scrollR{static_cast<float>(listX + listW - 12), static_cast<float>(listY), 12.0f, static_cast<float>(listH)};
+  (void)ui::ScrollbarV(7602, scrollR, total, view, &m_wayfindingManeuverFirst, mouseUi, uiTime);
+
+  const int textW = listW - 14;
+  for (int i = 0; i < view; ++i) {
+    const int idx = m_wayfindingManeuverFirst + i;
+    if (idx >= total) {
+      break;
+    }
+    const RouteManeuver& m = m_wayfindingRoute.maneuvers[idx];
+
+    std::string label = TextFormat("%2d. %s", idx + 1, m.instruction.c_str());
+    if (label.size() > 92) {
+      label.resize(89);
+      label += "...";
+    }
+
+    const Rectangle rowR{static_cast<float>(listX + 2), static_cast<float>(listY + 2 + i * rowH), static_cast<float>(textW), static_cast<float>(rowH - 2)};
+    const bool isFocus = (idx == m_wayfindingFocusManeuver);
+    if (ui::Button(7700 + idx, rowR, label, mouseUi, uiTime, true, isFocus)) {
+      // Toggle focus; when focused we render the segment only.
+      if (m_wayfindingFocusManeuver == idx) {
+        m_wayfindingFocusManeuver = -1;
+        m_wayfindingFocusPath.clear();
+      } else {
+        m_wayfindingFocusManeuver = idx;
+        rebuildWayfindingFocusPath();
+      }
+    }
+  }
+}
+
+void Game::stopPov()
+{
+  // Restore 2D camera.
+  if (m_pov.isActive()) {
+    m_pov.stop(m_camera);
+  }
+
+  // Restore 3D preview state if POV was driving it.
+  if (m_povSaved3DPreviewValid) {
+    m_show3DPreview = m_povSavedShow3DPreview;
+    m_3dPreviewCfg = m_povSaved3DPreviewCfg;
+    m_povSaved3DPreviewValid = false;
+    m_pov3DPreviewAccumSec = 0.0f;
+
+    // Force a refresh so the restored camera takes effect.
+    m_3dPreviewDirty = true;
+    m_3dPreviewTimer = 0.0f;
+  }
+}
+
+
+bool Game::startRoamPov(std::uint32_t seed, int lengthTiles)
+{
+  if (m_world.width() <= 0 || m_world.height() <= 0) {
+    return false;
+  }
+
+  PovRoamConfig roam = m_povRoamCfg;
+  roam.length = std::max(2, lengthTiles);
+
+  // Use selected tile if possible, otherwise use the camera target tile.
+  Point hint{m_world.width() / 2, m_world.height() / 2};
+  if (m_selected) {
+    hint = *m_selected;
+  } else {
+    if (const auto camTile =
+            WorldToTileElevated(m_camera.target, m_world, static_cast<float>(m_cfg.tileWidth),
+                                static_cast<float>(m_cfg.tileHeight), m_elev)) {
+      hint = *camTile;
+    }
+  }
+
+  std::string debug;
+  const std::vector<Point> path = GeneratePovRoamPath(m_world, hint, roam, seed, &debug);
+  m_povRoamDebug = debug;
+  m_povRoamSeed = seed;
+
+  if (path.size() < 2) {
+    return false;
+  }
+
+  // Insert lightweight "turn markers" so the ride occasionally breathes at corners.
+  std::vector<PovMarker> markers;
+  markers.reserve(64);
+
+  int lastMarker = -999999;
+  for (int i = 1; i + 1 < static_cast<int>(path.size()); ++i) {
+    const Point a = path[static_cast<std::size_t>(i - 1)];
+    const Point b = path[static_cast<std::size_t>(i)];
+    const Point c = path[static_cast<std::size_t>(i + 1)];
+    const Point d1{b.x - a.x, b.y - a.y};
+    const Point d2{c.x - b.x, c.y - b.y};
+
+    if (d1.x == d2.x && d1.y == d2.y) {
+      continue;
+    }
+
+    // Space markers out so we don't stutter on dense intersections.
+    if (i - lastMarker < 18) {
+      continue;
+    }
+    lastMarker = i;
+
+    PovMarker mk;
+    mk.pathIndex = i;
+    mk.holdSec = 0.25f;
+    mk.label = "Turn";
+    markers.push_back(std::move(mk));
+  }
+
+  // Make POV start.
+  m_pov.config().loop = true;
+  m_pov.setTitle("Roam");
+
+  m_pov.startFromPath(m_world, path, markers, static_cast<float>(m_cfg.tileWidth),
+                      static_cast<float>(m_cfg.tileHeight), m_elev, m_camera,
+                      GetScreenWidth(), GetScreenHeight(), seed);
+
+  // Optional: start driving the software 3D preview if enabled by the user.
+  if (m_povDrive3DPreview) {
+    // Save current preview state.
+    if (!m_povSaved3DPreviewValid) {
+      m_povSavedShow3DPreview = m_show3DPreview;
+      m_povSaved3DPreviewCfg = m_3dPreviewCfg;
+      m_povSaved3DPreviewValid = true;
+    }
+    m_show3DPreview = true;
+    m_pov3DPreviewAccumSec = 0.0f;
+    m_3dPreviewDirty = true;
+    m_3dPreviewTimer = 0.0f;
+  }
+
+  return true;
+}
+
+void Game::updatePov(float dt)
+{
+  if (!m_pov.isActive()) {
+    // If the user toggled 3D driving off while POV isn't active, ensure any saved
+    // 3D state is restored.
+    if (m_povSaved3DPreviewValid && !m_povDrive3DPreview) {
+      m_show3DPreview = m_povSavedShow3DPreview;
+      m_3dPreviewCfg = m_povSaved3DPreviewCfg;
+      m_povSaved3DPreviewValid = false;
+      m_pov3DPreviewAccumSec = 0.0f;
+      m_3dPreviewDirty = true;
+      m_3dPreviewTimer = 0.0f;
+    }
+    return;
+  }
+
+  const bool ok = m_pov.update(
+      dt,
+      m_world,
+      static_cast<float>(m_cfg.tileWidth),
+      static_cast<float>(m_cfg.tileHeight),
+      m_elev,
+      m_camera,
+      GetScreenWidth(),
+      GetScreenHeight());
+
+  if (!ok) {
+    // Controller stopped itself; also restore any preview override.
+    if (m_povSaved3DPreviewValid) {
+      m_show3DPreview = m_povSavedShow3DPreview;
+      m_3dPreviewCfg = m_povSaved3DPreviewCfg;
+      m_povSaved3DPreviewValid = false;
+      m_pov3DPreviewAccumSec = 0.0f;
+      m_3dPreviewDirty = true;
+      m_3dPreviewTimer = 0.0f;
+    }
+    return;
+  }
+
+  updatePov3DPreview(dt);
+}
+
+void Game::updatePov3DPreview(float dt)
+{
+  if (!m_pov.isActive()) {
+    return;
+  }
+
+  if (!m_povDrive3DPreview) {
+    // If we were driving the preview and the user toggled it off mid-ride,
+    // restore the old preview settings.
+    if (m_povSaved3DPreviewValid) {
+      m_show3DPreview = m_povSavedShow3DPreview;
+      m_3dPreviewCfg = m_povSaved3DPreviewCfg;
+      m_povSaved3DPreviewValid = false;
+      m_pov3DPreviewAccumSec = 0.0f;
+      m_3dPreviewDirty = true;
+      m_3dPreviewTimer = 0.0f;
+    }
+    return;
+  }
+
+  // Save preview state once, so we can restore it on stop.
+  if (!m_povSaved3DPreviewValid) {
+    m_povSaved3DPreviewValid = true;
+    m_povSavedShow3DPreview = m_show3DPreview;
+    m_povSaved3DPreviewCfg = m_3dPreviewCfg;
+  }
+
+  // Ensure the panel is visible if the user wants 3D POV driving.
+  m_show3DPreview = true;
+
+  // Throttle updates: the software renderer is expensive.
+  constexpr float kPov3DPreviewFps = 8.0f;
+  const float interval = 1.0f / kPov3DPreviewFps;
+  m_pov3DPreviewAccumSec += dt;
+  if (m_pov3DPreviewAccumSec < interval) {
+    return;
+  }
+  m_pov3DPreviewAccumSec = 0.0f;
+
+  Vector2 posTiles{0, 0};
+  Vector2 dirTiles{1, 0};
+  if (!m_pov.getTilePose(posTiles, dirTiles)) {
+    return;
+  }
+
+  // --- Convert tile-space pose -> orbit camera (Soft3D) ---
+  const float tileSize = m_3dPreviewCfg.meshCfg.tileSize;
+  const float heightScale = m_3dPreviewCfg.meshCfg.heightScale;
+
+  const int tx = std::clamp(static_cast<int>(std::floor(posTiles.x)), 0, m_world.width() - 1);
+  const int ty = std::clamp(static_cast<int>(std::floor(posTiles.y)), 0, m_world.height() - 1);
+  const float groundY = m_world.at(tx, ty).height * heightScale;
+
+  // Eye is slightly above the road surface.
+  const float eyeH = 1.35f * tileSize;
+  const float lookAhead = std::max(1.5f * tileSize, m_pov.config().lookAheadTiles * tileSize);
+  const float lookDown = 0.45f * tileSize;
+
+  const float eyeX = posTiles.x * tileSize;
+  const float eyeZ = posTiles.y * tileSize;
+  const float eyeY = groundY + eyeH;
+
+  // Normalize direction in tile space.
+  float dl = std::sqrt(dirTiles.x * dirTiles.x + dirTiles.y * dirTiles.y);
+  float dx = (dl > 1e-3f) ? (dirTiles.x / dl) : 1.0f;
+  float dz = (dl > 1e-3f) ? (dirTiles.y / dl) : 0.0f;
+
+  const float targetX = eyeX + dx * lookAhead;
+  const float targetZ = eyeZ + dz * lookAhead;
+  const float targetY = eyeY - lookDown;
+
+  const float offX = eyeX - targetX;
+  const float offY = eyeY - targetY;
+  const float offZ = eyeZ - targetZ;
+  const float dist = std::max(0.1f, std::sqrt(offX * offX + offY * offY + offZ * offZ));
+
+  const float odx = offX / dist;
+  const float ody = offY / dist;
+  const float odz = offZ / dist;
+
+  const float yawRad = std::atan2(odz, odx);
+  const float pitchRad = std::asin(std::clamp(ody, -1.0f, 1.0f));
+
+  m_3dPreviewCfg.projection = Projection3D::Perspective;
+  m_3dPreviewCfg.autoFit = false;
+  m_3dPreviewCfg.fovYDeg = 75.0f;
+  m_3dPreviewCfg.targetX = targetX;
+  m_3dPreviewCfg.targetY = targetY;
+  m_3dPreviewCfg.targetZ = targetZ;
+  m_3dPreviewCfg.distance = dist;
+  m_3dPreviewCfg.yawDeg = yawRad * (180.0f / 3.1415926535f);
+  m_3dPreviewCfg.pitchDeg = pitchRad * (180.0f / 3.1415926535f);
+  m_3dPreviewCfg.rollDeg = 0.0f;
+
+  m_3dPreviewDirty = true;
+  m_3dPreviewTimer = 0.0f;
 }
 
 void Game::handleInput(float dt)
@@ -12239,6 +13368,10 @@ void Game::update(float dt)
     m_3dPreviewTimer = 0.0f;
   }
 
+  // Procedural POV camera (ride-along). This runs after sim/vehicle updates so
+  // the camera can react to the latest world state.
+  updatePov(dt);
+
   // Optional dynamic resolution scaling for the world layer.
   updateDynamicWorldRenderScale(dt);
   updateVisualPrefsAutosave(dt);
@@ -12997,6 +14130,17 @@ void Game::draw()
     worldBrush = 0;
   }
 
+  // If neither inspect nor road-drag is active, we can optionally visualize an active navigation
+  // route computed via the dev console `route` command.
+  if (!m_roadDragActive && pathPtr == nullptr && m_showWayfindingOverlay && m_wayfindingRoute.ok) {
+    selected = m_wayfindingRoute.from.roadTile;
+    if (m_wayfindingFocusManeuver >= 0 && !m_wayfindingFocusPath.empty()) {
+      pathPtr = &m_wayfindingFocusPath;
+    } else if (!m_wayfindingRoute.pathTiles.empty()) {
+      pathPtr = &m_wayfindingRoute.pathTiles;
+    }
+  }
+
   const bool heatmapActive = (m_heatmapOverlay != HeatmapOverlay::Off);
   const bool heatmapUsesLandValue = heatmapActive && (m_heatmapOverlay != HeatmapOverlay::FloodDepth) && (m_heatmapOverlay != HeatmapOverlay::PondingDepth) && (m_heatmapOverlay != HeatmapOverlay::EvacuationTime) && (m_heatmapOverlay != HeatmapOverlay::EvacuationUnreachable) && (m_heatmapOverlay != HeatmapOverlay::EvacuationFlow);
   const bool districtStatsActive = m_showDistrictPanel || (m_showReport && m_reportPage == 4);
@@ -13388,6 +14532,9 @@ void Game::draw()
 
   // Road upgrade overlay (Ctrl+U).
   drawRoadUpgradeOverlay();
+
+  // Navigator: start/end markers for the currently computed route.
+  drawWayfindingOverlay();
 
   const float simSpeed = kSimSpeeds[static_cast<std::size_t>(std::clamp(m_simSpeedIndex, 0, kSimSpeedCount - 1))];
   const char* inspectInfo = (m_tool == Tool::Inspect && !m_inspectInfo.empty()) ? m_inspectInfo.c_str() : nullptr;
@@ -13892,8 +15039,8 @@ void Game::draw()
       if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouseUi, rr)) {
         m_trafficModelSelection = idx;
       }
-      const bool selected = (m_trafficModelSelection == idx);
-      if (selected) ui::DrawSelectionHighlight(rr, uiTime, /*strong=*/true);
+      const bool rowSelected = (m_trafficModelSelection == idx);
+      if (rowSelected) ui::DrawSelectionHighlight(rr, uiTime, /*strong=*/true);
 
       char buf[64];
       std::snprintf(buf, sizeof(buf), "%d (~%.1f tiles)", tm.jobPenaltyBaseMilli,
@@ -13910,7 +15057,7 @@ void Game::draw()
         m_trafficModelSelection = idx;
       }
 
-      const Color c = selected ? uiTh.text : uiTh.textDim;
+      const Color c = rowSelected ? uiTh.text : uiTh.textDim;
       ui::Text(x, rowY, 16, "Job penalty", c, /*bold=*/false, /*shadow=*/true, 1);
 
       int vv = tm.jobPenaltyBaseMilli;
@@ -14167,10 +15314,10 @@ void Game::draw()
       if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouseUi, rr)) {
         m_resilienceSelection = idx;
       }
-      const bool selected = (m_resilienceSelection == idx);
-      if (selected) ui::DrawSelectionHighlight(rr, uiTime, /*strong=*/true);
+      const bool rowSelected = (m_resilienceSelection == idx);
+      if (rowSelected) ui::DrawSelectionHighlight(rr, uiTime, /*strong=*/true);
 
-      ui::Text(x, rowY, 16, "Run", selected ? uiTh.text : uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
+      ui::Text(x, rowY, 16, "Run", rowSelected ? uiTh.text : uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
 
       const Rectangle br{static_cast<float>(x0 + panelW - 150),
                          static_cast<float>(rowY + 2),
@@ -14189,10 +15336,10 @@ void Game::draw()
       if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouseUi, rr)) {
         m_resilienceSelection = idx;
       }
-      const bool selected = (m_resilienceSelection == idx);
-      if (selected) ui::DrawSelectionHighlight(rr, uiTime, /*strong=*/true);
+      const bool rowSelected = (m_resilienceSelection == idx);
+      if (rowSelected) ui::DrawSelectionHighlight(rr, uiTime, /*strong=*/true);
 
-      ui::Text(x, rowY, 16, "Export", selected ? uiTh.text : uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
+      ui::Text(x, rowY, 16, "Export", rowSelected ? uiTh.text : uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
 
       const Rectangle br{static_cast<float>(x0 + panelW - 150),
                          static_cast<float>(rowY + 2),
@@ -14391,8 +15538,8 @@ void Game::draw()
       if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouseUi, rr)) {
         m_districtSelection = idx;
       }
-      const bool selected = (m_districtSelection == idx);
-      if (selected) ui::DrawSelectionHighlight(rr, uiTime, /*strong=*/true);
+      const bool rowSelected = (m_districtSelection == idx);
+      if (rowSelected) ui::DrawSelectionHighlight(rr, uiTime, /*strong=*/true);
 
       int district = std::clamp(m_activeDistrict, 0, kDistrictCount - 1);
       const char* label = "Active district";
@@ -14409,7 +15556,7 @@ void Game::draw()
         m_districtSelection = idx;
       }
 
-      const Color c = selected ? uiTh.text : uiTh.textDim;
+      const Color c = rowSelected ? uiTh.text : uiTh.textDim;
       ui::Text(x, rowY, 16, label, c, /*bold=*/false, /*shadow=*/true, 1);
 
       int vv = district;
@@ -14428,15 +15575,15 @@ void Game::draw()
       if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouseUi, rr)) {
         m_districtSelection = idx;
       }
-      const bool selected = (m_districtSelection == idx);
-      if (selected) ui::DrawSelectionHighlight(rr, uiTime, /*strong=*/true);
+      const bool rowSelected = (m_districtSelection == idx);
+      if (rowSelected) ui::DrawSelectionHighlight(rr, uiTime, /*strong=*/true);
 
       const Rectangle tr{static_cast<float>(xValueRight - 46), static_cast<float>(rowY + (rowH - 16) / 2), 46.0f, 16.0f};
       if (CheckCollisionPointRec(mouseUi, tr) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
         m_districtSelection = idx;
       }
 
-      const Color c = selected ? uiTh.text : uiTh.textDim;
+      const Color c = rowSelected ? uiTh.text : uiTh.textDim;
       ui::Text(x, rowY, 16, "Overlay", c, /*bold=*/false, /*shadow=*/true, 1);
 
       bool vv = m_showDistrictOverlay;
@@ -14521,6 +15668,11 @@ void Game::draw()
     drawTransitPanel(static_cast<int>(rect.x), static_cast<int>(rect.y));
   }
 
+  if (m_showWayfindingPanel) {
+    const Rectangle rect = rightDock.alloc(kWayfindingPanelW, kWayfindingPanelH);
+    drawWayfindingPanel(static_cast<int>(rect.x), static_cast<int>(rect.y));
+  }
+
   if (m_showRoadUpgradePanel) {
     const Rectangle rect = rightDock.alloc(kRoadUpgradePanelW, kRoadUpgradePanelH);
     drawRoadUpgradePanel(static_cast<int>(rect.x), static_cast<int>(rect.y));
@@ -14536,37 +15688,55 @@ void Game::draw()
   // Road-drag overlay: show preview metrics without touching the HUD layout.
   if (m_roadDragActive) {
     const int fontSize = 16;
+    const int smallFontSize = 14;
     const int pad = 10;
     const int lineH = fontSize + 4;
+    const int smallLineH = smallFontSize + 4;
 
-    const int tiles = static_cast<int>(m_roadDragUpgradeTiles.size());
-    const int level = m_roadDragUpgradeLevel;
-    const int cost = static_cast<int>(std::llround(m_roadDragMoneyCost));
+    const int pathTiles = static_cast<int>(m_roadDragPath.size());
+    const int newTiles = m_roadDragBuildCost;
+    const int upgradeTiles = m_roadDragUpgradeTiles;
+    const int bridgeTiles = m_roadDragBridgeTiles;
+    const int cost = m_roadDragMoneyCost;
+
+    const bool valid = m_roadDragValid && (pathTiles > 0);
     const bool affordable = (m_world.stats().money >= cost);
 
-    const std::string line1 = "Road drag";
-    const std::string line2 = TextFormat("Tiles: %d   Level: %d", tiles, level);
-    const std::string line3 = TextFormat("Cost: $%d%s", cost, affordable ? "" : "  (need $)");
+    const char* roadClass = RoadClassName(m_roadBuildLevel);
+
+    const std::string line1 = valid ? TextFormat("Road drag (%s)", roadClass)
+                                    : TextFormat("Road drag (%s) - INVALID", roadClass);
+    const std::string line2 = TextFormat("Path: %d tiles   New: %d   Upg: %d", pathTiles, newTiles, upgradeTiles);
+    const std::string line3 = TextFormat("Bridges: %d   Cost: $%d%s", bridgeTiles, cost,
+                                         (valid && !affordable) ? "  (need $)" : "");
+    const std::string line4 = "Release: build   Esc/RMB: cancel";
 
     int maxW = ui::MeasureTextWidth(line1, fontSize, /*bold=*/true, 1);
     maxW = std::max(maxW, ui::MeasureTextWidth(line2, fontSize, /*bold=*/false, 1));
     maxW = std::max(maxW, ui::MeasureTextWidth(line3, fontSize, /*bold=*/false, 1));
+    maxW = std::max(maxW, ui::MeasureTextWidth(line4, smallFontSize, /*bold=*/false, 1));
 
     const int boxW = maxW + pad * 2;
-    const int boxH = pad * 2 + lineH * 3;
+    const int boxH = pad * 2 + lineH * 3 + smallLineH;
 
     const Rectangle r{12.0f, 12.0f, static_cast<float>(boxW), static_cast<float>(boxH)};
     ui::DrawPanel(r, uiTime, /*active=*/true);
 
     int x = static_cast<int>(r.x) + pad;
     int y = static_cast<int>(r.y) + pad;
-    ui::Text(x, y, fontSize, line1, uiTh.text, /*bold=*/true, /*shadow=*/true, 1);
+
+    const Color titleColor = valid ? uiTh.text : uiTh.accentBad;
+    ui::Text(x, y, fontSize, line1, titleColor, /*bold=*/true, /*shadow=*/true, 1);
     y += lineH;
+
     ui::Text(x, y, fontSize, line2, uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
     y += lineH;
 
-    const Color costColor = affordable ? uiTh.accentOk : uiTh.accentBad;
+    const Color costColor = valid ? (affordable ? uiTh.accentOk : uiTh.accentBad) : uiTh.accentBad;
     ui::Text(x, y, fontSize, line3, costColor, /*bold=*/false, /*shadow=*/true, 1);
+    y += lineH;
+
+    ui::Text(x, y, smallFontSize, line4, uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
   }
 
 
@@ -14647,6 +15817,32 @@ void Game::draw()
     showToast(std::string("Screenshot saved: ") + m_pendingScreenshotPath, 3.0f);
     m_pendingScreenshot = false;
     m_pendingScreenshotPath.clear();
+  }
+
+  // POV HUD (ride-along camera status + stop button).
+  if (m_pov.isActive()) {
+    const int pad = 10;
+    const int fontTitle = 16;
+    const int fontSmall = 13;
+
+    const std::string st = m_pov.statusText();
+    const int textW = ui::MeasureTextWidth(st, fontSmall, /*bold=*/false, 1);
+
+    const int boxW = std::max(260, textW + pad * 2 + 70);
+    const int boxH = 52;
+
+    const int x = pad;
+    const int y = pad;
+    const Rectangle r{static_cast<float>(x), static_cast<float>(y), static_cast<float>(boxW), static_cast<float>(boxH)};
+    ui::DrawPanel(r, uiTime, /*active=*/true);
+
+    ui::Text(x + pad, y + 8, fontTitle, "POV", uiTh.text, /*bold=*/true, /*shadow=*/true, 1);
+    ui::Text(x + pad, y + 28, fontSmall, st, uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
+
+    const Rectangle stopR{r.x + r.width - 64.0f, r.y + 10.0f, 54.0f, 18.0f};
+    if (ui::Button(9050, stopR, "Stop", mouseUi, uiTime, true, false)) {
+      stopPov();
+    }
   }
 
   // Toast / status message

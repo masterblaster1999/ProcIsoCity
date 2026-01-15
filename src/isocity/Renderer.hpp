@@ -28,6 +28,7 @@
 #include "raylib.h"
 
 #include "isocity/GpuGeom.hpp"
+#include "isocity/OrganicMaterial.hpp"
 
 // Some environments still define min/max even with NOMINMAX; undef defensively.
 #if defined(_WIN32)
@@ -366,6 +367,14 @@ public:
   WeatherSettings::Mode weatherMode() const { return m_weather.mode; }
   bool weatherEnabled() const { return m_weather.mode != WeatherSettings::Mode::Clear; }
 
+  // Procedural animated "organic material" overlay (reaction-diffusion texture).
+  void setOrganicMaterialSettings(const OrganicMaterial::Settings& s) { m_organicSettings = s; }
+  const OrganicMaterial::Settings& organicMaterialSettings() const { return m_organicSettings; }
+  bool organicMaterialEnabled() const { return m_organicSettings.enabled; }
+
+  // Reseed the organic material simulation (keeps current settings).
+  void resetOrganicMaterial(std::uint32_t seed);
+
   // Cloud shadow controls (procedural atmospheric shadows).
   void setCloudShadowSettings(const CloudShadowSettings& s);
   const CloudShadowSettings& cloudShadowSettings() const { return m_cloudShadows; }
@@ -465,6 +474,12 @@ private:
   DayNightSettings m_dayNight{};
 
   WeatherSettings m_weather{};
+
+  // Animated reaction-diffusion "organic material" overlay.
+  OrganicMaterial m_organicMaterial{};
+  OrganicMaterial::Settings m_organicSettings{};
+  float m_organicLastTimeSec = 0.0f;
+  bool m_organicHasLastTime = false;
 
   CloudShadowSettings m_cloudShadows{};
   Texture2D m_cloudShadowTex{};

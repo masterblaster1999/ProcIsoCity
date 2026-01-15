@@ -20,6 +20,10 @@
 #include "isocity/RoadGraphResilience.hpp"
 #include "isocity/RoadResilienceBypass.hpp"
 #include "isocity/RoadUpgradePlanner.hpp"
+#include "isocity/StreetNames.hpp"
+#include "isocity/Wayfinding.hpp"
+#include "isocity/PovController.hpp"
+#include "isocity/PovProcedural.hpp"
 #include "isocity/SaveLoad.hpp"
 #include "isocity/Traffic.hpp"
 #include "isocity/Goods.hpp"
@@ -132,6 +136,19 @@ private:
 
   // Debug/developer console (toggle with F4).
   void setupDevConsole();
+
+  // In-game navigation / wayfinding.
+  void ensureWayfindingUpToDate();
+  void clearWayfindingRoute();
+  void rebuildWayfindingFocusPath();
+  void drawWayfindingPanel(int x0, int y0);
+  void drawWayfindingOverlay();
+
+  // Procedural POV (ride-along) camera.
+  void stopPov();
+  void updatePov(float dt);
+  void updatePov3DPreview(float dt);
+  bool startRoamPov(std::uint32_t seed, int lengthTiles);
 
   void handleInput(float dt);
   void update(float dt);
@@ -504,6 +521,51 @@ private:
 
   bool m_roadUpgradeSelectedMaskDirty = true;
   std::vector<std::uint8_t> m_roadUpgradeSelectedMask;
+
+  // ---------------------------------------------------------------------------------------------
+  // In-game navigation / wayfinding.
+  //
+  // This bridges the headless Wayfinding + StreetNames modules into the interactive app so you can:
+  //   - geocode street addresses / intersections / tile coords
+  //   - compute a turn-by-turn route
+  //   - visualize the route in-world
+  //
+  // Routes are typically created via the dev console `route` command.
+  bool m_showWayfindingPanel = false;
+  bool m_showWayfindingOverlay = false;
+
+  // Derived caches. Rebuilt lazily when marked dirty.
+  bool m_wayfindingDirty = true;
+  StreetNamingResult m_wayfindingStreets;
+  std::vector<ParcelAddress> m_wayfindingAddresses;
+  AddressIndex m_wayfindingIndex;
+
+  // Most recent query + route result.
+  std::string m_wayfindingFromQuery;
+  std::string m_wayfindingToQuery;
+  RouteResult m_wayfindingRoute;
+
+  // UI state.
+  int m_wayfindingManeuverFirst = 0;
+  int m_wayfindingFocusManeuver = -1; // -1 = show full route
+  std::vector<Point> m_wayfindingFocusPath;
+
+  // ---------------------------------------------------------------------------------------------
+  // Procedural POV camera.
+  //
+  // A cinematic "ride-along" camera rig that can follow the current wayfinding route
+  // or a procedurally generated TourPlanner tour.
+  PovController m_pov;
+  PovRoamConfig m_povRoamCfg{};
+  std::uint32_t m_povRoamSeed = 1u;
+  std::string m_povRoamDebug{};
+
+  // Optional: drive the software 3D preview camera from the POV rig.
+  bool m_povDrive3DPreview = false;
+  bool m_povSaved3DPreviewValid = false;
+  bool m_povSavedShow3DPreview = false;
+  Render3DConfig m_povSaved3DPreviewCfg{};
+  float m_pov3DPreviewAccumSec = 0.0f;
 
     // Flood/evacuation analysis panel (toggle with F).
   bool m_showResiliencePanel = false;

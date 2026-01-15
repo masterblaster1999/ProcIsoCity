@@ -908,13 +908,25 @@ TourPosterResult RenderTourPoster(const World& world, const TourPlan& tour, cons
 
   auto strokeThick = [&](int x0, int y0, int x1, int y1, int w, Rgba8 c) {
     w = std::max(1, w);
+
+    auto stroke = [&](int ax0, int ay0, int ax1, int ay1) {
+      gfx::StrokeLineAA(out.image,
+                        static_cast<float>(ax0),
+                        static_cast<float>(ay0),
+                        static_cast<float>(ax1),
+                        static_cast<float>(ay1),
+                        c,
+                        BlendMode::Alpha);
+    };
+
     // Simple multi-stroke approximation for small widths.
-    gfx::StrokeLineAA(out.image, x0, y0, x1, y1, c, BlendMode::Alpha);
-    for (int i = 1; i <= w / 2; ++i) {
-      gfx::StrokeLineAA(out.image, x0 + i, y0, x1 + i, y1, c, BlendMode::Alpha);
-      gfx::StrokeLineAA(out.image, x0 - i, y0, x1 - i, y1, c, BlendMode::Alpha);
-      gfx::StrokeLineAA(out.image, x0, y0 + i, x1, y1 + i, c, BlendMode::Alpha);
-      gfx::StrokeLineAA(out.image, x0, y0 - i, x1, y1 - i, c, BlendMode::Alpha);
+    stroke(x0, y0, x1, y1);
+    const int r = w / 2;
+    for (int i = 1; i <= r; ++i) {
+      stroke(x0 + i, y0, x1 + i, y1);
+      stroke(x0 - i, y0, x1 - i, y1);
+      stroke(x0, y0 + i, x1, y1 + i);
+      stroke(x0, y0 - i, x1, y1 - i);
     }
   };
 
@@ -923,15 +935,56 @@ TourPosterResult RenderTourPoster(const World& world, const TourPlan& tour, cons
     const Rgba8 outline{10, 10, 10, static_cast<std::uint8_t>(std::min<int>(255, cfg.routeAlpha))};
     const Rgba8 core{255, 80, 80, cfg.routeAlpha};
 
+    auto drawRouteTiles = [&](const std::vector<Point>& tiles) {
+      if (tiles.size() < 2) return;
+
+      auto flush = [&](const Point& aTile, const Point& bTile) {
+        const Point a = tileCenterPx(aTile);
+        const Point b = tileCenterPx(bTile);
+        strokeThick(a.x, a.y, b.x, b.y, cfg.routeLineWidthPx + 2, outline);
+        strokeThick(a.x, a.y, b.x, b.y, cfg.routeLineWidthPx, core);
+      };
+
+      // Collapse collinear runs into longer segments. This both speeds up export and avoids
+      // visible “jitter” where many tiny subpixel strokes accumulate.
+      Point segStart = tiles.front();
+      Point prev = segStart;
+      int dirX = 0;
+      int dirY = 0;
+      bool haveDir = false;
+
+      for (std::size_t i = 1; i < tiles.size(); ++i) {
+        const Point cur = tiles[i];
+        int dx = cur.x - prev.x;
+        int dy = cur.y - prev.y;
+        if (dx == 0 && dy == 0) continue;
+
+        dx = (dx > 0) - (dx < 0);
+        dy = (dy > 0) - (dy < 0);
+
+        if (!haveDir) {
+          haveDir = true;
+          dirX = dx;
+          dirY = dy;
+        } else if (dx != dirX || dy != dirY) {
+          flush(segStart, prev);
+          segStart = prev;
+          dirX = dx;
+          dirY = dy;
+        }
+
+        prev = cur;
+      }
+
+      if (haveDir) {
+        flush(segStart, prev);
+      }
+    };
+
     for (std::size_t si = 0; si < tour.stops.size(); ++si) {
       const RouteResult& r = tour.stops[si].routeFromPrev;
       if (!r.ok || r.pathTiles.size() < 2) continue;
-      for (std::size_t i = 1; i < r.pathTiles.size(); ++i) {
-        const Point a = tileCenterPx(r.pathTiles[i - 1]);
-        const Point b = tileCenterPx(r.pathTiles[i]);
-        strokeThick(a.x, a.y, b.x, b.y, cfg.routeLineWidthPx + 2, outline);
-        strokeThick(a.x, a.y, b.x, b.y, cfg.routeLineWidthPx, core);
-      }
+      drawRouteTiles(r.pathTiles);
     }
   }
 
