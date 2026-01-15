@@ -131,7 +131,7 @@ static std::uint64_t HashBlueprintContent(const Blueprint& bp)
     h = Fnv1a64(&height, sizeof(height), h);
     h = Fnv1a64(&variation, sizeof(variation), h);
     h = Fnv1a64(&level, sizeof(level), h);
-    h = Fnv1a64(&occupants, sizeof(occupants), h);
+	    h = Fnv1a64(reinterpret_cast<const std::uint8_t*>(&occupants), sizeof(occupants), h);
     h = Fnv1a64(&district, sizeof(district), h);
   }
 

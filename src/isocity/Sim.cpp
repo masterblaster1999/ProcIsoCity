@@ -602,18 +602,18 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
             const int steps = (static_cast<std::size_t>(ridx) < stopField.steps.size())
                                 ? stopField.steps[static_cast<std::size_t>(ridx)]
                                 : -1;
-            const bool served = (steps >= 0 && steps <= kWalkRadiusSteps);
+	            const bool tileServed = (steps >= 0 && steps <= kWalkRadiusSteps);
 
             if (t.overlay == Overlay::Residential) {
               resTotal += wgt;
-              if (served) {
+	              if (tileServed) {
                 resServed += wgt;
                 resWalkSum += static_cast<std::uint64_t>(steps) * wgt;
                 resWalkW += wgt;
               }
             } else if (t.overlay == Overlay::Commercial || t.overlay == Overlay::Industrial) {
               jobsTotal += wgt;
-              if (served) {
+	              if (tileServed) {
                 jobsServed += wgt;
                 jobsWalkSum += static_cast<std::uint64_t>(steps) * wgt;
                 jobsWalkW += wgt;
