@@ -33,6 +33,10 @@ const char* ToString(ProcGenTerrainPreset p)
   case ProcGenTerrainPreset::InlandSea: return "inland_sea";
   case ProcGenTerrainPreset::RiverValley: return "river_valley";
   case ProcGenTerrainPreset::MountainRing: return "mountain_ring";
+  case ProcGenTerrainPreset::Fjords: return "fjords";
+  case ProcGenTerrainPreset::Canyon: return "canyon";
+  case ProcGenTerrainPreset::Volcano: return "volcano";
+  case ProcGenTerrainPreset::Delta: return "delta";
   default: return "classic";
   }
 }
@@ -73,6 +77,29 @@ bool ParseProcGenTerrainPreset(const std::string& s, ProcGenTerrainPreset& out)
   if (eq("mountain") || eq("mountains") || eq("ring") || eq("mountainring") || eq("mountain_ring") ||
       eq("crater")) {
     out = ProcGenTerrainPreset::MountainRing;
+    return true;
+  }
+
+  if (eq("fjord") || eq("fjords") || eq("glacier") || eq("glacial") || eq("inlet") || eq("inlets")) {
+    out = ProcGenTerrainPreset::Fjords;
+    return true;
+  }
+
+  if (eq("canyon") || eq("canyons") || eq("gorge") || eq("gorges") || eq("grandcanyon") ||
+      eq("grand_canyon") || eq("grand-canyon")) {
+    out = ProcGenTerrainPreset::Canyon;
+    return true;
+  }
+
+  if (eq("volcano") || eq("volcanic") || eq("caldera") || eq("crater_lake") || eq("craterlake") ||
+      eq("crater-lake")) {
+    out = ProcGenTerrainPreset::Volcano;
+    return true;
+  }
+
+  if (eq("delta") || eq("riverdelta") || eq("river_delta") || eq("river-delta") || eq("floodplain") ||
+      eq("wetlands") || eq("marsh") || eq("marshes")) {
+    out = ProcGenTerrainPreset::Delta;
     return true;
   }
 
@@ -3839,6 +3866,114 @@ static void ApplyTerrainPreset(std::vector<float>& heights, int width, int heigh
     }
   }
 
+  // Precompute a deeper canyon centerline.
+  bool canyonHorizontal = false;
+  std::vector<float> canyonLine;
+  float canyonBase = 0.0f;
+
+  if (preset == ProcGenTerrainPreset::Canyon) {
+    canyonHorizontal = ((HashCoords32(width, height, seed32 ^ 0xCA7B0A1Bu) & 1u) != 0u);
+    const int len = canyonHorizontal ? width : height;
+    const int oth = canyonHorizontal ? height : width;
+    canyonLine.resize(static_cast<std::size_t>(std::max(0, len)), 0.0f);
+
+    // Keep the canyon fairly central so it feels like a "feature" of the map.
+    const float base01 = 0.42f + 0.16f * prng.nextF01();
+    canyonBase = base01 * static_cast<float>(oth);
+
+    // Big meanders.
+    const float amp = static_cast<float>(oth) * (0.22f + 0.10f * prng.nextF01());
+    const float smallAmp = amp * 0.42f;
+
+    for (int i = 0; i < len; ++i) {
+      const float t = (len > 1) ? (static_cast<float>(i) / static_cast<float>(len - 1)) : 0.0f;
+      const float n0 = fbmNormalized(t * 1.65f, 2.9f, seed32 ^ 0xCA11AB1Eu, 4) * 2.0f - 1.0f;
+      const float n1 = fbmNormalized(t * 5.75f, 7.7f, seed32 ^ 0x0DDC0FFEu, 2) * 2.0f - 1.0f;
+      float p = canyonBase + n0 * amp + n1 * smallAmp;
+
+      // Drift bias: encourages an S-curve that avoids always being centered.
+      const float drift = fbmNormalized(t * 0.95f, 9.1f, seed32 ^ 0x13579BDFu, 2) * 2.0f - 1.0f;
+      p += (t - 0.5f) * static_cast<float>(oth) * (0.14f * drift);
+
+      p = std::clamp(p, 2.0f, static_cast<float>(oth) - 3.0f);
+      canyonLine[static_cast<std::size_t>(i)] = p;
+    }
+  }
+
+  // Precompute a river delta (main channel + two distributaries near the mouth).
+  bool deltaHorizontal = false;
+  bool deltaMouthAtMax = true; // bottom or right
+  std::vector<float> deltaMain;
+  std::vector<float> deltaB1;
+  std::vector<float> deltaB2;
+  float deltaMouth = 0.0f;
+  float deltaSource = 0.0f;
+  int deltaLen = 0;
+  int deltaOth = 0;
+
+  if (preset == ProcGenTerrainPreset::Delta) {
+    // Pick a coast side deterministically.
+    const int side = static_cast<int>(HashCoords32(width, height, seed32 ^ 0xD311A5E5u) % 4u);
+    // 0 = top, 1 = right, 2 = bottom, 3 = left.
+    deltaHorizontal = (side == 1 || side == 3);
+    deltaMouthAtMax = (side == 2 || side == 1);
+    deltaLen = deltaHorizontal ? width : height;
+    deltaOth = deltaHorizontal ? height : width;
+    deltaMain.resize(static_cast<std::size_t>(std::max(0, deltaLen)), 0.0f);
+    deltaB1.resize(deltaMain.size(), 0.0f);
+    deltaB2.resize(deltaMain.size(), 0.0f);
+
+    // Mouth location along the coast.
+    const float mouth01 = 0.38f + 0.24f * prng.nextF01();
+    deltaMouth = mouth01 * static_cast<float>(deltaOth);
+
+    // Source location on the opposite side.
+    const float src01 = 0.28f + 0.44f * prng.nextF01();
+    deltaSource = src01 * static_cast<float>(deltaOth);
+
+    // Max branch divergence (in tiles) near the mouth.
+    const float branchMax = static_cast<float>(deltaOth) * (0.08f + 0.06f * prng.nextF01());
+
+    for (int i = 0; i < deltaLen; ++i) {
+      const int ii = deltaMouthAtMax ? i : (deltaLen - 1 - i);
+      const float t = (deltaLen > 1) ? (static_cast<float>(ii) / static_cast<float>(deltaLen - 1)) : 0.0f;
+
+      // Blend from source position to mouth position.
+      float p = Lerp(deltaSource, deltaMouth, t);
+
+      // Long meanders that damp near the mouth (delta tends to straighten as it fans out).
+      const float meander = (fbmNormalized(t * 2.05f, 3.1f, seed32 ^ 0xDE17A11Eu, 3) * 2.0f - 1.0f);
+      const float damp = 1.0f - Smoothstep(0.72f, 0.98f, t);
+      p += meander * static_cast<float>(deltaOth) * (0.12f * damp);
+
+      // Small-scale wiggle.
+      const float wiggle = (fbmNormalized(t * 6.8f, 9.7f, seed32 ^ 0xB16B00B5u, 2) * 2.0f - 1.0f);
+      p += wiggle * static_cast<float>(deltaOth) * 0.020f;
+
+      // Clamp away from edges.
+      p = std::clamp(p, 2.0f, static_cast<float>(deltaOth) - 3.0f);
+      deltaMain[static_cast<std::size_t>(i)] = p;
+
+      // Distributaries: diverge near the mouth.
+      const float div = Smoothstep(0.62f, 0.94f, t);
+      const float off = div * branchMax;
+      // Each branch gets its own slight noise.
+      const float bN = (fbmNormalized(t * 8.1f, 1.3f, seed32 ^ 0x51A71D00u, 2) * 2.0f - 1.0f);
+      deltaB1[static_cast<std::size_t>(i)] = std::clamp(p + off + bN * 1.6f, 2.0f, static_cast<float>(deltaOth) - 3.0f);
+      deltaB2[static_cast<std::size_t>(i)] = std::clamp(p - off - bN * 1.6f, 2.0f, static_cast<float>(deltaOth) - 3.0f);
+    }
+  }
+
+  // Volcano parameters (picked deterministically per-preset).
+  float volcanoCraterR = 0.18f;
+  float volcanoCraterInner = 0.10f;
+  float volcanoRimSigma = 0.040f;
+  if (preset == ProcGenTerrainPreset::Volcano) {
+    volcanoCraterR = 0.16f + 0.06f * prng.nextF01();
+    volcanoCraterInner = volcanoCraterR * (0.52f + 0.10f * prng.nextF01());
+    volcanoRimSigma = 0.030f + 0.025f * prng.nextF01();
+  }
+
   struct Island {
     float x = 0.0f;
     float y = 0.0f;
@@ -3981,10 +4116,233 @@ static void ApplyTerrainPreset(std::vector<float>& heights, int width, int heigh
         // Basin inside the ring.
         const float basin = std::exp(-(r * r) / (2.0f * 0.55f * 0.55f));
         h -= basin * (0.14f * strength);
+      } else if (preset == ProcGenTerrainPreset::Fjords) {
+        // Glaciated coasts: edge sea + a rugged coastal mountain band.
+        const int dxE = std::min(x, width - 1 - x);
+        const int dyE = std::min(y, height - 1 - y);
+        const float dEdge = static_cast<float>(std::min(dxE, dyE));
+        const float denom = std::max(1.0f, (minDim * 0.5f));
+        const float edge01 = std::clamp(dEdge / denom, 0.0f, 1.0f);
+
+        // Water at the very edge, land inland.
+        const float coast = Smoothstep(0.10f, 0.48f, edge01);
+        const float sea = 1.0f - coast;
+        h -= sea * (0.44f * strength);
+        h += coast * (0.05f * strength);
+
+        // Coastal mountains: a band inland from the coast.
+        const float band = Smoothstep(0.14f, 0.26f, edge01) * (1.0f - Smoothstep(0.56f, 0.82f, edge01));
+        const float rugged = (fbmNormalized(static_cast<float>(x) * coastScale * 0.55f,
+                                            static_cast<float>(y) * coastScale * 0.55f,
+                                            seed32 ^ 0xF10DDF00u, 3) * 2.0f - 1.0f);
+        const float m = std::clamp(0.70f + 0.30f * rugged, 0.25f, 1.25f);
+        h += band * m * (0.38f * strength);
+      } else if (preset == ProcGenTerrainPreset::Canyon) {
+        // Canyonlands: uplift into a plateau, then carve a deep winding canyon.
+        h += (0.18f * strength);
+
+        if (!canyonLine.empty()) {
+          float d = 0.0f;
+          if (canyonHorizontal) {
+            const float y0 = canyonLine[static_cast<std::size_t>(x)];
+            d = std::abs(static_cast<float>(y) - y0);
+          } else {
+            const float x0 = canyonLine[static_cast<std::size_t>(y)];
+            d = std::abs(static_cast<float>(x) - x0);
+          }
+
+          const float w01 = fbmNormalized((canyonHorizontal ? static_cast<float>(x) : static_cast<float>(y)) * 0.055f,
+                                          0.0f, seed32 ^ 0xCA7A0C00u, 3);
+          const float widthBase = 1.7f + w01 * 2.7f;
+          const float bank = widthBase * 3.4f;
+
+          const float t = Clamp01(1.0f - (d / widthBase));
+          h -= (t * t) * (0.82f * strength);
+
+          // Wider eroded shoulders.
+          const float tb = Clamp01(1.0f - (d / bank));
+          h -= (tb * tb) * (0.18f * strength);
+
+          // Ensure a continuous river core (visible even if river conversion is off).
+          if (d < widthBase * 0.33f) {
+            h = std::min(h, cfg.waterLevel - 0.10f - 0.04f * strength);
+          }
+
+          // Mesa terracing away from the canyon.
+          if (d > bank * 1.1f && h > cfg.waterLevel + 0.14f) {
+            const float step = 0.030f + 0.010f * (1.0f - std::min(strength, 1.0f));
+            const float off = 0.35f;
+            const float q = std::floor((h + off) / step) * step - off;
+            h = Lerp(h, q, 0.40f * strength);
+          }
+        }
+      } else if (preset == ProcGenTerrainPreset::Volcano) {
+        // Volcanic cone + caldera.
+        const float rn = std::clamp(r / 1.41421356f, 0.0f, 1.0f);
+
+        // Cone: broad base with a sharper peak.
+        const float cone = std::pow(std::max(0.0f, 1.0f - rn), 1.22f);
+        const float rough = (fbmNormalized(static_cast<float>(x) * coastScale * 0.95f,
+                                           static_cast<float>(y) * coastScale * 0.95f,
+                                           seed32 ^ 0xBADA55E5u, 3) * 2.0f - 1.0f);
+        h += cone * (0.62f * strength);
+        h += rough * cone * (0.06f * strength);
+
+        // Caldera depression.
+        const float crater = 1.0f - Smoothstep(volcanoCraterInner, volcanoCraterR, rn);
+        h -= crater * (0.70f * strength);
+
+        // Rim uplift.
+        const float dr = rn - volcanoCraterR;
+        const float rim = std::exp(-(dr * dr) / (2.0f * volcanoRimSigma * volcanoRimSigma));
+        h += rim * (0.22f * strength);
+      } else if (preset == ProcGenTerrainPreset::Delta) {
+        // Asymmetric coast + river delta. Use a macro downhill slope toward the mouth.
+        if (!deltaMain.empty()) {
+          const int a = deltaHorizontal ? x : y;
+          const int ii = deltaMouthAtMax ? a : (deltaLen - 1 - a);
+          const float t = (deltaLen > 1) ? (static_cast<float>(ii) / static_cast<float>(deltaLen - 1)) : 0.0f;
+
+          // Slope: inland a bit higher, coast lower.
+          h += (1.0f - t) * (0.08f * strength);
+          h -= t * (0.36f * strength);
+
+          // Wet coastal plain flattening.
+          const float coastal = Smoothstep(0.70f, 0.98f, t);
+          h -= coastal * coastal * (0.10f * strength);
+
+          const float o = static_cast<float>(deltaHorizontal ? y : x);
+          const float p0 = deltaMain[static_cast<std::size_t>(a)];
+          const float p1 = deltaB1[static_cast<std::size_t>(a)];
+          const float p2 = deltaB2[static_cast<std::size_t>(a)];
+
+          const float d0 = std::abs(o - p0);
+          const float d1 = std::abs(o - p1);
+          const float d2 = std::abs(o - p2);
+
+          const float widen = Smoothstep(0.62f, 1.0f, t);
+          const float wBase = 2.0f + 1.3f * strength;
+          const float w = wBase + widen * (4.2f + 2.4f * strength);
+          const float bank = w * 2.25f;
+
+          auto carve = [&](float d, float depthMul) {
+            const float tc = Clamp01(1.0f - (d / w));
+            const float tb = Clamp01(1.0f - (d / bank));
+            h -= (tc * tc) * (0.50f * strength) * depthMul;
+            h -= (tb * tb) * (0.12f * strength) * depthMul;
+
+            if (d < w * 0.28f) {
+              const float core = std::clamp(cfg.waterLevel - 0.10f - 0.04f * strength, -0.30f, 0.90f);
+              h = std::min(h, core);
+            }
+          };
+
+          carve(d0, 1.00f);
+          carve(d1, 0.75f * widen);
+          carve(d2, 0.75f * widen);
+
+          // Marshy islands / sediment noise near the coast.
+          const float marshN = (fbmNormalized(static_cast<float>(x) * coastScale * 1.20f,
+                                              static_cast<float>(y) * coastScale * 1.20f,
+                                              seed32 ^ 0xD311A5E5u, 3) * 2.0f - 1.0f);
+          h -= marshN * coastal * (0.05f * strength);
+        }
       }
 
       // Keep range stable-ish.
       heights[i] = std::clamp(h, -0.35f, 1.15f);
+    }
+  }
+
+  // Fjords need a second pass to carve long, narrow inlets. Doing this as a
+  // post-pass keeps the per-tile branch cheap and makes the result look more
+  // "structural" than a simple distance-field.
+  if (preset == ProcGenTerrainPreset::Fjords) {
+    auto carveMinDiamond = [&](int cx, int cy, int rad, float floor, float bankRise) {
+      rad = std::max(1, rad);
+      const int x0 = std::max(0, cx - rad);
+      const int x1 = std::min(width - 1, cx + rad);
+      const int y0 = std::max(0, cy - rad);
+      const int y1 = std::min(height - 1, cy + rad);
+
+      for (int yy = y0; yy <= y1; ++yy) {
+        for (int xx = x0; xx <= x1; ++xx) {
+          const int dist = std::abs(xx - cx) + std::abs(yy - cy);
+          if (dist > rad) continue;
+          const float k = 1.0f - (static_cast<float>(dist) / static_cast<float>(rad));
+          const float target = floor + (1.0f - k) * bankRise;
+          const std::size_t idx = Idx(xx, yy, width);
+          heights[idx] = std::min(heights[idx], target);
+        }
+      }
+    };
+
+    const int fjordCount = std::clamp(static_cast<int>(std::round(minDim / 42.0f)) + 3, 3, 11);
+    const int extraWide = (minDim >= 200.0f) ? 1 : 0;
+
+    for (int fi = 0; fi < fjordCount; ++fi) {
+      const int side = prng.rangeInt(0, 3); // 0 top, 1 right, 2 bottom, 3 left
+
+      float fx = 0.0f;
+      float fy = 0.0f;
+      float baseAngle = 0.0f;
+
+      const int mx = std::clamp(static_cast<int>(std::round(minDim * 0.08f)), 2, std::max(2, width / 3));
+      const int my = std::clamp(static_cast<int>(std::round(minDim * 0.08f)), 2, std::max(2, height / 3));
+
+      if (side == 0) { // top
+        fx = static_cast<float>(prng.rangeInt(mx, std::max(mx, width - 1 - mx)));
+        fy = 0.0f;
+        baseAngle = 1.5707963f;
+      } else if (side == 2) { // bottom
+        fx = static_cast<float>(prng.rangeInt(mx, std::max(mx, width - 1 - mx)));
+        fy = static_cast<float>(height - 1);
+        baseAngle = -1.5707963f;
+      } else if (side == 3) { // left
+        fx = 0.0f;
+        fy = static_cast<float>(prng.rangeInt(my, std::max(my, height - 1 - my)));
+        baseAngle = 0.0f;
+      } else { // right
+        fx = static_cast<float>(width - 1);
+        fy = static_cast<float>(prng.rangeInt(my, std::max(my, height - 1 - my)));
+        baseAngle = 3.1415927f;
+      }
+
+      // Inlet walk length and turning.
+      const int steps = static_cast<int>(std::round(minDim * (0.45f + 0.35f * prng.nextF01())));
+      float a = baseAngle + (prng.nextF01() - 0.5f) * 0.65f;
+
+      const float floor = std::clamp(cfg.waterLevel - 0.12f - 0.06f * strength, -0.32f, 0.95f);
+      const std::uint32_t fjSeed = seed32 ^ (0xF10DF00Du + static_cast<std::uint32_t>(fi + 1) * 0x9E3779B9u);
+
+      for (int s = 0; s < steps; ++s) {
+        const float tt = (steps > 1) ? (static_cast<float>(s) / static_cast<float>(steps - 1)) : 0.0f;
+
+        // A little coherent steering so fjords don't look like pure random walks.
+        const float steer = (fbmNormalized(fx * 0.055f, fy * 0.055f, fjSeed, 3) * 2.0f - 1.0f);
+        a += steer * 0.10f + (prng.nextF01() - 0.5f) * 0.04f;
+
+        fx += std::cos(a);
+        fy += std::sin(a);
+
+        const int ix = static_cast<int>(std::round(fx));
+        const int iy = static_cast<int>(std::round(fy));
+        if (ix < 2 || iy < 2 || ix >= width - 2 || iy >= height - 2) {
+          break;
+        }
+
+        int rad = 2 + extraWide + ((tt < 0.22f) ? 1 : 0);
+        if (prng.chance(0.06f)) rad += 1;
+
+        // Banks taper slightly as we go inland.
+        const float bankRise = (0.24f + 0.12f * strength) * (0.92f - 0.22f * tt);
+        carveMinDiamond(ix, iy, rad, floor, bankRise);
+      }
+    }
+
+    // Re-clamp after carving.
+    for (float& h : heights) {
+      h = std::clamp(h, -0.35f, 1.15f);
     }
   }
 }

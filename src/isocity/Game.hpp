@@ -10,6 +10,7 @@
 #include "isocity/EvacuationScenario.hpp"
 #include "isocity/FlowField.hpp"
 #include "isocity/Blueprint.hpp"
+#include "isocity/AutoBuild.hpp"
 #include "isocity/Iso.hpp"
 #include "isocity/ProcGen.hpp"
 #include "isocity/Renderer.hpp"
@@ -136,6 +137,10 @@ private:
 
   // Debug/developer console (toggle with F4).
   void setupDevConsole();
+
+  // AutoBuild bot (procedural city growth automation).
+  void runAutoBuild(int days, const AutoBuildConfig& cfg, const char* toastPrefix = nullptr);
+  void drawAutoBuildPanel(int x0, int y0);
 
   // In-game navigation / wayfinding.
   void ensureWayfindingUpToDate();
@@ -551,6 +556,16 @@ private:
   std::vector<Point> m_wayfindingFocusPath;
 
   // ---------------------------------------------------------------------------------------------
+  // AutoBuild bot (procedural city growth automation).
+  //
+  // Exposes the headless AutoBuild module inside the interactive app so you can
+  // grow a city automatically from the current world state.
+  bool m_showAutoBuildPanel = false;
+  AutoBuildConfig m_autoBuildCfg{};
+  AutoBuildReport m_autoBuildLastReport{};
+  int m_autoBuildRunDays = 30;
+  int m_autoBuildPanelScroll = 0;
+
   // Procedural POV camera.
   //
   // A cinematic "ride-along" camera rig that can follow the current wayfinding route

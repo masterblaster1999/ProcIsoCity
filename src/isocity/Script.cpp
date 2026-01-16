@@ -1557,7 +1557,8 @@ static bool CmdProc(ScriptRunnerState& ctx, ScriptRunner& runner, const std::vec
   if (key == "terrainpreset" || key == "terrain_preset" || key == "preset") {
     ProcGenTerrainPreset p{};
     if (!ParseProcGenTerrainPreset(val, p)) {
-      return runner.fail(path, lineNo, "unknown terrain_preset (try: classic|island|archipelago|inland_sea|river_valley|mountain_ring)");
+      return runner.fail(path, lineNo,
+                         "unknown terrain_preset (try: classic|island|archipelago|inland_sea|river_valley|mountain_ring|fjords|canyon|volcano|delta)");
     }
     ctx.procCfg.terrainPreset = p;
     return true;

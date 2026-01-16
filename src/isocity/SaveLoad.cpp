@@ -454,7 +454,7 @@ void FromBinV10(ProcGenConfig& cfg, const ProcGenConfigBinV10& b)
 
   // Defensive enum validation (avoid UB on corrupted saves).
   std::uint8_t presetU8 = b.terrainPreset;
-  if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::MountainRing)) {
+  if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::Delta)) {
     presetU8 = static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
   }
   cfg.terrainPreset = static_cast<ProcGenTerrainPreset>(presetU8);
@@ -485,7 +485,7 @@ void FromBinV11(ProcGenConfig& cfg, const ProcGenConfigBinV11& b)
   cfg.parkChance = b.parkChance;
 
   std::uint8_t presetU8 = b.terrainPreset;
-  if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::MountainRing)) {
+  if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::Delta)) {
     presetU8 = static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
   }
   cfg.terrainPreset = static_cast<ProcGenTerrainPreset>(presetU8);
@@ -515,7 +515,7 @@ void FromBinV12(ProcGenConfig& cfg, const ProcGenConfigBinV12& b)
   cfg.parkChance = b.parkChance;
 
   std::uint8_t presetU8 = b.terrainPreset;
-  if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::MountainRing)) {
+  if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::Delta)) {
     presetU8 = static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
   }
   cfg.terrainPreset = static_cast<ProcGenTerrainPreset>(presetU8);
@@ -2329,8 +2329,8 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
         std::uint8_t roadHierarchyEnabled = 0;
         std::uint8_t districtingMode = 0;
         // v12 originally had a padding byte here; we now use it to persist the
-  // macro road layout mode without bumping the save version.
-  std::uint8_t roadLayout = 0;
+        // macro road layout mode without bumping the save version.
+        std::uint8_t roadLayout = 0;
 
         float terrainPresetStrength = 1.0f;
         float roadHierarchyStrength = 0.0f;
@@ -2351,7 +2351,7 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
       outSummary.procCfg.parkChance = pcb.parkChance;
 
       std::uint8_t presetU8 = pcb.terrainPreset;
-      if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::MountainRing)) {
+      if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::Delta)) {
         presetU8 = static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
       }
       outSummary.procCfg.terrainPreset = static_cast<ProcGenTerrainPreset>(presetU8);
@@ -2365,6 +2365,13 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
         dmU8 = static_cast<std::uint8_t>(ProcGenDistrictingMode::Voronoi);
       }
       outSummary.procCfg.districtingMode = static_cast<ProcGenDistrictingMode>(dmU8);
+
+      // v12+ persists macro road layout.
+      std::uint8_t layoutU8 = pcb.roadLayout;
+      if (layoutU8 > static_cast<std::uint8_t>(ProcGenRoadLayout::SpaceColonization)) {
+        layoutU8 = static_cast<std::uint8_t>(ProcGenRoadLayout::Organic);
+      }
+      outSummary.procCfg.roadLayout = static_cast<ProcGenRoadLayout>(layoutU8);
     } else if (version >= kVersionV11) {
       struct ProcGenConfigBinLocalV11 {
         float terrainScale = 0.08f;
@@ -2378,8 +2385,8 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
         std::uint8_t terrainPreset = 0;
         std::uint8_t roadHierarchyEnabled = 0;
         // v12 originally had a padding byte here; we now use it to persist the
-  // macro road layout mode without bumping the save version.
-  std::uint8_t roadLayout = 0;
+        // macro road layout mode without bumping the save version.
+        std::uint8_t roadLayout = 0;
         std::uint8_t _pad1 = 0;
 
         float terrainPresetStrength = 1.0f;
@@ -2401,7 +2408,7 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
       outSummary.procCfg.parkChance = pcb.parkChance;
 
       std::uint8_t presetU8 = pcb.terrainPreset;
-      if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::MountainRing)) {
+      if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::Delta)) {
         presetU8 = static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
       }
       outSummary.procCfg.terrainPreset = static_cast<ProcGenTerrainPreset>(presetU8);
@@ -2424,8 +2431,8 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
 
         std::uint8_t terrainPreset = 0;
         // v12 originally had a padding byte here; we now use it to persist the
-  // macro road layout mode without bumping the save version.
-  std::uint8_t roadLayout = 0;
+        // macro road layout mode without bumping the save version.
+        std::uint8_t roadLayout = 0;
         std::uint8_t _pad1 = 0;
         std::uint8_t _pad2 = 0;
 
@@ -2447,7 +2454,7 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
       outSummary.procCfg.parkChance = pcb.parkChance;
 
       std::uint8_t presetU8 = pcb.terrainPreset;
-      if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::MountainRing)) {
+      if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::Delta)) {
         presetU8 = static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
       }
       outSummary.procCfg.terrainPreset = static_cast<ProcGenTerrainPreset>(presetU8);
@@ -2499,8 +2506,8 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
         std::uint8_t enabled = 1;
         std::uint8_t riversEnabled = 1;
         // v12 originally had a padding byte here; we now use it to persist the
-  // macro road layout mode without bumping the save version.
-  std::uint8_t roadLayout = 0;
+        // macro road layout mode without bumping the save version.
+        std::uint8_t roadLayout = 0;
         std::uint8_t _pad1 = 0;
 
         std::int32_t thermalIterations = 20;
@@ -2539,7 +2546,7 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
       outSummary.procCfg.erosion.enabled = false;
     }
 
-outSummary.hasProcCfg = true;
+    outSummary.hasProcCfg = true;
 
     StatsBinLocal sb{};
     if (!readPOD(sb)) {

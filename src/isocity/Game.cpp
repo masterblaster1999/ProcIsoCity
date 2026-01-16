@@ -75,6 +75,8 @@ constexpr int kRoadUpgradePanelW = 460;
 constexpr int kRoadUpgradePanelH = 360;
 constexpr int kWayfindingPanelW = 420;
 constexpr int kWayfindingPanelH = 386;
+constexpr int kAutoBuildPanelW = 460;
+constexpr int kAutoBuildPanelH = 420;
 
 // Simple flow-dock for stacking panels on the right. When vertical space runs out it wraps to a new
 // column to the left, keeping panels on-screen without overlap.
@@ -1024,6 +1026,149 @@ void Game::setupDevConsole()
         }
       });
 
+
+
+  // --- deterministic AutoBuild "city bot" ---
+  // Bridges the headless AutoBuild module into the interactive app.
+  m_console.registerCommand(
+    "bot",
+    "bot <key> <value> | bot show | bot reset | bot ui  - configure AutoBuild (city bot)",
+    [this, toLower](DevConsole& c, const DevConsole::Args& args)
+      {
+        auto printUsage = [&c]()
+          {
+            c.print("Usage:");
+            c.print("  bot show            Show current bot config");
+            c.print("  bot reset           Reset bot config to defaults");
+            c.print("  bot ui              Toggle the AutoBuild panel");
+            c.print("  bot <key> <value>   Set one config key");
+          };
+
+        if (args.empty()) {
+          printUsage();
+          return;
+        }
+
+        const std::string sub = toLower(args[0]);
+        if (sub == "show") {
+          const AutoBuildConfig& cfg = m_autoBuildCfg;
+          c.print("bot config:");
+          c.print(TextFormat("  zonesPerDay=%d", cfg.zonesPerDay));
+          c.print(TextFormat("  zoneClusterMaxTiles=%d", cfg.zoneClusterMaxTiles));
+          c.print(TextFormat("  roadsPerDay=%d", cfg.roadsPerDay));
+          c.print(TextFormat("  parksPerDay=%d", cfg.parksPerDay));
+          c.print(TextFormat("  useParkOptimizer=%s", cfg.useParkOptimizer ? "true" : "false"));
+          c.print(TextFormat("  roadLevel=%d", cfg.roadLevel));
+          c.print(TextFormat("  useRoadPlanner=%s", cfg.useRoadPlanner ? "true" : "false"));
+          c.print(TextFormat("  allowBridges=%s", cfg.allowBridges ? "true" : "false"));
+          c.print(TextFormat("  minMoneyReserve=%d", cfg.minMoneyReserve));
+          c.print(TextFormat("  parkPerZoneTiles=%d", cfg.parkPerZoneTiles));
+          c.print(TextFormat("  autoUpgradeRoads=%s", cfg.autoUpgradeRoads ? "true" : "false"));
+          c.print(TextFormat("  congestionUpgradeThreshold=%.3f", cfg.congestionUpgradeThreshold));
+          c.print(TextFormat("  roadUpgradesPerDay=%d", cfg.roadUpgradesPerDay));
+          c.print(TextFormat("  autoBuildResilienceBypasses=%s", cfg.autoBuildResilienceBypasses ? "true" : "false"));
+          c.print(TextFormat("  resilienceBypassCongestionThreshold=%.3f", cfg.resilienceBypassCongestionThreshold));
+          c.print(TextFormat("  resilienceBypassesPerDay=%d", cfg.resilienceBypassesPerDay));
+          c.print(TextFormat("  landValueRecalcDays=%d", cfg.landValueRecalcDays));
+          c.print(TextFormat("  respectOutsideConnection=%s", cfg.respectOutsideConnection ? "true" : "false"));
+          c.print(TextFormat("  ensureOutsideConnection=%s", cfg.ensureOutsideConnection ? "true" : "false"));
+          c.print(TextFormat("  maxRoadSpurLength=%d", cfg.maxRoadSpurLength));
+          return;
+        }
+
+        if (sub == "reset") {
+          m_autoBuildCfg = AutoBuildConfig{};
+          m_autoBuildPanelScroll = 0;
+          c.print("bot: reset to defaults");
+          showToast("Bot config reset", 2.0f);
+          return;
+        }
+
+        if (sub == "ui" || sub == "panel") {
+          m_showAutoBuildPanel = !m_showAutoBuildPanel;
+          ui::ClearActiveWidget();
+          showToast(m_showAutoBuildPanel ? "Bot panel: ON" : "Bot panel: OFF", 2.0f);
+          return;
+        }
+
+        if (args.size() < 2) {
+          printUsage();
+          return;
+        }
+
+        std::string err;
+        if (!ParseAutoBuildKey(args[0], args[1], m_autoBuildCfg, err)) {
+          c.print("bot: " + err);
+          showToast("Bot: invalid config", 2.0f);
+          return;
+        }
+
+        c.print("bot: set " + args[0] + "=" + args[1]);
+      });
+
+  m_console.registerCommand(
+    "autobuild",
+    "autobuild <days> [key=value ...]  - run AutoBuild on the current world state",
+    [this, toLower, parseI32](DevConsole& c, const DevConsole::Args& args)
+      {
+        auto printUsage = [&c]()
+          {
+            c.print("Usage:");
+            c.print("  autobuild <days>");
+            c.print("  autobuild <days> key=value ...");
+            c.print("  autobuild ui");
+            c.print("");
+            c.print("Example:");
+            c.print("  autobuild 120 zonesPerDay=4 roadsPerDay=2 useRoadPlanner=true");
+            c.print("");
+            c.print("Config keys are case-insensitive. See AutoBuild.hpp for the full list.");
+          };
+
+        if (args.empty()) {
+          printUsage();
+          return;
+        }
+
+        const std::string a0 = toLower(args[0]);
+        if (a0 == "ui" || a0 == "panel") {
+          m_showAutoBuildPanel = !m_showAutoBuildPanel;
+          ui::ClearActiveWidget();
+          showToast(m_showAutoBuildPanel ? "Bot panel: ON" : "Bot panel: OFF", 2.0f);
+          return;
+        }
+
+        int days = 0;
+        if (!parseI32(args[0], &days) || days <= 0) {
+          c.print("autobuild: invalid days: " + args[0]);
+          return;
+        }
+
+        AutoBuildConfig cfg = m_autoBuildCfg;
+        for (std::size_t i = 1; i < args.size(); ++i) {
+          const std::string& tok = args[i];
+          const std::size_t eq = tok.find('=');
+          if (eq == std::string::npos) {
+            c.print("autobuild: expected key=value, got: " + tok);
+            return;
+          }
+          const std::string key = tok.substr(0, eq);
+          const std::string val = tok.substr(eq + 1);
+          std::string err;
+          if (!ParseAutoBuildKey(key, val, cfg, err)) {
+            c.print("autobuild: " + err);
+            return;
+          }
+        }
+
+        ui::ClearActiveWidget();
+        runAutoBuild(days, cfg, "AutoBuild");
+
+        const AutoBuildReport& rep = m_autoBuildLastReport;
+        c.print(TextFormat(
+          "autobuild: simulated %d/%d days | roads %d (+%d up) | zones %d | parks %d | fails %d",
+          rep.daysSimulated, rep.daysRequested, rep.roadsBuilt, rep.roadsUpgraded, rep.zonesBuilt, rep.parksBuilt,
+          rep.failedBuilds));
+      });
   // --- turn-by-turn navigation / wayfinding ---
   //
   // This bridges the headless `StreetNames` + `Wayfinding` modules into the interactive app.
@@ -1960,13 +2105,16 @@ void Game::setupDevConsole()
           c.print(TextFormat("  sand_level = %.3f", m_procCfg.sandLevel));
           c.print(TextFormat("  hubs = %d", m_procCfg.hubs));
           c.print(TextFormat("  extra_connections = %d", m_procCfg.extraConnections));
+          c.print(TextFormat("  road_layout = %s", ToString(m_procCfg.roadLayout)));
           c.print(TextFormat("  zone_chance = %.3f", m_procCfg.zoneChance));
           c.print(TextFormat("  park_chance = %.3f", m_procCfg.parkChance));
           c.print(TextFormat("  terrain_preset = %s", ToString(m_procCfg.terrainPreset)));
           c.print(TextFormat("  terrain_preset_strength = %.3f", m_procCfg.terrainPresetStrength));
           c.print(TextFormat("  road_hierarchy_enabled = %s", m_procCfg.roadHierarchyEnabled ? "true" : "false"));
           c.print(TextFormat("  road_hierarchy_strength = %.3f", m_procCfg.roadHierarchyStrength));
+          c.print(TextFormat("  districting_mode = %s", ToString(m_procCfg.districtingMode)));
           c.print(TextFormat("  erosion.enabled = %s", m_procCfg.erosion.enabled ? "true" : "false"));
+          c.print(TextFormat("  rivers_enabled = %s", m_procCfg.erosion.riversEnabled ? "true" : "false"));
         };
 
         auto listPresets = [&]() {
@@ -1977,6 +2125,42 @@ void Game::setupDevConsole()
           c.print("  inland_sea");
           c.print("  river_valley");
           c.print("  mountain_ring");
+          c.print("  fjords");
+          c.print("  canyon");
+          c.print("  volcano");
+          c.print("  delta");
+        };
+
+        auto listRoadLayouts = [&]() {
+          c.print("Road layouts:");
+          c.print("  organic");
+          c.print("  grid");
+          c.print("  radial");
+          c.print("  space_colonization");
+        };
+
+        auto listDistrictingModes = [&]() {
+          c.print("Districting modes:");
+          c.print("  voronoi");
+          c.print("  road_flow");
+          c.print("  block_graph");
+        };
+
+        auto listAll = [&]() {
+          c.print("Keys:");
+          c.print("  terrain_scale water_level sand_level hubs extra_connections zone_chance park_chance");
+          c.print("  preset strength road_layout road_hierarchy road_hierarchy_strength districting_mode");
+          c.print("  erosion rivers");
+          listPresets();
+          listRoadLayouts();
+          listDistrictingModes();
+          c.print("Examples:");
+          c.print("  proc preset island");
+          c.print("  proc strength 1.5");
+          c.print("  proc road_layout grid");
+          c.print("  proc districting_mode block_graph");
+          c.print("  proc rivers 1");
+          c.print("  regen same");
         };
 
         if (args.empty()) {
@@ -1986,8 +2170,20 @@ void Game::setupDevConsole()
         }
 
         const std::string key = toLower(args[0]);
-        if (key == "list" || key == "presets") {
+        if (key == "list" || key == "help") {
+          listAll();
+          return;
+        }
+        if (key == "presets") {
           listPresets();
+          return;
+        }
+        if (key == "layouts" || key == "road_layouts") {
+          listRoadLayouts();
+          return;
+        }
+        if (key == "districts" || key == "districting" || key == "districting_modes") {
+          listDistrictingModes();
           return;
         }
         if (key == "show" || key == "get") {
@@ -2012,6 +2208,19 @@ void Game::setupDevConsole()
           m_procCfg.terrainPreset = p;
           showToast(TextFormat("Preset: %s", ToString(p)));
           c.print(std::string("terrain_preset = ") + ToString(p));
+          return;
+        }
+
+        if (key == "road_layout" || key == "roadlayout" || key == "layout") {
+          ProcGenRoadLayout l{};
+          if (!ParseProcGenRoadLayout(val, l)) {
+            c.print("Unknown road layout: " + val);
+            listRoadLayouts();
+            return;
+          }
+          m_procCfg.roadLayout = l;
+          showToast(TextFormat("Road layout: %s", ToString(l)));
+          c.print(std::string("road_layout = ") + ToString(l));
           return;
         }
 
@@ -2070,6 +2279,24 @@ void Game::setupDevConsole()
           showToast(m_procCfg.roadHierarchyEnabled ? "Road hierarchy: on" : "Road hierarchy: off");
         } else if (key == "road_hierarchy_strength" || key == "roadhierarchystrength") {
           setF32(m_procCfg.roadHierarchyStrength, 0.0f, 3.0f, "road_hierarchy_strength");
+        } else if (key == "districting_mode" || key == "districting" || key == "district") {
+          ProcGenDistrictingMode m{};
+          if (!ParseProcGenDistrictingMode(val, m)) {
+            c.print("Unknown districting mode: " + val);
+            listDistrictingModes();
+            return;
+          }
+          m_procCfg.districtingMode = m;
+          showToast(TextFormat("Districting: %s", ToString(m)));
+          c.print(std::string("districting_mode = ") + ToString(m));
+        } else if (key == "rivers" || key == "rivers_enabled" || key == "erosion_rivers" || key == "riversenabled") {
+          int b = 0;
+          if (!parseI32(val, b) || (b != 0 && b != 1)) {
+            c.print("Usage: proc rivers <0|1>");
+            return;
+          }
+          m_procCfg.erosion.riversEnabled = (b != 0);
+          showToast(m_procCfg.erosion.riversEnabled ? "Rivers: on" : "Rivers: off");
         } else if (key == "erosion" || key == "erosion_enabled") {
           int b = 0;
           if (!parseI32(val, b) || (b != 0 && b != 1)) {
@@ -2080,7 +2307,7 @@ void Game::setupDevConsole()
           showToast(m_procCfg.erosion.enabled ? "Erosion: on" : "Erosion: off");
         } else {
           c.print("Unknown proc key: " + args[0]);
-          c.print("Try: proc show, proc list, proc preset <name>, proc strength <f>");
+          c.print("Try: proc show, proc list, proc preset <name>, proc strength <f>, proc road_layout <name>");
         }
       });
 
@@ -11197,6 +11424,289 @@ void Game::drawWayfindingPanel(int x0, int y0) {
   }
 }
 
+
+
+void Game::runAutoBuild(int days, const AutoBuildConfig& cfg, const char* toastPrefix)
+{
+  endPaintStroke();
+
+  if (days <= 0) {
+    showToast("AutoBuild: days must be >= 1", 2.0f);
+    return;
+  }
+
+  World w = m_world;
+  Simulator sim = m_sim;
+
+  std::vector<Stats> tickStats;
+  const AutoBuildReport rep = RunAutoBuild(w, sim, cfg, days, &tickStats);
+  m_autoBuildLastReport = rep;
+
+  // Preserve history so the report panel remains continuous after fast-forwarding.
+  std::vector<CityHistorySample> prevHistory = std::move(m_cityHistory);
+
+  std::string toast;
+  if (toastPrefix && toastPrefix[0] != '\0') {
+    toast = TextFormat("%s: %d days | roads %d (+%d) | zones %d | parks %d | fails %d",
+                       toastPrefix, rep.daysSimulated, rep.roadsBuilt, rep.roadsUpgraded, rep.zonesBuilt,
+                       rep.parksBuilt, rep.failedBuilds);
+  } else {
+    toast = TextFormat("AutoBuild: %d days | roads %d (+%d) | zones %d | parks %d | fails %d",
+                       rep.daysSimulated, rep.roadsBuilt, rep.roadsUpgraded, rep.zonesBuilt,
+                       rep.parksBuilt, rep.failedBuilds);
+  }
+
+  // Commit new world state (recomputes caches and clears transient selections).
+  adoptLoadedWorld(std::move(w), m_procCfg, m_sim.config(), toast, nullptr);
+
+  // Restore and append simulation history samples.
+  m_cityHistory = std::move(prevHistory);
+  if (!tickStats.empty()) {
+    for (const Stats& s : tickStats) {
+      recordHistorySample(s);
+    }
+  } else {
+    recordHistorySample(m_world.stats());
+  }
+}
+
+
+void Game::drawAutoBuildPanel(int x0, int y0)
+{
+  const float uiScale = m_uiScale;
+  const Vector2 mouseUi = mouseUiPosition(uiScale);
+  const float uiTime = GetTime();
+  const auto& uiTh = ui::GetTheme();
+
+  const int panelW = kAutoBuildPanelW;
+  const int panelH = kAutoBuildPanelH;
+
+  Rectangle panelR{static_cast<float>(x0), static_cast<float>(y0), static_cast<float>(panelW),
+                   static_cast<float>(panelH)};
+
+  ui::DrawPanel(panelR, uiTime, true);
+  ui::DrawPanelHeader(panelR, "AutoBuild Bot", uiTime, true);
+
+  // Close button.
+  const Rectangle closeBtn{panelR.x + panelR.width - 28.0f, panelR.y + 8.0f, 20.0f, 20.0f};
+  if (ui::Button(6101, closeBtn, "X", mouseUi, uiTime)) {
+    m_showAutoBuildPanel = false;
+    ui::ClearActiveWidget();
+    return;
+  }
+
+  int x = x0 + 12;
+  int y = y0 + 36;
+
+  ui::Text(x, y, 14, "Deterministic city growth automation for the current world.", uiTh.textDim);
+  y += 18;
+
+  // Run length.
+  ui::Text(x, y, 14, "Days", uiTh.text);
+  {
+    const float valueW = 52.0f;
+    Rectangle sliderR{static_cast<float>(x + 56), static_cast<float>(y - 4),
+                      static_cast<float>(panelW - 56 - 12) - valueW, 18.0f};
+    ui::SliderInt(6102, sliderR, m_autoBuildRunDays, 1, 365, 1, mouseUi, uiTime);
+    ui::Text(x0 + panelW - 12 - static_cast<int>(valueW), y, 14,
+             TextFormat("%d", m_autoBuildRunDays), uiTh.text);
+  }
+  y += 24;
+
+  // Buttons.
+  const int btnH = 22;
+  const int btnW = 84;
+  Rectangle runBtn{static_cast<float>(x), static_cast<float>(y), static_cast<float>(btnW),
+                   static_cast<float>(btnH)};
+  Rectangle stepBtn{static_cast<float>(x + btnW + 8), static_cast<float>(y), static_cast<float>(btnW),
+                    static_cast<float>(btnH)};
+  Rectangle resetBtn{static_cast<float>(x + 2 * (btnW + 8)), static_cast<float>(y),
+                     static_cast<float>(btnW), static_cast<float>(btnH)};
+
+  if (ui::Button(6103, runBtn, "Run", mouseUi, uiTime, true, true)) {
+    ui::ClearActiveWidget();
+    runAutoBuild(m_autoBuildRunDays, m_autoBuildCfg, "AutoBuild");
+  }
+
+  if (ui::Button(6104, stepBtn, "Step", mouseUi, uiTime, true, true)) {
+    ui::ClearActiveWidget();
+    runAutoBuild(1, m_autoBuildCfg, "AutoBuild");
+  }
+
+  if (ui::Button(6105, resetBtn, "Reset", mouseUi, uiTime, true, false)) {
+    m_autoBuildCfg = AutoBuildConfig{};
+    m_autoBuildPanelScroll = 0;
+    ui::ClearActiveWidget();
+    showToast("Bot config reset", 2.0f);
+  }
+
+  y += btnH + 10;
+
+  // Scrollable config list.
+  const int bottomH = 64;
+  const int listX = x0 + 12;
+  const int listY = y;
+  const int listW = panelW - 24;
+  const int listH = panelH - (listY - y0) - bottomH;
+  Rectangle listR{static_cast<float>(listX), static_cast<float>(listY), static_cast<float>(listW),
+                  static_cast<float>(listH)};
+
+  ui::DrawPanelInset(listR, uiTime);
+
+  constexpr int rowH = 24;
+  constexpr int contentRows = 26;
+  const int viewRows = std::max(1, static_cast<int>(listR.height) / rowH);
+
+  m_autoBuildPanelScroll = std::clamp(m_autoBuildPanelScroll, 0, std::max(0, contentRows - viewRows));
+
+  // Scrollbar.
+  const Rectangle scrollbarR{listR.x + listR.width - 12.0f, listR.y, 12.0f, listR.height};
+  ui::ScrollbarV(6106, scrollbarR, contentRows, viewRows, m_autoBuildPanelScroll, mouseUi, uiTime, true);
+
+  const Rectangle contentR = ui::ContentRectWithScrollbar(listR);
+  const float rowX = contentR.x + 6.0f;
+  const float widgetW = 160.0f;
+  const float widgetX = contentR.x + contentR.width - widgetW - 6.0f;
+
+  auto drawHeading = [&](int yRow, const char* label) {
+    ui::Text(static_cast<int>(rowX), yRow + 4, 15, label, uiTh.textDim, true, false, 1.0f);
+  };
+
+  auto drawBoolRow = [&](int id, int yRow, const char* label, bool& v, bool enabled) {
+    ui::Text(static_cast<int>(rowX), yRow + 4, 14, label, enabled ? uiTh.text : uiTh.textDim);
+    Rectangle tR{widgetX + widgetW - 44.0f, static_cast<float>(yRow + 2), 44.0f,
+                 static_cast<float>(rowH - 4)};
+    ui::Toggle(id, tR, v, mouseUi, uiTime, enabled);
+  };
+
+  auto drawIntRow = [&](int id, int yRow, const char* label, int& v, int lo, int hi, int step,
+                        bool enabled) {
+    ui::Text(static_cast<int>(rowX), yRow + 4, 14, TextFormat("%s: %d", label, v),
+             enabled ? uiTh.text : uiTh.textDim);
+    Rectangle sR{widgetX, static_cast<float>(yRow + 3), widgetW, static_cast<float>(rowH - 6)};
+    ui::SliderInt(id, sR, v, lo, hi, step, mouseUi, uiTime, enabled);
+  };
+
+  auto drawFloatRow = [&](int id, int yRow, const char* label, float& v, float lo, float hi, float step,
+                          bool enabled) {
+    ui::Text(static_cast<int>(rowX), yRow + 4, 14, TextFormat("%s: %.2f", label, v),
+             enabled ? uiTh.text : uiTh.textDim);
+    Rectangle sR{widgetX, static_cast<float>(yRow + 3), widgetW, static_cast<float>(rowH - 6)};
+    ui::SliderFloat(id, sR, v, lo, hi, step, mouseUi, uiTime, enabled);
+  };
+
+  const int first = m_autoBuildPanelScroll;
+  const int last = std::min(contentRows, first + viewRows);
+
+  for (int r = first; r < last; ++r) {
+    const int yRow = listY + (r - first) * rowH;
+    const int idBase = 6200 + r * 10;
+
+    switch (r) {
+      case 0:
+        drawHeading(yRow, "Growth");
+        break;
+      case 1:
+        drawIntRow(idBase, yRow, "Zones/day", m_autoBuildCfg.zonesPerDay, 0, 8, 1, true);
+        break;
+      case 2:
+        drawIntRow(idBase, yRow, "Zone cluster", m_autoBuildCfg.zoneClusterMaxTiles, 1, 12, 1, true);
+        break;
+      case 3:
+        drawIntRow(idBase, yRow, "Roads/day", m_autoBuildCfg.roadsPerDay, 0, 8, 1, true);
+        break;
+      case 4:
+        drawBoolRow(idBase, yRow, "Use road planner", m_autoBuildCfg.useRoadPlanner, true);
+        break;
+      case 5:
+        drawIntRow(idBase, yRow, "Road level", m_autoBuildCfg.roadLevel, 1, 3, 1, true);
+        break;
+      case 6:
+        drawIntRow(idBase, yRow, "Road spur length", m_autoBuildCfg.maxRoadSpurLength, 2, 60, 1, true);
+        break;
+      case 7:
+        drawBoolRow(idBase, yRow, "Allow bridges", m_autoBuildCfg.allowBridges, true);
+        break;
+      case 8:
+        drawIntRow(idBase, yRow, "Parks/day", m_autoBuildCfg.parksPerDay, 0, 8, 1, true);
+        break;
+      case 9:
+        drawBoolRow(idBase, yRow, "Use park optimizer", m_autoBuildCfg.useParkOptimizer, true);
+        break;
+      case 10:
+        drawIntRow(idBase, yRow, "Park per zone tiles", m_autoBuildCfg.parkPerZoneTiles, 1, 80, 1, true);
+        break;
+      case 11:
+        drawIntRow(idBase, yRow, "Min money reserve", m_autoBuildCfg.minMoneyReserve, 0, 250, 1, true);
+        break;
+      case 12:
+        drawIntRow(idBase, yRow, "Land value recalc", m_autoBuildCfg.landValueRecalcDays, 1, 60, 1, true);
+        break;
+      case 13:
+        drawHeading(yRow, "Outside connection");
+        break;
+      case 14:
+        drawBoolRow(idBase, yRow, "Respect existing", m_autoBuildCfg.respectOutsideConnection, true);
+        break;
+      case 15:
+        drawBoolRow(idBase, yRow, "Ensure exists", m_autoBuildCfg.ensureOutsideConnection, true);
+        break;
+      case 16:
+        drawHeading(yRow, "Road upgrades");
+        break;
+      case 17:
+        drawBoolRow(idBase, yRow, "Auto-upgrade roads", m_autoBuildCfg.autoUpgradeRoads, true);
+        break;
+      case 18:
+        drawFloatRow(idBase, yRow, "Congestion", m_autoBuildCfg.congestionUpgradeThreshold, 0.0f, 1.0f, 0.01f,
+                     m_autoBuildCfg.autoUpgradeRoads);
+        break;
+      case 19:
+        drawIntRow(idBase, yRow, "Upgrades/day", m_autoBuildCfg.roadUpgradesPerDay, 0, 20, 1,
+                   m_autoBuildCfg.autoUpgradeRoads);
+        break;
+      case 20:
+        drawHeading(yRow, "Resilience bypass");
+        break;
+      case 21:
+        drawBoolRow(idBase, yRow, "Auto-build bypasses", m_autoBuildCfg.autoBuildResilienceBypasses, true);
+        break;
+      case 22:
+        drawFloatRow(idBase, yRow, "Bypass congestion", m_autoBuildCfg.resilienceBypassCongestionThreshold, 0.0f,
+                     1.0f, 0.01f, m_autoBuildCfg.autoBuildResilienceBypasses);
+        break;
+      case 23:
+        drawIntRow(idBase, yRow, "Bypasses/day", m_autoBuildCfg.resilienceBypassesPerDay, 0, 20, 1,
+                   m_autoBuildCfg.autoBuildResilienceBypasses);
+        break;
+      case 24:
+        drawBoolRow(idBase, yRow, "Bypass bridges", m_autoBuildCfg.resilienceBypassAllowBridges,
+                    m_autoBuildCfg.autoBuildResilienceBypasses);
+        break;
+      case 25:
+        drawIntRow(idBase, yRow, "Bypass target", m_autoBuildCfg.resilienceBypassTargetLevel, 1, 3, 1,
+                   m_autoBuildCfg.autoBuildResilienceBypasses);
+        break;
+      default:
+        break;
+    }
+  }
+
+  // Bottom status.
+  const AutoBuildReport& rep = m_autoBuildLastReport;
+  const int by = y0 + panelH - 50;
+  ui::Text(x0 + 12, by, 14,
+           TextFormat("Last: days %d/%d  roads %d (+%d)  zones %d  parks %d  fails %d", rep.daysSimulated,
+                      rep.daysRequested, rep.roadsBuilt, rep.roadsUpgraded, rep.zonesBuilt, rep.parksBuilt,
+                      rep.failedBuilds),
+           uiTh.textDim);
+
+  ui::Text(x0 + 12, by + 16, 12,
+           "Console: bot show | bot <key> <value> | autobuild <days> key=value ...",
+           uiTh.textDim);
+}
+
+
 void Game::stopPov()
 {
   // Restore 2D camera.
@@ -12039,6 +12549,7 @@ void Game::handleInput(float dt)
       } else {
         showToast("Road upgrades: OFF");
       }
+
     }
   }
 
@@ -12801,6 +13312,76 @@ void Game::handleInput(float dt)
 
   // --- Minimap interaction (UI consumes left mouse so we don't accidentally paint the world). ---
   bool consumeLeft = false;
+
+  // UI panels should consume left mouse so we do not click-through and
+  // accidentally paint/inspect the world while interacting with widgets.
+  const bool uiConsumesLeft = [&]() -> bool {
+    // Report panel (top-left).
+    if (m_showReport) {
+      int w = 520;
+      int h = 420;
+      const int x0 = kUiPanelMargin;
+      const int y0 = kUiPanelTopY;
+      if (uiW > 0) {
+        w = std::min(w, uiW - x0 - kUiPanelMargin);
+      }
+      if (uiH > 0) {
+        h = std::min(h, uiH - y0 - kUiPanelMargin);
+      }
+      if (w > 0 && h > 0) {
+        const Rectangle r{static_cast<float>(x0), static_cast<float>(y0), static_cast<float>(w), static_cast<float>(h)};
+        if (CheckCollisionPointRec(mouseUi, r)) {
+          return true;
+        }
+      }
+    }
+
+    // Video settings panel (below report if visible).
+    if (m_showVideoSettings) {
+      int w = 432;
+      int h = 276;
+      const int x0 = kUiPanelMargin;
+      int y0 = kUiPanelTopY;
+      if (m_showReport) {
+        y0 += 420 + kUiPanelMargin;
+      }
+      if (uiW > 0) {
+        w = std::min(w, uiW - x0 - kUiPanelMargin);
+      }
+      if (uiH > 0) {
+        h = std::min(h, uiH - y0 - kUiPanelMargin);
+      }
+      if (w > 0 && h > 0) {
+        const Rectangle r{static_cast<float>(x0), static_cast<float>(y0), static_cast<float>(w), static_cast<float>(h)};
+        if (CheckCollisionPointRec(mouseUi, r)) {
+          return true;
+        }
+      }
+    }
+
+    // Right-side docked panels.
+    {
+      RightPanelDock dock(uiW, uiH);
+      auto checkDock = [&](bool show, int pw, int ph) -> bool {
+        if (!show) return false;
+        const Rectangle r = dock.alloc(pw, ph);
+        return CheckCollisionPointRec(mouseUi, r);
+      };
+      if (checkDock(m_showPolicy, kPolicyPanelW, kPolicyPanelH)) return true;
+      if (checkDock(m_showTrafficModel, kTrafficPanelW, kTrafficPanelH)) return true;
+      if (checkDock(m_showResiliencePanel, kResiliencePanelW, kResiliencePanelH)) return true;
+      if (checkDock(m_showDistrictPanel, kDistrictPanelW, kDistrictPanelH)) return true;
+      if (checkDock(m_showTransitPanel, kTransitPanelW, kTransitPanelH)) return true;
+      if (checkDock(m_showWayfindingPanel, kWayfindingPanelW, kWayfindingPanelH)) return true;
+      if (checkDock(m_showRoadUpgradePanel, kRoadUpgradePanelW, kRoadUpgradePanelH)) return true;
+      if (checkDock(m_showAutoBuildPanel, kAutoBuildPanelW, kAutoBuildPanelH)) return true;
+    }
+
+    return false;
+  }();
+  if (uiConsumesLeft && (leftDown || leftPressed)) {
+    consumeLeft = true;
+  }
   bool overMinimap = false;
   if (m_showMinimap && m_world.width() > 0 && m_world.height() > 0) {
     const Renderer::MinimapLayout mini = m_renderer.minimapLayout(m_world, uiW, uiH);
@@ -15708,6 +16289,10 @@ void Game::draw()
   if (m_showRoadUpgradePanel) {
     const Rectangle rect = rightDock.alloc(kRoadUpgradePanelW, kRoadUpgradePanelH);
     drawRoadUpgradePanel(static_cast<int>(rect.x), static_cast<int>(rect.y));
+  }
+  if (m_showAutoBuildPanel) {
+    const Rectangle rect = rightDock.alloc(kAutoBuildPanelW, kAutoBuildPanelH);
+    drawAutoBuildPanel(static_cast<int>(rect.x), static_cast<int>(rect.y));
   }
 
   drawVideoSettingsPanel(uiW, uiH);

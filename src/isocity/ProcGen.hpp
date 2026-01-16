@@ -21,7 +21,13 @@ enum class ProcGenTerrainPreset : std::uint8_t {
   Archipelago = 2, // Multiple smaller islands.
   InlandSea = 3,   // Central water body with surrounding land.
   RiverValley = 4, // Major meandering river corridor bisecting the map.
-  MountainRing = 5 // Ring-like ridge / crater-style macro relief.
+  MountainRing = 5, // Ring-like ridge / crater-style macro relief.
+
+  // More "extreme" presets.
+  Fjords = 6,  // Glaciated coast: mountainous shoreline with long narrow inlets.
+  Canyon = 7,  // High plateau cut by a deep winding canyon river.
+  Volcano = 8, // Central volcanic cone with a caldera (optionally lake-filled).
+  Delta = 9,   // Low coastal river delta with branching distributaries.
 };
 
 // Human-readable name (stable for saves/CLI).

@@ -1,4 +1,5 @@
 #include "isocity/Hash.hpp"
+#include "isocity/ConfigIO.hpp"
 #include "isocity/Json.hpp"
 #include "isocity/ProcGen.hpp"
 #include "isocity/SaveLoad.hpp"
@@ -127,6 +128,19 @@ std::string HexU64(std::uint64_t v)
   return oss.str();
 }
 
+bool ParseJsonObjectText(const std::string& text, isocity::JsonValue& outObj, std::string& outErr)
+{
+  isocity::JsonValue v;
+  if (!isocity::ParseJson(text, v, outErr)) return false;
+  if (!v.isObject()) {
+    outErr = "expected JSON object";
+    return false;
+  }
+  outObj = std::move(v);
+  outErr.clear();
+  return true;
+}
+
 void PrintHelp()
 {
   std::cout
@@ -134,6 +148,7 @@ void PrintHelp()
       << "Usage:\n"
       << "  proc_isocity_cli [--load <save.bin>] [--seed <u64>] [--size <WxH>]\n"
       << "                 [--gen-preset <name>] [--gen-preset-strength <N>]\n"
+      << "                 [--gen-road-layout <organic|grid|radial|space_colonization>]\n"
       << "                 [--gen-road-hierarchy <0|1>] [--gen-road-hierarchy-strength <N>]\n"
       << "                 [--gen-districting-mode <voronoi|road_flow|block_graph>] [--days <N>]\n"
       << "                 [--out <summary.json>] [--csv <ticks.csv>] [--save <save.bin>]\n"
@@ -171,12 +186,13 @@ void PrintHelp()
       << "Notes:\n"
       << "  - If --load is provided, the world + ProcGenConfig + SimConfig are loaded from the save.\n"
       << "  - Otherwise, a new world is generated from (--seed, --size).\n"
-      << "  - --gen-preset/--gen-preset-strength/--gen-road-hierarchy*/--gen-districting-mode only apply when generating a new world.\n"
+      << "  - --gen-preset/--gen-preset-strength/--gen-road-layout/--gen-road-hierarchy*/--gen-districting-mode only apply when generating a new world.\n"
       << "  - --days advances the simulator by N ticks via Simulator::stepOnce().\n"
       << "  - A stable 64-bit hash of the final world is included in the JSON output.\n";
 }
 
-bool WriteJsonSummary(const isocity::World& world, std::uint64_t hash, const std::string& outPath)
+bool WriteJsonSummary(const isocity::World& world, std::uint64_t hash, const std::string& outPath,
+                      const isocity::ProcGenConfig& procCfg, const isocity::SimConfig& simCfg)
 {
   const isocity::Stats& s = world.stats();
 
@@ -189,7 +205,30 @@ bool WriteJsonSummary(const isocity::World& world, std::uint64_t hash, const std
   add(root, "width", JsonValue::MakeNumber(static_cast<double>(world.width())));
   add(root, "height", JsonValue::MakeNumber(static_cast<double>(world.height())));
   add(root, "seed", JsonValue::MakeNumber(static_cast<double>(world.seed())));
+  add(root, "seed_hex", JsonValue::MakeString(HexU64(world.seed())));
   add(root, "hash", JsonValue::MakeString(HexU64(hash)));
+
+  // Embed the exact configs used for this run so the JSON output is fully reproducible.
+  // We reuse ConfigIO's serialization to keep field names consistent across tools.
+  {
+    std::string err;
+    JsonValue procObj;
+    if (!ParseJsonObjectText(isocity::ProcGenConfigToJson(procCfg, 2), procObj, err)) {
+      std::cerr << "Failed to serialize ProcGenConfig to JSON: " << err << "\n";
+      return false;
+    }
+    add(root, "proc", std::move(procObj));
+  }
+
+  {
+    std::string err;
+    JsonValue simObj;
+    if (!ParseJsonObjectText(isocity::SimConfigToJson(simCfg, 2), simObj, err)) {
+      std::cerr << "Failed to serialize SimConfig to JSON: " << err << "\n";
+      return false;
+    }
+    add(root, "sim", std::move(simObj));
+  }
 
   JsonValue st = JsonValue::MakeObject();
   add(st, "day", JsonValue::MakeNumber(static_cast<double>(s.day)));
@@ -351,13 +390,13 @@ int main(int argc, char** argv)
       }
     } else if (arg == "--gen-preset") {
       if (!requireValue(i, val)) {
-        std::cerr << "--gen-preset requires a name (classic|island|archipelago|inland_sea|river_valley|mountain_ring)\n";
+        std::cerr << "--gen-preset requires a name (classic|island|archipelago|inland_sea|river_valley|mountain_ring|fjords|canyon|volcano|delta)\n";
         return 2;
       }
       isocity::ProcGenTerrainPreset p{};
       if (!isocity::ParseProcGenTerrainPreset(val, p)) {
         std::cerr << "Unknown --gen-preset: " << val << "\n";
-        std::cerr << "Valid presets: classic, island, archipelago, inland_sea, river_valley, mountain_ring\n";
+        std::cerr << "Valid presets: classic, island, archipelago, inland_sea, river_valley, mountain_ring, fjords, canyon, volcano, delta\n";
         return 2;
       }
       procCfg.terrainPreset = p;
@@ -368,6 +407,17 @@ int main(int argc, char** argv)
         return 2;
       }
       procCfg.terrainPresetStrength = std::clamp(s, 0.0f, 5.0f);
+    } else if (arg == "--gen-road-layout" || arg == "--gen-roadlayout") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--gen-road-layout requires a layout name\n";
+        return 2;
+      }
+      ProcGenRoadLayout layout{};
+      if (!ParseProcGenRoadLayout(val, layout)) {
+        std::cerr << "--gen-road-layout expects one of: organic|grid|radial|space_colonization\n";
+        return 2;
+      }
+      procCfg.roadLayout = layout;
     } else if (arg == "--gen-road-hierarchy") {
       if (!requireValue(i, val)) {
         std::cerr << "--gen-road-hierarchy requires 0 or 1\n";
@@ -1716,7 +1766,7 @@ int main(int argc, char** argv)
 
     const std::uint64_t hash = HashWorld(world, true);
     const std::string jsonP = expandPath(outJson, runIdx, actualSeed);
-    if (!WriteJsonSummary(world, hash, jsonP)) {
+    if (!WriteJsonSummary(world, hash, jsonP, runProcCfg, sim.config())) {
       std::cerr << "Failed to write JSON summary" << (jsonP.empty() ? "" : (": " + jsonP)) << "\n";
       return 1;
     }
