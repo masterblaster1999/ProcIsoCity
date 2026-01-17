@@ -13,6 +13,8 @@
 
 #include "isocity/LandValue.hpp"
 
+#include "isocity/DeterministicMath.hpp"
+
 #include "isocity/Isochrone.hpp"
 
 #include "isocity/Random.hpp"
@@ -403,6 +405,56 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
     tradePlan.marketIndex = 1.0f;
   }
 
+  // Procedural macro economy (optional): compute a deterministic daily snapshot and
+  // feed its multipliers into the goods model and budget/happiness calculations.
+  EconomySnapshot eco{};
+  std::array<float, static_cast<std::size_t>(kDistrictCount)> econTaxBaseMult{};
+  econTaxBaseMult.fill(1.0f);
+
+  std::vector<float> econIndSupplyMult;
+  std::vector<float> econComDemandMult;
+
+  if (m_economyModel.enabled) {
+    eco = ComputeEconomySnapshot(world, s.day, m_economyModel);
+
+    s.economyIndex = eco.economyIndex;
+    s.economyInflation = eco.inflation;
+    s.economyCityWealth = eco.cityWealth;
+    s.economyEventKind = static_cast<int>(eco.activeEvent.kind);
+    s.economyEventDaysLeft = std::max(0, eco.activeEventDaysLeft);
+
+    for (int d = 0; d < kDistrictCount; ++d) {
+      const float m = eco.districts[static_cast<std::size_t>(d)].taxBaseMult;
+      econTaxBaseMult[static_cast<std::size_t>(d)] = std::max(0.0f, m);
+    }
+
+    // Build per-tile multipliers (only meaningful on job-zone tiles).
+    econIndSupplyMult.assign(n, 1.0f);
+    econComDemandMult.assign(n, 1.0f);
+
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) {
+        const Tile& t = world.at(x, y);
+        const int d = std::clamp(static_cast<int>(t.district), 0, kDistrictCount - 1);
+        const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+        if (idx >= n) continue;
+
+        if (t.overlay == Overlay::Industrial) {
+          econIndSupplyMult[idx] = eco.districts[static_cast<std::size_t>(d)].industrialSupplyMult;
+        } else if (t.overlay == Overlay::Commercial) {
+          econComDemandMult[idx] = eco.districts[static_cast<std::size_t>(d)].commercialDemandMult;
+        }
+      }
+    }
+  } else {
+    // Baseline values so UI/debug output is stable.
+    s.economyIndex = 1.0f;
+    s.economyInflation = 0.0f;
+    s.economyCityWealth = 0.5f;
+    s.economyEventKind = 0;
+    s.economyEventDaysLeft = 0;
+  }
+
   // Goods/logistics model: route industrial output to commercial demand along roads.
   GoodsConfig gc;
   gc.requireOutsideConnection = m_cfg.requireOutsideConnection;
@@ -410,6 +462,10 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
   gc.allowExports = m_tradeModel.allowExports;
   gc.importCapacityPct = std::clamp(tradePlan.importCapacityPct, 0, 100);
   gc.exportCapacityPct = std::clamp(tradePlan.exportCapacityPct, 0, 100);
+  if (m_economyModel.enabled) {
+    gc.industrialSupplyMult = &econIndSupplyMult;
+    gc.commercialDemandMult = &econComDemandMult;
+  }
   const GoodsResult goods = ComputeGoodsFlow(world, gc, roadToEdge, zoneAccess);
   s.goodsProduced = goods.goodsProduced;
   s.goodsDemand = goods.goodsDemand;
@@ -798,7 +854,9 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
       else if (t.overlay == Overlay::Industrial) taxPerOcc = m_cfg.taxIndustrial;
 
       const float taxMult = taxMultFor(t);
-      const float raw = static_cast<float>(t.occupants) * static_cast<float>(taxPerOcc) * lvMult * taxMult;
+      const int d = clampDistrict(static_cast<int>(t.district));
+      const float econMult = econTaxBaseMult[static_cast<std::size_t>(d)];
+      const float raw = static_cast<float>(t.occupants) * static_cast<float>(taxPerOcc) * lvMult * taxMult * econMult;
       const int add = std::max(0, static_cast<int>(std::lround(raw)));
       taxRevenue += add;
     }
@@ -866,9 +924,10 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
   const float goodsPenalty = std::min(kGoodsPenaltyCap, (1.0f - goods.satisfaction) * kGoodsPenaltyCap);
 
   const float taxPenalty = std::min(0.20f, s.avgTaxPerCapita * std::max(0.0f, m_cfg.taxHappinessPerCapita));
+  const float inflationPenalty = std::min(0.06f, std::max(0.0f, s.economyInflation) * 1.25f);
   const float lvBonus = std::clamp((s.avgLandValue - 0.50f) * 0.10f, -0.05f, 0.05f);
 
-  s.happiness = Clamp01(0.45f + parkBonus + lvBonus - unemployment * 0.35f - commutePenalty - congestionPenalty - goodsPenalty - taxPenalty);
+  s.happiness = Clamp01(0.45f + parkBonus + lvBonus - unemployment * 0.35f - commutePenalty - congestionPenalty - goodsPenalty - taxPenalty - inflationPenalty);
 
   // Demand meter (for UI/debug): recompute using the newly derived happiness.
   const float jobPressure = (scan.housingCap > 0)
@@ -1026,7 +1085,7 @@ void Simulator::step(World& world)
     int y = 0;
     int cap = 0;
     Overlay type = Overlay::None;
-    float weight = 1.0f;
+    int weightQ16 = kQ16; // deterministic desirability key
   };
 
   std::vector<JobSite> sites;
@@ -1048,17 +1107,32 @@ void Simulator::step(World& world)
                               static_cast<std::size_t>(x);
       const float lvVal = (idx < lv.value.size()) ? lv.value[idx] : 0.0f;
 
-      const float w = (t.overlay == Overlay::Commercial) ? m_cfg.commercialDesirabilityWeight
-                                                         : m_cfg.industrialDesirabilityWeight;
-      const float desirBase = (t.overlay == Overlay::Commercial) ? lvVal : (1.0f - lvVal);
-      const float weight = std::clamp(1.0f + w * (desirBase - 0.5f), 0.25f, 2.0f);
+      // Determinism note:
+      //  - Sorting by raw floats can be sensitive to tiny cross-platform rounding differences.
+      //  - We quantize land value to Q16 and compute a fixed-point desirability key.
+      const float wCfg = (t.overlay == Overlay::Commercial) ? m_cfg.commercialDesirabilityWeight
+                                                           : m_cfg.industrialDesirabilityWeight;
 
-      sites.push_back(JobSite{x, y, cap, t.overlay, weight});
+      const int lvQ16 = Float01ToQ16(std::clamp(lvVal, 0.0f, 1.0f));
+      const int desirQ16 = (t.overlay == Overlay::Commercial) ? lvQ16 : (kQ16 - lvQ16);
+
+      // Quantize config weight to Q16. Clamp to a sane range to avoid overflow and extreme behavior.
+      const float wCfgClamped = std::clamp(wCfg, -4.0f, 4.0f);
+      const int wQ16 = RoundToInt(wCfgClamped * static_cast<float>(kQ16));
+
+      const int deltaQ16 = desirQ16 - (kQ16 / 2);
+      const std::int64_t scaled = (static_cast<std::int64_t>(wQ16) * static_cast<std::int64_t>(deltaQ16)) /
+                                  static_cast<std::int64_t>(kQ16);
+
+      int weightQ16 = kQ16 + static_cast<int>(scaled);
+      weightQ16 = std::clamp(weightQ16, kQ16 / 4, kQ16 * 2);
+
+      sites.push_back(JobSite{x, y, cap, t.overlay, weightQ16});
     }
   }
 
   std::sort(sites.begin(), sites.end(), [&](const JobSite& a, const JobSite& b) {
-    if (a.weight != b.weight) return a.weight > b.weight;
+    if (a.weightQ16 != b.weightQ16) return a.weightQ16 > b.weightQ16;
     if (a.y != b.y) return a.y < b.y;
     return a.x < b.x;
   });

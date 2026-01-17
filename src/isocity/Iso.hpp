@@ -8,7 +8,7 @@
 #include "isocity/Elevation.hpp"
 #include "isocity/Types.hpp"
 
-#include "raylib.h"
+#include "isocity/RaylibShim.hpp"
 
 namespace isocity {
 

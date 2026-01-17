@@ -2,7 +2,7 @@
 
 #include "isocity/Ui.hpp"
 
-#include "raylib.h"
+#include "isocity/RaylibShim.hpp"
 
 #include <algorithm>
 #include <cmath>

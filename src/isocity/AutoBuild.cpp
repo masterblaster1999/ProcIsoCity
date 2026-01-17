@@ -1016,7 +1016,8 @@ static void UpgradeMostCongestedRoads(World& world, const SimConfig& simCfg, con
   struct RoadCand {
     int x = 0;
     int y = 0;
-    float ratio = 0.0f;
+    int traffic = 0;
+    int cap = 1;
     std::uint32_t tie = 0;
   };
 
@@ -1038,20 +1039,25 @@ static void UpgradeMostCongestedRoads(World& world, const SimConfig& simCfg, con
       const std::uint16_t v = traffic.roadTraffic[idx];
       if (v == 0) continue;
       const int cap = std::max(1, RoadCapacityForLevel(baseCap, lvl));
-      const float ratio = static_cast<float>(v) / static_cast<float>(cap);
-      if (ratio < 1.05f) continue; // only upgrade meaningfully loaded roads
+      const int trafficV = static_cast<int>(v);
+      // Deterministic threshold: ratio >= 1.05 (avoid float).
+      if (trafficV * 100 < cap * 105) continue; // only upgrade meaningfully loaded roads
 
       RoadCand rc;
       rc.x = x;
       rc.y = y;
-      rc.ratio = ratio;
+      rc.traffic = trafficV;
+      rc.cap = cap;
       rc.tie = HashCoords32(x, y, seedBase);
       cands.push_back(rc);
     }
   }
 
   std::sort(cands.begin(), cands.end(), [](const RoadCand& a, const RoadCand& b) {
-    if (a.ratio != b.ratio) return a.ratio > b.ratio;
+    // Compare ratios (traffic/cap) deterministically without floats via cross-multiplication.
+    const std::int64_t lhs = static_cast<std::int64_t>(a.traffic) * static_cast<std::int64_t>(b.cap);
+    const std::int64_t rhs = static_cast<std::int64_t>(b.traffic) * static_cast<std::int64_t>(a.cap);
+    if (lhs != rhs) return lhs > rhs;
     return a.tie < b.tie;
   });
 

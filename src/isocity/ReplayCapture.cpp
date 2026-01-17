@@ -261,13 +261,19 @@ bool ReplayCapture::recordConfigPatch(const World& world, const ProcGenConfig* p
   return true;
 }
 
-void ReplayCapture::recordSimTuning(const TrafficModelSettings& trafficModel, const TransitModelSettings& transitModel)
+void ReplayCapture::recordSimTuning(const TrafficModelSettings& trafficModel, const TransitModelSettings& transitModel,
+                                    const TradeModelSettings& tradeModel,
+                                    const ServicesModelSettings& servicesModel,
+                                    const EconomyModelSettings& economyModel)
 {
   if (!m_active) return;
   ReplayEvent e;
   e.type = ReplayEventType::SimTuning;
   e.trafficModel = trafficModel;
   e.transitModel = transitModel;
+  e.tradeModel = tradeModel;
+  e.servicesModel = servicesModel;
+  e.economyModel = economyModel;
   m_replay.events.push_back(std::move(e));
 }
 
@@ -294,13 +300,20 @@ bool ReplayCapture::captureSettingsIfChanged(const World& world, const ProcGenCo
     }
   }
 
-  const bool tuningChanged = !m_haveLastTuning || !TrafficModelSettingsEqual(sim.trafficModel(), m_lastTrafficModel) ||
-                             !TransitModelSettingsEqual(sim.transitModel(), m_lastTransitModel);
+  const bool tuningChanged = !m_haveLastTuning ||
+                             !TrafficModelSettingsEqual(sim.trafficModel(), m_lastTrafficModel) ||
+                             !TransitModelSettingsEqual(sim.transitModel(), m_lastTransitModel) ||
+                             (sim.tradeModel() != m_lastTradeModel) ||
+                             (sim.servicesModel() != m_lastServicesModel) ||
+                             (sim.economyModel() != m_lastEconomyModel);
 
   if (tuningChanged) {
-    recordSimTuning(sim.trafficModel(), sim.transitModel());
+    recordSimTuning(sim.trafficModel(), sim.transitModel(), sim.tradeModel(), sim.servicesModel(), sim.economyModel());
     m_lastTrafficModel = sim.trafficModel();
     m_lastTransitModel = sim.transitModel();
+    m_lastTradeModel = sim.tradeModel();
+    m_lastServicesModel = sim.servicesModel();
+    m_lastEconomyModel = sim.economyModel();
     m_haveLastTuning = true;
   }
 

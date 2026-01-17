@@ -20,6 +20,7 @@
 #include "isocity/LandValue.hpp"
 #include "isocity/Replay.hpp"
 #include "isocity/Hash.hpp"
+#include "isocity/DeterministicMath.hpp"
 #include "isocity/Json.hpp"
 #include "isocity/Compression.hpp"
 #include "isocity/Export.hpp"
@@ -936,6 +937,75 @@ void TestProcGenRoadLayoutSpaceColonizationDeterminismAndConnectivity()
   cfg.roadLayout = ProcGenRoadLayout::SpaceColonization;
 
   const std::uint64_t seed = 0x12345678u;
+
+  World w = GenerateWorld(48, 48, seed, cfg);
+  World w2 = GenerateWorld(48, 48, seed, cfg);
+
+  EXPECT_EQ(HashWorld(w, true), HashWorld(w2, true));
+
+  int roadTiles = 0;
+  for (int y = 0; y < w.height(); ++y) {
+    for (int x = 0; x < w.width(); ++x) {
+      if (w.at(x, y).overlay == Overlay::Road) ++roadTiles;
+    }
+  }
+  EXPECT_TRUE(roadTiles > 50);
+
+  RoadGraph g = BuildRoadGraph(w);
+  EXPECT_TRUE(!g.nodes.empty());
+
+  // Connectivity check on the road graph.
+  const int n = static_cast<int>(g.nodes.size());
+  std::vector<char> vis(static_cast<std::size_t>(n), 0);
+  int comps = 0;
+
+  for (int i = 0; i < n; ++i) {
+    if (vis[static_cast<std::size_t>(i)]) continue;
+    ++comps;
+    std::vector<int> stack;
+    stack.push_back(i);
+    vis[static_cast<std::size_t>(i)] = 1;
+
+    while (!stack.empty()) {
+      const int cur = stack.back();
+      stack.pop_back();
+
+      for (const int eIdx : g.nodes[static_cast<std::size_t>(cur)].edges) {
+        if (eIdx < 0 || eIdx >= static_cast<int>(g.edges.size())) continue;
+        const RoadGraphEdge& e = g.edges[static_cast<std::size_t>(eIdx)];
+        const int other = (e.a == cur) ? e.b : e.a;
+        if (other < 0 || other >= n) continue;
+        if (vis[static_cast<std::size_t>(other)]) continue;
+        vis[static_cast<std::size_t>(other)] = 1;
+        stack.push_back(other);
+      }
+    }
+  }
+
+  EXPECT_EQ(comps, 1);
+}
+
+
+
+void TestProcGenRoadLayoutRadialDeterminismAndConnectivity()
+{
+  using namespace isocity;
+
+  ProcGenRoadLayout m{};
+  EXPECT_TRUE(ParseProcGenRoadLayout("radial", m));
+  EXPECT_EQ(m, ProcGenRoadLayout::Radial);
+  EXPECT_EQ(std::string(ToString(m)), std::string("radial"));
+
+  ProcGenConfig cfg{};
+  cfg.hubs = 6;
+  cfg.extraConnections = 2;
+  cfg.roadLayout = ProcGenRoadLayout::Radial;
+
+  // Keep this test focused on the radial road layout logic (avoid water cutting the graph).
+  cfg.waterLevel = 0.0f;
+  cfg.sandLevel = 0.0f;
+
+  const std::uint64_t seed = 0xCAFEBABEu;
 
   World w = GenerateWorld(48, 48, seed, cfg);
   World w2 = GenerateWorld(48, 48, seed, cfg);
@@ -2613,6 +2683,48 @@ void TestWorldHashDeterministicForSameSeed()
   const std::uint64_t hc = HashWorld(c);
 
   EXPECT_TRUE(hc != ha);
+}
+
+void TestWorldHashIncludesMacroEconomyStats()
+{
+  using namespace isocity;
+
+  World w(16, 16, 999);
+
+  // Populate the rest of the derived stats so this test only checks whether the
+  // *macro economy* fields are included in the stats hash.
+  Simulator sim;
+  sim.refreshDerivedStats(w);
+
+  const std::uint64_t h0 = HashWorld(w);
+
+  // Mutate macro-economy-only fields; world hash should change.
+  w.stats().economyIndex = 1.2345f;
+  w.stats().economyInflation = 0.042f;
+  w.stats().economyEventKind = 3;
+  w.stats().economyEventDaysLeft = 7;
+  w.stats().economyCityWealth = 0.77f;
+
+  const std::uint64_t h1 = HashWorld(w);
+  EXPECT_TRUE(h1 != h0);
+}
+
+void TestDeterministicTrigApproxBasics()
+{
+  using namespace isocity;
+
+  // Smoke tests: we mainly care that the implementation is stable and periodic
+  // (exact trig accuracy is not the goal).
+  EXPECT_NEAR(FastSinRad(0.0f), 0.0f, 1.0e-5f);
+  EXPECT_NEAR(FastCosRad(0.0f), 1.0f, 2.0e-3f);
+
+  EXPECT_NEAR(FastSinRad(kHalfPiF), 1.0f, 2.0e-3f);
+  EXPECT_NEAR(FastSinRad(-kHalfPiF), -1.0f, 2.0e-3f);
+  EXPECT_NEAR(FastSinRad(kPiF), 0.0f, 2.0e-3f);
+
+  // Periodicity: x and x+2pi should match.
+  EXPECT_NEAR(FastSinRad(0.123f), FastSinRad(0.123f + kTwoPiF), 2.0e-3f);
+  EXPECT_NEAR(FastCosRad(-0.75f), FastCosRad(-0.75f + kTwoPiF), 2.0e-3f);
 }
 
 void TestProcGenBlockZoningCreatesInteriorAccessibleZones()
@@ -7790,6 +7902,7 @@ int main()
   TestTrafficCongestionAwareSplitsParallelRoutes();
   TestSaveLoadRoundTrip();
   TestProcGenRoadLayoutSpaceColonizationDeterminismAndConnectivity();
+  TestProcGenRoadLayoutRadialDeterminismAndConnectivity();
   TestSaveLoadBytesRoundTrip();
   TestSLLZCompressionRoundTrip();
   TestJsonUnicodeEscapesAndStringify();
@@ -7832,6 +7945,8 @@ int main()
   TestJobAssignmentPrefersHighLandValueCommercial();
 
   TestWorldHashDeterministicForSameSeed();
+  TestWorldHashIncludesMacroEconomyStats();
+  TestDeterministicTrigApproxBasics();
   TestProcGenBlockZoningCreatesInteriorAccessibleZones();
   TestProcGenRiversAsWaterAddsWaterTiles();
   TestProcGenErosionToggleAffectsHash();

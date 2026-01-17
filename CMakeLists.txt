@@ -84,6 +84,7 @@ add_library(isocity_core
   src/isocity/TransitPlanner.cpp
   src/isocity/TransitPlannerExport.cpp
   src/isocity/Sim.cpp
+  src/isocity/Economy.cpp
   src/isocity/Services.cpp
   src/isocity/ServiceOptimizer.cpp
   src/isocity/FlowField.cpp
@@ -147,39 +148,93 @@ endif()
 if (PROCISOCITY_BUILD_APP)
   # Dependencies (raylib)
   if (PROCISOCITY_USE_SYSTEM_RAYLIB)
-    find_package(raylib REQUIRED)
+    # Prefer an upstream CMake config package if it exists (some installations ship one).
+    find_package(raylib CONFIG QUIET)
+    if (NOT raylib_FOUND)
+      list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+      find_package(raylib REQUIRED)
+    endif()
   else()
-    include(FetchContent)
-    set(FETCHCONTENT_QUIET OFF)
+    # Fetch raylib unless the user has requested a fully-disconnected configure and
+    # the raylib sources are not already available locally.
+    set(_procisocity_need_fetch_raylib TRUE)
 
-    # raylib release tag used by this template (raylib 5.5).
-    # You can update this later once you’re ready.
-    FetchContent_Declare(
-      raylib
-      GIT_REPOSITORY https://github.com/raysan5/raylib.git
-      GIT_TAG 5.5
-      GIT_SHALLOW TRUE
-    )
+    if (FETCHCONTENT_FULLY_DISCONNECTED)
+      # If the user points FetchContent at a local checkout, it can still be used in
+      # fully disconnected mode.
+      if (DEFINED FETCHCONTENT_SOURCE_DIR_RAYLIB AND NOT "${FETCHCONTENT_SOURCE_DIR_RAYLIB}" STREQUAL "")
+        set(_procisocity_need_fetch_raylib TRUE)
+      else()
+        # If raylib was populated previously, it will usually live under:
+        #   ${FETCHCONTENT_BASE_DIR}/raylib-src
+        # (default: ${CMAKE_BINARY_DIR}/_deps/raylib-src).
+        set(_fc_base_dir "${FETCHCONTENT_BASE_DIR}")
+        if (NOT _fc_base_dir)
+          set(_fc_base_dir "${CMAKE_BINARY_DIR}/_deps")
+        endif()
+        set(_raylib_populated_dir "${_fc_base_dir}/raylib-src")
 
-    # Keep raylib lean for an app/game.
-    set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
-    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+        if (NOT EXISTS "${_raylib_populated_dir}/CMakeLists.txt")
+          set(_procisocity_need_fetch_raylib FALSE)
+        endif()
+      endif()
 
-    FetchContent_MakeAvailable(raylib)
-
-    # raylib (and its bundled single-file dependencies) generate a lot of warnings on MSVC.
-    # Suppress warnings for the third-party target so the build output focuses on our code.
-    if (TARGET raylib)
-      get_target_property(_raylib_imported raylib IMPORTED)
-      if (NOT _raylib_imported)
-        if (MSVC)
-          target_compile_options(raylib PRIVATE /W0)
-        else()
-          target_compile_options(raylib PRIVATE -w)
+      if (NOT _procisocity_need_fetch_raylib)
+        message(STATUS "FetchContent is fully disconnected and raylib sources are not available locally; trying system raylib.")
+        find_package(raylib CONFIG QUIET)
+        if (NOT raylib_FOUND)
+          list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+          find_package(raylib QUIET)
+        endif()
+        if (NOT raylib_FOUND)
+          message(FATAL_ERROR
+            "raylib was not found, but FetchContent downloads are disabled (FETCHCONTENT_FULLY_DISCONNECTED=ON).\n"
+            "Options:\n"
+            "  - Install raylib (and optionally set raylib_ROOT/RAYLIB_ROOT)\n"
+            "  - Provide a local raylib checkout: -DFETCHCONTENT_SOURCE_DIR_RAYLIB=<path>\n"
+            "  - Disable the app build: -DPROCISOCITY_BUILD_APP=OFF\n"
+            "  - Or configure once with network access so FetchContent can populate raylib\n")
         endif()
       endif()
     endif()
+
+    if (_procisocity_need_fetch_raylib)
+      include(FetchContent)
+
+      # raylib release tag used by this template (raylib 5.5).
+      # You can update this later once you’re ready.
+      FetchContent_Declare(
+        raylib
+        GIT_REPOSITORY https://github.com/raysan5/raylib.git
+        GIT_TAG 5.5
+        GIT_SHALLOW TRUE
+      )
+
+      # Keep raylib lean for an app/game.
+      set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+      set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
+      set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+
+      FetchContent_MakeAvailable(raylib)
+
+      # raylib (and its bundled single-file dependencies) generate a lot of warnings on MSVC.
+      # Suppress warnings for the third-party target so the build output focuses on our code.
+      if (TARGET raylib)
+        get_target_property(_raylib_imported raylib IMPORTED)
+        if (NOT _raylib_imported)
+          if (MSVC)
+            target_compile_options(raylib PRIVATE /W0)
+          else()
+            target_compile_options(raylib PRIVATE -w)
+          endif()
+        endif()
+      endif()
+    endif()
+  endif()
+
+  # Normalize target naming across package variants.
+  if (TARGET raylib::raylib AND NOT TARGET raylib)
+    add_library(raylib ALIAS raylib::raylib)
   endif()
 
   add_executable(proc_isocity
@@ -219,6 +274,9 @@ if (PROCISOCITY_BUILD_APP)
     src/isocity/PostFxSettings.hpp
     src/isocity/PostFx.hpp
     src/isocity/PostFx.cpp
+
+    src/isocity/ShaderUtil.hpp
+    src/isocity/ShaderUtil.cpp
   )
 
   target_include_directories(proc_isocity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -233,13 +291,19 @@ if (PROCISOCITY_BUILD_APP)
   procisocity_set_strict_warnings(proc_isocity)
 
   # Convenience: copy DLLs on Windows when using MSVC + shared builds.
+  #
+  # Note: some system raylib configurations provide an INTERFACE target (e.g. via pkg-config).
+  # INTERFACE libraries don't have a runtime artifact, so $<TARGET_FILE:...> would be invalid.
   if (WIN32 AND TARGET raylib)
-    add_custom_command(TARGET proc_isocity POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        $<TARGET_FILE:raylib>
-        $<TARGET_FILE_DIR:proc_isocity>
-      COMMENT "Copying raylib runtime next to the executable (if needed)"
-    )
+    get_target_property(_raylib_type raylib TYPE)
+    if (NOT _raylib_type STREQUAL "INTERFACE_LIBRARY")
+      add_custom_command(TARGET proc_isocity POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          $<TARGET_FILE:raylib>
+          $<TARGET_FILE_DIR:proc_isocity>
+        COMMENT "Copying raylib runtime next to the executable (if needed)"
+      )
+    endif()
   endif()
 endif()
 
@@ -503,6 +567,16 @@ if (PROCISOCITY_BUILD_CLI)
   target_link_libraries(proc_isocity_goodsgraph PRIVATE isocity_core)
 
   procisocity_set_strict_warnings(proc_isocity_goodsgraph)
+
+  # Macro economy snapshot tool (headless): compute a deterministic daily economy state.
+  add_executable(proc_isocity_economy
+    src/cli/economy.cpp
+  )
+
+  target_include_directories(proc_isocity_economy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_economy PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_economy)
 
   # Transit line planning tool (headless): plan bus-line style corridors from simulated demand.
   add_executable(proc_isocity_transitplan

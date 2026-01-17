@@ -495,6 +495,7 @@ bool BuildProjector(const OsmLatLonBounds& b, int w, int h, int padding, Project
   return true;
 }
 
+[[maybe_unused]]
 bool WayHasAnyInterestingTags(const OsmWay& w)
 {
   return !w.highway.empty() || !w.building.empty() || !w.landuse.empty() || !w.leisure.empty() ||

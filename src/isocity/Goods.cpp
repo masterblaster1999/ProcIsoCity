@@ -32,6 +32,16 @@ bool MaskUsable(const std::vector<std::uint8_t>* mask, int w, int h)
   return mask->size() == expect;
 }
 
+float SafeTileMult(const std::vector<float>* m, std::size_t idx, std::size_t expect)
+{
+  if (!m) return 1.0f;
+  if (m->size() != expect) return 1.0f;
+  if (idx >= expect) return 1.0f;
+  const float v = (*m)[idx];
+  if (!std::isfinite(v)) return 1.0f;
+  return std::clamp(v, 0.0f, 4.0f);
+}
+
 inline int BaseIndustrialSupply(int level)
 {
   // Mirror the industrial job capacity from the core sim.
@@ -247,7 +257,8 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
       }
       if (!isTraversableRoad(ridx)) continue;
 
-      const float raw = static_cast<float>(BaseIndustrialSupply(static_cast<int>(t.level))) * cfg.supplyScale;
+      const float tileMult = SafeTileMult(cfg.industrialSupplyMult, zidx, n);
+      const float raw = static_cast<float>(BaseIndustrialSupply(static_cast<int>(t.level))) * cfg.supplyScale * tileMult;
       const int supply = std::max(0, static_cast<int>(std::lround(raw)));
       if (supply <= 0) continue;
 
@@ -333,7 +344,8 @@ GoodsResult ComputeGoodsFlow(const World& world, const GoodsConfig& cfg,
       if (zidx >= zoneAccess->roadIdx.size()) continue;
       if (zoneAccess->roadIdx[zidx] < 0) continue;
 
-      const float raw = static_cast<float>(BaseCommercialDemand(static_cast<int>(t.level))) * cfg.demandScale;
+      const float tileMult = SafeTileMult(cfg.commercialDemandMult, zidx, n);
+      const float raw = static_cast<float>(BaseCommercialDemand(static_cast<int>(t.level))) * cfg.demandScale * tileMult;
       const int demand = std::max(0, static_cast<int>(std::lround(raw)));
       if (demand <= 0) continue;
 

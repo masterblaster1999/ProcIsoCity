@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-#include "raylib.h"
+#include "isocity/RaylibShim.hpp"
 
 namespace isocity {
 
@@ -29,6 +29,10 @@ public:
   // Safe to call multiple times.
   void init();
 
+  // Force recompilation (useful when editing external override shaders).
+  // Returns true if the shader is ready after reloading.
+  bool reload();
+
   // Release GPU resources.
   void shutdown();
 
@@ -36,6 +40,9 @@ public:
   // Compatibility alias (older code expected isReady()).
   bool isReady() const { return ready(); }
   bool failed() const { return m_failed; }
+
+  // True if an on-disk override was used for the most recent successful compile.
+  bool usedOverride() const { return m_usedOverride; }
 
   // Draw `tex` with post FX if enabled + shader is ready.
   // Falls back to normal DrawTexturePro when disabled or unavailable.
@@ -54,6 +61,7 @@ private:
   Shader m_shader{};
   bool m_ready = false;
   bool m_failed = false;
+  bool m_usedOverride = false;
 
   int m_locTime = -1;
   int m_locSeed = -1;
@@ -63,6 +71,13 @@ private:
   int m_locVignette = -1;
   int m_locChroma = -1;
   int m_locScanlines = -1;
+
+  int m_locFxaa = -1;
+  int m_locSharpen = -1;
+
+  // Optional uniforms for custom shaders (safe to ignore if not present).
+  int m_locResolution = -1;
+  int m_locTexelSize = -1;
 };
 
 } // namespace isocity

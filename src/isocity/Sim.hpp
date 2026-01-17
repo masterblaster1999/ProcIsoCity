@@ -3,6 +3,7 @@
 #include "isocity/World.hpp"
 #include "isocity/TransitPlanner.hpp"
 #include "isocity/TradeMarket.hpp"
+#include "isocity/Economy.hpp"
 #include "isocity/Services.hpp"
 
 #include <array>
@@ -191,6 +192,9 @@ public:
   const TradeModelSettings& tradeModel() const { return m_tradeModel; }
   TradeModelSettings& tradeModel() { return m_tradeModel; }
 
+  const EconomyModelSettings& economyModel() const { return m_economyModel; }
+  EconomyModelSettings& economyModel() { return m_economyModel; }
+
   // Recompute derived HUD stats (population/capacities/roads/parks/employment/happiness)
   // without advancing time or modifying tiles.
   void refreshDerivedStats(World& world) const;
@@ -208,6 +212,7 @@ private:
   TransitModelSettings m_transitModel{};
   ServicesModelSettings m_servicesModel{};
   TradeModelSettings m_tradeModel{};
+  EconomyModelSettings m_economyModel{};
   float m_accum = 0.0f;
 };
 

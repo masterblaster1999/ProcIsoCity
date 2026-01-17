@@ -39,7 +39,7 @@
 #include <string>
 #include <vector>
 
-#include "raylib.h"
+#include "isocity/RaylibShim.hpp"
 
 namespace isocity {
 

@@ -1,6 +1,7 @@
 #include "isocity/GfxTileset.hpp"
 
 #include "isocity/Random.hpp"
+#include "isocity/DeterministicMath.hpp"
 #include "isocity/GfxBuildings.hpp"
 #include "isocity/GfxFacilities.hpp"
 #include "isocity/GfxProps.hpp"
@@ -413,8 +414,8 @@ RgbaImage MakeTerrainVariant(TerrainKind kind, int variant,
       const float n = (Frac01(h) - 0.5f) * 0.10f;
 
       const float phase = static_cast<float>(variant) * 0.65f;
-      const float waves0 = 0.060f * std::sin(static_cast<float>(x) * 0.35f + static_cast<float>(y) * 0.70f + phase);
-      const float waves1 = 0.030f * std::sin(static_cast<float>(x) * 0.90f - static_cast<float>(y) * 0.45f + phase * 1.73f);
+      const float waves0 = 0.060f * FastSinRad(static_cast<float>(x) * 0.35f + static_cast<float>(y) * 0.70f + phase);
+      const float waves1 = 0.030f * FastSinRad(static_cast<float>(x) * 0.90f - static_cast<float>(y) * 0.45f + phase * 1.73f);
 
       float b = 1.0f + n + waves0 + waves1;
       b *= 0.92f + 0.15f * d.edge;

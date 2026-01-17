@@ -73,13 +73,15 @@ public:
   //
   // - ProcGenConfig/SimConfig changes are recorded as "config-only" Patch events
   //   (WorldPatch with zero tile deltas).
-  // - Traffic/Transit model changes are recorded as SimTuning events.
+  // - Traffic/Transit/Trade/Services/Economy model changes are recorded as SimTuning events.
   bool captureSettingsIfChanged(const World& world, const ProcGenConfig& procCfg, const Simulator& sim,
                                 std::string& outError);
 
 private:
   bool recordConfigPatch(const World& world, const ProcGenConfig* procCfg, const SimConfig* simCfg, std::string& outError);
-  void recordSimTuning(const TrafficModelSettings& trafficModel, const TransitModelSettings& transitModel);
+  void recordSimTuning(const TrafficModelSettings& trafficModel, const TransitModelSettings& transitModel,
+                       const TradeModelSettings& tradeModel, const ServicesModelSettings& servicesModel,
+                       const EconomyModelSettings& economyModel);
 
   bool m_active = false;
   Replay m_replay{};
@@ -92,6 +94,9 @@ private:
   bool m_haveLastTuning = false;
   TrafficModelSettings m_lastTrafficModel{};
   TransitModelSettings m_lastTransitModel{};
+  TradeModelSettings m_lastTradeModel{};
+  ServicesModelSettings m_lastServicesModel{};
+  EconomyModelSettings m_lastEconomyModel{};
 };
 
 } // namespace isocity

@@ -12,6 +12,7 @@
 #include "isocity/Hydrology.hpp"
 #include "isocity/Road.hpp"
 #include "isocity/Random.hpp"
+#include "isocity/DeterministicMath.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1293,14 +1294,18 @@ static void CarveHubConnectionsRadial(World& world, RNG& rng, const std::vector<
   if (hubPts.size() < 2) return;
 
   // Compute hub centroid.
-  float cx = 0.0f;
-  float cy = 0.0f;
+  //
+  // We keep both the floating centroid (for distance heuristics) and an integer
+  // centroid numerator (for deterministic angle ordering later).
+  std::int64_t sumX = 0;
+  std::int64_t sumY = 0;
   for (const P& p : hubPts) {
-    cx += static_cast<float>(p.x);
-    cy += static_cast<float>(p.y);
+    sumX += static_cast<std::int64_t>(p.x);
+    sumY += static_cast<std::int64_t>(p.y);
   }
-  cx /= static_cast<float>(hubPts.size());
-  cy /= static_cast<float>(hubPts.size());
+
+  const float cx = static_cast<float>(sumX) / static_cast<float>(hubPts.size());
+  const float cy = static_cast<float>(sumY) / static_cast<float>(hubPts.size());
 
   // Pick the most "central" hub as the spoke origin.
   int centerIdx = 0;
@@ -1327,33 +1332,59 @@ static void CarveHubConnectionsRadial(World& world, RNG& rng, const std::vector<
     CarveRoadCurvy(world, rng, center, p, lvl, /*allowBridges=*/true, seed32 ^ HashCoords32(centerIdx, i, 0x5F0CE001u));
   }
 
-  // Outer ring: connect hubs around the centroid by angle.
+  // Outer ring: connect hubs around the centroid in circular order.
+  //
+  // Determinism note: avoid std::atan2 here. Transcendental functions can vary
+  // slightly across platforms/compilers, which can change sort ordering and thus
+  // the generated road graph for the same seed.
+  //
+  // We instead sort by polar angle using a half-plane test + cross-product
+  // comparator, operating purely on integers. We scale vectors by hub count so
+  // the centroid division is eliminated:
+  //   dx = p.x * N - sumX
+  //   dy = p.y * N - sumY
   struct HubAngle {
     int idx = 0;
-    float ang = 0.0f;
-    float r = 0.0f;
+    std::int64_t dx = 0;
+    std::int64_t dy = 0;
+    std::int64_t r = 0; // Manhattan radius proxy (|dx| + |dy|), scaled by N
   };
+
+  auto abs64 = [](std::int64_t v) -> std::int64_t { return v < 0 ? -v : v; };
+  auto upper = [](std::int64_t dx, std::int64_t dy) -> bool { return (dy > 0) || (dy == 0 && dx >= 0); };
 
   std::vector<HubAngle> outer;
   outer.reserve(hubPts.size());
+  const std::int64_t nHub = static_cast<std::int64_t>(hubPts.size());
+
   for (int i = 0; i < static_cast<int>(hubPts.size()); ++i) {
     if (i == centerIdx) continue;
     const P p = hubPts[static_cast<std::size_t>(i)];
-    const float dx = static_cast<float>(p.x) - cx;
-    const float dy = static_cast<float>(p.y) - cy;
+
     HubAngle ha;
     ha.idx = i;
-    ha.ang = std::atan2(dy, dx);
-    ha.r = std::fabs(dx) + std::fabs(dy);
+    ha.dx = static_cast<std::int64_t>(p.x) * nHub - sumX;
+    ha.dy = static_cast<std::int64_t>(p.y) * nHub - sumY;
+    ha.r = abs64(ha.dx) + abs64(ha.dy);
     outer.push_back(ha);
   }
 
   if (outer.size() >= 3) {
     std::sort(outer.begin(), outer.end(), [&](const HubAngle& a, const HubAngle& b) {
-      if (a.ang != b.ang) return a.ang < b.ang;
+      const bool au = upper(a.dx, a.dy);
+      const bool bu = upper(b.dx, b.dy);
+      if (au != bu) return au > bu;
+
+      // Cross product sign determines relative angle within the same half-plane.
+      const std::int64_t cross = a.dx * b.dy - a.dy * b.dx;
+      if (cross != 0) return cross > 0;
+
+      // Collinear: prefer farther hubs first (stable ring around the outside).
       if (a.r != b.r) return a.r > b.r;
-      const std::uint32_t ha = HashCoords32(a.idx, static_cast<int>(std::lround(a.r)), seed32 ^ 0xBEEFBEEFu);
-      const std::uint32_t hb = HashCoords32(b.idx, static_cast<int>(std::lround(b.r)), seed32 ^ 0xBEEFBEEFu);
+
+      // Final deterministic tie-breaker.
+      const std::uint32_t ha = HashCoords32(a.idx, static_cast<int>(a.r), seed32 ^ 0xBEEFBEEFu);
+      const std::uint32_t hb = HashCoords32(b.idx, static_cast<int>(b.r), seed32 ^ 0xBEEFBEEFu);
       return ha < hb;
     });
 
@@ -1761,8 +1792,12 @@ static void CarveBeltwayIfUseful(World& world, RNG& rng, const std::vector<P>& h
     const float j = TileRand01(i, points, seed32 ^ 0xB17BEEFu) * 2.0f - 1.0f;
     const float r = R * (1.0f + 0.07f * j);
 
-    const int tx = static_cast<int>(std::round(cx + r * std::cos(ang)));
-    const int ty = static_cast<int>(std::round(cy + r * std::sin(ang)));
+    float sa = 0.0f;
+    float ca = 1.0f;
+    FastSinCosRad(ang, sa, ca);
+
+    const int tx = static_cast<int>(std::round(cx + r * ca));
+    const int ty = static_cast<int>(std::round(cy + r * sa));
 
     P p{tx, ty};
     if (!FindNearestBuildableLand(world, tx, ty, /*maxR=*/6, seed32 ^ (0x9E3779B9u * static_cast<std::uint32_t>(i + 1)),
@@ -4322,8 +4357,12 @@ static void ApplyTerrainPreset(std::vector<float>& heights, int width, int heigh
         const float steer = (fbmNormalized(fx * 0.055f, fy * 0.055f, fjSeed, 3) * 2.0f - 1.0f);
         a += steer * 0.10f + (prng.nextF01() - 0.5f) * 0.04f;
 
-        fx += std::cos(a);
-        fy += std::sin(a);
+        float sa = 0.0f;
+        float ca = 1.0f;
+        FastSinCosRad(a, sa, ca);
+
+        fx += ca;
+        fy += sa;
 
         const int ix = static_cast<int>(std::round(fx));
         const int iy = static_cast<int>(std::round(fy));

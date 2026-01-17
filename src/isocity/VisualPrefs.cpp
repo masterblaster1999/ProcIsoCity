@@ -289,6 +289,18 @@ bool VisualPrefsEqual(const VisualPrefs& a, const VisualPrefs& b)
   if (!NearlyEqual(a.volumetricClouds.bottomFade, b.volumetricClouds.bottomFade)) return false;
   if (!NearlyEqual(a.volumetricClouds.clearAmount, b.volumetricClouds.clearAmount)) return false;
 
+  // Post FX
+  if (a.postFx.enabled != b.postFx.enabled) return false;
+  if (a.postFx.colorBits != b.postFx.colorBits) return false;
+  if (!NearlyEqual(a.postFx.ditherStrength, b.postFx.ditherStrength)) return false;
+  if (!NearlyEqual(a.postFx.grain, b.postFx.grain)) return false;
+  if (!NearlyEqual(a.postFx.vignette, b.postFx.vignette)) return false;
+  if (!NearlyEqual(a.postFx.chroma, b.postFx.chroma)) return false;
+  if (!NearlyEqual(a.postFx.scanlines, b.postFx.scanlines)) return false;
+  if (!NearlyEqual(a.postFx.fxaa, b.postFx.fxaa)) return false;
+  if (!NearlyEqual(a.postFx.sharpen, b.postFx.sharpen)) return false;
+  if (a.postFx.includeWeather != b.postFx.includeWeather) return false;
+
   // Elevation
   if (!NearlyEqual(a.elevation.maxPixels, b.elevation.maxPixels)) return false;
   if (a.elevation.quantizeSteps != b.elevation.quantizeSteps) return false;
@@ -567,6 +579,10 @@ std::string VisualPrefsToJson(const VisualPrefs& p, int indentSpaces)
   Indent(oss, indent * 3);
   oss << "\"scanlines\": " << FloatToJson(p.postFx.scanlines) << ",\n";
   Indent(oss, indent * 3);
+  oss << "\"fxaa\": " << FloatToJson(p.postFx.fxaa) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"sharpen\": " << FloatToJson(p.postFx.sharpen) << ",\n";
+  Indent(oss, indent * 3);
   oss << "\"include_weather\": ";
   WriteBool(oss, p.postFx.includeWeather);
   oss << "\n";
@@ -715,6 +731,8 @@ bool ApplyVisualPrefsJson(const JsonValue& root, VisualPrefs& ioPrefs, std::stri
       if (!ApplyF32(*pf, "vignette", ioPrefs.postFx.vignette, outError)) return false;
       if (!ApplyF32(*pf, "chroma", ioPrefs.postFx.chroma, outError)) return false;
       if (!ApplyF32(*pf, "scanlines", ioPrefs.postFx.scanlines, outError)) return false;
+      if (!ApplyF32(*pf, "fxaa", ioPrefs.postFx.fxaa, outError)) return false;
+      if (!ApplyF32(*pf, "sharpen", ioPrefs.postFx.sharpen, outError)) return false;
       if (!ApplyBool(*pf, "include_weather", ioPrefs.postFx.includeWeather, outError)) return false;
     }
   }
@@ -767,6 +785,8 @@ bool ApplyVisualPrefsJson(const JsonValue& root, VisualPrefs& ioPrefs, std::stri
   ioPrefs.postFx.vignette = std::clamp(ioPrefs.postFx.vignette, 0.0f, 1.0f);
   ioPrefs.postFx.chroma = std::clamp(ioPrefs.postFx.chroma, 0.0f, 1.0f);
   ioPrefs.postFx.scanlines = std::clamp(ioPrefs.postFx.scanlines, 0.0f, 1.0f);
+  ioPrefs.postFx.fxaa = std::clamp(ioPrefs.postFx.fxaa, 0.0f, 1.0f);
+  ioPrefs.postFx.sharpen = std::clamp(ioPrefs.postFx.sharpen, 0.0f, 1.0f);
 
   ioPrefs.elevation.maxPixels = std::clamp(ioPrefs.elevation.maxPixels, 0.0f, 1024.0f);
   ioPrefs.elevation.quantizeSteps = std::clamp(ioPrefs.elevation.quantizeSteps, 0, 128);

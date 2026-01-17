@@ -1,6 +1,6 @@
 #pragma once
 
-#include "raylib.h"
+#include "isocity/RaylibShim.hpp"
 
 #include <cstdint>
 #include <string_view>

@@ -2,7 +2,7 @@
 
 #include "isocity/Types.hpp"
 
-#include "raylib.h"
+#include "isocity/RaylibShim.hpp"
 
 #include <cstdint>
 #include <string>

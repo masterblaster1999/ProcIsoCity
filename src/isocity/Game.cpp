@@ -20,6 +20,7 @@
 #include "isocity/WorldTiling.hpp"
 #include "isocity/Ui.hpp"
 #include "isocity/ZoneAccess.hpp"
+#include "isocity/ShaderUtil.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -812,6 +813,24 @@ void Game::setupDevConsole()
       "echo", "echo <text...>  - print text", [joinArgs](DevConsole& c, const DevConsole::Args& args) {
         if (args.empty()) return;
         c.print(joinArgs(args, 0));
+      });
+
+  m_console.registerCommand(
+      "shader_reload",
+      "shader_reload  - reload on-disk GLSL overrides (postfx, volcloud)",
+      [this](DevConsole& c, const DevConsole::Args&) {
+        const ShaderOverrideSearch s = FindShaderOverrideDir();
+        if (!s.dir.empty()) {
+          c.print("Shader override dir: " + s.dir.string());
+        } else {
+          c.print("Shader override dir: (not found; using embedded fallbacks)");
+        }
+
+        const bool postOk = m_postFxPipeline.reload();
+        c.print(std::string("PostFX: ") + (postOk ? "reloaded" : "reload failed"));
+
+        m_renderer.reloadShaderOverrides();
+        c.print("Renderer: shader overrides reloaded");
       });
 
   // ScriptRunner bridge: run the same deterministic headless scripts used by the CLI tools
@@ -5694,12 +5713,24 @@ void Game::adjustVideoSettings(int dir)
       showToast(TextFormat("Post FX: scanlines %.0f%%", m_postFx.scanlines * 100.0f));
     } break;
 
-    case 33:
+    case 33: {
+      const float step = shift ? 0.10f : 0.03f;
+      m_postFx.fxaa = clamp01(m_postFx.fxaa + (static_cast<float>(d) * step));
+      showToast(TextFormat("Post FX: FXAA %.0f%%", m_postFx.fxaa * 100.0f));
+    } break;
+
+    case 34: {
+      const float step = shift ? 0.10f : 0.03f;
+      m_postFx.sharpen = clamp01(m_postFx.sharpen + (static_cast<float>(d) * step));
+      showToast(TextFormat("Post FX: sharpen %.0f%%", m_postFx.sharpen * 100.0f));
+    } break;
+
+    case 35:
       m_postFx.includeWeather = !m_postFx.includeWeather;
       showToast(m_postFx.includeWeather ? "Post FX: include weather" : "Post FX: weather separate");
       break;
 
-    case 34:
+    case 36:
       m_postFx = PostFxSettings{};
       showToast("Post FX: RESET");
       if (!wantsWorldRenderTarget()) unloadWorldRenderTarget();
@@ -5886,6 +5917,8 @@ void Game::applyVisualPrefs(const VisualPrefs& prefs)
   m_postFx.vignette = std::clamp(m_postFx.vignette, 0.0f, 1.0f);
   m_postFx.chroma = std::clamp(m_postFx.chroma, 0.0f, 1.0f);
   m_postFx.scanlines = std::clamp(m_postFx.scanlines, 0.0f, 1.0f);
+  m_postFx.fxaa = std::clamp(m_postFx.fxaa, 0.0f, 1.0f);
+  m_postFx.sharpen = std::clamp(m_postFx.sharpen, 0.0f, 1.0f);
 
 
   if (m_worldRenderScaleAuto) {
@@ -12419,7 +12452,7 @@ void Game::handleInput(float dt)
       m_roadUpgradeSelection = (m_roadUpgradeSelection + delta + count) % count;
     } else if (m_showVideoSettings) {
       const int count = (m_videoPage == 0)   ? 11
-                        : (m_videoPage == 1) ? 35
+                        : (m_videoPage == 1) ? 37
                         : (m_videoPage == 2) ? 18
                                              : 11;
       m_videoSelection = (m_videoSelection + delta + count) % count;
@@ -14280,7 +14313,7 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
   const int panelW = std::max(std::min(panelMaxW, availW), std::min(panelMinW, availW));
   const int rowH = 22;
   const int rows = (m_videoPage == 0)   ? 11
-                   : (m_videoPage == 1) ? 35
+                   : (m_videoPage == 1) ? 37
                    : (m_videoPage == 2) ? 18
                                         : 11;
   const int panelH = 64 + rows * rowH + 28;
@@ -14429,8 +14462,10 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
     drawRow(30, "Vignette", TextFormat("%.0f%%", m_postFx.vignette * 100.0f), !m_postFx.enabled);
     drawRow(31, "Chroma aberration", TextFormat("%.0f%%", m_postFx.chroma * 100.0f), !m_postFx.enabled);
     drawRow(32, "Scanlines", TextFormat("%.0f%%", m_postFx.scanlines * 100.0f), !m_postFx.enabled);
-    drawRow(33, "Include weather", onOff(m_postFx.includeWeather), !m_postFx.enabled);
-    drawRow(34, "Reset Post FX", "Click / ]");
+    drawRow(33, "FXAA", TextFormat("%.0f%%", m_postFx.fxaa * 100.0f), !m_postFx.enabled);
+    drawRow(34, "Sharpen", TextFormat("%.0f%%", m_postFx.sharpen * 100.0f), !m_postFx.enabled);
+    drawRow(35, "Include weather", onOff(m_postFx.includeWeather), !m_postFx.enabled);
+    drawRow(36, "Reset Post FX", "Click / ]");
   } else if (m_videoPage == 2) {
     // ----------------------------
     // Atmosphere page

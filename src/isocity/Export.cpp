@@ -1,4 +1,5 @@
 #include "isocity/Export.hpp"
+#include "isocity/DeterministicMath.hpp"
 
 #include "isocity/GfxTilesetAtlas.hpp"
 #include "isocity/Random.hpp"
@@ -379,11 +380,9 @@ inline DayNightState ComputeDayNightState(const IsoOverviewConfig::DayNightConfi
   DayNightState st{};
   if (!cfg.enabled) return st;
 
-  st.phase = std::fmod(cfg.phase01, 1.0f);
-  if (st.phase < 0.0f) st.phase += 1.0f;
+  st.phase = Wrap01(cfg.phase01);
 
-  constexpr float kPi = 3.14159265358979323846f;
-  st.sun = std::sin(st.phase * 2.0f * kPi);
+  st.sun = FastSinRad(st.phase * kTwoPiF);
 
   // Mirror the in-app behaviour: day turns on slightly before the horizon.
   st.day = SmoothStep(-0.18f, 0.22f, st.sun);

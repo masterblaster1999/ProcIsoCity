@@ -18,7 +18,8 @@ constexpr std::uint8_t kMagic[8] = {'I','S','O','R','E','P','L','\0'};
 constexpr std::uint32_t kReplayVersionV1 = 1;
 constexpr std::uint32_t kReplayVersionV2 = 2;
 constexpr std::uint32_t kReplayVersionV3 = 3;
-constexpr std::uint32_t kReplayVersion = kReplayVersionV3;
+constexpr std::uint32_t kReplayVersionV4 = 4;
+constexpr std::uint32_t kReplayVersion = kReplayVersionV4;
 
 bool ReadExact(std::istream& in, void* dst, std::size_t n)
 {
@@ -171,6 +172,175 @@ bool ReadTransitModelSettings(std::istream& in, TransitModelSettings& s)
   return in.good();
 }
 
+bool WriteTradeModelSettings(std::ostream& out, const TradeModelSettings& s)
+{
+  const std::uint8_t enabled = s.enabled ? 1u : 0u;
+  const std::uint8_t allowImp = s.allowImports ? 1u : 0u;
+  const std::uint8_t allowExp = s.allowExports ? 1u : 0u;
+  if (!WritePOD(out, enabled)) return false;
+  if (!WritePOD(out, allowImp)) return false;
+  if (!WritePOD(out, allowExp)) return false;
+  if (!WritePOD(out, s.tariffPct)) return false;
+  if (!WritePOD(out, s.importPartner)) return false;
+  if (!WritePOD(out, s.exportPartner)) return false;
+  return out.good();
+}
+
+bool ReadTradeModelSettings(std::istream& in, TradeModelSettings& s)
+{
+  std::uint8_t b = 0;
+  if (!ReadPOD(in, b)) return false;
+  s.enabled = (b & 1u) != 0u;
+  if (!ReadPOD(in, b)) return false;
+  s.allowImports = (b & 1u) != 0u;
+  if (!ReadPOD(in, b)) return false;
+  s.allowExports = (b & 1u) != 0u;
+  if (!ReadPOD(in, s.tariffPct)) return false;
+  if (!ReadPOD(in, s.importPartner)) return false;
+  if (!ReadPOD(in, s.exportPartner)) return false;
+  return in.good();
+}
+
+bool WriteServicesModelSettings(std::ostream& out, const ServicesModelSettings& s)
+{
+  const std::uint8_t enabled = s.enabled ? 1u : 0u;
+  const std::uint8_t req = s.requireOutsideConnection ? 1u : 0u;
+  if (!WritePOD(out, enabled)) return false;
+  if (!WritePOD(out, req)) return false;
+  const std::uint8_t wm = static_cast<std::uint8_t>(s.weightMode);
+  if (!WritePOD(out, wm)) return false;
+  if (!WritePOD(out, s.catchmentRadiusSteps)) return false;
+
+  for (float v : s.distanceBandWeight) {
+    if (!WritePOD(out, v)) return false;
+  }
+  for (float v : s.distanceBandCutFrac) {
+    if (!WritePOD(out, v)) return false;
+  }
+
+  const std::uint8_t dm = static_cast<std::uint8_t>(s.demandMode);
+  if (!WritePOD(out, dm)) return false;
+
+  const std::uint8_t dr = s.demandResidential ? 1u : 0u;
+  const std::uint8_t dc = s.demandCommercial ? 1u : 0u;
+  const std::uint8_t di = s.demandIndustrial ? 1u : 0u;
+  if (!WritePOD(out, dr)) return false;
+  if (!WritePOD(out, dc)) return false;
+  if (!WritePOD(out, di)) return false;
+
+  if (!WritePOD(out, s.educationDemandMult)) return false;
+  if (!WritePOD(out, s.healthDemandMult)) return false;
+  if (!WritePOD(out, s.safetyDemandMult)) return false;
+
+  for (int v : s.educationSupplyPerLevel) {
+    if (!WritePOD(out, v)) return false;
+  }
+  for (int v : s.healthSupplyPerLevel) {
+    if (!WritePOD(out, v)) return false;
+  }
+  for (int v : s.safetySupplyPerLevel) {
+    if (!WritePOD(out, v)) return false;
+  }
+
+  for (int v : s.educationMaintenancePerDay) {
+    if (!WritePOD(out, v)) return false;
+  }
+  for (int v : s.healthMaintenancePerDay) {
+    if (!WritePOD(out, v)) return false;
+  }
+  for (int v : s.safetyMaintenancePerDay) {
+    if (!WritePOD(out, v)) return false;
+  }
+
+  if (!WritePOD(out, s.targetAccess)) return false;
+  return out.good();
+}
+
+bool ReadServicesModelSettings(std::istream& in, ServicesModelSettings& s)
+{
+  std::uint8_t b = 0;
+  if (!ReadPOD(in, b)) return false;
+  s.enabled = (b & 1u) != 0u;
+  if (!ReadPOD(in, b)) return false;
+  s.requireOutsideConnection = (b & 1u) != 0u;
+  std::uint8_t wm = 0;
+  if (!ReadPOD(in, wm)) return false;
+  s.weightMode = static_cast<IsochroneWeightMode>(wm);
+  if (!ReadPOD(in, s.catchmentRadiusSteps)) return false;
+
+  for (float& v : s.distanceBandWeight) {
+    if (!ReadPOD(in, v)) return false;
+  }
+  for (float& v : s.distanceBandCutFrac) {
+    if (!ReadPOD(in, v)) return false;
+  }
+
+  std::uint8_t dm = 0;
+  if (!ReadPOD(in, dm)) return false;
+  s.demandMode = static_cast<ServiceDemandMode>(dm);
+
+  if (!ReadPOD(in, b)) return false;
+  s.demandResidential = (b & 1u) != 0u;
+  if (!ReadPOD(in, b)) return false;
+  s.demandCommercial = (b & 1u) != 0u;
+  if (!ReadPOD(in, b)) return false;
+  s.demandIndustrial = (b & 1u) != 0u;
+
+  if (!ReadPOD(in, s.educationDemandMult)) return false;
+  if (!ReadPOD(in, s.healthDemandMult)) return false;
+  if (!ReadPOD(in, s.safetyDemandMult)) return false;
+
+  for (int& v : s.educationSupplyPerLevel) {
+    if (!ReadPOD(in, v)) return false;
+  }
+  for (int& v : s.healthSupplyPerLevel) {
+    if (!ReadPOD(in, v)) return false;
+  }
+  for (int& v : s.safetySupplyPerLevel) {
+    if (!ReadPOD(in, v)) return false;
+  }
+
+  for (int& v : s.educationMaintenancePerDay) {
+    if (!ReadPOD(in, v)) return false;
+  }
+  for (int& v : s.healthMaintenancePerDay) {
+    if (!ReadPOD(in, v)) return false;
+  }
+  for (int& v : s.safetyMaintenancePerDay) {
+    if (!ReadPOD(in, v)) return false;
+  }
+
+  if (!ReadPOD(in, s.targetAccess)) return false;
+  return in.good();
+}
+
+bool WriteEconomyModelSettings(std::ostream& out, const EconomyModelSettings& s)
+{
+  const std::uint8_t enabled = s.enabled ? 1u : 0u;
+  if (!WritePOD(out, enabled)) return false;
+  if (!WritePOD(out, s.seedSalt)) return false;
+  if (!WritePOD(out, s.sectorCount)) return false;
+  if (!WritePOD(out, s.macroPeriodDays)) return false;
+  if (!WritePOD(out, s.minEventDurationDays)) return false;
+  if (!WritePOD(out, s.maxEventDurationDays)) return false;
+  if (!WritePOD(out, s.eventScanbackDays)) return false;
+  return out.good();
+}
+
+bool ReadEconomyModelSettings(std::istream& in, EconomyModelSettings& s)
+{
+  std::uint8_t enabled = 0;
+  if (!ReadPOD(in, enabled)) return false;
+  s.enabled = (enabled & 1u) != 0u;
+  if (!ReadPOD(in, s.seedSalt)) return false;
+  if (!ReadPOD(in, s.sectorCount)) return false;
+  if (!ReadPOD(in, s.macroPeriodDays)) return false;
+  if (!ReadPOD(in, s.minEventDurationDays)) return false;
+  if (!ReadPOD(in, s.maxEventDurationDays)) return false;
+  if (!ReadPOD(in, s.eventScanbackDays)) return false;
+  return in.good();
+}
+
 // Load an embedded save blob into a World.
 //
 // SaveLoad now supports in-memory loading, so replay playback can avoid temp files.
@@ -214,7 +384,8 @@ bool SaveReplayBinary(const Replay& replay, const std::string& path, std::string
   }
 
   const std::uint32_t version = (replay.version == 0) ? kReplayVersion : replay.version;
-  if (version != kReplayVersionV1 && version != kReplayVersionV2 && version != kReplayVersionV3) {
+  if (version != kReplayVersionV1 && version != kReplayVersionV2 && version != kReplayVersionV3 &&
+      version != kReplayVersionV4) {
     outError = "Unsupported replay version (writer)";
     return false;
   }
@@ -329,6 +500,20 @@ bool SaveReplayBinary(const Replay& replay, const std::string& path, std::string
           outError = "Write failed (sim tuning transit settings)";
           return false;
         }
+        if (version >= kReplayVersionV4) {
+          if (!WriteTradeModelSettings(out, e.tradeModel)) {
+            outError = "Write failed (sim tuning trade settings)";
+            return false;
+          }
+          if (!WriteServicesModelSettings(out, e.servicesModel)) {
+            outError = "Write failed (sim tuning services settings)";
+            return false;
+          }
+          if (!WriteEconomyModelSettings(out, e.economyModel)) {
+            outError = "Write failed (sim tuning economy settings)";
+            return false;
+          }
+        }
         break;
       }
     }
@@ -364,7 +549,8 @@ bool LoadReplayBinary(Replay& outReplay, const std::string& path, std::string& o
     outError = "Read failed (version)";
     return false;
   }
-  if (version != kReplayVersionV1 && version != kReplayVersionV2 && version != kReplayVersionV3) {
+  if (version != kReplayVersionV1 && version != kReplayVersionV2 && version != kReplayVersionV3 &&
+      version != kReplayVersionV4) {
     outError = "Unsupported replay version";
     return false;
   }
@@ -552,6 +738,20 @@ bool LoadReplayBinary(Replay& outReplay, const std::string& path, std::string& o
           outError = "Read failed (sim tuning transit settings)";
           return false;
         }
+        if (version >= kReplayVersionV4) {
+          if (!ReadTradeModelSettings(in, e.tradeModel)) {
+            outError = "Read failed (sim tuning trade settings)";
+            return false;
+          }
+          if (!ReadServicesModelSettings(in, e.servicesModel)) {
+            outError = "Read failed (sim tuning services settings)";
+            return false;
+          }
+          if (!ReadEconomyModelSettings(in, e.economyModel)) {
+            outError = "Read failed (sim tuning economy settings)";
+            return false;
+          }
+        }
         break;
       }
     }
@@ -587,10 +787,16 @@ bool PlayReplay(const Replay& replay, World& outWorld, ProcGenConfig& outProcCfg
   // stored in saves). Replays restore them via SimTuning events.
   TrafficModelSettings trafficModel = sim.trafficModel();
   TransitModelSettings transitModel = sim.transitModel();
+  TradeModelSettings tradeModel = sim.tradeModel();
+  ServicesModelSettings servicesModel = sim.servicesModel();
+  EconomyModelSettings economyModel = sim.economyModel();
 
   auto applyTuning = [&]() {
     sim.trafficModel() = trafficModel;
     sim.transitModel() = transitModel;
+    sim.tradeModel() = tradeModel;
+    sim.servicesModel() = servicesModel;
+    sim.economyModel() = economyModel;
   };
   applyTuning();
 
@@ -634,6 +840,9 @@ bool PlayReplay(const Replay& replay, World& outWorld, ProcGenConfig& outProcCfg
       case ReplayEventType::SimTuning: {
         trafficModel = e.trafficModel;
         transitModel = e.transitModel;
+        tradeModel = e.tradeModel;
+        servicesModel = e.servicesModel;
+        economyModel = e.economyModel;
         applyTuning();
         sim.resetTimer();
         break;

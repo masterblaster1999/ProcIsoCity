@@ -5,7 +5,7 @@
 #include <vector>
 
 // This module is renderer-side (raylib/OpenGL). It is not part of isocity_core.
-#include "raylib.h"
+#include "isocity/RaylibShim.hpp"
 
 namespace isocity {
 

@@ -129,6 +129,13 @@ std::uint64_t HashStats(const Stats& s)
   HashByte(h, static_cast<std::uint8_t>(s.tradeExportDisrupted ? 1 : 0));
   HashF32(h, s.tradeMarketIndex);
 
+  // Macro economy.
+  HashF32(h, s.economyIndex);
+  HashF32(h, s.economyInflation);
+  HashI32(h, s.economyEventKind);
+  HashI32(h, s.economyEventDaysLeft);
+  HashF32(h, s.economyCityWealth);
+
   // Economy snapshot.
   HashI32(h, s.income);
   HashI32(h, s.expenses);

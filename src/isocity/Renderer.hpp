@@ -25,7 +25,7 @@
   #endif
 #endif
 
-#include "raylib.h"
+#include "isocity/RaylibShim.hpp"
 
 #include "isocity/GpuGeom.hpp"
 #include "isocity/OrganicMaterial.hpp"
@@ -318,6 +318,10 @@ public:
   Renderer& operator=(const Renderer&) = delete;
 
   void rebuildTextures(std::uint64_t seed);
+
+  // Force recompilation of any optional on-disk shader overrides.
+  // (Useful when iterating on custom GLSL files.)
+  void reloadShaderOverrides();
 
   void setElevationSettings(const ElevationSettings& s)
   {

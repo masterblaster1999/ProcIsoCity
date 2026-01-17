@@ -138,6 +138,14 @@ struct Stats {
   bool tradeExportDisrupted = false;
   float tradeMarketIndex = 1.0f; // ~1.0 baseline
 
+  // --- Derived macro economy stats (recomputed by the simulator; not persisted in saves) ---
+  // These are produced by the procedural economy layer (when enabled).
+  float economyIndex = 1.0f;       // ~1.0 baseline (boom/bust)
+  float economyInflation = 0.0f;   // volatility proxy (0..~0.15 typical)
+  int economyEventKind = 0;        // EconomyEventKind as integer (0 = none)
+  int economyEventDaysLeft = 0;    // remaining days of the active event
+  float economyCityWealth = 0.5f;  // aggregate wealth proxy (0..1)
+
   // --- Derived economy snapshot (recomputed by the simulator; not persisted in saves) ---
   // These fields describe the *last simulated tick's* budget effects.
   int income = 0;          // total income added this tick (taxes + export revenue)

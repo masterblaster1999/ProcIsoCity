@@ -14,6 +14,8 @@
 #include "isocity/GfxProps.hpp"
 #include "isocity/GfxBuildings.hpp"
 
+#include "isocity/ShaderUtil.hpp"
+
 
 #include <algorithm>
 #include <cmath>
@@ -3470,15 +3472,38 @@ void Renderer::unloadVolumetricCloudResources()
   m_volCloudLocBottomFade = -1;
 }
 
+void Renderer::reloadShaderOverrides()
+{
+  // Currently only the volumetric cloud shader supports disk overrides.
+  // Add more here as the renderer grows.
+  unloadVolumetricCloudResources();
+  ensureVolumetricCloudShader();
+}
+
 void Renderer::ensureVolumetricCloudShader()
 {
   if (m_volCloudShader.id != 0) return;
   if (m_volCloudShaderFailed) return;
 
-  m_volCloudShader = LoadShaderFromMemory(kVolumetricCloudVS, kVolumetricCloudFS);
+  const std::vector<std::string> defines = {
+      "#define PROCISOCITY 1",
+      "#define PROCISOCITY_VOLCLOUD 1",
+  };
+
+  ShaderBuildResult r = LoadShaderProgramWithOverrides("volcloud", kVolumetricCloudVS, kVolumetricCloudFS, defines);
+  m_volCloudShader = r.shader;
   if (m_volCloudShader.id == 0) {
     m_volCloudShaderFailed = true;
+    if (!r.log.empty()) {
+      TraceLog(LOG_WARNING, "[VolCloud] shader compile failed:\n%s", r.log.c_str());
+    } else {
+      TraceLog(LOG_WARNING, "[VolCloud] shader compile failed (no log)");
+    }
     return;
+  }
+
+  if (!r.log.empty()) {
+    TraceLog(LOG_INFO, "[VolCloud] shader log:\n%s", r.log.c_str());
   }
 
   m_volCloudLocViewMin = GetShaderLocation(m_volCloudShader, "u_viewMin");

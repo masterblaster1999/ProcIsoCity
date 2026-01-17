@@ -1,6 +1,7 @@
 #include "isocity/TradeMarket.hpp"
 
 #include "isocity/Random.hpp"
+#include "isocity/DeterministicMath.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -151,12 +152,15 @@ static std::vector<float> ComputeDailyMarketFactor(std::uint32_t seed32, int day
     const std::uint32_t h0 = HashCoords32(static_cast<int>(i), 17, seed32 ^ 0xA11CEu);
     const std::uint32_t h1 = HashCoords32(static_cast<int>(i), 91, seed32 ^ 0xC0FFEEu);
 
-    const float phase = Frac01(h0) * 6.28318530718f;
-    const float freq = 0.030f + 0.070f * Frac01(h1);
+    // Deterministic pseudo-cycle (avoid std::sin to reduce cross-platform drift).
+    const int minPeriod = 63;
+    const int maxPeriod = 210;
+    const int span = std::max(1, maxPeriod - minPeriod);
+    const int periodDays = minPeriod + static_cast<int>(h1 % static_cast<std::uint32_t>(span));
+    const int phaseDays = static_cast<int>(h0 % static_cast<std::uint32_t>(std::max(2, periodDays)));
 
-    const float cyc = std::sin(static_cast<float>(day) * freq + phase);
+    const float cyc = Q16ToFloat(PseudoSineWaveQ16(day, periodDays, phaseDays));
     const float cycAmp = 0.12f + 0.10f * Frac01(h1 ^ 0x9E3779B9u);
-
     const std::uint32_t hn = HashCoords32(day, static_cast<int>(i) * 13 + 7, ds ^ 0xD00Du);
     const float noise = (Frac01(hn) - 0.5f) * comm[i].volatility;
 

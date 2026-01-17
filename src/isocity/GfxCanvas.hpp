@@ -3,6 +3,8 @@
 #include "isocity/Export.hpp"     // RgbaImage
 #include "isocity/GfxPalette.hpp" // Rgba8
 
+#include "isocity/DeterministicMath.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -70,8 +72,9 @@ inline Affine2D AffineScale(float sx, float sy)
 inline Affine2D AffineRotate(float radians)
 {
   Affine2D a{};
-  const float c = std::cos(radians);
-  const float s = std::sin(radians);
+  float s = 0.0f;
+  float c = 1.0f;
+  FastSinCosRad(radians, s, c);
   a.m00 = c;
   a.m01 = -s;
   a.m10 = s;

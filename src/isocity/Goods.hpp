@@ -44,6 +44,16 @@ struct GoodsConfig {
   // Base commercial demand is 8 * level (mirrors commercial job capacity).
   float supplyScale = 1.0f;
   float demandScale = 1.0f;
+
+  // Optional per-tile multipliers applied in addition to the global scales above.
+  //
+  // If provided, these arrays must have size width*height and use the world grid
+  // index: idx = y*width + x.
+  //
+  // This hook is used by the procedural economy model to create district-level
+  // variation in production/consumption.
+  const std::vector<float>* industrialSupplyMult = nullptr;
+  const std::vector<float>* commercialDemandMult = nullptr;
 };
 
 struct GoodsResult {
