@@ -268,11 +268,26 @@ bool VisualPrefsEqual(const VisualPrefs& a, const VisualPrefs& b)
   if (a.weather.drawParticles != b.weather.drawParticles) return false;
   if (a.weather.reflectLights != b.weather.reflectLights) return false;
 
+
+  // Material FX
+  if (a.materialFx.enabled != b.materialFx.enabled) return false;
+  if (!NearlyEqual(a.materialFx.scale, b.materialFx.scale)) return false;
+  if (!NearlyEqual(a.materialFx.waterStrength, b.materialFx.waterStrength)) return false;
+  if (!NearlyEqual(a.materialFx.waterDistortPx, b.materialFx.waterDistortPx)) return false;
+  if (!NearlyEqual(a.materialFx.waterSparkle, b.materialFx.waterSparkle)) return false;
+  if (!NearlyEqual(a.materialFx.foamStrength, b.materialFx.foamStrength)) return false;
+  if (!NearlyEqual(a.materialFx.foamWidthPx, b.materialFx.foamWidthPx)) return false;
+  if (!NearlyEqual(a.materialFx.causticsStrength, b.materialFx.causticsStrength)) return false;
+  if (!NearlyEqual(a.materialFx.wetSandStrength, b.materialFx.wetSandStrength)) return false;
+  if (!NearlyEqual(a.materialFx.wetSandWidthPx, b.materialFx.wetSandWidthPx)) return false;
+  if (!NearlyEqual(a.materialFx.vegetationStrength, b.materialFx.vegetationStrength)) return false;
+
   // Cloud shadows
   if (a.cloudShadows.enabled != b.cloudShadows.enabled) return false;
   if (!NearlyEqual(a.cloudShadows.strength, b.cloudShadows.strength)) return false;
   if (!NearlyEqual(a.cloudShadows.scale, b.cloudShadows.scale)) return false;
   if (!NearlyEqual(a.cloudShadows.speed, b.cloudShadows.speed)) return false;
+  if (!NearlyEqual(a.cloudShadows.evolve, b.cloudShadows.evolve)) return false;
   if (!NearlyEqual(a.cloudShadows.coverage, b.cloudShadows.coverage)) return false;
   if (!NearlyEqual(a.cloudShadows.softness, b.cloudShadows.softness)) return false;
   if (!NearlyEqual(a.cloudShadows.clearAmount, b.cloudShadows.clearAmount)) return false;
@@ -299,7 +314,32 @@ bool VisualPrefsEqual(const VisualPrefs& a, const VisualPrefs& b)
   if (!NearlyEqual(a.postFx.scanlines, b.postFx.scanlines)) return false;
   if (!NearlyEqual(a.postFx.fxaa, b.postFx.fxaa)) return false;
   if (!NearlyEqual(a.postFx.sharpen, b.postFx.sharpen)) return false;
+
+  if (a.postFx.tonemapEnabled != b.postFx.tonemapEnabled) return false;
+  if (!NearlyEqual(a.postFx.exposure, b.postFx.exposure)) return false;
+  if (!NearlyEqual(a.postFx.contrast, b.postFx.contrast)) return false;
+  if (!NearlyEqual(a.postFx.saturation, b.postFx.saturation)) return false;
+
+  if (!NearlyEqual(a.postFx.outline, b.postFx.outline)) return false;
+  if (!NearlyEqual(a.postFx.outlineThreshold, b.postFx.outlineThreshold)) return false;
+  if (!NearlyEqual(a.postFx.outlineThickness, b.postFx.outlineThickness)) return false;
+  if (a.postFx.taaEnabled != b.postFx.taaEnabled) return false;
+  if (!NearlyEqual(a.postFx.taaHistory, b.postFx.taaHistory)) return false;
+  if (!NearlyEqual(a.postFx.taaJitter, b.postFx.taaJitter)) return false;
+  if (!NearlyEqual(a.postFx.taaResponse, b.postFx.taaResponse)) return false;
   if (a.postFx.includeWeather != b.postFx.includeWeather) return false;
+
+  // Lens precipitation (rain on lens / wet camera)
+  if (!NearlyEqual(a.postFx.lensWeather, b.postFx.lensWeather)) return false;
+  if (!NearlyEqual(a.postFx.lensDistort, b.postFx.lensDistort)) return false;
+  if (!NearlyEqual(a.postFx.lensScale, b.postFx.lensScale)) return false;
+  if (!NearlyEqual(a.postFx.lensDrips, b.postFx.lensDrips)) return false;
+
+  if (!NearlyEqual(a.postFx.bloom, b.postFx.bloom)) return false;
+  if (!NearlyEqual(a.postFx.bloomThreshold, b.postFx.bloomThreshold)) return false;
+  if (!NearlyEqual(a.postFx.bloomKnee, b.postFx.bloomKnee)) return false;
+  if (!NearlyEqual(a.postFx.bloomRadius, b.postFx.bloomRadius)) return false;
+  if (a.postFx.bloomDownsample != b.postFx.bloomDownsample) return false;
 
   // Elevation
   if (!NearlyEqual(a.elevation.maxPixels, b.elevation.maxPixels)) return false;
@@ -398,6 +438,9 @@ std::string VisualPrefsToJson(const VisualPrefs& p, int indentSpaces)
   oss << "\"merged_zone_buildings\": ";
   WriteBool(oss, p.mergedZoneBuildings);
   oss << ",\n";
+
+  Indent(oss, indent * 2);
+  oss << "\"gfx_theme\": \"" << GfxThemeName(p.gfxTheme) << "\",\n";
 
   Indent(oss, indent * 2);
   oss << "\"base_cache\": ";
@@ -509,6 +552,37 @@ std::string VisualPrefsToJson(const VisualPrefs& p, int indentSpaces)
   Indent(oss, indent * 2);
   oss << "},\n";
 
+
+  // Material FX (shader-based, world-space).
+  Indent(oss, indent * 2);
+  oss << "\"material_fx\": {\n";
+  Indent(oss, indent * 3);
+  oss << "\"enabled\": ";
+  WriteBool(oss, p.materialFx.enabled);
+  oss << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"scale\": " << FloatToJson(p.materialFx.scale) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"water_strength\": " << FloatToJson(p.materialFx.waterStrength) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"water_distort_px\": " << FloatToJson(p.materialFx.waterDistortPx) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"water_sparkle\": " << FloatToJson(p.materialFx.waterSparkle) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"foam_strength\": " << FloatToJson(p.materialFx.foamStrength) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"foam_width_px\": " << FloatToJson(p.materialFx.foamWidthPx) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"caustics_strength\": " << FloatToJson(p.materialFx.causticsStrength) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"wet_sand_strength\": " << FloatToJson(p.materialFx.wetSandStrength) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"wet_sand_width_px\": " << FloatToJson(p.materialFx.wetSandWidthPx) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"vegetation_strength\": " << FloatToJson(p.materialFx.vegetationStrength) << "\n";
+  Indent(oss, indent * 2);
+  oss << "},\n";
+
   // Cloud shadows (procedural, world-space).
   Indent(oss, indent * 2);
   oss << "\"cloud_shadows\": {\n";
@@ -522,6 +596,8 @@ std::string VisualPrefsToJson(const VisualPrefs& p, int indentSpaces)
   oss << "\"scale\": " << FloatToJson(p.cloudShadows.scale) << ",\n";
   Indent(oss, indent * 3);
   oss << "\"speed\": " << FloatToJson(p.cloudShadows.speed) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"evolve\": " << FloatToJson(p.cloudShadows.evolve) << ",\n";
   Indent(oss, indent * 3);
   oss << "\"coverage\": " << FloatToJson(p.cloudShadows.coverage) << ",\n";
   Indent(oss, indent * 3);
@@ -582,10 +658,57 @@ std::string VisualPrefsToJson(const VisualPrefs& p, int indentSpaces)
   oss << "\"fxaa\": " << FloatToJson(p.postFx.fxaa) << ",\n";
   Indent(oss, indent * 3);
   oss << "\"sharpen\": " << FloatToJson(p.postFx.sharpen) << ",\n";
+
+  Indent(oss, indent * 3);
+  oss << "\"tonemap_enabled\": ";
+  WriteBool(oss, p.postFx.tonemapEnabled);
+  oss << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"exposure\": " << FloatToJson(p.postFx.exposure) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"contrast\": " << FloatToJson(p.postFx.contrast) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"saturation\": " << FloatToJson(p.postFx.saturation) << ",\n";
+
+  Indent(oss, indent * 3);
+  oss << "\"outline\": " << FloatToJson(p.postFx.outline) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"outline_threshold\": " << FloatToJson(p.postFx.outlineThreshold) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"outline_thickness\": " << FloatToJson(p.postFx.outlineThickness) << ",\n";
+
+  Indent(oss, indent * 3);
+  oss << "\"taa_enabled\": ";
+  WriteBool(oss, p.postFx.taaEnabled);
+  oss << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"taa_history\": " << FloatToJson(p.postFx.taaHistory) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"taa_jitter\": " << FloatToJson(p.postFx.taaJitter) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"taa_response\": " << FloatToJson(p.postFx.taaResponse) << ",\n";
   Indent(oss, indent * 3);
   oss << "\"include_weather\": ";
   WriteBool(oss, p.postFx.includeWeather);
-  oss << "\n";
+  oss << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"lens_weather\": " << FloatToJson(p.postFx.lensWeather) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"lens_distort\": " << FloatToJson(p.postFx.lensDistort) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"lens_scale\": " << FloatToJson(p.postFx.lensScale) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"lens_drips\": " << FloatToJson(p.postFx.lensDrips) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"bloom\": " << FloatToJson(p.postFx.bloom) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"bloom_threshold\": " << FloatToJson(p.postFx.bloomThreshold) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"bloom_knee\": " << FloatToJson(p.postFx.bloomKnee) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"bloom_radius\": " << FloatToJson(p.postFx.bloomRadius) << ",\n";
+  Indent(oss, indent * 3);
+  oss << "\"bloom_downsample\": " << p.postFx.bloomDownsample << "\n";
   Indent(oss, indent * 2);
   oss << "}\n";
 
@@ -641,6 +764,20 @@ bool ApplyVisualPrefsJson(const JsonValue& root, VisualPrefs& ioPrefs, std::stri
   const JsonValue* ren = nullptr;
   if (GetObj(root, "renderer", &ren)) {
     if (!ApplyBool(*ren, "merged_zone_buildings", ioPrefs.mergedZoneBuildings, outError)) return false;
+
+    // gfx_theme (palette)
+    if (const JsonValue* gt = FindJsonMember(*ren, "gfx_theme")) {
+      if (!gt->isString()) {
+        outError = "expected string for renderer.gfx_theme";
+        return false;
+      }
+      GfxTheme th;
+      if (!ParseGfxTheme(gt->stringValue, th)) {
+        outError = "unknown renderer.gfx_theme: " + gt->stringValue;
+        return false;
+      }
+      ioPrefs.gfxTheme = th;
+    }
     if (!ApplyBool(*ren, "base_cache", ioPrefs.baseCacheEnabled, outError)) return false;
     if (!ApplyLayersObject(*ren, ioPrefs.layerMask, outError)) return false;
 
@@ -694,6 +831,23 @@ bool ApplyVisualPrefsJson(const JsonValue& root, VisualPrefs& ioPrefs, std::stri
       if (!ApplyBool(*we, "reflect_lights", ioPrefs.weather.reflectLights, outError)) return false;
     }
 
+
+
+    // material_fx
+    const JsonValue* mfx = nullptr;
+    if (GetObj(*ren, "material_fx", &mfx)) {
+      if (!ApplyBool(*mfx, "enabled", ioPrefs.materialFx.enabled, outError)) return false;
+      if (!ApplyF32(*mfx, "scale", ioPrefs.materialFx.scale, outError)) return false;
+      if (!ApplyF32(*mfx, "water_strength", ioPrefs.materialFx.waterStrength, outError)) return false;
+      if (!ApplyF32(*mfx, "water_distort_px", ioPrefs.materialFx.waterDistortPx, outError)) return false;
+      if (!ApplyF32(*mfx, "water_sparkle", ioPrefs.materialFx.waterSparkle, outError)) return false;
+      if (!ApplyF32(*mfx, "foam_strength", ioPrefs.materialFx.foamStrength, outError)) return false;
+      if (!ApplyF32(*mfx, "foam_width_px", ioPrefs.materialFx.foamWidthPx, outError)) return false;
+      if (!ApplyF32(*mfx, "caustics_strength", ioPrefs.materialFx.causticsStrength, outError)) return false;
+      if (!ApplyF32(*mfx, "wet_sand_strength", ioPrefs.materialFx.wetSandStrength, outError)) return false;
+      if (!ApplyF32(*mfx, "wet_sand_width_px", ioPrefs.materialFx.wetSandWidthPx, outError)) return false;
+      if (!ApplyF32(*mfx, "vegetation_strength", ioPrefs.materialFx.vegetationStrength, outError)) return false;
+    }
     // cloud_shadows
     const JsonValue* cs = nullptr;
     if (GetObj(*ren, "cloud_shadows", &cs)) {
@@ -701,6 +855,7 @@ bool ApplyVisualPrefsJson(const JsonValue& root, VisualPrefs& ioPrefs, std::stri
       if (!ApplyF32(*cs, "strength", ioPrefs.cloudShadows.strength, outError)) return false;
       if (!ApplyF32(*cs, "scale", ioPrefs.cloudShadows.scale, outError)) return false;
       if (!ApplyF32(*cs, "speed", ioPrefs.cloudShadows.speed, outError)) return false;
+      if (!ApplyF32(*cs, "evolve", ioPrefs.cloudShadows.evolve, outError)) return false;
       if (!ApplyF32(*cs, "coverage", ioPrefs.cloudShadows.coverage, outError)) return false;
       if (!ApplyF32(*cs, "softness", ioPrefs.cloudShadows.softness, outError)) return false;
       if (!ApplyF32(*cs, "clear_amount", ioPrefs.cloudShadows.clearAmount, outError)) return false;
@@ -733,7 +888,36 @@ bool ApplyVisualPrefsJson(const JsonValue& root, VisualPrefs& ioPrefs, std::stri
       if (!ApplyF32(*pf, "scanlines", ioPrefs.postFx.scanlines, outError)) return false;
       if (!ApplyF32(*pf, "fxaa", ioPrefs.postFx.fxaa, outError)) return false;
       if (!ApplyF32(*pf, "sharpen", ioPrefs.postFx.sharpen, outError)) return false;
+
+      if (!ApplyBool(*pf, "tonemap_enabled", ioPrefs.postFx.tonemapEnabled, outError)) return false;
+      if (!ApplyBool(*pf, "tonemapEnabled", ioPrefs.postFx.tonemapEnabled, outError)) return false;
+      if (!ApplyF32(*pf, "exposure", ioPrefs.postFx.exposure, outError)) return false;
+      if (!ApplyF32(*pf, "contrast", ioPrefs.postFx.contrast, outError)) return false;
+      if (!ApplyF32(*pf, "saturation", ioPrefs.postFx.saturation, outError)) return false;
+
+      if (!ApplyF32(*pf, "outline", ioPrefs.postFx.outline, outError)) return false;
+      if (!ApplyF32(*pf, "outline_threshold", ioPrefs.postFx.outlineThreshold, outError)) return false;
+      if (!ApplyF32(*pf, "outlineThreshold", ioPrefs.postFx.outlineThreshold, outError)) return false;
+      if (!ApplyF32(*pf, "outline_thickness", ioPrefs.postFx.outlineThickness, outError)) return false;
+      if (!ApplyF32(*pf, "outlineThickness", ioPrefs.postFx.outlineThickness, outError)) return false;
+      if (!ApplyBool(*pf, "taa_enabled", ioPrefs.postFx.taaEnabled, outError)) return false;
+      if (!ApplyF32(*pf, "taa_history", ioPrefs.postFx.taaHistory, outError)) return false;
+      if (!ApplyF32(*pf, "taa_jitter", ioPrefs.postFx.taaJitter, outError)) return false;
+      if (!ApplyF32(*pf, "taa_response", ioPrefs.postFx.taaResponse, outError)) return false;
       if (!ApplyBool(*pf, "include_weather", ioPrefs.postFx.includeWeather, outError)) return false;
+
+      // Lens precipitation (optional)
+      if (!ApplyF32(*pf, "lens_weather", ioPrefs.postFx.lensWeather, outError)) return false;
+      if (!ApplyF32(*pf, "lens_distort", ioPrefs.postFx.lensDistort, outError)) return false;
+      if (!ApplyF32(*pf, "lens_scale", ioPrefs.postFx.lensScale, outError)) return false;
+      if (!ApplyF32(*pf, "lens_drips", ioPrefs.postFx.lensDrips, outError)) return false;
+
+      // Bloom (optional)
+      if (!ApplyF32(*pf, "bloom", ioPrefs.postFx.bloom, outError)) return false;
+      if (!ApplyF32(*pf, "bloom_threshold", ioPrefs.postFx.bloomThreshold, outError)) return false;
+      if (!ApplyF32(*pf, "bloom_knee", ioPrefs.postFx.bloomKnee, outError)) return false;
+      if (!ApplyF32(*pf, "bloom_radius", ioPrefs.postFx.bloomRadius, outError)) return false;
+      if (!ApplyI32(*pf, "bloom_downsample", ioPrefs.postFx.bloomDownsample, outError)) return false;
     }
   }
 
@@ -762,9 +946,22 @@ bool ApplyVisualPrefsJson(const JsonValue& root, VisualPrefs& ioPrefs, std::stri
   ioPrefs.weather.overcast = std::clamp(ioPrefs.weather.overcast, 0.0f, 1.0f);
   ioPrefs.weather.fog = std::clamp(ioPrefs.weather.fog, 0.0f, 1.0f);
 
+
+  ioPrefs.materialFx.scale = std::clamp(ioPrefs.materialFx.scale, 0.25f, 8.0f);
+  ioPrefs.materialFx.waterStrength = std::clamp(ioPrefs.materialFx.waterStrength, 0.0f, 2.0f);
+  ioPrefs.materialFx.waterDistortPx = std::clamp(ioPrefs.materialFx.waterDistortPx, 0.0f, 4.0f);
+  ioPrefs.materialFx.waterSparkle = std::clamp(ioPrefs.materialFx.waterSparkle, 0.0f, 2.0f);
+  ioPrefs.materialFx.foamStrength = std::clamp(ioPrefs.materialFx.foamStrength, 0.0f, 2.0f);
+  ioPrefs.materialFx.foamWidthPx = std::clamp(ioPrefs.materialFx.foamWidthPx, 0.0f, 8.0f);
+  ioPrefs.materialFx.causticsStrength = std::clamp(ioPrefs.materialFx.causticsStrength, 0.0f, 2.0f);
+  ioPrefs.materialFx.wetSandStrength = std::clamp(ioPrefs.materialFx.wetSandStrength, 0.0f, 2.0f);
+  ioPrefs.materialFx.wetSandWidthPx = std::clamp(ioPrefs.materialFx.wetSandWidthPx, 0.0f, 8.0f);
+  ioPrefs.materialFx.vegetationStrength = std::clamp(ioPrefs.materialFx.vegetationStrength, 0.0f, 2.0f);
+
   ioPrefs.cloudShadows.strength = std::clamp(ioPrefs.cloudShadows.strength, 0.0f, 1.0f);
   ioPrefs.cloudShadows.scale = std::clamp(ioPrefs.cloudShadows.scale, 0.25f, 8.0f);
   ioPrefs.cloudShadows.speed = std::clamp(ioPrefs.cloudShadows.speed, 0.0f, 5.0f);
+  ioPrefs.cloudShadows.evolve = std::clamp(ioPrefs.cloudShadows.evolve, 0.0f, 1.0f);
   ioPrefs.cloudShadows.coverage = std::clamp(ioPrefs.cloudShadows.coverage, 0.0f, 1.0f);
   ioPrefs.cloudShadows.softness = std::clamp(ioPrefs.cloudShadows.softness, 0.0f, 1.0f);
   ioPrefs.cloudShadows.clearAmount = std::clamp(ioPrefs.cloudShadows.clearAmount, 0.0f, 1.0f);
@@ -787,6 +984,28 @@ bool ApplyVisualPrefsJson(const JsonValue& root, VisualPrefs& ioPrefs, std::stri
   ioPrefs.postFx.scanlines = std::clamp(ioPrefs.postFx.scanlines, 0.0f, 1.0f);
   ioPrefs.postFx.fxaa = std::clamp(ioPrefs.postFx.fxaa, 0.0f, 1.0f);
   ioPrefs.postFx.sharpen = std::clamp(ioPrefs.postFx.sharpen, 0.0f, 1.0f);
+
+  ioPrefs.postFx.exposure = std::clamp(ioPrefs.postFx.exposure, 0.0f, 4.0f);
+  ioPrefs.postFx.contrast = std::clamp(ioPrefs.postFx.contrast, 0.0f, 2.0f);
+  ioPrefs.postFx.saturation = std::clamp(ioPrefs.postFx.saturation, 0.0f, 2.0f);
+
+  ioPrefs.postFx.outline = std::clamp(ioPrefs.postFx.outline, 0.0f, 1.0f);
+  ioPrefs.postFx.outlineThreshold = std::clamp(ioPrefs.postFx.outlineThreshold, 0.0f, 1.0f);
+  ioPrefs.postFx.outlineThickness = std::clamp(ioPrefs.postFx.outlineThickness, 0.5f, 4.0f);
+  ioPrefs.postFx.taaHistory = std::clamp(ioPrefs.postFx.taaHistory, 0.0f, 0.98f);
+  ioPrefs.postFx.taaJitter = std::clamp(ioPrefs.postFx.taaJitter, 0.0f, 1.0f);
+  ioPrefs.postFx.taaResponse = std::clamp(ioPrefs.postFx.taaResponse, 0.0f, 1.0f);
+
+  ioPrefs.postFx.lensWeather = std::clamp(ioPrefs.postFx.lensWeather, 0.0f, 1.0f);
+  ioPrefs.postFx.lensDistort = std::clamp(ioPrefs.postFx.lensDistort, 0.0f, 1.0f);
+  ioPrefs.postFx.lensScale = std::clamp(ioPrefs.postFx.lensScale, 0.5f, 2.0f);
+  ioPrefs.postFx.lensDrips = std::clamp(ioPrefs.postFx.lensDrips, 0.0f, 1.0f);
+
+  ioPrefs.postFx.bloom = std::clamp(ioPrefs.postFx.bloom, 0.0f, 1.0f);
+  ioPrefs.postFx.bloomThreshold = std::clamp(ioPrefs.postFx.bloomThreshold, 0.0f, 1.0f);
+  ioPrefs.postFx.bloomKnee = std::clamp(ioPrefs.postFx.bloomKnee, 0.0f, 1.0f);
+  ioPrefs.postFx.bloomRadius = std::clamp(ioPrefs.postFx.bloomRadius, 0.25f, 4.0f);
+  ioPrefs.postFx.bloomDownsample = std::clamp(ioPrefs.postFx.bloomDownsample, 1, 8);
 
   ioPrefs.elevation.maxPixels = std::clamp(ioPrefs.elevation.maxPixels, 0.0f, 1024.0f);
   ioPrefs.elevation.quantizeSteps = std::clamp(ioPrefs.elevation.quantizeSteps, 0, 128);

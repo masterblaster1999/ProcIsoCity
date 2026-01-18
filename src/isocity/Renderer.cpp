@@ -305,6 +305,461 @@ inline WeatherState ComputeWeatherState(float timeSec, const Renderer::WeatherSe
 
 
 // ---------------------------------------------------------------------------------------------
+// Weather screen FX shader (procedural precipitation particles)
+// ---------------------------------------------------------------------------------------------
+//
+// This shader draws rain/snow particles in a single full-screen pass. It replaces the
+// older CPU particle loops when available, but preserves a CPU fallback for portability.
+// Optional overrides live under shaders/weatherfx.*.glsl.
+
+static const char* kWeatherFxVS = R"GLSL(
+#version 330
+
+layout(location = 0) in vec3 vertexPosition;
+layout(location = 1) in vec2 vertexTexCoord;
+layout(location = 2) in vec4 vertexColor;
+
+uniform mat4 mvp;
+
+out vec2 fragTexCoord;
+out vec4 fragColor;
+
+void main()
+{
+    fragTexCoord = vertexTexCoord;
+    fragColor = vertexColor;
+    gl_Position = mvp*vec4(vertexPosition, 1.0);
+}
+)GLSL";
+
+static const char* kWeatherFxFS = R"GLSL(
+#version 330
+
+in vec2 fragTexCoord;
+in vec4 fragColor;
+
+out vec4 finalColor;
+
+uniform sampler2D texture0;
+uniform vec4 colDiffuse;
+
+uniform vec2  u_resolution;   // pixels
+uniform float u_time;         // seconds
+uniform float u_seed;         // [0,1)
+uniform int   u_mode;         // 0=clear, 1=rain, 2=snow
+uniform float u_intensity;    // 0..1
+uniform vec2  u_windDir;      // normalized-ish, y-down
+uniform float u_windSpeed;    // multiplier
+uniform float u_day;          // 0..1 (1=day, 0=night)
+
+float saturate(float x) { return clamp(x, 0.0, 1.0); }
+
+// Fast hash without sin/cos (good enough for particle jitter).
+float hash12(vec2 p)
+{
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+vec2 hash22(vec2 p)
+{
+    float n = hash12(p);
+    return vec2(n, hash12(p + n + 37.0));
+}
+
+vec2 safeNormalize(vec2 v)
+{
+    float l2 = dot(v, v);
+    if (l2 < 1.0e-8) return vec2(0.0, 1.0);
+    return v * inversesqrt(l2);
+}
+
+// Particle accumulation helper: one particle per grid cell, evaluated from the pixel.
+// Coordinates are in a rotated basis aligned to wind: x=perp, y=dir.
+float rainParticles(vec2 uv, float intensity, vec2 seed2, float dayMul, float windSpeed)
+{
+    float area = max(1.0, u_resolution.x * u_resolution.y);
+    float count = clamp(area * 0.00012 * intensity, 60.0, 900.0);
+    float cellSize = sqrt(area / max(1.0, count));
+
+    float baseLen = 10.0 + 18.0 * intensity;
+    float speed = (650.0 + 900.0 * intensity) * windSpeed;
+
+    vec2 uvm = uv - vec2(0.0, u_time * speed);
+
+    vec2 cell = floor(uvm / cellSize);
+
+    float a = 0.0;
+
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            vec2 g = cell + vec2(float(i), float(j));
+
+            vec2 r2 = hash22(g + seed2 * 19.31);
+            float r3 = hash12(g + seed2 * 41.17 + 7.13);
+
+            vec2 center = (g + r2) * cellSize;
+            vec2 d = uvm - center;
+
+            float len = baseLen * (0.60 + 0.90 * r3);
+            float halfLen = 0.5 * len;
+
+            float w = (0.55 + 0.85 * r2.x) * (0.80 + 0.45 * intensity);
+
+            float lx = 1.0 - smoothstep(w, w + 1.0, abs(d.x));
+            float ly = 1.0 - smoothstep(halfLen, halfLen + 1.5, abs(d.y));
+
+            float amp = (18.0 + 88.0 * intensity * (0.35 + 0.65 * r3)) * dayMul / 255.0;
+            a += lx * ly * amp;
+        }
+    }
+
+    return saturate(a);
+}
+
+float snowParticles(vec2 uv, float intensity, vec2 seed2, float dayMul, float windSpeed)
+{
+    float area = max(1.0, u_resolution.x * u_resolution.y);
+    float count = clamp(area * 0.00018 * intensity, 120.0, 1800.0);
+    float cellSize = sqrt(area / max(1.0, count));
+
+    float speed = (45.0 + 80.0 * intensity) * windSpeed;
+
+    vec2 uvm = uv - vec2(0.0, u_time * speed);
+
+    vec2 cell = floor(uvm / cellSize);
+
+    float a = 0.0;
+
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            vec2 g = cell + vec2(float(i), float(j));
+
+            vec2 r2 = hash22(g + seed2 * 23.71);
+            float r3 = hash12(g + seed2 * 55.91 + 3.7);
+
+            vec2 center = (g + r2) * cellSize;
+
+            // Gentle sideways wobble so flakes don't look like a static grid.
+            float wobble = sin(u_time * 0.9 + r2.y * 12.0 + u_seed * 6.2831853);
+            center.x += wobble * cellSize * 0.12;
+
+            vec2 d = uvm - center;
+
+            float radius = 0.8 + 2.0 * r3;
+            float flake = 1.0 - smoothstep(radius, radius + 1.2, length(d));
+
+            float amp = (32.0 + 130.0 * intensity * (0.25 + 0.75 * r3)) * dayMul / 255.0;
+            a += flake * amp;
+        }
+    }
+
+    return saturate(a);
+}
+
+void main()
+{
+    // Raylib's screen coordinate system is y-down. Convert gl_FragCoord (y-up) to y-down.
+    vec2 p = vec2(gl_FragCoord.x, u_resolution.y - gl_FragCoord.y);
+
+    float intensity = saturate(u_intensity);
+    if (u_mode == 0 || intensity <= 0.001) {
+        finalColor = vec4(0.0);
+        return;
+    }
+
+    vec2 wind = safeNormalize(u_windDir);
+
+    // Snow reads better with a stronger vertical component (less horizontal drift) so it
+    // does not smear across the screen when windY is small.
+    if (u_mode == 2) {
+        wind = safeNormalize(vec2(wind.x * 0.35, wind.y));
+    }
+
+    vec2 dir = wind;
+    vec2 perp = vec2(-dir.y, dir.x);
+
+    // Rotate into wind basis (orthonormal, preserves lengths).
+    vec2 uv = vec2(dot(p, perp), dot(p, dir));
+
+    // Match the existing CPU implementation's "day multiplier" so particles read slightly
+    // more strongly at night.
+    float dayMul = (u_mode == 2) ? (0.75 + 0.25 * saturate(u_day))
+                                  : (0.70 + 0.30 * saturate(u_day));
+
+    vec2 seed2 = vec2(u_seed, u_seed * 1.37 + 0.11);
+
+    vec3 col = vec3(1.0);
+    float a = 0.0;
+
+    if (u_mode == 1) {
+        a = rainParticles(uv, intensity, seed2, dayMul, max(0.05, u_windSpeed));
+        col = vec3(210.0/255.0, 220.0/255.0, 235.0/255.0);
+    } else {
+        a = snowParticles(uv, intensity, seed2, dayMul, max(0.05, u_windSpeed));
+        col = vec3(1.0);
+    }
+
+    vec4 tint = colDiffuse * fragColor;
+    finalColor = vec4(col * tint.rgb, a * tint.a);
+}
+)GLSL";
+
+
+// ---------------------------------------------------------------------------------------------
+// MaterialFX shader (cached-terrain material animation)
+// ---------------------------------------------------------------------------------------------
+//
+// We keep the shader embedded so the project remains asset-free.
+// The optional on-disk overrides live under shaders/materialfx.*.glsl.
+//
+// This shader is applied when drawing cached terrain bands. A separate per-band mask render
+// texture encodes where the effect should apply (R=water, G=vegetation). The procedural noise is
+// anchored in world space so it pans naturally with the camera.
+
+static const char* kMaterialFxVS = R"GLSL(
+#version 330
+
+layout(location = 0) in vec3 vertexPosition;
+layout(location = 1) in vec2 vertexTexCoord;
+layout(location = 2) in vec4 vertexColor;
+
+uniform mat4 mvp;
+
+out vec2 fragTexCoord;
+out vec4 fragColor;
+out vec2 vWorldPos;
+
+void main()
+{
+    fragTexCoord = vertexTexCoord;
+    fragColor = vertexColor;
+    vWorldPos = vertexPosition.xy;
+    gl_Position = mvp*vec4(vertexPosition, 1.0);
+}
+)GLSL";
+
+static const char* kMaterialFxFS = R"GLSL(
+#version 330
+
+in vec2 fragTexCoord;
+in vec4 fragColor;
+in vec2 vWorldPos;
+
+out vec4 finalColor;
+
+uniform sampler2D texture0;
+uniform sampler2D u_materialMask;
+uniform vec4 colDiffuse;
+
+uniform float u_time;
+uniform vec2  u_windDir;
+uniform float u_windSpeed;
+
+// 1/texture dimensions for texture0 (in UV units).
+uniform vec2  u_texelSize;
+
+// World-space noise frequency multiplier.
+uniform float u_freq;
+
+uniform float u_seed;
+
+uniform float u_waterStrength;
+uniform float u_waterDistortPx;
+uniform float u_waterSparkle;
+
+uniform float u_foamStrength;
+uniform float u_foamWidthPx;
+uniform float u_causticsStrength;
+
+uniform float u_wetSandStrength;
+uniform float u_wetSandWidthPx;
+
+uniform float u_vegStrength;
+
+float saturate(float x) { return clamp(x, 0.0, 1.0); }
+
+vec2 safeNormalize(vec2 v)
+{
+    float l = length(v);
+    return (l > 1e-6) ? (v / l) : vec2(0.0, 1.0);
+}
+
+float hash12(vec2 p)
+{
+    float h = dot(p, vec2(127.1, 311.7));
+    return fract(sin(h) * 43758.5453123);
+}
+
+float noise21(vec2 p)
+{
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f*f*(3.0 - 2.0*f);
+
+    float a = hash12(i + vec2(0.0, 0.0));
+    float b = hash12(i + vec2(1.0, 0.0));
+    float c = hash12(i + vec2(0.0, 1.0));
+    float d = hash12(i + vec2(1.0, 1.0));
+
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+float fbm21(vec2 p)
+{
+    float v = 0.0;
+    float a = 0.5;
+    for (int i = 0; i < 5; ++i) {
+        v += a * noise21(p);
+        p = p * 2.0 + vec2(37.1, 17.7);
+        a *= 0.5;
+    }
+    return v;
+}
+
+float sampleWater(vec2 uv)
+{
+    return texture(u_materialMask, clamp(uv, vec2(0.0), vec2(1.0))).r;
+}
+
+float waterEdge(vec2 uv, vec2 off)
+{
+    float c = sampleWater(uv);
+    float n = sampleWater(uv + vec2(0.0, -off.y));
+    float s = sampleWater(uv + vec2(0.0,  off.y));
+    float e = sampleWater(uv + vec2( off.x, 0.0));
+    float w = sampleWater(uv + vec2(-off.x, 0.0));
+    float m = min(min(n, s), min(e, w));
+    return c * (1.0 - m);
+}
+
+float waterNearby(vec2 uv, vec2 off)
+{
+    float n = sampleWater(uv + vec2(0.0, -off.y));
+    float s = sampleWater(uv + vec2(0.0,  off.y));
+    float e = sampleWater(uv + vec2( off.x, 0.0));
+    float w = sampleWater(uv + vec2(-off.x, 0.0));
+    return max(max(n, s), max(e, w));
+}
+
+void main()
+{
+    vec4 base = texture(texture0, fragTexCoord);
+
+    vec4 mask = texture(u_materialMask, fragTexCoord);
+    float water = mask.r;
+    float veg = mask.g;
+    float sand = mask.b;
+
+    // Early out for pixels with no material effects.
+    if (water <= 0.001 && veg <= 0.001 && sand <= 0.001) {
+        vec4 modulate = colDiffuse * fragColor;
+        finalColor = vec4(base.rgb * modulate.rgb, base.a * modulate.a);
+        return;
+    }
+
+    vec2 windDir = safeNormalize(u_windDir);
+    float windSpeed = max(u_windSpeed, 0.0);
+    vec2 wind = windDir * max(windSpeed, 0.05);
+
+    // World-space coordinates drive the noise so the pattern sticks to the world.
+    vec2 p = vWorldPos * u_freq;
+    p += wind * (u_time * 0.035);
+    p += vec2(u_seed * 17.13, u_seed * 9.71);
+
+    float n1 = fbm21(p);
+    float n2 = fbm21(p * 1.71 + vec2(13.2, 7.9));
+
+    // Signed flow field from noise.
+    vec2 flow = (vec2(n1, n2) - 0.5) * 2.0;
+
+    // --- Water: subtle UV distortion + sparkle highlights ---
+    vec3 col = base.rgb;
+    if (water > 0.001) {
+        float distortPx = max(u_waterDistortPx, 0.0);
+        vec2 uvD = fragTexCoord + flow * u_texelSize * distortPx;
+        uvD = clamp(uvD, vec2(0.0), vec2(1.0));
+
+        vec3 warped = texture(texture0, uvD).rgb;
+        float w = saturate(water * u_waterStrength);
+        col = mix(col, warped, w);
+
+        float ridges = fbm21(p * 3.10 + windDir * (u_time * 0.05) + wind * 0.35);
+        float sp = smoothstep(0.78, 0.98, ridges);
+        sp *= water * clamp(u_waterSparkle, 0.0, 2.0);
+        col += sp * vec3(0.10, 0.12, 0.15);
+    }
+
+    // --- Water: shoreline foam ---
+    float foamStrength = clamp(u_foamStrength, 0.0, 2.0);
+    if (water > 0.001 && foamStrength > 0.001) {
+        float wpx = max(u_foamWidthPx, 0.5);
+        vec2 off = u_texelSize * wpx;
+
+        float shore = waterEdge(fragTexCoord, off);
+
+        // Break up the foam band with moving noise and ridges.
+        vec2 fp = p * 4.20 + windDir * (u_time * 0.25) + vec2(2.3, 7.1);
+        float fn = fbm21(fp);
+
+        vec2 rp = p * 8.50 - windDir * (u_time * 0.20) + vec2(9.7, 2.1);
+        float rn = fbm21(rp);
+
+        float f = smoothstep(0.40, 0.92, fn) * (0.55 + 0.45 * smoothstep(0.35, 0.85, rn));
+        float foam = saturate(shore * f);
+
+        vec3 foamCol = vec3(0.93, 0.94, 0.95);
+        float a = saturate(foam * foamStrength * 0.45);
+        col = mix(col, foamCol, a);
+    }
+
+    // --- Water: caustics (subtle bright patterns) ---
+    float causticsStrength = clamp(u_causticsStrength, 0.0, 2.0);
+    if (water > 0.001 && causticsStrength > 0.001) {
+        vec2 cp = p * 6.60 + windDir * (u_time * 0.55) + vec2(11.3, 4.9);
+        float cn = fbm21(cp);
+        float c = smoothstep(0.55, 0.90, cn);
+        col += water * c * causticsStrength * vec3(0.07, 0.09, 0.12);
+    }
+
+    // --- Shoreline sand: wet darkening + sparkles ---
+    float wetStrength = clamp(u_wetSandStrength, 0.0, 2.0);
+    if (sand > 0.001 && wetStrength > 0.001) {
+        float wpx = max(u_wetSandWidthPx, 0.5);
+        vec2 off = u_texelSize * wpx;
+
+        float nearW = waterNearby(fragTexCoord, off);
+        float wet = saturate(sand * nearW);
+
+        // Darken toward the water.
+        float dark = saturate(wet * wetStrength * 0.55);
+        col *= (1.0 - dark * 0.18);
+
+        // Add occasional small sparkles from micro ripples at the edge.
+        vec2 spP = p * 5.00 + windDir * (u_time * 0.35) + vec2(21.1, 7.4);
+        float sn = fbm21(spP);
+        float sp = smoothstep(0.82, 0.98, sn) * wet * wetStrength;
+        col += sp * vec3(0.05, 0.04, 0.03);
+    }
+
+    // --- Vegetation: brightness flutter ---
+    if (veg > 0.001) {
+        float flutter = fbm21(p * 1.35 - wind * 0.22) - 0.5;
+        float v = veg * clamp(u_vegStrength, 0.0, 2.0);
+
+        col *= (1.0 + v * flutter * 0.18);
+        col.g += v * flutter * 0.05;
+    }
+
+    col = clamp(col, vec3(0.0), vec3(1.0));
+
+    vec4 modulate = colDiffuse * fragColor;
+    finalColor = vec4(col * modulate.rgb, base.a * modulate.a);
+}
+)GLSL";
+
+// ---------------------------------------------------------------------------------------------
 // Volumetric clouds shader
 // ---------------------------------------------------------------------------------------------
 //
@@ -507,6 +962,150 @@ void main()
 
     vec4 texel = texture(texture0, fragTexCoord);
     finalColor = vec4(col, clamp(alpha, 0.0, 1.0)) * texel * colDiffuse * fragColor;
+}
+)GLSL";
+
+// ---------------------------------------------------------------------------------------------
+// Cloud shadow mask shader (tileable, GPU-generated)
+// ---------------------------------------------------------------------------------------------
+//
+// This is an optional, tiny shader that renders a tileable alpha mask into a small
+// RenderTexture2D. The resulting texture is then repeated across the world to darken
+// terrain/buildings slightly (atmospheric cloud shadows).
+//
+// Compared to the CPU-generated fallback texture, this shader supports internal morphing
+// (see CloudShadowSettings::evolve) so the shadow field doesn't feel like a static stamp
+// that only translates.
+
+static const char* kCloudMaskVS = R"GLSL(
+#version 330
+
+layout(location = 0) in vec3 vertexPosition;
+layout(location = 1) in vec2 vertexTexCoord;
+layout(location = 2) in vec4 vertexColor;
+
+uniform mat4 mvp;
+
+out vec2 fragTexCoord;
+out vec4 fragColor;
+
+void main()
+{
+    fragTexCoord = vertexTexCoord;
+    fragColor = vertexColor;
+    gl_Position = mvp * vec4(vertexPosition, 1.0);
+}
+)GLSL";
+
+static const char* kCloudMaskFS = R"GLSL(
+#version 330
+
+in vec2 fragTexCoord;
+in vec4 fragColor;
+out vec4 finalColor;
+
+uniform sampler2D texture0;
+uniform vec4 colDiffuse;
+
+uniform float u_time;
+uniform float u_seed;
+uniform float u_coverage;
+uniform float u_softness;
+uniform float u_evolve;
+
+// Hash without trig (stable and cheap).
+uint hash_u32(uint x)
+{
+    x ^= x >> 16;
+    x *= 2246822519u;
+    x ^= x >> 13;
+    x *= 3266489917u;
+    x ^= x >> 16;
+    return x;
+}
+
+float hash01(uvec2 v, uint seed)
+{
+    uint h = hash_u32(v.x * 1664525u + v.y * 1013904223u + seed);
+    return float(h & 0x00FFFFFFu) / 16777216.0; // 24-bit mantissa
+}
+
+// Tileable value noise in [0,1] over a discrete period.
+float noiseTile(vec2 p, int period, uint seed)
+{
+    vec2 i0f = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f*f*(3.0 - 2.0*f);
+
+    ivec2 i0 = ivec2(i0f);
+    int px0 = int(mod(float(i0.x), float(period)));
+    int py0 = int(mod(float(i0.y), float(period)));
+    int px1 = (px0 + 1) % period;
+    int py1 = (py0 + 1) % period;
+
+    float a = hash01(uvec2(uint(px0), uint(py0)), seed);
+    float b = hash01(uvec2(uint(px1), uint(py0)), seed);
+    float c = hash01(uvec2(uint(px0), uint(py1)), seed);
+    float d = hash01(uvec2(uint(px1), uint(py1)), seed);
+
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+float fbmTile(vec2 p, int period, uint seed)
+{
+    float v = 0.0;
+    float a = 0.5;
+    int per = period;
+    for (int i = 0; i < 5; ++i) {
+        v += a * noiseTile(p, per, seed + uint(i) * 101u);
+        p = p * 2.02 + vec2(37.1, 17.7);
+        per *= 2;
+        a *= 0.5;
+    }
+    return v;
+}
+
+void main()
+{
+    // We render into a small mask texture; use texCoord as stable [0,1] domain.
+    const int basePeriod = 32;
+
+    // Convert seed float -> stable uint.
+    uint s = uint(fract(u_seed) * 65535.0) ^ 0xC10D15u;
+
+    float cov = clamp(u_coverage, 0.0, 1.0);
+    float soft = clamp(u_softness, 0.0, 1.0);
+    float evol = clamp(u_evolve, 0.0, 1.0);
+
+    // Time is only used for morphing; translation is handled in world space.
+    float t = u_time * (0.12 + 0.65 * evol);
+
+    // Base coords in a repeating domain.
+    vec2 p = fragTexCoord * float(basePeriod);
+    p += vec2(11.3, 4.9);
+
+    // Domain warp to break up repetition; keep warp strength small to preserve tiling.
+    vec2 w;
+    w.x = fbmTile(p + vec2(0.0, 0.0) + t * 0.75, basePeriod, s);
+    w.y = fbmTile(p + vec2(5.2, 1.3) - t * 0.55, basePeriod, s ^ 0xA341316Cu);
+    p += (w - 0.5) * (2.2 + 1.5 * soft);
+
+    float n = fbmTile(p + vec2(19.7, 7.1) + t * 0.18, basePeriod, s ^ 0x51A5EEDu);
+
+    // Higher coverage => lower threshold.
+    float thr = mix(0.80, 0.32, cov);
+    float edge = mix(0.04, 0.18, soft);
+    float m = smoothstep(thr - edge, thr + edge, n);
+
+    // Thicker centers; softer edges.
+    m *= (0.70 + 0.45 * n);
+    m = clamp(m, 0.0, 1.0);
+    m = m * m;
+
+    // Raylib pipeline modulation.
+    vec4 base = texture(texture0, fragTexCoord);
+    vec4 modulate = base * colDiffuse * fragColor;
+    finalColor = vec4(modulate.rgb, modulate.a * m);
 }
 )GLSL";
 
@@ -2414,47 +3013,46 @@ Renderer::MinimapLayout ComputeMinimapLayout(int mapW, int mapH, int screenW, in
 }
 
 // Determine a minimap pixel color for a tile.
-Color MinimapColorForTile(const isocity::Tile& t)
+Color MinimapColorForTile(const isocity::Tile& t, const GfxPalette& pal)
 {
   using namespace isocity;
 
-  // Base terrain colors.
-  Color base = Color{70, 160, 90, 255};
-  if (t.terrain == Terrain::Water) base = Color{35, 90, 210, 255};
-  if (t.terrain == Terrain::Sand) base = Color{195, 170, 95, 255};
+  auto toColor = [](Rgba8 c) -> Color { return Color{c.r, c.g, c.b, 255}; };
+
+  // Base terrain colors (theme-aware).
+  Color base = toColor(pal.grass);
+  if (t.terrain == Terrain::Water) base = toColor(pal.water);
+  if (t.terrain == Terrain::Sand) base = toColor(pal.sand);
 
   // Simple height shading: higher tiles are slightly brighter.
   const float b = std::clamp(0.70f + t.height * 0.45f, 0.35f, 1.25f);
   base = Mul(base, b);
 
-  // Overlays: mix towards a strong color so gameplay is readable.
+  // Overlays: mix towards strong colors so gameplay is readable.
   switch (t.overlay) {
   case Overlay::None: return base;
   case Overlay::Road: {
-    // Higher-tier roads read darker / stronger on the minimap.
     const int lvl = std::clamp<int>(static_cast<int>(t.level), 1, 3);
 
-    // Roads on water are bridges; render them a bit lighter/warmer so they are readable over water.
     if (t.terrain == Terrain::Water) {
-      const Color bridge = (lvl == 1) ? Color{190, 170, 125, 255}
-                          : (lvl == 2) ? Color{180, 160, 118, 255}
-                                       : Color{170, 152, 110, 255};
+      const Color bridge = (lvl == 1) ? toColor(pal.bridgeDeck1) : (lvl == 2) ? toColor(pal.bridgeDeck2) : toColor(pal.bridgeDeck3);
       const float k = (lvl == 1) ? 0.82f : (lvl == 2) ? 0.84f : 0.86f;
       return LerpColor(base, bridge, k);
     }
 
-    const Color road = (lvl == 1) ? Color{28, 28, 30, 255} : (lvl == 2) ? Color{24, 24, 28, 255} : Color{20, 20, 25, 255};
+    const Color road = (lvl == 1) ? toColor(pal.roadAsphalt1) : (lvl == 2) ? toColor(pal.roadAsphalt2) : toColor(pal.roadAsphalt3);
     const float k = (lvl == 1) ? 0.85f : (lvl == 2) ? 0.88f : 0.90f;
     return LerpColor(base, road, k);
   }
-  case Overlay::Park: return LerpColor(base, Color{70, 200, 95, 255}, 0.70f);
-  case Overlay::Residential: return LerpColor(base, Color{80, 160, 235, 255}, 0.80f);
-  case Overlay::Commercial: return LerpColor(base, Color{240, 170, 60, 255}, 0.80f);
-  case Overlay::Industrial: return LerpColor(base, Color{200, 90, 220, 255}, 0.80f);
+  case Overlay::Park: return LerpColor(base, toColor(pal.overlayPark), 0.70f);
+  case Overlay::Residential: return LerpColor(base, toColor(pal.overlayResidential), 0.80f);
+  case Overlay::Commercial: return LerpColor(base, toColor(pal.overlayCommercial), 0.80f);
+  case Overlay::Industrial: return LerpColor(base, toColor(pal.overlayIndustrial), 0.80f);
   default: break;
   }
   return base;
 }
+
 
 // Draw a simple extruded "building" for zone tiles.
 void DrawZoneBuilding(const isocity::Tile& t, float tileW, float tileH, float zoom, const Vector2& tileCenter,
@@ -3383,8 +3981,17 @@ void Renderer::unloadTextures()
   // Geometry-shader programs need to be released before the GL context is torn down.
   m_gpuRibbon.shutdown();
 
+  // Shader-based weather screen FX rely on GL resources.
+  unloadWeatherFxResources();
+
+  // Shader-based terrain material FX rely on GL resources.
+  unloadMaterialFxResources();
+
   // Shader-based volumetric clouds also rely on GL resources.
   unloadVolumetricCloudResources();
+
+  // Optional GPU cloud shadow mask resources.
+  unloadCloudMaskResources();
 
   for (auto& tv : m_terrainTex) {
     for (auto& t : tv) {
@@ -3445,6 +4052,141 @@ void Renderer::unloadTextures()
   unloadMinimap();
 }
 
+void Renderer::unloadCloudMaskResources()
+{
+  if (m_cloudMaskShader.id != 0) {
+    UnloadShader(m_cloudMaskShader);
+    m_cloudMaskShader = Shader{};
+  }
+
+  if (m_cloudMaskRT.id != 0) {
+    UnloadRenderTexture(m_cloudMaskRT);
+    m_cloudMaskRT = RenderTexture2D{};
+  }
+
+  m_cloudMaskShaderFailed = false;
+
+  m_cloudMaskLocTime = -1;
+  m_cloudMaskLocSeed = -1;
+  m_cloudMaskLocCoverage = -1;
+  m_cloudMaskLocSoftness = -1;
+  m_cloudMaskLocEvolve = -1;
+  m_cloudMaskLastUpdateSec = -1000.0f;
+}
+
+void Renderer::ensureCloudMaskShader()
+{
+  if (m_cloudMaskShader.id != 0) return;
+  if (m_cloudMaskShaderFailed) return;
+
+  const std::vector<std::string> defines = {
+      "#define PROCISOCITY 1",
+      "#define PROCISOCITY_CLOUDMASK 1",
+  };
+
+  ShaderBuildResult r = LoadShaderProgramWithOverrides("cloudmask", kCloudMaskVS, kCloudMaskFS, defines);
+  m_cloudMaskShader = r.shader;
+  if (m_cloudMaskShader.id == 0) {
+    m_cloudMaskShaderFailed = true;
+    if (!r.log.empty()) {
+      TraceLog(LOG_WARNING, "[CloudMask] shader compile failed:\n%s", r.log.c_str());
+    }
+    return;
+  }
+
+  if (!r.log.empty()) {
+    TraceLog(LOG_INFO, "[CloudMask] shader log:\n%s", r.log.c_str());
+  }
+
+  m_cloudMaskLocTime = GetShaderLocation(m_cloudMaskShader, "u_time");
+  m_cloudMaskLocSeed = GetShaderLocation(m_cloudMaskShader, "u_seed");
+  m_cloudMaskLocCoverage = GetShaderLocation(m_cloudMaskShader, "u_coverage");
+  m_cloudMaskLocSoftness = GetShaderLocation(m_cloudMaskShader, "u_softness");
+  m_cloudMaskLocEvolve = GetShaderLocation(m_cloudMaskShader, "u_evolve");
+}
+
+void Renderer::ensureCloudMaskRT()
+{
+  if (m_cloudMaskRT.id != 0) return;
+
+  constexpr int kSize = 256;
+  m_cloudMaskRT = LoadRenderTexture(kSize, kSize);
+  if (m_cloudMaskRT.id == 0) return;
+
+  // We'll repeat this mask across the world; make sure wrap mode supports it.
+  SetTextureWrap(m_cloudMaskRT.texture, TEXTURE_WRAP_REPEAT);
+  SetTextureFilter(m_cloudMaskRT.texture, TEXTURE_FILTER_BILINEAR);
+
+  // Force an update on next use.
+  m_cloudMaskLastUpdateSec = -1000.0f;
+}
+
+void Renderer::updateCloudMaskRT(float timeSec, float cloudiness)
+{
+  if (!m_cloudShadows.enabled) return;
+  if (cloudiness <= 0.001f) return;
+
+  // Only attempt GPU path when the shader is available.
+  ensureCloudMaskShader();
+  if (m_cloudMaskShader.id == 0) return;
+
+  ensureCloudMaskRT();
+  if (m_cloudMaskRT.id == 0) return;
+
+  const float evolve = std::clamp(m_cloudShadows.evolve, 0.0f, 1.0f);
+
+  // If evolve is 0, the field is static; update once.
+  const float fps = std::clamp(10.0f + 20.0f * evolve, 10.0f, 30.0f);
+  const float interval = (evolve <= 0.001f) ? 1000.0f : (1.0f / fps);
+  if ((timeSec - m_cloudMaskLastUpdateSec) < interval) return;
+  m_cloudMaskLastUpdateSec = timeSec;
+
+  // Map seed to [0,1) as a float (portable; avoids integer uniforms).
+  const std::uint32_t seed = m_gfxSeed32 ^ 0xC10D15u;
+  const float seedF = static_cast<float>(static_cast<double>(seed) / 4294967296.0);
+
+  // Let weather cloudiness subtly influence shape as well as opacity.
+  const float cov = std::clamp(m_cloudShadows.coverage * (0.45f + 0.55f * cloudiness), 0.0f, 1.0f);
+  const float soft = std::clamp(m_cloudShadows.softness * (0.70f + 0.30f * cloudiness), 0.0f, 1.0f);
+  const float evo = std::clamp(evolve * cloudiness, 0.0f, 1.0f);
+
+  BeginTextureMode(m_cloudMaskRT);
+  ClearBackground(Color{0, 0, 0, 0});
+
+  BeginShaderMode(m_cloudMaskShader);
+  if (m_cloudMaskLocTime >= 0) SetShaderValue(m_cloudMaskShader, m_cloudMaskLocTime, &timeSec, SHADER_UNIFORM_FLOAT);
+  if (m_cloudMaskLocSeed >= 0) SetShaderValue(m_cloudMaskShader, m_cloudMaskLocSeed, &seedF, SHADER_UNIFORM_FLOAT);
+  if (m_cloudMaskLocCoverage >= 0) SetShaderValue(m_cloudMaskShader, m_cloudMaskLocCoverage, &cov, SHADER_UNIFORM_FLOAT);
+  if (m_cloudMaskLocSoftness >= 0) SetShaderValue(m_cloudMaskShader, m_cloudMaskLocSoftness, &soft, SHADER_UNIFORM_FLOAT);
+  if (m_cloudMaskLocEvolve >= 0) SetShaderValue(m_cloudMaskShader, m_cloudMaskLocEvolve, &evo, SHADER_UNIFORM_FLOAT);
+
+  // Full target quad.
+  DrawRectangle(0, 0, m_cloudMaskRT.texture.width, m_cloudMaskRT.texture.height, WHITE);
+  EndShaderMode();
+
+  EndTextureMode();
+}
+
+
+void Renderer::unloadWeatherFxResources()
+{
+  if (m_weatherFxShader.id != 0) {
+    UnloadShader(m_weatherFxShader);
+    m_weatherFxShader = Shader{};
+  }
+
+  m_weatherFxShaderFailed = false;
+
+  m_weatherFxLocResolution = -1;
+  m_weatherFxLocTime = -1;
+  m_weatherFxLocSeed = -1;
+  m_weatherFxLocMode = -1;
+  m_weatherFxLocIntensity = -1;
+  m_weatherFxLocWindDir = -1;
+  m_weatherFxLocWindSpeed = -1;
+  m_weatherFxLocDay = -1;
+}
+
 
 void Renderer::unloadVolumetricCloudResources()
 {
@@ -3474,10 +4216,134 @@ void Renderer::unloadVolumetricCloudResources()
 
 void Renderer::reloadShaderOverrides()
 {
-  // Currently only the volumetric cloud shader supports disk overrides.
-  // Add more here as the renderer grows.
+  // Rebuild any optional on-disk shader overrides.
+  unloadWeatherFxResources();
+  unloadMaterialFxResources();
   unloadVolumetricCloudResources();
+  unloadCloudMaskResources();
+
+  ensureWeatherFxShader();
+  ensureMaterialFxShader();
   ensureVolumetricCloudShader();
+  ensureCloudMaskShader();
+}
+
+void Renderer::setGfxTheme(GfxTheme t)
+{
+  if (t == m_gfxTheme) return;
+  m_gfxTheme = t;
+
+  // Theme affects procedural textures and sprites, so regenerate them.
+  rebuildTextures(static_cast<std::uint64_t>(m_gfxSeed32));
+
+  // Minimap colors are palette-based too.
+  m_minimapDirty = true;
+
+  // Cached base layers must be redrawn with the new palette.
+  markBaseCacheDirtyAll();
+}
+
+void Renderer::ensureWeatherFxShader()
+{
+  if (m_weatherFxShader.id != 0) return;
+  if (m_weatherFxShaderFailed) return;
+
+  const std::vector<std::string> defines = {
+      "#define PROCISOCITY 1",
+      "#define PROCISOCITY_WEATHERFX 1",
+  };
+
+  ShaderBuildResult r = LoadShaderProgramWithOverrides("weatherfx", kWeatherFxVS, kWeatherFxFS, defines);
+  m_weatherFxShader = r.shader;
+  if (m_weatherFxShader.id == 0) {
+    if (!r.log.empty()) {
+      TraceLog(LOG_WARNING, "[WeatherFx] Shader build log:\n%s", r.log.c_str());
+    }
+    m_weatherFxShaderFailed = true;
+    return;
+  }
+
+  if (!r.log.empty()) {
+    TraceLog(LOG_INFO, "[WeatherFx] Shader build log:\n%s", r.log.c_str());
+  }
+
+  m_weatherFxLocResolution = GetShaderLocation(m_weatherFxShader, "u_resolution");
+  m_weatherFxLocTime = GetShaderLocation(m_weatherFxShader, "u_time");
+  m_weatherFxLocSeed = GetShaderLocation(m_weatherFxShader, "u_seed");
+  m_weatherFxLocMode = GetShaderLocation(m_weatherFxShader, "u_mode");
+  m_weatherFxLocIntensity = GetShaderLocation(m_weatherFxShader, "u_intensity");
+  m_weatherFxLocWindDir = GetShaderLocation(m_weatherFxShader, "u_windDir");
+  m_weatherFxLocWindSpeed = GetShaderLocation(m_weatherFxShader, "u_windSpeed");
+  m_weatherFxLocDay = GetShaderLocation(m_weatherFxShader, "u_day");
+}
+
+void Renderer::ensureMaterialFxShader()
+{
+  if (m_materialFxShader.id != 0) return;
+  if (m_materialFxShaderFailed) return;
+
+  const std::vector<std::string> defines = {
+      "#define PROCISOCITY 1",
+      "#define PROCISOCITY_MATERIALFX 1",
+  };
+
+  ShaderBuildResult r = LoadShaderProgramWithOverrides("materialfx", kMaterialFxVS, kMaterialFxFS, defines);
+  m_materialFxShader = r.shader;
+  if (m_materialFxShader.id == 0) {
+    if (!r.log.empty()) {
+      TraceLog(LOG_WARNING, "[MaterialFx] Shader build log:\n%s", r.log.c_str());
+    }
+    m_materialFxShaderFailed = true;
+    return;
+  }
+
+  if (!r.log.empty()) {
+    TraceLog(LOG_INFO, "[MaterialFx] Shader build log:\n%s", r.log.c_str());
+  }
+
+  m_materialFxLocTime = GetShaderLocation(m_materialFxShader, "u_time");
+  m_materialFxLocWindDir = GetShaderLocation(m_materialFxShader, "u_windDir");
+  m_materialFxLocWindSpeed = GetShaderLocation(m_materialFxShader, "u_windSpeed");
+  m_materialFxLocTexelSize = GetShaderLocation(m_materialFxShader, "u_texelSize");
+  m_materialFxLocFreq = GetShaderLocation(m_materialFxShader, "u_freq");
+  m_materialFxLocSeed = GetShaderLocation(m_materialFxShader, "u_seed");
+  m_materialFxLocWaterStrength = GetShaderLocation(m_materialFxShader, "u_waterStrength");
+  m_materialFxLocWaterDistortPx = GetShaderLocation(m_materialFxShader, "u_waterDistortPx");
+  m_materialFxLocWaterSparkle = GetShaderLocation(m_materialFxShader, "u_waterSparkle");
+  m_materialFxLocFoamStrength = GetShaderLocation(m_materialFxShader, "u_foamStrength");
+  m_materialFxLocFoamWidthPx = GetShaderLocation(m_materialFxShader, "u_foamWidthPx");
+  m_materialFxLocCausticsStrength = GetShaderLocation(m_materialFxShader, "u_causticsStrength");
+  m_materialFxLocWetSandStrength = GetShaderLocation(m_materialFxShader, "u_wetSandStrength");
+  m_materialFxLocWetSandWidthPx = GetShaderLocation(m_materialFxShader, "u_wetSandWidthPx");
+  m_materialFxLocVegStrength = GetShaderLocation(m_materialFxShader, "u_vegStrength");
+  m_materialFxLocMaterialMask = GetShaderLocation(m_materialFxShader, "u_materialMask");
+}
+
+void Renderer::unloadMaterialFxResources()
+{
+  if (m_materialFxShader.id != 0) {
+    UnloadShader(m_materialFxShader);
+    m_materialFxShader = Shader{};
+  }
+
+  m_materialFxShaderFailed = false;
+
+  m_materialFxLocTime = -1;
+  m_materialFxLocWindDir = -1;
+  m_materialFxLocWindSpeed = -1;
+  m_materialFxLocTexelSize = -1;
+  m_materialFxLocFreq = -1;
+  m_materialFxLocSeed = -1;
+  m_materialFxLocWaterStrength = -1;
+  m_materialFxLocWaterDistortPx = -1;
+  m_materialFxLocWaterSparkle = -1;
+  m_materialFxLocFoamStrength = -1;
+  m_materialFxLocFoamWidthPx = -1;
+  m_materialFxLocCausticsStrength = -1;
+  m_materialFxLocWetSandStrength = -1;
+  m_materialFxLocWetSandWidthPx = -1;
+  m_materialFxLocVegStrength = -1;
+  m_materialFxLocMaterialMask = -1;
 }
 
 void Renderer::ensureVolumetricCloudShader()
@@ -3691,7 +4557,7 @@ void Renderer::rebuildVehicleSprites()
 
   // Use the palette system for vehicle paint materials (keeps the project asset-free while
   // still looking coherent across seeds).
-  const GfxPalette pal = GenerateGfxPalette(m_gfxSeed32 ^ 0xB16B00B5u, GfxTheme::Classic);
+  const GfxPalette pal = GenerateGfxPalette(m_gfxSeed32 ^ 0xB16B00B5u, m_gfxTheme);
 
   auto loadTex = [](const RgbaImage& src) -> Texture2D {
     Texture2D t{};
@@ -3751,7 +4617,7 @@ void Renderer::rebuildBuildingSprites()
   cfg.includeEmissive = true;
 
   // Use the same palette system as other procedural sprites so buildings feel cohesive.
-  const GfxPalette pal = GenerateGfxPalette(m_gfxSeed32 ^ 0xB1D1B00Du, GfxTheme::Classic);
+  const GfxPalette pal = GenerateGfxPalette(m_gfxSeed32 ^ 0xB1D1B00Du, m_gfxTheme);
 
   auto loadTex = [](const RgbaImage& src) -> Texture2D {
     Texture2D t{};
@@ -3811,7 +4677,7 @@ void Renderer::rebuildPropSprites()
   GfxPropsConfig cfgPeople = cfgTrees;
   cfgPeople.includeEmissive = true;
 
-  const GfxPalette pal = GenerateGfxPalette(m_gfxSeed32 ^ 0x51A5EEDu, GfxTheme::Classic);
+  const GfxPalette pal = GenerateGfxPalette(m_gfxSeed32 ^ 0x51A5EEDu, m_gfxTheme);
 
   auto loadTex = [](const RgbaImage& src) -> Texture2D {
     Texture2D t{};
@@ -3859,9 +4725,15 @@ void Renderer::rebuildPropSprites()
 void Renderer::setCloudShadowSettings(const CloudShadowSettings& s)
 {
   const bool regen = (s.coverage != m_cloudShadows.coverage) || (s.softness != m_cloudShadows.softness);
+  const bool forceGpuUpdate = regen || (s.evolve != m_cloudShadows.evolve) || (s.enabled != m_cloudShadows.enabled);
   m_cloudShadows = s;
 
-  // Only the shape parameters require re-synthesizing the mask texture.
+  // Force the GPU mask to refresh next time it is used.
+  if (forceGpuUpdate) {
+    m_cloudMaskLastUpdateSec = -1000.0f;
+  }
+
+  // CPU fallback texture is regenerated only when the shape changes.
   if (regen || m_cloudShadowTex.id == 0) {
     rebuildCloudShadowTexture();
   }
@@ -3971,6 +4843,10 @@ void Renderer::unloadBaseCache()
     if (b.terrain.id != 0) {
       UnloadRenderTexture(b.terrain);
       b.terrain = RenderTexture2D{};
+    }
+    if (b.materialMask.id != 0) {
+      UnloadRenderTexture(b.materialMask);
+      b.materialMask = RenderTexture2D{};
     }
     if (b.structures.id != 0) {
       UnloadRenderTexture(b.structures);
@@ -4082,6 +4958,12 @@ void Renderer::ensureBaseCache(const World& world)
       b.terrain = LoadRenderTexture(texW, texH);
       if (b.terrain.id != 0) {
         SetTextureFilter(b.terrain.texture, TEXTURE_FILTER_POINT);
+      }
+
+      // Material mask cache (for shader-based material animation).
+      b.materialMask = LoadRenderTexture(texW, texH);
+      if (b.materialMask.id != 0) {
+        SetTextureFilter(b.materialMask.texture, TEXTURE_FILTER_POINT);
       }
 
       // Structures base cache (roads/zones/parks).
@@ -4223,6 +5105,51 @@ void Renderer::rebuildTerrainCacheBand(const World& world, BandCache& band)
   }
 
   EndTextureMode();
+
+  // Build material mask for shader-based material animation (R=water, G=vegetation, B=shore sand).
+  if (band.materialMask.id != 0) {
+    BeginTextureMode(band.materialMask);
+    ClearBackground(BLANK);
+
+    auto isWater = [&](int nx, int ny) -> bool {
+      if (!world.inBounds(nx, ny)) return false;
+      return world.at(nx, ny).terrain == Terrain::Water;
+    };
+
+    for (int sum = band.sum0; sum <= band.sum1; ++sum) {
+      const int x0 = std::max(0, sum - (mapH - 1));
+      const int x1 = std::min(mapW - 1, sum);
+      for (int x = x0; x <= x1; ++x) {
+        const int y = sum - x;
+        const Tile& t = world.at(x, y);
+
+        if (t.terrain != Terrain::Water && t.terrain != Terrain::Grass && t.terrain != Terrain::Sand) continue;
+
+        // Only mark sand very near water, to keep the mask sparse.
+        if (t.terrain == Terrain::Sand) {
+          const bool nearWater =
+            isWater(x - 1, y) || isWater(x + 1, y) || isWater(x, y - 1) || isWater(x, y + 1) ||
+            isWater(x - 1, y - 1) || isWater(x - 1, y + 1) || isWater(x + 1, y - 1) || isWater(x + 1, y + 1);
+          if (!nearWater) continue;
+        }
+
+        const float elevPx = TileElevationPx(t, m_elev);
+        const Vector2 baseCenterW = TileToWorldCenter(x, y, tileWf, tileHf);
+        const Vector2 baseCenter{baseCenterW.x + shift.x, baseCenterW.y + shift.y};
+        const Vector2 center{baseCenter.x, baseCenter.y - elevPx};
+
+        if (t.terrain == Terrain::Water) {
+          DrawDiamond(center, tileWf, tileHf, Color{255, 0, 0, 255});
+        } else if (t.terrain == Terrain::Grass) {
+          DrawDiamond(center, tileWf, tileHf, Color{0, 255, 0, 255});
+        } else { // Sand (near water)
+          DrawDiamond(center, tileWf, tileHf, Color{0, 0, 255, 255});
+        }
+      }
+    }
+
+    EndTextureMode();
+  }
   band.dirtyTerrain = false;
 }
 
@@ -4305,12 +5232,14 @@ void Renderer::ensureMinimapUpToDate(const World& world)
 
   if (!m_minimapDirty && m_minimapTex.id != 0) return;
 
+  const GfxPalette pal = GenerateGfxPalette(m_gfxSeed32 ^ 0xC0FFEEu, m_gfxTheme);
+
   // Rebuild pixel buffer.
   for (int y = 0; y < h; ++y) {
     for (int x = 0; x < w; ++x) {
       const Tile& t = world.at(x, y);
       m_minimapPixels[static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x)] =
-          MinimapColorForTile(t);
+          MinimapColorForTile(t, pal);
     }
   }
 
@@ -4612,6 +5541,33 @@ void Renderer::rebuildTextures(std::uint64_t seed)
   const std::uint32_t s = static_cast<std::uint32_t>(seed);
   m_gfxSeed32 = s;
 
+  const GfxPalette pal = GenerateGfxPalette(s ^ 0xC0FFEEu, m_gfxTheme);
+  auto toColor = [](const Rgba8& v) -> Color { return Color{v.r, v.g, v.b, v.a}; };
+
+  const Color waterColor = toColor(pal.water);
+  const Color sandColor = toColor(pal.sand);
+  const Color grassColor = toColor(pal.grass);
+  const Color shorelineFoamColor = toColor(pal.shorelineFoam);
+
+  const Color roadAsphalt1Color = toColor(pal.roadAsphalt1);
+  const Color roadAsphalt2Color = toColor(pal.roadAsphalt2);
+  const Color roadAsphalt3Color = toColor(pal.roadAsphalt3);
+  const Color roadMarkWhiteColor = toColor(pal.roadMarkWhite);
+  const Color roadMarkYellowColor = toColor(pal.roadMarkYellow);
+
+  const Color bridgeDeck1Color = toColor(pal.bridgeDeck1);
+  const Color bridgeDeck2Color = toColor(pal.bridgeDeck2);
+  const Color bridgeDeck3Color = toColor(pal.bridgeDeck3);
+
+  const Color overlayResidentialColor = toColor(pal.overlayResidential);
+  const Color overlayCommercialColor = toColor(pal.overlayCommercial);
+  const Color overlayIndustrialColor = toColor(pal.overlayIndustrial);
+  const Color overlayParkColor = toColor(pal.overlayPark);
+  const Color treeDarkColor = toColor(pal.treeDark);
+
+  const bool isSpace = (m_gfxTheme == GfxTheme::SpaceColony);
+
+
   // --- Terrain ---
   // Multiple variants per terrain type drastically reduce visible tiling.
   auto terrainPixel = [&](Terrain kind, int variant, int x, int y, const DiamondParams& d) -> Color {
@@ -4624,12 +5580,16 @@ void Renderer::rebuildTextures(std::uint64_t seed)
 
       // Subtle diagonal waves (purely procedural), with variant-dependent phase.
       const float phase = static_cast<float>(variant) * 0.65f;
-      const float waves0 = 0.060f * std::sin((x * 0.35f + y * 0.70f) + phase);
-      const float waves1 = 0.030f * std::sin((x * 0.90f - y * 0.45f) + phase * 1.73f);
+      const float waveAmp0 = isSpace ? 0.018f : 0.060f;
+      const float waveAmp1 = isSpace ? 0.009f : 0.030f;
+      const float waves0 = waveAmp0 * std::sin((x * 0.35f + y * 0.70f) + phase);
+      const float waves1 = waveAmp1 * std::sin((x * 0.90f - y * 0.45f) + phase * 1.73f);
       const float b = 1.0f + n + waves0 + waves1;
 
-      Color base = Color{40, 95, 210, 255};
+      Color base = waterColor;
       base = Mul(base, b);
+
+      if (isSpace && ((h & 0x7Fu) == 0x2Au)) base = Mul(base, 1.08f);
 
       // Slightly fade edges to reduce harsh tile seams.
       base.a = static_cast<unsigned char>(255.0f * std::clamp(d.edge * 4.0f, 0.0f, 1.0f));
@@ -4642,12 +5602,18 @@ void Renderer::rebuildTextures(std::uint64_t seed)
       // Low-frequency "ripples" so dunes don't look perfectly flat.
       const float r = 0.040f * std::sin((x * 0.22f + y * 0.31f) + static_cast<float>(variant) * 1.10f);
 
-      Color base = Color{200, 186, 135, 255};
+      Color base = sandColor;
       base = Mul(base, 1.0f + n + r);
 
       // Grain speckles.
       if ((h & 0x1Fu) == 0x1Fu) base = Mul(base, 0.85f);
       if ((h & 0x3Fu) == 0x23u) base = Mul(base, 1.08f);
+
+      if (isSpace) {
+        // Regolith: extra rocky speckles / micro-craters.
+        if ((h & 0xFFu) == 0x4Au) base = Mul(base, 0.65f);
+        if ((h & 0x3FFu) == 0x2F0u) base = Mul(base, 0.55f);
+      }
 
       base.a = static_cast<unsigned char>(255.0f * std::clamp(d.edge * 6.0f, 0.0f, 1.0f));
       return base;
@@ -4659,12 +5625,18 @@ void Renderer::rebuildTextures(std::uint64_t seed)
       // Macro tint variation within a tile (subtle). This plus variants helps break repetition.
       const float patch = 0.040f * std::sin((x * 0.16f - y * 0.19f) + static_cast<float>(variant) * 0.95f);
 
-      Color base = Color{70, 170, 90, 255};
+      Color base = grassColor;
       base = Mul(base, 1.0f + n + patch);
 
       // Tiny darker "blades" of grass.
       if ((h & 0x7Fu) == 0x3Fu) base = Mul(base, 0.78f);
       if ((h & 0xFFu) == 0x5Du) base = Mul(base, 0.88f);
+
+      if (isSpace) {
+        // Habitat: subtle panel grid / seams.
+        if ((x % 12) == 0 || (y % 12) == 0) base = Mul(base, 0.85f);
+        if (((x + y) & 0x1Fu) == 0x00u) base = Mul(base, 1.06f);
+      }
 
       base.a = static_cast<unsigned char>(255.0f * std::clamp(d.edge * 6.0f, 0.0f, 1.0f));
       return base;
@@ -4768,7 +5740,8 @@ void Renderer::rebuildTextures(std::uint64_t seed)
 
         if (foam > 0.0f && c.a != 0) {
           const unsigned char keepA = c.a;
-          Color foamC = Color{245, 250, 255, keepA};
+          Color foamC = shorelineFoamColor;
+          foamC.a = keepA;
           c = LerpColor(c, foamC, foam);
           c.a = keepA;
         }
@@ -4823,8 +5796,9 @@ void Renderer::rebuildTextures(std::uint64_t seed)
     if (level == 1) {
       // Street
       st.roadW = 0.130f;
-      st.asphalt = Color{95, 95, 100, 230};
-      st.mark = Color{235, 235, 230, 245};
+      st.asphalt = roadAsphalt1Color;
+      st.mark = Mul(roadMarkWhiteColor, 0.96f);
+      st.mark2 = roadMarkYellowColor;
       st.dashFreq = 10.0f;
       st.dashed = true;
       st.doubleCenter = false;
@@ -4834,9 +5808,9 @@ void Renderer::rebuildTextures(std::uint64_t seed)
     } else if (level == 2) {
       // Avenue
       st.roadW = 0.175f;
-      st.asphalt = Color{85, 85, 90, 235};
-      st.mark = Color{240, 240, 240, 245};
-      st.mark2 = Color{250, 215, 95, 245};
+      st.asphalt = roadAsphalt2Color;
+      st.mark = roadMarkWhiteColor;
+      st.mark2 = roadMarkYellowColor;
       st.dashed = false;
       st.doubleCenter = true;
       st.lineGap = 0.022f;
@@ -4846,8 +5820,9 @@ void Renderer::rebuildTextures(std::uint64_t seed)
     } else { // level 3
       // Highway
       st.roadW = 0.215f;
-      st.asphalt = Color{72, 72, 76, 240};
-      st.mark = Color{245, 245, 245, 245};
+      st.asphalt = roadAsphalt3Color;
+      st.mark = roadMarkWhiteColor;
+      st.mark2 = roadMarkYellowColor;
       st.dashed = true;
       st.doubleCenter = false;
       st.highway = true;
@@ -4858,7 +5833,16 @@ void Renderer::rebuildTextures(std::uint64_t seed)
       st.crosswalk = false;
       st.edgeDark = 0.70f;
     }
+
+    // In the space colony theme, markings are slightly more emissive-looking.
+    if (isSpace) {
+      st.mark = Mul(st.mark, 1.03f);
+      st.mark2 = Mul(st.mark2, 1.06f);
+    }
+
     return st;
+  };
+
   };
 
   auto makeRoadVariant = [&](std::uint8_t mask, int level, int variant) -> Texture2D {
@@ -4995,9 +5979,9 @@ void Renderer::rebuildTextures(std::uint64_t seed)
     RoadStyle st = roadStyleForLevel(level);
     const float centerR = st.roadW * 1.10f;
 
-    Color deck = Color{160, 130, 95, 235}; // wood for streets
-    if (level == 2) deck = Color{170, 170, 175, 240}; // concrete-ish
-    if (level == 3) deck = Color{150, 150, 155, 240}; // darker concrete / steel
+    Color deck = bridgeDeck1Color; // deck material
+    if (level == 2) deck = bridgeDeck2Color;
+    if (level == 3) deck = bridgeDeck3Color;
 
     const std::uint32_t seedv =
         s ^ 0xB00B1E5u ^ (static_cast<std::uint32_t>(mask) * 0x7F4A7C15u) ^
@@ -5106,11 +6090,17 @@ void Renderer::rebuildTextures(std::uint64_t seed)
     const std::uint32_t h = HashCoords32(x, y, s ^ 0xCAFE0001u);
     const float n = (Frac01(h) - 0.5f) * 0.12f;
 
-    Color roof = Color{190, 70, 65, 255};
+    Color roof = overlayResidentialColor;
     roof = Mul(roof, 1.0f + n);
 
-    // Simple roof tiles pattern.
-    if ((x + y) % 6 == 0) roof = Mul(roof, 0.86f);
+    if (isSpace) {
+      // Space colony: dome/panel seams + occasional highlights.
+      if ((x % 10) == 0 || (y % 10) == 0) roof = Mul(roof, 0.80f);
+      if ((h & 0x3Fu) == 0x12u) roof = Mul(roof, 1.10f);
+    } else {
+      // Simple roof tiles pattern.
+      if ((x + y) % 6 == 0) roof = Mul(roof, 0.86f);
+    }
 
     // Slight vignette.
     roof = Mul(roof, 0.92f + 0.10f * d.edge);
@@ -5122,11 +6112,18 @@ void Renderer::rebuildTextures(std::uint64_t seed)
     const std::uint32_t h = HashCoords32(x, y, s ^ 0xCAFE0002u);
     const float n = (Frac01(h) - 0.5f) * 0.10f;
 
-    Color c = Color{70, 115, 190, 255};
+    Color c = overlayCommercialColor;
     c = Mul(c, 1.0f + n);
 
-    // Windows pattern.
-    if ((x / 3 + y / 2) % 5 == 0) c = Mul(c, 1.15f);
+    if (isSpace) {
+      // Space colony: circuit-like facade traces.
+      if ((x % 8) == 0 || (y % 8) == 0) c = Mul(c, 0.82f);
+      if (((x / 2 + y / 2) % 11) == 0) c = Mul(c, 1.12f);
+      if ((h & 0x7Fu) == 0x33u) c = Mul(c, 0.70f);
+    } else {
+      // Windows pattern.
+      if ((x / 3 + y / 2) % 5 == 0) c = Mul(c, 1.15f);
+    }
 
     c = Mul(c, 0.92f + 0.10f * d.edge);
     return c;
@@ -5137,11 +6134,17 @@ void Renderer::rebuildTextures(std::uint64_t seed)
     const std::uint32_t h = HashCoords32(x, y, s ^ 0xCAFE0003u);
     const float n = (Frac01(h) - 0.5f) * 0.10f;
 
-    Color c = Color{210, 180, 75, 255};
+    Color c = overlayIndustrialColor;
     c = Mul(c, 1.0f + n);
 
-    // Hazard stripes
-    if (((x + y) / 3) % 2 == 0) c = Mul(c, 0.85f);
+    if (isSpace) {
+      // Space colony: metal panel seams + vents.
+      if ((x % 9) == 0 || (y % 9) == 0) c = Mul(c, 0.84f);
+      if (((x + y) % 23) == 0) c = Mul(c, 1.10f);
+    } else {
+      // Hazard stripes
+      if (((x + y) / 3) % 2 == 0) c = Mul(c, 0.85f);
+    }
 
     c = Mul(c, 0.92f + 0.10f * d.edge);
     return c;
@@ -5152,11 +6155,26 @@ void Renderer::rebuildTextures(std::uint64_t seed)
     const std::uint32_t h = HashCoords32(x, y, s ^ 0xCAFE0004u);
     const float n = (Frac01(h) - 0.5f) * 0.12f;
 
-    Color c = Color{60, 190, 95, 230};
+    Color c = overlayParkColor;
+    c.a = 230;
     c = Mul(c, 1.0f + n);
 
-    // Procedural "trees" (dark dots).
-    if ((h & 0xFFu) == 0x7Au) c = Color{25, 110, 55, 240};
+    if (isSpace) {
+      // Space colony: greenhouse / habitat module grid + tiny light pips.
+      if ((x % 10) == 0 || (y % 10) == 0) c = Mul(c, 0.88f);
+      if ((h & 0xFFu) == 0x7Au) {
+        Color glow = roadMarkWhiteColor;
+        glow.a = 220;
+        c = glow;
+      }
+    } else {
+      // Procedural "trees" (dark dots).
+      if ((h & 0xFFu) == 0x7Au) {
+        Color td = treeDarkColor;
+        td.a = 240;
+        c = td;
+      }
+    }
 
     const float a = std::clamp(d.edge * 7.0f, 0.0f, 1.0f);
     c.a = static_cast<unsigned char>(static_cast<float>(c.a) * a);
@@ -5174,6 +6192,9 @@ void Renderer::rebuildTextures(std::uint64_t seed)
 
   // World-space cloud shadow mask (procedural, tileable).
   rebuildCloudShadowTexture();
+
+  // Force GPU cloud mask to refresh after reseeding.
+  m_cloudMaskLastUpdateSec = -1000.0f;
 
   // Animated procedural organic material overlay uses its own internal textures.
   m_organicHasLastTime = false;
@@ -5822,6 +6843,8 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
 
   // Draw cached bands (terrain then structures) in band order (back-to-front).
   if (terrainCacheReady || structureCacheReady) {
+    const bool wantMaterialFx = (terrainCacheReady && layerTerrain && m_materialFx.enabled && drawAestheticDetails);
+    if (wantMaterialFx) ensureMaterialFxShader();
     for (const auto& b : m_bands) {
       int texW = 0;
       int texH = 0;
@@ -5845,8 +6868,88 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
       if (!intersects) continue;
 
       const Rectangle srcRT = Rectangle{0, 0, static_cast<float>(texW), -static_cast<float>(texH)};
-      if (terrainCacheReady && layerTerrain) DrawTextureRec(b.terrain.texture, srcRT, b.origin, WHITE);
-      if (structureCacheReady && layerStructures) DrawTextureRec(b.structures.texture, srcRT, b.origin, WHITE);
+      if (terrainCacheReady && layerTerrain && b.terrain.id != 0) {
+        const bool materialFxOK = (drawAestheticDetails && m_materialFx.enabled && m_materialFxShader.id != 0 && b.materialMask.id != 0);
+        if (materialFxOK) {
+          BeginShaderMode(m_materialFxShader);
+
+          // Per-frame uniforms.
+          if (m_materialFxLocTime >= 0) {
+            float t = timeSec;
+            SetShaderValue(m_materialFxShader, m_materialFxLocTime, &t, SHADER_UNIFORM_FLOAT);
+          }
+          if (m_materialFxLocWindDir >= 0) {
+            Vector2 wd{weather.windX, weather.windY};
+            SetShaderValue(m_materialFxShader, m_materialFxLocWindDir, &wd, SHADER_UNIFORM_VEC2);
+          }
+          if (m_materialFxLocWindSpeed >= 0) {
+            float ws = weather.windSpeed;
+            SetShaderValue(m_materialFxShader, m_materialFxLocWindSpeed, &ws, SHADER_UNIFORM_FLOAT);
+          }
+          if (m_materialFxLocSeed >= 0) {
+            const float seed = static_cast<float>((m_gfxSeed32 ^ 0x9E3779B9u) & 0x00FFFFFFu) / 16777216.0f;
+            SetShaderValue(m_materialFxShader, m_materialFxLocSeed, &seed, SHADER_UNIFORM_FLOAT);
+          }
+
+          // Per-band uniforms.
+          if (m_materialFxLocTexelSize >= 0) {
+            Vector2 ts{1.0f / std::max(1, texW), 1.0f / std::max(1, texH)};
+            SetShaderValue(m_materialFxShader, m_materialFxLocTexelSize, &ts, SHADER_UNIFORM_VEC2);
+          }
+          if (m_materialFxLocFreq >= 0) {
+            const float scale = std::max(0.25f, m_materialFx.scale);
+            const float freq = (1.0f / std::max(1.0f, tileWf * 12.0f)) / scale;
+            SetShaderValue(m_materialFxShader, m_materialFxLocFreq, &freq, SHADER_UNIFORM_FLOAT);
+          }
+
+          if (m_materialFxLocWaterStrength >= 0) {
+            float v = m_materialFx.waterStrength;
+            SetShaderValue(m_materialFxShader, m_materialFxLocWaterStrength, &v, SHADER_UNIFORM_FLOAT);
+          }
+          if (m_materialFxLocWaterDistortPx >= 0) {
+            float v = m_materialFx.waterDistortPx;
+            SetShaderValue(m_materialFxShader, m_materialFxLocWaterDistortPx, &v, SHADER_UNIFORM_FLOAT);
+          }
+          if (m_materialFxLocWaterSparkle >= 0) {
+            float v = m_materialFx.waterSparkle;
+            SetShaderValue(m_materialFxShader, m_materialFxLocWaterSparkle, &v, SHADER_UNIFORM_FLOAT);
+          }
+          if (m_materialFxLocFoamStrength >= 0) {
+            float v = m_materialFx.foamStrength;
+            SetShaderValue(m_materialFxShader, m_materialFxLocFoamStrength, &v, SHADER_UNIFORM_FLOAT);
+          }
+          if (m_materialFxLocFoamWidthPx >= 0) {
+            float v = m_materialFx.foamWidthPx;
+            SetShaderValue(m_materialFxShader, m_materialFxLocFoamWidthPx, &v, SHADER_UNIFORM_FLOAT);
+          }
+          if (m_materialFxLocCausticsStrength >= 0) {
+            float v = m_materialFx.causticsStrength;
+            SetShaderValue(m_materialFxShader, m_materialFxLocCausticsStrength, &v, SHADER_UNIFORM_FLOAT);
+          }
+          if (m_materialFxLocWetSandStrength >= 0) {
+            float v = m_materialFx.wetSandStrength;
+            SetShaderValue(m_materialFxShader, m_materialFxLocWetSandStrength, &v, SHADER_UNIFORM_FLOAT);
+          }
+          if (m_materialFxLocWetSandWidthPx >= 0) {
+            float v = m_materialFx.wetSandWidthPx;
+            SetShaderValue(m_materialFxShader, m_materialFxLocWetSandWidthPx, &v, SHADER_UNIFORM_FLOAT);
+          }
+          if (m_materialFxLocVegStrength >= 0) {
+            float v = m_materialFx.vegetationStrength;
+            SetShaderValue(m_materialFxShader, m_materialFxLocVegStrength, &v, SHADER_UNIFORM_FLOAT);
+          }
+
+          if (m_materialFxLocMaterialMask >= 0) {
+            SetShaderValueTexture(m_materialFxShader, m_materialFxLocMaterialMask, b.materialMask.texture);
+          }
+
+          DrawTextureRec(b.terrain.texture, srcRT, b.origin, WHITE);
+          EndShaderMode();
+        } else {
+          DrawTextureRec(b.terrain.texture, srcRT, b.origin, WHITE);
+        }
+      }
+      if (structureCacheReady && layerStructures && b.structures.id != 0) DrawTextureRec(b.structures.texture, srcRT, b.origin, WHITE);
     }
   }
 
@@ -7004,38 +8107,50 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
   //
   // Note: cloud shadows can optionally persist in Clear weather (controlled by
   // CloudShadowSettings::clearAmount) so we can have drifting ambience without forcing rain/snow.
-  if (drawAestheticDetails && m_cloudShadows.enabled && m_cloudShadowTex.id != 0) {
+  if (drawAestheticDetails && m_cloudShadows.enabled) {
     const float cloudiness = (m_weather.mode == WeatherSettings::Mode::Clear)
                                  ? std::clamp(m_cloudShadows.clearAmount, 0.0f, 1.0f)
                                  : std::clamp(m_weather.overcast, 0.0f, 1.0f);
     if (cloudiness > 0.001f) {
-      const float dnMul = (m_dayNight.enabled) ? std::clamp(dayNight.day, 0.0f, 1.0f) : 1.0f;
-      const float alpha = std::clamp(m_cloudShadows.strength * cloudiness * dnMul, 0.0f, 1.0f);
-      if (alpha > 0.001f) {
-        const float pad = tileWf * 2.0f;
-        const float dstX = viewAABB.minX - pad;
-        const float dstY = viewAABB.minY - pad;
-        const float dstW = (viewAABB.maxX - viewAABB.minX) + pad * 2.0f;
-        const float dstH = (viewAABB.maxY - viewAABB.minY) + pad * 2.0f;
+      // Update the GPU mask if available (evolving field); otherwise we fall back to the
+      // pre-synthesized CPU texture.
+      updateCloudMaskRT(timeSec, cloudiness);
 
-        const float scale = std::clamp(m_cloudShadows.scale, 0.25f, 8.0f);
-        const float worldPeriod = tileWf * 18.0f * scale;
-        const float texPerWorld = static_cast<float>(m_cloudShadowTex.width) / worldPeriod;
+      const bool useGpuMask = (m_cloudMaskRT.id != 0);
+      const Texture2D* cloudTex = useGpuMask ? &m_cloudMaskRT.texture : &m_cloudShadowTex;
+      if (cloudTex && cloudTex->id != 0) {
+        const float dnMul = (m_dayNight.enabled) ? std::clamp(dayNight.day, 0.0f, 1.0f) : 1.0f;
+        const float alpha = std::clamp(m_cloudShadows.strength * cloudiness * dnMul, 0.0f, 1.0f);
+        if (alpha > 0.001f) {
+          const float pad = tileWf * 2.0f;
+          const float dstX = viewAABB.minX - pad;
+          const float dstY = viewAABB.minY - pad;
+          const float dstW = (viewAABB.maxX - viewAABB.minX) + pad * 2.0f;
+          const float dstH = (viewAABB.maxY - viewAABB.minY) + pad * 2.0f;
 
-        const float speedMul = std::max(0.0f, m_cloudShadows.speed);
-        const float worldSpeed = tileWf * 0.60f * speedMul * weather.windSpeed;
-        const float offX = weather.windX * worldSpeed * timeSec;
-        const float offY = weather.windY * worldSpeed * timeSec;
+          const float scale = std::clamp(m_cloudShadows.scale, 0.25f, 8.0f);
+          const float worldPeriod = tileWf * 18.0f * scale;
+          const float texPerWorld = static_cast<float>(cloudTex->width) / worldPeriod;
 
-        const Rectangle srcRect{
-            (dstX + offX) * texPerWorld,
-            (dstY + offY) * texPerWorld,
-            dstW * texPerWorld,
-            dstH * texPerWorld};
-        const Rectangle dst{dstX, dstY, dstW, dstH};
+          const float speedMul = std::max(0.0f, m_cloudShadows.speed);
+          const float worldSpeed = tileWf * 0.60f * speedMul * weather.windSpeed;
+          const float offX = weather.windX * worldSpeed * timeSec;
+          const float offY = weather.windY * worldSpeed * timeSec;
 
-        const unsigned char a = static_cast<unsigned char>(std::round(255.0f * alpha));
-        DrawTexturePro(m_cloudShadowTex, srcRect, dst, Vector2{0.0f, 0.0f}, 0.0f, Color{0, 0, 0, a});
+          Rectangle srcRect{
+              (dstX + offX) * texPerWorld,
+              (dstY + offY) * texPerWorld,
+              dstW * texPerWorld,
+              dstH * texPerWorld};
+          if (useGpuMask) {
+            // RenderTextures are y-flipped in raylib.
+            srcRect.height = -srcRect.height;
+          }
+
+          const Rectangle dst{dstX, dstY, dstW, dstH};
+          const unsigned char a = static_cast<unsigned char>(std::round(255.0f * alpha));
+          DrawTexturePro(*cloudTex, srcRect, dst, Vector2{0.0f, 0.0f}, 0.0f, Color{0, 0, 0, a});
+        }
       }
     }
   }
@@ -7397,6 +8512,7 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
 void Renderer::drawWeatherScreenFX(int screenW, int screenH, float timeSec, bool allowAestheticDetails)
 {
   if (!allowAestheticDetails) return;
+  if (!m_weather.affectScreen) return;
 
   // Nothing to draw?
   if (m_weather.mode == WeatherSettings::Mode::Clear) return;
@@ -7419,10 +8535,48 @@ void Renderer::drawWeatherScreenFX(int screenW, int screenH, float timeSec, bool
     }
   }
 
+  // Precipitation particles.
   if (!m_weather.drawParticles) return;
   if (w.intensity <= 0.01f) return;
 
+  // Seed used for procedural render details (stable per world, different per subsystem).
   const std::uint32_t seed = m_gfxSeed32 ^ 0xA11CE5u;
+
+  // Prefer the GPU weather shader when available; fall back to CPU particles if the shader fails.
+  ensureWeatherFxShader();
+  if (m_weatherFxShader.id != 0) {
+    const Vector2 res{static_cast<float>(screenW), static_cast<float>(screenH)};
+
+    // Map seed to [0,1) as a float (portable; avoids integer uniforms).
+    const float seedF = static_cast<float>(static_cast<double>(seed) / 4294967296.0);
+
+    const int mode = (w.mode == WeatherSettings::Mode::Rain) ? 1 : 2;
+    const float intensity = w.intensity;
+    const Vector2 windDir{w.windX, w.windY};
+    const float windSpeed = w.windSpeed;
+    const float day = dn.day;
+
+    BeginShaderMode(m_weatherFxShader);
+
+    if (m_weatherFxLocResolution >= 0) SetShaderValue(m_weatherFxShader, m_weatherFxLocResolution, &res, SHADER_UNIFORM_VEC2);
+    if (m_weatherFxLocTime >= 0) SetShaderValue(m_weatherFxShader, m_weatherFxLocTime, &timeSec, SHADER_UNIFORM_FLOAT);
+    if (m_weatherFxLocSeed >= 0) SetShaderValue(m_weatherFxShader, m_weatherFxLocSeed, &seedF, SHADER_UNIFORM_FLOAT);
+    if (m_weatherFxLocMode >= 0) SetShaderValue(m_weatherFxShader, m_weatherFxLocMode, &mode, SHADER_UNIFORM_INT);
+    if (m_weatherFxLocIntensity >= 0) SetShaderValue(m_weatherFxShader, m_weatherFxLocIntensity, &intensity, SHADER_UNIFORM_FLOAT);
+    if (m_weatherFxLocWindDir >= 0) SetShaderValue(m_weatherFxShader, m_weatherFxLocWindDir, &windDir, SHADER_UNIFORM_VEC2);
+    if (m_weatherFxLocWindSpeed >= 0) SetShaderValue(m_weatherFxShader, m_weatherFxLocWindSpeed, &windSpeed, SHADER_UNIFORM_FLOAT);
+    if (m_weatherFxLocDay >= 0) SetShaderValue(m_weatherFxShader, m_weatherFxLocDay, &day, SHADER_UNIFORM_FLOAT);
+
+    // Full-screen quad. (color acts as a tint; keep white)
+    DrawRectangle(0, 0, screenW, screenH, WHITE);
+
+    EndShaderMode();
+    return;
+  }
+
+  // ---------------------------------------------------------------------------
+  // CPU fallback
+  // ---------------------------------------------------------------------------
   const float area = static_cast<float>(screenW) * static_cast<float>(screenH);
 
   if (w.mode == WeatherSettings::Mode::Rain) {

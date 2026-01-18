@@ -105,6 +105,7 @@ static float ThemeSat(GfxTheme t)
   case GfxTheme::Noir: return 0.0f;
   case GfxTheme::Pastel: return 0.35f;
   case GfxTheme::Neon: return 0.95f;
+  case GfxTheme::SpaceColony: return 0.60f;
   default: return 0.75f;
   }
 }
@@ -229,6 +230,53 @@ GfxPalette GenerateGfxPalette(std::uint32_t seed, GfxTheme theme)
     asphalt2.v = 0.42f;
     asphalt3.v = 0.36f;
     break;
+  case GfxTheme::SpaceColony:
+    // Cold metals + regolith + saturated zone lighting.
+    water.h = 200.0f;
+    water.s *= 0.85f;
+    water.v = 0.62f;
+    sand.h = 32.0f;
+    sand.s *= 0.40f;
+    sand.v = 0.74f;
+    grass.h = 155.0f;
+    grass.s *= 0.85f;
+    grass.v = 0.70f;
+
+    // Zone overlays lean sci-fi: cyan / purple / amber / teal-green.
+    res.h = 190.0f;
+    res.s = 0.75f;
+    res.v = 0.82f;
+    com.h = 285.0f;
+    com.s = 0.75f;
+    com.v = 0.80f;
+    ind.h = 35.0f;
+    ind.s = 0.78f;
+    ind.v = 0.86f;
+    park.h = 145.0f;
+    park.s = 0.70f;
+    park.v = 0.76f;
+
+    // Roads/bridges read as dark metal.
+    asphalt1.h = 215.0f;
+    asphalt1.s = 0.12f;
+    asphalt1.v = 0.34f;
+    asphalt2.h = 215.0f;
+    asphalt2.s = 0.10f;
+    asphalt2.v = 0.30f;
+    asphalt3.h = 215.0f;
+    asphalt3.s = 0.08f;
+    asphalt3.v = 0.26f;
+
+    deck1.h = 210.0f;
+    deck1.s = 0.10f;
+    deck1.v = 0.60f;
+    deck2.h = 210.0f;
+    deck2.s = 0.07f;
+    deck2.v = 0.62f;
+    deck3.h = 210.0f;
+    deck3.s = 0.05f;
+    deck3.v = 0.56f;
+    break;
   }
 
   // Per-theme, per-seed micro-shifts.
@@ -313,6 +361,7 @@ const char* GfxThemeName(GfxTheme t)
   case GfxTheme::Noir: return "noir";
   case GfxTheme::Neon: return "neon";
   case GfxTheme::Pastel: return "pastel";
+  case GfxTheme::SpaceColony: return "space_colony";
   default: return "classic";
   }
 }
@@ -349,6 +398,12 @@ bool ParseGfxTheme(const std::string& s, GfxTheme& out)
     return true;
   }
 
+
+  if (t == "space" || t == "spacecolony" || t == "space_colony" || t == "colony" ||
+      t == "lunar" || t == "moon" || t == "mars") {
+    out = GfxTheme::SpaceColony;
+    return true;
+  }
   return false;
 }
 

@@ -21,6 +21,7 @@
 #include "isocity/Ui.hpp"
 #include "isocity/ZoneAccess.hpp"
 #include "isocity/ShaderUtil.hpp"
+#include "isocity/GfxPalette.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -817,7 +818,7 @@ void Game::setupDevConsole()
 
   m_console.registerCommand(
       "shader_reload",
-      "shader_reload  - reload on-disk GLSL overrides (postfx, volcloud)",
+      "shader_reload  - reload on-disk GLSL overrides (postfx, taa, bloom_extract, bloom_blur, weatherfx, materialfx, volcloud, cloudmask)",
       [this](DevConsole& c, const DevConsole::Args&) {
         const ShaderOverrideSearch s = FindShaderOverrideDir();
         if (!s.dir.empty()) {
@@ -3736,7 +3737,7 @@ void Game::setupDevConsole()
   // --- cloud shadows ---
   m_console.registerCommand(
       "cloud",
-      "cloud [on|off|toggle] | cloud strength <0..1> | cloud scale <0.25..8> | cloud speed <0..3> | "
+      "cloud [on|off|toggle] | cloud strength <0..1> | cloud scale <0.25..8> | cloud speed <0..3> | cloud evolve <0..1> | "
       "cloud coverage <0..1> | cloud softness <0..1>",
       [this, toLower, parseF32](DevConsole& c, const DevConsole::Args& args) {
         auto s = m_renderer.cloudShadowSettings();
@@ -3744,8 +3745,8 @@ void Game::setupDevConsole()
         auto clamp01 = [&](float v) { return std::max(0.0f, std::min(1.0f, v)); };
 
         auto printStatus = [&]() {
-          c.print(TextFormat("CloudShadows: %s  strength=%.2f  scale=%.2f  speed=%.2f  coverage=%.2f  softness=%.2f",
-                             s.enabled ? "ON" : "OFF", s.strength, s.scale, s.speed, s.coverage, s.softness));
+          c.print(TextFormat("CloudShadows: %s  strength=%.2f  scale=%.2f  speed=%.2f  evolve=%.2f  coverage=%.2f  softness=%.2f",
+                             s.enabled ? "ON" : "OFF", s.strength, s.scale, s.speed, s.evolve, s.coverage, s.softness));
         };
 
         auto parseOnOffToggle = [&](const std::string& v, bool cur, bool& out) -> bool {
@@ -3820,6 +3821,18 @@ void Game::setupDevConsole()
           return;
         }
 
+        if ((a0 == "evolve" || a0 == "morph") && args.size() >= 2) {
+          float v = 0.0f;
+          if (!parseF32(args[1], v)) {
+            c.print("Bad evolve value.");
+            return;
+          }
+          s.evolve = clamp01(v);
+          m_renderer.setCloudShadowSettings(s);
+          printStatus();
+          return;
+        }
+
         if ((a0 == "coverage" || a0 == "cover") && args.size() >= 2) {
           float v = 0.0f;
           if (!parseF32(args[1], v)) {
@@ -3850,6 +3863,7 @@ void Game::setupDevConsole()
         c.print("  cloud strength <0..1>");
         c.print("  cloud scale <0.25..8>");
         c.print("  cloud speed <0..3>");
+        c.print("  cloud evolve <0..1>");
         c.print("  cloud coverage <0..1>");
         c.print("  cloud softness <0..1>");
       });
@@ -5352,7 +5366,7 @@ void Game::adjustVideoSettings(int dir)
       showToast(TextFormat("%s: %.0f%%", label, v * 100.0f));
     };
 
-    // Row indices must match drawVideoSettingsPanel() Atmosphere page (0..17).
+    // Row indices must match drawVideoSettingsPanel() Atmosphere page (0..18).
     switch (m_videoSelection) {
       case 0:
         cs.enabled = !cs.enabled;
@@ -5379,84 +5393,90 @@ void Game::adjustVideoSettings(int dir)
       } break;
       case 4: {
         const float step = shift ? 0.10f : 0.03f;
+        cs.evolve = clamp01(cs.evolve + static_cast<float>(d) * step);
+        m_renderer.setCloudShadowSettings(cs);
+        toastPct("Shadow evolve", cs.evolve);
+      } break;
+      case 5: {
+        const float step = shift ? 0.10f : 0.03f;
         cs.coverage = clamp01(cs.coverage + static_cast<float>(d) * step);
         m_renderer.setCloudShadowSettings(cs);
         toastPct("Shadow coverage", cs.coverage);
       } break;
-      case 5: {
+      case 6: {
         const float step = shift ? 0.10f : 0.03f;
         cs.softness = clamp01(cs.softness + static_cast<float>(d) * step);
         m_renderer.setCloudShadowSettings(cs);
         toastPct("Shadow softness", cs.softness);
       } break;
-      case 6: {
+      case 7: {
         const float step = shift ? 0.10f : 0.05f;
         cs.clearAmount = clamp01(cs.clearAmount + static_cast<float>(d) * step);
         m_renderer.setCloudShadowSettings(cs);
         toastPct("Clear sky", cs.clearAmount);
       } break;
 
-      case 7:
+      case 8:
         vc.enabled = !vc.enabled;
         m_renderer.setVolumetricCloudSettings(vc);
         showToast(vc.enabled ? "Volumetric clouds: ON" : "Volumetric clouds: OFF");
         break;
-      case 8: {
+      case 9: {
         const float step = shift ? 0.10f : 0.03f;
         vc.opacity = clamp01(vc.opacity + static_cast<float>(d) * step);
         m_renderer.setVolumetricCloudSettings(vc);
         toastPct("Cloud opacity", vc.opacity);
       } break;
-      case 9: {
+      case 10: {
         const float step = shift ? 0.10f : 0.03f;
         vc.coverage = clamp01(vc.coverage + static_cast<float>(d) * step);
         m_renderer.setVolumetricCloudSettings(vc);
         toastPct("Cloud coverage", vc.coverage);
       } break;
-      case 10: {
+      case 11: {
         const float step = shift ? 0.25f : 0.05f;
         vc.density = std::clamp(vc.density + static_cast<float>(d) * step, 0.0f, 2.0f);
         m_renderer.setVolumetricCloudSettings(vc);
         showToast(TextFormat("Cloud density: %.2fx", vc.density));
       } break;
-      case 11: {
+      case 12: {
         const float step = shift ? 0.50f : 0.10f;
         vc.scale = std::clamp(vc.scale + static_cast<float>(d) * step, 0.25f, 8.0f);
         m_renderer.setVolumetricCloudSettings(vc);
         showToast(TextFormat("Cloud scale: %.2fx", vc.scale));
       } break;
-      case 12: {
+      case 13: {
         const float step = shift ? 0.50f : 0.10f;
         vc.speed = std::clamp(vc.speed + static_cast<float>(d) * step, 0.0f, 5.0f);
         m_renderer.setVolumetricCloudSettings(vc);
         showToast(TextFormat("Cloud speed: %.2fx", vc.speed));
       } break;
-      case 13: {
+      case 14: {
         const float step = shift ? 0.10f : 0.03f;
         vc.softness = clamp01(vc.softness + static_cast<float>(d) * step);
         m_renderer.setVolumetricCloudSettings(vc);
         toastPct("Cloud softness", vc.softness);
       } break;
-      case 14: {
+      case 15: {
         const int step = shift ? 4 : 2;
         vc.steps = std::clamp(vc.steps + d * step, 8, 64);
         m_renderer.setVolumetricCloudSettings(vc);
         showToast(TextFormat("Cloud steps: %d", vc.steps));
       } break;
-      case 15: {
+      case 16: {
         const float step = shift ? 0.10f : 0.03f;
         vc.bottomFade = clamp01(vc.bottomFade + static_cast<float>(d) * step);
         m_renderer.setVolumetricCloudSettings(vc);
         toastPct("Bottom fade", vc.bottomFade);
       } break;
-      case 16: {
+      case 17: {
         const float step = shift ? 0.10f : 0.05f;
         vc.clearAmount = clamp01(vc.clearAmount + static_cast<float>(d) * step);
         m_renderer.setVolumetricCloudSettings(vc);
         toastPct("Clear sky", vc.clearAmount);
       } break;
 
-      case 17:
+      case 18:
         m_renderer.setCloudShadowSettings(Renderer::CloudShadowSettings{});
         m_renderer.setVolumetricCloudSettings(Renderer::VolumetricCloudSettings{});
         showToast("Atmosphere: RESET");
@@ -5725,16 +5745,189 @@ void Game::adjustVideoSettings(int dir)
       showToast(TextFormat("Post FX: sharpen %.0f%%", m_postFx.sharpen * 100.0f));
     } break;
 
-    case 35:
+    case 35: {
+      m_postFx.taaEnabled = !m_postFx.taaEnabled;
+      if (m_postFx.taaEnabled) {
+        showToast(m_postFxPipeline.taaReady() ? "TAA: ON" : "TAA: ON (shader fallback)");
+      } else {
+        showToast("TAA: OFF");
+      }
+    } break;
+
+    case 36: {
+      const float step = shift ? 0.10f : 0.03f;
+      m_postFx.taaHistory = clamp01(m_postFx.taaHistory + (static_cast<float>(d) * step));
+      showToast(TextFormat("TAA history: %.0f%%", m_postFx.taaHistory * 100.0f));
+    } break;
+
+    case 37: {
+      const float step = shift ? 0.10f : 0.03f;
+      m_postFx.taaJitter = clamp01(m_postFx.taaJitter + (static_cast<float>(d) * step));
+      showToast(TextFormat("TAA jitter: %.0f%%", m_postFx.taaJitter * 100.0f));
+    } break;
+
+    case 38: {
+      const float step = shift ? 0.10f : 0.03f;
+      m_postFx.taaResponse = clamp01(m_postFx.taaResponse + (static_cast<float>(d) * step));
+      showToast(TextFormat("TAA response: %.0f%%", m_postFx.taaResponse * 100.0f));
+    } break;
+
+    case 39:
       m_postFx.includeWeather = !m_postFx.includeWeather;
       showToast(m_postFx.includeWeather ? "Post FX: include weather" : "Post FX: weather separate");
       break;
 
-    case 36:
+    case 40: {
+      const float step = shift ? 0.10f : 0.03f;
+      m_postFx.bloom = clamp01(m_postFx.bloom + (static_cast<float>(d) * step));
+      showToast(TextFormat("Bloom: %.0f%%", m_postFx.bloom * 100.0f));
+    } break;
+
+    case 41: {
+      const float step = shift ? 0.10f : 0.03f;
+      m_postFx.bloomThreshold = clamp01(m_postFx.bloomThreshold + (static_cast<float>(d) * step));
+      showToast(TextFormat("Bloom threshold: %.0f%%", m_postFx.bloomThreshold * 100.0f));
+    } break;
+
+    case 42: {
+      const float step = shift ? 0.50f : 0.10f;
+      m_postFx.bloomRadius = std::clamp(m_postFx.bloomRadius + (static_cast<float>(d) * step), 0.25f, 4.0f);
+      showToast(TextFormat("Bloom radius: %.2fx", m_postFx.bloomRadius));
+    } break;
+
+    case 43: {
+      const int opts[] = {1, 2, 4, 8};
+      int idx = 2; // default (4x)
+      for (int i = 0; i < 4; ++i) {
+        if (opts[i] == m_postFx.bloomDownsample) {
+          idx = i;
+          break;
+        }
+      }
+
+      idx = std::clamp(idx + d, 0, 3);
+      m_postFx.bloomDownsample = opts[idx];
+      showToast(TextFormat("Bloom downsample: %dx", m_postFx.bloomDownsample));
+    } break;
+
+    case 44: {
+      m_postFx.tonemapEnabled = !m_postFx.tonemapEnabled;
+      showToast(m_postFx.tonemapEnabled ? "Tonemap: ON" : "Tonemap: OFF");
+    } break;
+
+    case 45: {
+      const float step = shift ? 0.25f : 0.05f;
+      m_postFx.exposure = std::clamp(m_postFx.exposure + (static_cast<float>(d) * step), 0.0f, 4.0f);
+      showToast(TextFormat("Exposure: %.2fx", m_postFx.exposure));
+    } break;
+
+    case 46: {
+      const float step = shift ? 0.25f : 0.05f;
+      m_postFx.contrast = std::clamp(m_postFx.contrast + (static_cast<float>(d) * step), 0.0f, 2.0f);
+      showToast(TextFormat("Contrast: %.2fx", m_postFx.contrast));
+    } break;
+
+    case 47: {
+      const float step = shift ? 0.25f : 0.05f;
+      m_postFx.saturation = std::clamp(m_postFx.saturation + (static_cast<float>(d) * step), 0.0f, 2.0f);
+      showToast(TextFormat("Saturation: %.2fx", m_postFx.saturation));
+    } break;
+
+    case 48: {
+      const float step = shift ? 0.10f : 0.03f;
+      m_postFx.outline = clamp01(m_postFx.outline + (static_cast<float>(d) * step));
+      showToast(TextFormat("Outlines: %.0f%%", m_postFx.outline * 100.0f));
+    } break;
+
+    case 49: {
+      const float step = shift ? 0.10f : 0.03f;
+      m_postFx.outlineThreshold = clamp01(m_postFx.outlineThreshold + (static_cast<float>(d) * step));
+      showToast(TextFormat("Outline threshold: %.0f%%", m_postFx.outlineThreshold * 100.0f));
+    } break;
+
+    case 50: {
+      const float step = shift ? 0.50f : 0.10f;
+      m_postFx.outlineThickness = std::clamp(m_postFx.outlineThickness + (static_cast<float>(d) * step), 0.5f, 4.0f);
+      showToast(TextFormat("Outline thickness: %.2f px", m_postFx.outlineThickness));
+    } break;
+
+    // Lens precipitation (rain on lens / wet camera)
+    case 51: {
+      const float step = shift ? 0.10f : 0.03f;
+      m_postFx.lensWeather = clamp01(m_postFx.lensWeather + (static_cast<float>(d) * step));
+      showToast(TextFormat("Lens rain: %.0f%%", m_postFx.lensWeather * 100.0f));
+    } break;
+
+    case 52: {
+      const float step = shift ? 0.10f : 0.03f;
+      m_postFx.lensDistort = clamp01(m_postFx.lensDistort + (static_cast<float>(d) * step));
+      showToast(TextFormat("Lens distort: %.0f%%", m_postFx.lensDistort * 100.0f));
+    } break;
+
+    case 53: {
+      const float step = shift ? 0.25f : 0.05f;
+      m_postFx.lensScale = std::clamp(m_postFx.lensScale + (static_cast<float>(d) * step), 0.5f, 2.0f);
+      showToast(TextFormat("Lens scale: %.2fx", m_postFx.lensScale));
+    } break;
+
+    case 54: {
+      const float step = shift ? 0.10f : 0.03f;
+      m_postFx.lensDrips = clamp01(m_postFx.lensDrips + (static_cast<float>(d) * step));
+      showToast(TextFormat("Lens drips: %.0f%%", m_postFx.lensDrips * 100.0f));
+    } break;
+
+    case 55:
       m_postFx = PostFxSettings{};
+      // Reset any in-flight temporal history.
+      m_taaActiveLastFrame = false;
+      m_taaPrevCamValid = false;
+      m_taaFrameIndex = 0;
       showToast("Post FX: RESET");
       if (!wantsWorldRenderTarget()) unloadWorldRenderTarget();
       break;
+
+    case 56: {
+      // Cycle procedural gfx palette theme.
+      constexpr GfxTheme kThemes[] = {
+        GfxTheme::Classic,
+        GfxTheme::Autumn,
+        GfxTheme::Desert,
+        GfxTheme::Noir,
+        GfxTheme::Neon,
+        GfxTheme::Pastel,
+        GfxTheme::SpaceColony,
+      };
+
+      const int n = static_cast<int>(sizeof(kThemes) / sizeof(kThemes[0]));
+      const GfxTheme cur = m_renderer.gfxTheme();
+      int idx = 0;
+      for (int i = 0; i < n; ++i) {
+        if (kThemes[i] == cur) {
+          idx = i;
+          break;
+        }
+      }
+
+      const int step = (dir >= 0) ? 1 : -1;
+      const int nextIdx = (idx + step + n) % n;
+      const GfxTheme next = kThemes[nextIdx];
+
+      m_renderer.setGfxTheme(next);      auto themeLabel = [](GfxTheme t) -> const char* {
+        switch (t) {
+          case GfxTheme::Classic: return "Classic";
+          case GfxTheme::Autumn: return "Autumn";
+          case GfxTheme::Desert: return "Desert";
+          case GfxTheme::Noir: return "Noir";
+          case GfxTheme::Neon: return "Neon";
+          case GfxTheme::Pastel: return "Pastel";
+          case GfxTheme::SpaceColony: return "Space Colony";
+          default: return "Classic";
+        }
+      };
+
+      showToast(TextFormat("Gfx theme: %s", themeLabel(next)));
+      break;
+    }
 
     default:
       break;
@@ -5852,6 +6045,7 @@ VisualPrefs Game::captureVisualPrefs() const
   p.shadows = m_renderer.shadowSettings();
   p.dayNight = m_renderer.dayNightSettings();
   p.weather = m_renderer.weatherSettings();
+  p.materialFx = m_renderer.materialFxSettings();
   p.cloudShadows = m_renderer.cloudShadowSettings();
   p.volumetricClouds = m_renderer.volumetricCloudSettings();
 
@@ -5920,6 +6114,28 @@ void Game::applyVisualPrefs(const VisualPrefs& prefs)
   m_postFx.fxaa = std::clamp(m_postFx.fxaa, 0.0f, 1.0f);
   m_postFx.sharpen = std::clamp(m_postFx.sharpen, 0.0f, 1.0f);
 
+  // Filmic tonemap / grade (safe clamps, even if the effect is disabled).
+  m_postFx.exposure = std::clamp(m_postFx.exposure, 0.0f, 4.0f);
+  m_postFx.contrast = std::clamp(m_postFx.contrast, 0.0f, 2.0f);
+  m_postFx.saturation = std::clamp(m_postFx.saturation, 0.0f, 2.0f);
+
+  // Screen-space outlines.
+  m_postFx.outline = std::clamp(m_postFx.outline, 0.0f, 1.0f);
+  m_postFx.outlineThreshold = std::clamp(m_postFx.outlineThreshold, 0.0f, 1.0f);
+  m_postFx.outlineThickness = std::clamp(m_postFx.outlineThickness, 0.5f, 4.0f);
+
+  // Temporal AA.
+  m_postFx.taaHistory = std::clamp(m_postFx.taaHistory, 0.0f, 0.98f);
+  m_postFx.taaJitter = std::clamp(m_postFx.taaJitter, 0.0f, 1.0f);
+  m_postFx.taaResponse = std::clamp(m_postFx.taaResponse, 0.0f, 1.0f);
+
+  // Bloom.
+  m_postFx.bloom = std::clamp(m_postFx.bloom, 0.0f, 1.0f);
+  m_postFx.bloomThreshold = std::clamp(m_postFx.bloomThreshold, 0.0f, 1.0f);
+  m_postFx.bloomKnee = std::clamp(m_postFx.bloomKnee, 0.0f, 1.0f);
+  m_postFx.bloomRadius = std::clamp(m_postFx.bloomRadius, 0.25f, 4.0f);
+  m_postFx.bloomDownsample = std::clamp(m_postFx.bloomDownsample, 1, 8);
+
 
   if (m_worldRenderScaleAuto) {
     m_worldRenderScale = std::clamp(m_worldRenderScale, m_worldRenderScaleMin, m_worldRenderScaleMax);
@@ -5956,6 +6172,7 @@ void Game::applyVisualPrefs(const VisualPrefs& prefs)
   m_renderer.setShadowSettings(prefs.shadows);
   m_renderer.setDayNightSettings(prefs.dayNight);
   m_renderer.setWeatherSettings(prefs.weather);
+  m_renderer.setMaterialFxSettings(prefs.materialFx);
   m_renderer.setCloudShadowSettings(prefs.cloudShadows);
   m_renderer.setVolumetricCloudSettings(prefs.volumetricClouds);
 
@@ -12452,8 +12669,8 @@ void Game::handleInput(float dt)
       m_roadUpgradeSelection = (m_roadUpgradeSelection + delta + count) % count;
     } else if (m_showVideoSettings) {
       const int count = (m_videoPage == 0)   ? 11
-                        : (m_videoPage == 1) ? 37
-                        : (m_videoPage == 2) ? 18
+                        : (m_videoPage == 1) ? 57
+                        : (m_videoPage == 2) ? 19
                                              : 11;
       m_videoSelection = (m_videoSelection + delta + count) % count;
       if (m_videoPage == 0) m_videoSelectionDisplay = m_videoSelection;
@@ -14313,8 +14530,8 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
   const int panelW = std::max(std::min(panelMaxW, availW), std::min(panelMinW, availW));
   const int rowH = 22;
   const int rows = (m_videoPage == 0)   ? 11
-                   : (m_videoPage == 1) ? 37
-                   : (m_videoPage == 2) ? 18
+                   : (m_videoPage == 1) ? 57
+                   : (m_videoPage == 2) ? 19
                                         : 11;
   const int panelH = 64 + rows * rowH + 28;
 
@@ -14419,6 +14636,19 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
       }
     };
 
+    auto gfxThemeStr = [](GfxTheme t) -> const char* {
+      switch (t) {
+        case GfxTheme::Classic: return "Classic";
+        case GfxTheme::Autumn: return "Autumn";
+        case GfxTheme::Desert: return "Desert";
+        case GfxTheme::Noir: return "Noir";
+        case GfxTheme::Neon: return "Neon";
+        case GfxTheme::Pastel: return "Pastel";
+        case GfxTheme::SpaceColony: return "Space Colony";
+        default: return "Classic";
+      }
+    };
+
     drawRow(0, "Render cache (banded)", onOff(m_renderer.baseCacheEnabled()));
 
     drawRow(1, "Layer: Terrain", onOff(m_renderer.layerEnabled(Renderer::RenderLayer::Terrain)));
@@ -14464,8 +14694,51 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
     drawRow(32, "Scanlines", TextFormat("%.0f%%", m_postFx.scanlines * 100.0f), !m_postFx.enabled);
     drawRow(33, "FXAA", TextFormat("%.0f%%", m_postFx.fxaa * 100.0f), !m_postFx.enabled);
     drawRow(34, "Sharpen", TextFormat("%.0f%%", m_postFx.sharpen * 100.0f), !m_postFx.enabled);
-    drawRow(35, "Include weather", onOff(m_postFx.includeWeather), !m_postFx.enabled);
-    drawRow(36, "Reset Post FX", "Click / ]");
+
+    const char* taaStatus =
+      (!m_postFx.taaEnabled) ? "Off" : (m_postFxPipeline.taaReady() ? "On" : "On (fallback)");
+    drawRow(35, "Temporal AA", taaStatus, !m_postFx.enabled);
+    drawRow(36, "TAA stability", TextFormat("%.0f%%", m_postFx.taaHistory * 100.0f),
+            (!m_postFx.enabled || !m_postFx.taaEnabled));
+    drawRow(37, "TAA jitter", TextFormat("%.0f%%", m_postFx.taaJitter * 100.0f),
+            (!m_postFx.enabled || !m_postFx.taaEnabled));
+    drawRow(38, "TAA response", TextFormat("%.0f%%", m_postFx.taaResponse * 100.0f),
+            (!m_postFx.enabled || !m_postFx.taaEnabled));
+
+    drawRow(39, "Include weather", onOff(m_postFx.includeWeather), !m_postFx.enabled);
+    drawRow(40, "Bloom", TextFormat("%.0f%%", m_postFx.bloom * 100.0f), !m_postFx.enabled);
+    drawRow(41, "Bloom threshold", TextFormat("%.0f%%", m_postFx.bloomThreshold * 100.0f), !m_postFx.enabled);
+    drawRow(42, "Bloom radius", TextFormat("%.2fx", m_postFx.bloomRadius), !m_postFx.enabled);
+    drawRow(43, "Bloom downsample", TextFormat("%dx", m_postFx.bloomDownsample), !m_postFx.enabled);
+
+    // Filmic tonemap + grade
+    drawRow(44, "Filmic tonemap", onOff(m_postFx.tonemapEnabled), !m_postFx.enabled);
+    drawRow(45, "Exposure", TextFormat("%.2fx", m_postFx.exposure),
+            (!m_postFx.enabled || !m_postFx.tonemapEnabled));
+    drawRow(46, "Contrast", TextFormat("%.2fx", m_postFx.contrast),
+            (!m_postFx.enabled || !m_postFx.tonemapEnabled));
+    drawRow(47, "Saturation", TextFormat("%.2fx", m_postFx.saturation),
+            (!m_postFx.enabled || !m_postFx.tonemapEnabled));
+
+    // Screen-space outlines
+    drawRow(48, "Outlines", TextFormat("%.0f%%", m_postFx.outline * 100.0f), !m_postFx.enabled);
+    drawRow(49, "Outline threshold", TextFormat("%.0f%%", m_postFx.outlineThreshold * 100.0f),
+            (!m_postFx.enabled || m_postFx.outline < 0.001f));
+    drawRow(50, "Outline thickness", TextFormat("%.2f px", m_postFx.outlineThickness),
+            (!m_postFx.enabled || m_postFx.outline < 0.001f));
+
+    // Lens precipitation (rain on lens / wet camera)
+    drawRow(51, "Lens rain", TextFormat("%.0f%%", m_postFx.lensWeather * 100.0f), !m_postFx.enabled);
+    drawRow(52, "Lens distort", TextFormat("%.0f%%", m_postFx.lensDistort * 100.0f),
+            (!m_postFx.enabled || m_postFx.lensWeather < 0.001f));
+    drawRow(53, "Lens scale", TextFormat("%.2fx", m_postFx.lensScale),
+            (!m_postFx.enabled || m_postFx.lensWeather < 0.001f));
+    drawRow(54, "Lens drips", TextFormat("%.0f%%", m_postFx.lensDrips * 100.0f),
+            (!m_postFx.enabled || m_postFx.lensWeather < 0.001f));
+
+    drawRow(55, "Reset Post FX", "Click / ]");
+
+    drawRow(56, "Gfx theme", gfxThemeStr(m_renderer.gfxTheme()));
   } else if (m_videoPage == 2) {
     // ----------------------------
     // Atmosphere page
@@ -14542,33 +14815,34 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
       rowY += rowH;
     };
 
-    // Row indices must match adjustVideoSettings() Atmosphere page cases (0..17).
+    // Row indices must match adjustVideoSettings() Atmosphere page cases (0..18).
     drawToggleRow(0, "Cloud shadows", cs.enabled, onOff(cs.enabled));
     drawSliderRow(1, "Shadow strength", cs.strength, 0.0f, 1.0f, TextFormat("%.0f%%", cs.strength * 100.0f), cs.enabled);
     drawSliderRow(2, "Shadow scale", cs.scale, 0.25f, 8.0f, TextFormat("%.2fx", cs.scale), cs.enabled);
     drawSliderRow(3, "Shadow speed", cs.speed, 0.0f, 5.0f, TextFormat("%.2fx", cs.speed), cs.enabled);
-    drawSliderRow(4, "Shadow coverage", cs.coverage, 0.0f, 1.0f, TextFormat("%.0f%%", cs.coverage * 100.0f), cs.enabled);
-    drawSliderRow(5, "Shadow softness", cs.softness, 0.0f, 1.0f, TextFormat("%.0f%%", cs.softness * 100.0f), cs.enabled);
-    drawSliderRow(6, "Clear sky", cs.clearAmount, 0.0f, 1.0f, TextFormat("%.0f%%", cs.clearAmount * 100.0f), cs.enabled);
+    drawSliderRow(4, "Shadow evolve", cs.evolve, 0.0f, 1.0f, TextFormat("%.0f%%", cs.evolve * 100.0f), cs.enabled);
+    drawSliderRow(5, "Shadow coverage", cs.coverage, 0.0f, 1.0f, TextFormat("%.0f%%", cs.coverage * 100.0f), cs.enabled);
+    drawSliderRow(6, "Shadow softness", cs.softness, 0.0f, 1.0f, TextFormat("%.0f%%", cs.softness * 100.0f), cs.enabled);
+    drawSliderRow(7, "Clear sky", cs.clearAmount, 0.0f, 1.0f, TextFormat("%.0f%%", cs.clearAmount * 100.0f), cs.enabled);
 
-    drawToggleRow(7, "Volumetric clouds", vc.enabled, onOff(vc.enabled));
-    drawSliderRow(8, "Cloud opacity", vc.opacity, 0.0f, 1.0f, TextFormat("%.0f%%", vc.opacity * 100.0f), vc.enabled);
-    drawSliderRow(9, "Cloud coverage", vc.coverage, 0.0f, 1.0f, TextFormat("%.0f%%", vc.coverage * 100.0f), vc.enabled);
-    drawSliderRow(10, "Cloud density", vc.density, 0.0f, 2.0f, TextFormat("%.2fx", vc.density), vc.enabled);
-    drawSliderRow(11, "Cloud scale", vc.scale, 0.25f, 8.0f, TextFormat("%.2fx", vc.scale), vc.enabled);
-    drawSliderRow(12, "Cloud speed", vc.speed, 0.0f, 5.0f, TextFormat("%.2fx", vc.speed), vc.enabled);
-    drawSliderRow(13, "Cloud softness", vc.softness, 0.0f, 1.0f, TextFormat("%.0f%%", vc.softness * 100.0f), vc.enabled);
+    drawToggleRow(8, "Volumetric clouds", vc.enabled, onOff(vc.enabled));
+    drawSliderRow(9, "Cloud opacity", vc.opacity, 0.0f, 1.0f, TextFormat("%.0f%%", vc.opacity * 100.0f), vc.enabled);
+    drawSliderRow(10, "Cloud coverage", vc.coverage, 0.0f, 1.0f, TextFormat("%.0f%%", vc.coverage * 100.0f), vc.enabled);
+    drawSliderRow(11, "Cloud density", vc.density, 0.0f, 2.0f, TextFormat("%.2fx", vc.density), vc.enabled);
+    drawSliderRow(12, "Cloud scale", vc.scale, 0.25f, 8.0f, TextFormat("%.2fx", vc.scale), vc.enabled);
+    drawSliderRow(13, "Cloud speed", vc.speed, 0.0f, 5.0f, TextFormat("%.2fx", vc.speed), vc.enabled);
+    drawSliderRow(14, "Cloud softness", vc.softness, 0.0f, 1.0f, TextFormat("%.0f%%", vc.softness * 100.0f), vc.enabled);
     {
       float stepsF = static_cast<float>(vc.steps);
-      drawSliderRow(14, "Cloud steps", stepsF, 8.0f, 64.0f, TextFormat("%d", vc.steps), vc.enabled);
+      drawSliderRow(15, "Cloud steps", stepsF, 8.0f, 64.0f, TextFormat("%d", vc.steps), vc.enabled);
       vc.steps = std::clamp(static_cast<int>(std::lround(stepsF)), 8, 64);
     }
-    drawSliderRow(15, "Bottom fade", vc.bottomFade, 0.0f, 1.0f, TextFormat("%.0f%%", vc.bottomFade * 100.0f), vc.enabled);
-    drawSliderRow(16, "Clear sky", vc.clearAmount, 0.0f, 1.0f, TextFormat("%.0f%%", vc.clearAmount * 100.0f), vc.enabled);
+    drawSliderRow(16, "Bottom fade", vc.bottomFade, 0.0f, 1.0f, TextFormat("%.0f%%", vc.bottomFade * 100.0f), vc.enabled);
+    drawSliderRow(17, "Clear sky", vc.clearAmount, 0.0f, 1.0f, TextFormat("%.0f%%", vc.clearAmount * 100.0f), vc.enabled);
 
     // Reset row (clickable).
     {
-      const int idx = 17;
+      const int idx = 18;
       const bool selected = (m_videoSelection == idx);
       const Rectangle rr = rowRectFor(rowY);
       if (selected) {
@@ -14755,13 +15029,54 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
 
 
 
+static void DrawSpaceBackground(int screenW, int screenH, std::uint64_t seed, float t)
+{
+  // Deep-space gradient base.
+  ClearBackground(Color{5, 6, 10, 255});
+  DrawRectangleGradientV(0, 0, screenW, screenH, Color{12, 14, 24, 255}, Color{0, 0, 0, 255});
+
+  // A faint planet/moon disk to give depth.
+  const int r = static_cast<int>(0.18f * static_cast<float>(std::min(screenW, screenH)));
+  const int cx = static_cast<int>(0.82f * static_cast<float>(screenW));
+  const int cy = static_cast<int>(0.22f * static_cast<float>(screenH));
+  DrawCircleGradient(cx, cy, static_cast<float>(r), Color{80, 86, 96, 255}, Color{30, 34, 40, 255});
+  DrawCircle(cx + static_cast<int>(r * 0.22f), cy + static_cast<int>(r * 0.16f), static_cast<float>(r) * 0.98f, Color{0, 0, 0, 115});
+
+  // Procedural stars (deterministic per world seed, subtly twinkling).
+  const int target = std::clamp((screenW * screenH) / 9000, 120, 420);
+  RNG rng(seed ^ 0x51A7F11Eull);
+  for (int i = 0; i < target; ++i) {
+    const int x = static_cast<int>(rng.uniform01() * static_cast<float>(screenW));
+    const int y = static_cast<int>(rng.uniform01() * static_cast<float>(screenH));
+
+    // Slight tint variety.
+    const float tint = rng.uniform01();
+    const unsigned char rC = static_cast<unsigned char>(std::clamp(235.0f + 20.0f * tint, 0.0f, 255.0f));
+    const unsigned char gC = static_cast<unsigned char>(std::clamp(235.0f + 10.0f * (1.0f - tint), 0.0f, 255.0f));
+    const unsigned char bC = static_cast<unsigned char>(std::clamp(240.0f + 25.0f * (1.0f - tint), 0.0f, 255.0f));
+
+    // Twinkle.
+    const float freq = 0.35f + 1.75f * rng.uniform01();
+    const float phase = rng.uniform01() * 6.2831853f;
+    const float tw = 0.55f + 0.45f * std::sin(t * freq + phase);
+    const unsigned char a = static_cast<unsigned char>(std::clamp(60.0f + 190.0f * tw, 0.0f, 255.0f));
+
+    const int size = ((rng.nextU32() & 0x7u) == 0u) ? 2 : 1;
+    DrawRectangle(x, y, size, size, Color{rC, gC, bC, a});
+  }
+}
+
 void Game::draw()
 {
   BeginDrawing();
-  ClearBackground(Color{30, 32, 38, 255});
 
   const int screenW = GetScreenWidth();
   const int screenH = GetScreenHeight();
+  if (m_renderer.gfxTheme() == GfxTheme::SpaceColony) {
+    DrawSpaceBackground(screenW, screenH, m_world.seed(), static_cast<float>(GetTime()));
+  } else {
+    ClearBackground(Color{30, 32, 38, 255});
+  }
   const float uiScale = m_uiScale;
   const int uiW = static_cast<int>(std::round(static_cast<float>(screenW) / uiScale));
   const int uiH = static_cast<int>(std::round(static_cast<float>(screenH) / uiScale));
@@ -15062,10 +15377,74 @@ void Game::draw()
   if (!wantsWorldRenderTarget() || !m_worldRenderRTValid) {
     drawWorldDirect();
   } else {
+    Vector2 taaJitterPx{0.0f, 0.0f};
+    bool taaResetHistory = false;
+
     Camera2D camRT = m_camera;
     camRT.zoom = m_camera.zoom * m_worldRenderScale;
     camRT.offset.x = m_camera.offset.x * m_worldRenderScale;
     camRT.offset.y = m_camera.offset.y * m_worldRenderScale;
+
+    const Camera2D camRTBase = camRT;
+
+    const bool taaActive = m_postFx.enabled && m_postFx.taaEnabled && m_postFxPipeline.taaReady();
+
+    if (taaActive) {
+      auto camDifferent = [](const Camera2D& a, const Camera2D& b) -> bool {
+        const float epsPos = 1e-3f;
+        const float epsZoom = 1e-6f;
+        const float epsRot = 1e-3f;
+        return std::abs(a.target.x - b.target.x) > epsPos || std::abs(a.target.y - b.target.y) > epsPos ||
+               std::abs(a.offset.x - b.offset.x) > epsPos || std::abs(a.offset.y - b.offset.y) > epsPos ||
+               std::abs(a.zoom - b.zoom) > epsZoom || std::abs(a.rotation - b.rotation) > epsRot;
+      };
+
+      bool forceReset = (!m_taaActiveLastFrame || !m_taaPrevCamValid);
+      if (!forceReset && camDifferent(camRTBase, m_taaPrevCam)) forceReset = true;
+      if (!forceReset && (m_taaPrevRTW != m_worldRenderRTWidth || m_taaPrevRTH != m_worldRenderRTHeight)) forceReset = true;
+
+      if (forceReset) {
+        taaResetHistory = true;
+        taaJitterPx = Vector2{0.0f, 0.0f};
+        m_taaFrameIndex = 0;
+      } else {
+        auto halton = [](int index, int base) -> float {
+          float f = 1.0f;
+          float r = 0.0f;
+          int i = index;
+          while (i > 0) {
+            f /= static_cast<float>(base);
+            r += f * static_cast<float>(i % base);
+            i /= base;
+          }
+          return r;
+        };
+
+        const float jitterAmp = std::clamp(m_postFx.taaJitter, 0.0f, 1.0f);
+        const int idx = m_taaFrameIndex + 1;
+        taaJitterPx.x = (halton(idx, 2) - 0.5f) * jitterAmp;
+        taaJitterPx.y = (halton(idx, 3) - 0.5f) * jitterAmp;
+
+        m_taaFrameIndex = (m_taaFrameIndex + 1) % 1024;
+      }
+
+      // Apply jitter in world-RT pixel units. (PostFxPipeline cancels it in the TAA resolve shader.)
+      camRT.offset.x += taaJitterPx.x;
+      camRT.offset.y += taaJitterPx.y;
+
+      // Update prev-state using the *unjittered* camera.
+      m_taaPrevCam = camRTBase;
+      m_taaPrevCamValid = true;
+      m_taaPrevWorldRenderScale = m_worldRenderScale;
+      m_taaPrevRTW = m_worldRenderRTWidth;
+      m_taaPrevRTH = m_worldRenderRTHeight;
+      m_taaActiveLastFrame = true;
+    } else {
+      // If TAA isn't active, clear state so enabling it triggers a reset.
+      m_taaActiveLastFrame = false;
+      m_taaPrevCamValid = false;
+      m_taaFrameIndex = 0;
+    }
 
     BeginTextureMode(m_worldRenderRT);
     ClearBackground(Color{30, 32, 38, 255});
@@ -15098,9 +15477,41 @@ void Game::draw()
                            -static_cast<float>(m_worldRenderRTHeight)};
     const Rectangle dst = {0.0f, 0.0f, static_cast<float>(screenW), static_cast<float>(screenH)};
 
-    if (m_postFx.enabled && m_postFxPipeline.isReady()) {
-      m_postFxPipeline.drawTexture(
-          m_worldRenderRT.texture, src, dst, m_postFx, m_timeSec, static_cast<std::uint32_t>(m_world.seed()));
+    if (m_postFx.enabled) {
+      // Feed weather uniforms to the PostFX shader so lens precipitation (rain on lens)
+      // can automatically track current conditions.
+      const auto wx = m_renderer.weatherSettings();
+      const int wxMode = static_cast<int>(wx.mode);
+      const float wxIntensity = wx.intensity;
+
+      // Convert deg -> direction; normalize and bias slightly "down" (y+) so the shader
+      // stays stable across all camera orientations.
+      const float wxAngRad = wx.windAngleDeg * (3.14159265358979323846f / 180.0f);
+      Vector2 wxWindDir{std::cos(wxAngRad), std::sin(wxAngRad)};
+      {
+        const float l2 = wxWindDir.x * wxWindDir.x + wxWindDir.y * wxWindDir.y;
+        if (l2 > 1.0e-6f) {
+          const float inv = 1.0f / std::sqrt(l2);
+          wxWindDir.x *= inv;
+          wxWindDir.y *= inv;
+        } else {
+          wxWindDir = Vector2{0.0f, 1.0f};
+        }
+        if (wxWindDir.y < 0.15f) wxWindDir.y = 0.15f;
+        const float l3 = wxWindDir.x * wxWindDir.x + wxWindDir.y * wxWindDir.y;
+        if (l3 > 1.0e-6f) {
+          const float inv = 1.0f / std::sqrt(l3);
+          wxWindDir.x *= inv;
+          wxWindDir.y *= inv;
+        }
+      }
+      const float wxWindSpeed = wx.windSpeed;
+
+      m_postFxPipeline.drawTexturePro(
+          m_worldRenderRT.texture, src, dst, m_postFx, m_timeSec, static_cast<std::uint32_t>(m_world.seed()), WHITE,
+          taaJitterPx, taaResetHistory,
+          wxMode, wxIntensity,
+          wxWindDir, wxWindSpeed);
     } else {
       DrawTexturePro(m_worldRenderRT.texture, src, dst, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
     }

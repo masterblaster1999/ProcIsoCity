@@ -63,6 +63,9 @@ struct VisualPrefs {
   // --- World visuals ---
   bool mergedZoneBuildings = true;
 
+  // Procedural palette theme for the custom graphics engine (terrain, roads, overlays, sprites).
+  GfxTheme gfxTheme = GfxTheme::Classic;
+
   // --- Renderer toggles ---
   bool baseCacheEnabled = true;
   std::uint32_t layerMask = Renderer::kLayerAll;
@@ -70,6 +73,9 @@ struct VisualPrefs {
   Renderer::ShadowSettings shadows{};
   Renderer::DayNightSettings dayNight{};
   Renderer::WeatherSettings weather{};
+
+  // Procedural material animation (optional, visual-only).
+  Renderer::MaterialFxSettings materialFx{};
 
   // Atmospheric ambience (optional). These are visual-only and do not affect simulation.
   Renderer::CloudShadowSettings cloudShadows{};

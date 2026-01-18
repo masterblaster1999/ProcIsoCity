@@ -3,6 +3,7 @@
 #include "isocity/Iso.hpp"
 #include "isocity/World.hpp"
 #include "isocity/ZoneParcels.hpp"
+#include "isocity/GfxPalette.hpp"
 
 #include <array>
 #include <cstdint>
@@ -161,6 +162,46 @@ public:
     bool reflectLights = true;
   };
 
+
+  // World-space material animation (procedural water ripples, vegetation flutter, shoreline foam).
+  //
+  // Implemented as a lightweight shader applied to cached terrain bands. A per-band mask render
+  // texture encodes where the effect should apply (R=water, G=vegetation, B=shore sand).
+  struct MaterialFxSettings {
+    bool enabled = true;
+
+    // World-space feature size multiplier (higher => larger waves/patches).
+    float scale = 1.0f;
+
+    // 0..2 strength of water UV distortion.
+    float waterStrength = 0.75f;
+
+    // UV distortion amount in pixels (scaled by u_texelSize in shader).
+    float waterDistortPx = 1.0f;
+
+    // 0..2 sparkle highlight intensity on water.
+    float waterSparkle = 0.35f;
+
+    // 0..2 shoreline foam intensity.
+    float foamStrength = 0.45f;
+
+    // Foam sample radius in pixels (higher => thicker foam band).
+    float foamWidthPx = 2.0f;
+
+    // 0..2 water caustics intensity.
+    float causticsStrength = 0.25f;
+
+    // 0..2 vegetation flutter intensity.
+    float vegetationStrength = 0.25f;
+
+    // 0..2 wet sand darkening + sparkle along shore.
+    float wetSandStrength = 0.35f;
+
+    // Wet-sand sample radius in pixels (higher => wider wet band).
+    float wetSandWidthPx = 3.0f;
+  };
+
+
   // Soft, large-scale cloud shadow mask rendered in world space (purely procedural).
   //
   // This is separate from ShadowSettings (building-cast shadows) and is intended to add
@@ -182,6 +223,12 @@ public:
 
     // 0..1 edge softness (higher => blurrier edges).
     float softness = 0.70f;
+
+    // 0..1 how quickly the cloud mask morphs internally over time.
+    //
+    // This is separate from speed (translation driven by wind) and helps the cloud
+    // shadows feel alive even when wind is low.
+    float evolve = 0.18f;
 
     // 0..1 baseline cloudiness used when the weather mode is Clear.
     //
@@ -323,6 +370,10 @@ public:
   // (Useful when iterating on custom GLSL files.)
   void reloadShaderOverrides();
 
+  // Graphics palette theme (affects procedural terrain/roads/overlays + sprites).
+  void setGfxTheme(GfxTheme t);
+  GfxTheme gfxTheme() const { return m_gfxTheme; }
+
   void setElevationSettings(const ElevationSettings& s)
   {
     m_elev = s;
@@ -370,6 +421,13 @@ public:
   void setWeatherMode(WeatherSettings::Mode mode) { m_weather.mode = mode; }
   WeatherSettings::Mode weatherMode() const { return m_weather.mode; }
   bool weatherEnabled() const { return m_weather.mode != WeatherSettings::Mode::Clear; }
+
+
+  // Procedural material animation controls (shader-based).
+  void setMaterialFxSettings(const MaterialFxSettings& s) { m_materialFx = s; }
+  const MaterialFxSettings& materialFxSettings() const { return m_materialFx; }
+  bool materialFxEnabled() const { return m_materialFx.enabled; }
+
 
   // Procedural animated "organic material" overlay (reaction-diffusion texture).
   void setOrganicMaterialSettings(const OrganicMaterial::Settings& s) { m_organicSettings = s; }
@@ -479,6 +537,42 @@ private:
 
   WeatherSettings m_weather{};
 
+  // Shader resources for screen-space weather particles (procedural rain/snow).
+  Shader m_weatherFxShader{};
+  bool m_weatherFxShaderFailed = false;
+
+  int m_weatherFxLocResolution = -1;
+  int m_weatherFxLocTime = -1;
+  int m_weatherFxLocSeed = -1;
+  int m_weatherFxLocMode = -1;
+  int m_weatherFxLocIntensity = -1;
+  int m_weatherFxLocWindDir = -1;
+  int m_weatherFxLocWindSpeed = -1;
+  int m_weatherFxLocDay = -1;
+
+  MaterialFxSettings m_materialFx{};
+
+  // Shader resources for MaterialFx (procedural water/vegetation animation).
+  Shader m_materialFxShader{};
+  bool m_materialFxShaderFailed = false;
+
+  int m_materialFxLocTime = -1;
+  int m_materialFxLocWindDir = -1;
+  int m_materialFxLocWindSpeed = -1;
+  int m_materialFxLocTexelSize = -1;
+  int m_materialFxLocFreq = -1;
+  int m_materialFxLocSeed = -1;
+  int m_materialFxLocWaterStrength = -1;
+  int m_materialFxLocWaterDistortPx = -1;
+  int m_materialFxLocWaterSparkle = -1;
+  int m_materialFxLocFoamStrength = -1;
+  int m_materialFxLocFoamWidthPx = -1;
+  int m_materialFxLocCausticsStrength = -1;
+  int m_materialFxLocWetSandStrength = -1;
+  int m_materialFxLocWetSandWidthPx = -1;
+  int m_materialFxLocVegStrength = -1;
+  int m_materialFxLocMaterialMask = -1;
+
   // Animated reaction-diffusion "organic material" overlay.
   OrganicMaterial m_organicMaterial{};
   OrganicMaterial::Settings m_organicSettings{};
@@ -487,6 +581,21 @@ private:
 
   CloudShadowSettings m_cloudShadows{};
   Texture2D m_cloudShadowTex{};
+
+  // Optional GPU-driven evolving cloud shadow mask.
+  //
+  // When the cloudmask shader is available, we render a small tileable mask into a
+  // RenderTexture2D and repeat it across the world. This keeps the mask asset-free
+  // while allowing slow internal evolution (not just translation).
+  RenderTexture2D m_cloudMaskRT{};
+  Shader m_cloudMaskShader{};
+  bool m_cloudMaskShaderFailed = false;
+  int m_cloudMaskLocTime = -1;
+  int m_cloudMaskLocSeed = -1;
+  int m_cloudMaskLocCoverage = -1;
+  int m_cloudMaskLocSoftness = -1;
+  int m_cloudMaskLocEvolve = -1;
+  float m_cloudMaskLastUpdateSec = -1000.0f;
 
   // Visible volumetric cloud overlay resources.
   VolumetricCloudSettings m_volClouds{};
@@ -574,6 +683,17 @@ private:
 
   void rebuildCloudShadowTexture();
 
+  void ensureCloudMaskShader();
+  void unloadCloudMaskResources();
+  void ensureCloudMaskRT();
+  void updateCloudMaskRT(float timeSec, float cloudiness);
+
+  void ensureWeatherFxShader();
+  void unloadWeatherFxResources();
+
+  void ensureMaterialFxShader();
+  void unloadMaterialFxResources();
+
   void ensureVolumetricCloudShader();
   void unloadVolumetricCloudResources();
   void drawVolumetricCloudLayer(const WorldRect& viewAABB, float tileW, float timeSec,
@@ -583,6 +703,7 @@ private:
 
   // 32-bit seed used for procedural render details (ties visual variety to world seed).
   std::uint32_t m_gfxSeed32 = 0;
+  GfxTheme m_gfxTheme = GfxTheme::Classic;
 
   // Minimap texture (one pixel per tile). This is purely a UI convenience.
   Texture2D m_minimapTex{};
@@ -595,8 +716,9 @@ private:
   struct BandCache {
     // Static base layers are cached separately to support multi-layer rendering and to allow
     // some overlays to remain dynamic without invalidating everything.
-    RenderTexture2D terrain{};     // terrain tops + cliff walls
-    RenderTexture2D structures{};  // roads/zones/parks (only when not in utility overlay mode)
+    RenderTexture2D terrain{};       // terrain tops + cliff walls
+    RenderTexture2D materialMask{}; // R=water, G=vegetation, B=shore sand (for shader-based material animation)
+    RenderTexture2D structures{};    // roads/zones/parks (only when not in utility overlay mode)
 
     int sum0 = 0;     // inclusive
     int sum1 = 0;     // inclusive

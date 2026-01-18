@@ -714,6 +714,15 @@ private:
   // Stylized post-processing when compositing the world render target.
   PostFxSettings m_postFx{};
   PostFxPipeline m_postFxPipeline{};
+
+  // Temporal AA state (used when PostFX TAA is enabled).
+  bool m_taaActiveLastFrame = false;
+  bool m_taaPrevCamValid = false;
+  Camera2D m_taaPrevCam{};           // unjittered camera used for world RT render
+  float m_taaPrevWorldRenderScale = 1.0f;
+  int m_taaPrevRTW = 0;
+  int m_taaPrevRTH = 0;
+  int m_taaFrameIndex = 0;
   bool m_mergedZoneBuildings = true;
 
   // Smoothed CPU frame time (for the video/settings panel + auto world scaling).

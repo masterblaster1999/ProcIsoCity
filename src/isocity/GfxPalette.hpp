@@ -25,6 +25,7 @@ enum class GfxTheme : std::uint8_t {
   Noir = 3,
   Neon = 4,
   Pastel = 5,
+  SpaceColony = 6,
 };
 
 struct GfxPalette {
