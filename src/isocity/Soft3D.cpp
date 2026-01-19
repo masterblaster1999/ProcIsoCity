@@ -484,7 +484,7 @@ inline void ApplyPostFx(PpmImage& img, const std::vector<float>& depth, const So
   if (img.rgb.size() != nPix * 3u) return;
   if (depth.size() != nPix) return;
 
-  const bool needLin = fx.enableAO || fx.enableEdge || fx.enableTonemap;
+  const bool needLin = fx.enableAO || fx.enableEdge || fx.enableTonemap || fx.enableBloom;
   const bool needDither = fx.enableDither;
   if (!needLin && !needDither) return;
 
@@ -637,6 +637,100 @@ inline void ApplyPostFx(PpmImage& img, const std::vector<float>& depth, const So
     }
   }
 
+
+
+  // --- Bloom (bright-pass + blur) ---
+  if (needLin && fx.enableBloom)
+  {
+    const float strength = std::max(0.0f, fx.bloomStrength);
+    const float threshold = ClampF(fx.bloomThreshold, 0.0f, 1.0f);
+    const float radius = std::max(0.0f, fx.bloomRadius);
+
+    if (strength > 1e-6f && radius > 1e-6f)
+    {
+      const int nPix = w * h;
+      std::vector<float> bloom(3 * nPix, 0.0f);
+      std::vector<float> tmp(3 * nPix, 0.0f);
+
+      const float invRange = 1.0f / std::max(1e-6f, 1.0f - threshold);
+
+      // Bright pass.
+      for (int i = 0; i < nPix; ++i)
+      {
+        const float r = lin[i * 3 + 0];
+        const float g = lin[i * 3 + 1];
+        const float b = lin[i * 3 + 2];
+        const float m = std::max(r, std::max(g, b));
+        if (m <= threshold)
+        {
+          continue;
+        }
+
+        // Smooth ramp from threshold..1.
+        const float u = ClampF((m - threshold) * invRange, 0.0f, 1.0f);
+        const float k = Smoothstep(0.0f, 1.0f, u);
+
+        bloom[i * 3 + 0] = r * k;
+        bloom[i * 3 + 1] = g * k;
+        bloom[i * 3 + 2] = b * k;
+      }
+
+      const float rNorm = ClampF(radius, 0.0f, 2.0f);
+      const int passes = std::clamp(static_cast<int>(std::round(rNorm * 6.0f)), 1, 12);
+
+      auto blurH = [&](const std::vector<float>& src, std::vector<float>& dst) {
+        dst.resize(src.size());
+        for (int y = 0; y < h; ++y)
+        {
+          for (int x = 0; x < w; ++x)
+          {
+            const int xm = std::max(0, x - 1);
+            const int xp = std::min(w - 1, x + 1);
+            const size_t i = static_cast<size_t>((y * w + x) * 3);
+            const size_t im = static_cast<size_t>((y * w + xm) * 3);
+            const size_t ip = static_cast<size_t>((y * w + xp) * 3);
+
+            dst[i + 0] = (src[im + 0] + 2.0f * src[i + 0] + src[ip + 0]) * 0.25f;
+            dst[i + 1] = (src[im + 1] + 2.0f * src[i + 1] + src[ip + 1]) * 0.25f;
+            dst[i + 2] = (src[im + 2] + 2.0f * src[i + 2] + src[ip + 2]) * 0.25f;
+          }
+        }
+      };
+
+      auto blurV = [&](const std::vector<float>& src, std::vector<float>& dst) {
+        dst.resize(src.size());
+        for (int y = 0; y < h; ++y)
+        {
+          const int ym = std::max(0, y - 1);
+          const int yp = std::min(h - 1, y + 1);
+          for (int x = 0; x < w; ++x)
+          {
+            const size_t i = static_cast<size_t>((y * w + x) * 3);
+            const size_t im = static_cast<size_t>((ym * w + x) * 3);
+            const size_t ip = static_cast<size_t>((yp * w + x) * 3);
+
+            dst[i + 0] = (src[im + 0] + 2.0f * src[i + 0] + src[ip + 0]) * 0.25f;
+            dst[i + 1] = (src[im + 1] + 2.0f * src[i + 1] + src[ip + 1]) * 0.25f;
+            dst[i + 2] = (src[im + 2] + 2.0f * src[i + 2] + src[ip + 2]) * 0.25f;
+          }
+        }
+      };
+
+      for (int p = 0; p < passes; ++p)
+      {
+        blurH(bloom, tmp);
+        blurV(tmp, bloom);
+      }
+
+      // Additive blend back into the main buffer.
+      for (int i = 0; i < nPix; ++i)
+      {
+        lin[i * 3 + 0] = ClampF(lin[i * 3 + 0] + strength * bloom[i * 3 + 0], 0.0f, 1.0f);
+        lin[i * 3 + 1] = ClampF(lin[i * 3 + 1] + strength * bloom[i * 3 + 1], 0.0f, 1.0f);
+        lin[i * 3 + 2] = ClampF(lin[i * 3 + 2] + strength * bloom[i * 3 + 2], 0.0f, 1.0f);
+      }
+    }
+  }
   // --- Edge outlines (depth discontinuity) ---
   if (fx.enableEdge && needLin) {
     const float thr = ClampF(fx.edgeThreshold, 0.0f, 1.0f);

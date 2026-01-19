@@ -1100,15 +1100,15 @@ PpmImage RenderPpmLayer(const World& world, ExportLayer layer, const LandValueRe
   bool haveServices = false;
   if (layer == ExportLayer::ServicesOverall || layer == ExportLayer::ServicesEducation ||
       layer == ExportLayer::ServicesHealth || layer == ExportLayer::ServicesSafety) {
-    ServicesModelSettings cfg{};
-    cfg.enabled = true;
+    ServicesModelSettings svcCfg{};
+    svcCfg.enabled = true;
     // Keep exports deterministic and reasonably aligned with the in-game defaults.
-    cfg.requireOutsideConnection = true;
-    cfg.weightMode = IsochroneWeightMode::TravelTime;
-    cfg.catchmentRadiusSteps = 18;
+    svcCfg.requireOutsideConnection = true;
+    svcCfg.weightMode = IsochroneWeightMode::TravelTime;
+    svcCfg.catchmentRadiusSteps = 18;
 
     const std::vector<ServiceFacility> facilities = ExtractServiceFacilitiesFromWorld(world);
-    services = ComputeServices(world, cfg, facilities);
+    services = ComputeServices(world, svcCfg, facilities);
     haveServices = true;
   }
 
@@ -1239,14 +1239,14 @@ IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const
   bool haveServices = false;
   if (layer == ExportLayer::ServicesOverall || layer == ExportLayer::ServicesEducation ||
       layer == ExportLayer::ServicesHealth || layer == ExportLayer::ServicesSafety) {
-    ServicesModelSettings cfg{};
-    cfg.enabled = true;
-    cfg.requireOutsideConnection = true;
-    cfg.weightMode = IsochroneWeightMode::TravelTime;
-    cfg.catchmentRadiusSteps = 18;
+    ServicesModelSettings svcCfg{};
+    svcCfg.enabled = true;
+    svcCfg.requireOutsideConnection = true;
+    svcCfg.weightMode = IsochroneWeightMode::TravelTime;
+    svcCfg.catchmentRadiusSteps = 18;
 
     const std::vector<ServiceFacility> facilities = ExtractServiceFacilitiesFromWorld(world);
-    services = ComputeServices(world, cfg, facilities);
+    services = ComputeServices(world, svcCfg, facilities);
     haveServices = true;
   }
 

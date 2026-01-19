@@ -43,6 +43,9 @@ struct RNG {
     return static_cast<float>(u) / static_cast<float>(1u << 24);
   }
 
+  // Back-compat alias (older code calls this uniform01).
+  float uniform01() { return nextF01(); }
+
   int rangeInt(int minInclusive, int maxInclusive)
   {
     if (maxInclusive <= minInclusive) return minInclusive;

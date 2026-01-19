@@ -97,6 +97,9 @@ constexpr int kAutosaveSlotMin = 1;
 constexpr int kAutosaveSlotMax = 3;
 constexpr float kAutosaveIntervalSec = 60.0f;
 
+// Limit of queued dossier jobs to avoid unbounded memory growth.
+constexpr int kDossierQueueMax = 8;
+
 // --- UI layout ---
 // Panels are drawn in a virtual UI coordinate system (see Game::draw). These constants are in that
 // same coordinate space.
@@ -1232,7 +1235,7 @@ void Game::setupDevConsole()
         }
 
         int days = 0;
-        if (!parseI32(args[0], &days) || days <= 0) {
+        if (!parseI32(args[0], days) || days <= 0) {
           c.print("autobuild: invalid days: " + args[0]);
           return;
         }
@@ -4753,14 +4756,14 @@ void Game::setupDevConsole()
 
           if (ext == ".json") {
             JsonValue root = JsonValue::MakeObject();
-            root.objectValue["objective"] = JsonValue::MakeString(MineObjectiveName(m_mineSession->config().objective));
-            root.objectValue["total"] = JsonValue::MakeNumber(m_mineSession->total());
+            root.objectValue.push_back({"objective", JsonValue::MakeString(MineObjectiveName(m_mineSession->config().objective))});
+            root.objectValue.push_back({"total", JsonValue::MakeNumber(m_mineSession->total())});
             JsonValue arr = JsonValue::MakeArray();
             arr.arrayValue.reserve(recs.size());
             for (const MineRecord& r : recs) {
               arr.arrayValue.push_back(MineRecordToJson(r));
             }
-            root.objectValue["records"] = std::move(arr);
+            root.objectValue.push_back({"records", std::move(arr)});
 
             std::string err;
             const bool ok = WriteJsonFile(pathOut, root, err, JsonWriteOptions{true, 2, true});
@@ -18638,7 +18641,7 @@ void Game::drawHeadlessLabPanel(int x0, int y0)
         const int idx = m_mineSession->index();
         const int total = m_mineSession->total();
         ui::Text(innerX + 4, y, 14,
-                 TextFormat("Session: %d / %d  |  last %.2f ms", idx, total, m_mineLastStepMs), uiTh.text);
+                 TextFormat("Session: %d / %d  |  last %.2f ms", idx, total, m_mineLastAutoStepMs), uiTh.text);
         y += 22;
 
         const int btnH = 18;

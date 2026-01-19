@@ -5847,8 +5847,6 @@ void Renderer::rebuildTextures(std::uint64_t seed)
     return st;
   };
 
-  };
-
   auto makeRoadVariant = [&](std::uint8_t mask, int level, int variant) -> Texture2D {
     const RoadStyle st = roadStyleForLevel(level);
     const float centerR = st.roadW * 1.10f;

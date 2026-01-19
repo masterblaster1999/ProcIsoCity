@@ -4,6 +4,8 @@
 
 #include <cstdint>
 #include <string_view>
+#include <algorithm>
+#include <cmath>
 
 namespace isocity {
 namespace ui {
@@ -152,9 +154,33 @@ bool Toggle(int id, Rectangle r, bool& ioValue, Vector2 mouseUi, float timeSec, 
 bool SliderFloat(int id, Rectangle r, float& ioValue, float minValue, float maxValue,
                  Vector2 mouseUi, float timeSec, bool enabled = true);
 
+// Convenience overload: quantized float slider (step size in value units).
+inline bool SliderFloat(int id, Rectangle r, float& ioValue, float minValue, float maxValue,
+                        float step, Vector2 mouseUi, float timeSec, bool enabled = true)
+{
+  const bool changed = SliderFloat(id, r, ioValue, minValue, maxValue, mouseUi, timeSec, enabled);
+  if (!(step > 0.0f) || !std::isfinite(step)) {
+    return changed;
+  }
+  const float q = std::round(ioValue / step) * step;
+  const float clamped = std::clamp(q, minValue, maxValue);
+  if (std::abs(clamped - ioValue) > 1e-6f) {
+    ioValue = clamped;
+    return true;
+  }
+  return changed;
+}
+
 // Integer slider (snaps to step).
 bool SliderInt(int id, Rectangle r, int& ioValue, int minValue, int maxValue, int step,
                Vector2 mouseUi, float timeSec, bool enabled = true);
+
+// Convenience overload: int slider with implicit step=1.
+inline bool SliderInt(int id, Rectangle r, int& ioValue, int minValue, int maxValue,
+                      Vector2 mouseUi, float timeSec, bool enabled = true)
+{
+  return SliderInt(id, r, ioValue, minValue, maxValue, 1, mouseUi, timeSec, enabled);
+}
 
 // Simple button.
 // Returns true if clicked this frame.

@@ -125,6 +125,13 @@ struct Soft3DPostFxConfig {
   float saturation = 1.0f; // 1=identity
   float vignette = 0.0f;   // 0..1
 
+  // --- Bloom (bright-pass + blur) ---
+  // Applied in linear space after tonemap and before the final color conversion.
+  bool enableBloom = false;
+  float bloomStrength = 0.18f;  // additive blend amount
+  float bloomRadius = 0.80f;    // normalized blur amount (0..1 typical)
+  float bloomThreshold = 0.75f; // bright-pass threshold in [0,1]
+
   // --- Ordered dithering + quantization ---
   bool enableDither = false;
   float ditherStrength = 0.35f; // 0..1

@@ -47,6 +47,10 @@ enum class ExportLayer : std::uint8_t {
   ServicesSafety = 13,
 };
 
+// Back-compat alias: older UI code refers to the 2D export layer enum as ExportLayer2D.
+using ExportLayer2D = ExportLayer;
+
+
 struct PpmImage {
   int width = 0;
   int height = 0;
@@ -477,6 +481,22 @@ struct Render3DConfig {
   float fogStart = 0.35f; // [0..1] depth
   float fogEnd = 1.0f;
 
+
+
+  // --- Environment (optional) ---
+  //
+  // If timeOfDay is in [0,1], RenderWorld3D will derive a reasonable sun direction and
+  // sky/fog defaults from it. If < 0 (default), explicit lightDir/bg/fog settings are used.
+  //
+  // timeOfDay convention: 0=midnight, 0.25=dawn, 0.5=noon, 0.75=dusk.
+  float timeOfDay = -1.0f;
+
+  // Wind direction in degrees (0=east, 90=north). Used for future cloud/rain drift.
+  float windDirDeg = 0.0f;
+
+  // Weather strengths in [0,1].
+  float rainStrength = 0.0f;
+  float cloudStrength = 0.0f;
   // --- Post-processing (software renderer only) ---
   //
   // These are optional "style" improvements that run after rasterization.
@@ -511,6 +531,19 @@ struct Render3DConfig {
   float saturation = 1.0f;
   float vignette = 0.0f;
 
+
+
+  // Convenience toggles/params used by the in-game 3D preview UI.
+  // These are mapped onto the underlying post pipeline by RenderWorld3D.
+  bool postGrade = false;
+  bool postVignette = false;
+
+  bool postBloom = false;
+  float postBloomStrength = 0.18f;
+  float postBloomRadius = 0.80f;
+
+  // If >= 0, overrides ditherStrength (useful for UI sliders); otherwise ditherStrength is used.
+  float postDitherStrength = -1.0f;
   // Ordered dithering + quantization.
   bool postDither = false;
   float ditherStrength = 0.35f;

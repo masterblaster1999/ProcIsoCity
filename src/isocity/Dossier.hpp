@@ -72,6 +72,7 @@ struct CityDossierConfig {
   bool export3d = false;
 
   // When export3d is enabled, this config controls the render.
+  bool export3dPreview = true;  // include the 3D render preview in the dossier index
   Render3DConfig render3dCfg{};
 
   // Data exports.

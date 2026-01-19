@@ -152,6 +152,12 @@ static void RegenTheme(std::uint64_t seed)
   g.theme.accentBad = ColorFromHSV(5.0f, semanticSat, semanticVal);
   g.theme.accentBad.a = 255;
 
+  // Bright/highlight accent (e.g. selected rows).
+  g.theme.accentHi = WithAlpha(Lighten(accent, 0.20f), 90);
+
+  // Back-compat alias used by some UI call-sites.
+  g.theme.bad = g.theme.accentBad;
+
 
   // Derive subtle top/bottom panel colors from the accent so each seed feels different,
   // but keep things dark enough for readability.

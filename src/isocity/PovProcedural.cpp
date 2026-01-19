@@ -318,8 +318,8 @@ std::vector<Point> GeneratePovRoamPath(const World& world, Point startHint, cons
       score += (rng.nextF01() - 0.5f) * 0.35f;
 
       // Convert score -> weight. Clamp to avoid overflow.
-      const float w = std::exp(std::max(-8.0f, std::min(8.0f, score)));
-      weights.push_back(w);
+      const float weight = std::exp(std::max(-8.0f, std::min(8.0f, score)));
+      weights.push_back(weight);
     }
 
     const int idx = ChooseIndexWeighted(weights, rng);

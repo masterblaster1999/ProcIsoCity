@@ -325,7 +325,7 @@ std::vector<ServiceFacility> ExtractServiceFacilitiesFromWorld(const World& worl
   for (int y = 0; y < world.height(); ++y) {
     for (int x = 0; x < world.width(); ++x) {
       const Tile& t = world.at(x, y);
-      ServiceType type;
+      ServiceType type = ServiceType::Education;
       bool isFacility = true;
 
       switch (t.overlay) {

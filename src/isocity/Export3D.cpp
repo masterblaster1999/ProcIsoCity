@@ -349,6 +349,98 @@ PpmImage RenderWorld3D(const World& world, ExportLayer layer, const Render3DConf
   shading.fogB = cfg.fogB;
   shading.enableFog = cfg.fog;
   shading.fogStrength = cfg.fogStrength;
+
+
+  // Optional environment controls. When timeOfDay is set to a value in [0..1], we
+  // derive a plausible sun direction / ambient+diffuse balance and a sky+fog tint.
+  //
+  //  timeOfDay: 0.00 = midnight, 0.25 = sunrise, 0.50 = noon, 0.75 = sunset.
+  //
+  // This keeps the core renderer deterministic while providing a higher-level
+  // art-directed control surface for the in-game 3D preview and dossier exports.
+  if (cfg.timeOfDay >= 0.0f)
+  {
+    constexpr float kPi = 3.14159265358979323846f;
+
+    float t = cfg.timeOfDay;
+    t = t - std::floor(t);  // wrap to [0,1)
+
+    // Basic day factor: 0 at sunrise/sunset, 1 at noon.
+    const float sun = std::sin((t - 0.25f) * 2.0f * kPi);  // [-1..1]
+    const float day = std::clamp(sun, 0.0f, 1.0f);
+
+    const float clouds = std::clamp(cfg.cloudStrength, 0.0f, 1.0f);
+    const float rain = std::clamp(cfg.rainStrength, 0.0f, 1.0f);
+    const float haze = std::clamp(clouds * 0.55f + rain * 0.85f, 0.0f, 1.0f);
+
+    // Sun path: east->south->west.
+    const float azDeg = 180.0f + (t - 0.5f) * 360.0f;  // 0.25->90, 0.5->180, 0.75->270
+    const float elevDeg = 6.0f + day * 64.0f;
+
+    const float az = azDeg * (kPi / 180.0f);
+    const float el = elevDeg * (kPi / 180.0f);
+
+    shading.lightDirX = std::cos(el) * std::cos(az);
+    shading.lightDirY = std::sin(el);
+    shading.lightDirZ = std::cos(el) * std::sin(az);
+
+    // Clouds/rain push the look toward flatter, hazier lighting.
+    const float baseAmbient = 0.22f + 0.14f * day;
+    const float baseDiffuse = 0.28f + 0.52f * day;
+
+    const float cloudDiffuseMul = 1.0f - 0.55f * clouds;
+    const float cloudAmbientMul = 1.0f + 0.25f * clouds;
+
+    const float rainDiffuseMul = 1.0f - 0.35f * rain;
+    const float rainAmbientMul = 1.0f + 0.15f * rain;
+
+    shading.ambient = std::clamp(baseAmbient * cloudAmbientMul * rainAmbientMul, 0.0f, 1.0f);
+    shading.diffuse = std::clamp(baseDiffuse * cloudDiffuseMul * rainDiffuseMul, 0.0f, 1.5f);
+
+    // Sky color palette (linear-ish floats in [0..1]).
+    auto lerp = [](float a, float b, float u) { return a + (b - a) * u; };
+    auto smoothstep = [](float e0, float e1, float x)
+    {
+      const float u = std::clamp((x - e0) / (e1 - e0), 0.0f, 1.0f);
+      return u * u * (3.0f - 2.0f * u);
+    };
+
+    const float warm = smoothstep(0.0f, 0.25f, day) * smoothstep(0.0f, 0.35f, 1.0f - day);
+
+    // Night -> day
+    float skyR = lerp(0.06f, 0.47f, day);
+    float skyG = lerp(0.07f, 0.67f, day);
+    float skyB = lerp(0.12f, 0.92f, day);
+
+    // Inject warm sunrise/sunset tint.
+    skyR = lerp(skyR, 1.00f, warm * 0.75f);
+    skyG = lerp(skyG, 0.54f, warm * 0.75f);
+    skyB = lerp(skyB, 0.25f, warm * 0.75f);
+
+    // Clouds desaturate toward gray-blue.
+    skyR = lerp(skyR, 0.65f, clouds * 0.45f);
+    skyG = lerp(skyG, 0.67f, clouds * 0.45f);
+    skyB = lerp(skyB, 0.72f, clouds * 0.45f);
+
+    // Rain darkens the sky slightly.
+    const float rainDim = lerp(1.0f, 0.75f, rain);
+    skyR *= rainDim;
+    skyG *= rainDim;
+    skyB *= rainDim;
+
+    shading.bgR = static_cast<uint8_t>(std::clamp(skyR, 0.0f, 1.0f) * 255.0f);
+    shading.bgG = static_cast<uint8_t>(std::clamp(skyG, 0.0f, 1.0f) * 255.0f);
+    shading.bgB = static_cast<uint8_t>(std::clamp(skyB, 0.0f, 1.0f) * 255.0f);
+
+    if (shading.enableFog)
+    {
+      // Use the sky as the fog tint and increase strength a bit under haze.
+      shading.fogR = shading.bgR;
+      shading.fogG = shading.bgG;
+      shading.fogB = shading.bgB;
+      shading.fogStrength = std::max(shading.fogStrength, 0.08f + 0.22f * haze);
+    }
+  }
   shading.fogStart = cfg.fogStart;
   shading.fogEnd = cfg.fogEnd;
 
@@ -383,14 +475,24 @@ PpmImage RenderWorld3D(const World& world, ExportLayer layer, const Render3DConf
   rc.postFx.edgeG = cfg.edgeG;
   rc.postFx.edgeB = cfg.edgeB;
 
-  rc.postFx.enableTonemap = cfg.postTonemap;
+  rc.postFx.enableTonemap = cfg.postTonemap || cfg.postGrade || cfg.postVignette || (cfg.vignette > 0.0f);
   rc.postFx.exposure = cfg.exposure;
   rc.postFx.contrast = cfg.contrast;
   rc.postFx.saturation = cfg.saturation;
-  rc.postFx.vignette = cfg.vignette;
+  float vignette = cfg.vignette;
+  if (cfg.postVignette && vignette <= 0.0f)
+  {
+    vignette = 0.25f;
+  }
+  rc.postFx.vignette = vignette;
+
+  // Bloom (bright-pass + blur).
+  rc.postFx.enableBloom = cfg.postBloom;
+  rc.postFx.bloomStrength = cfg.postBloomStrength;
+  rc.postFx.bloomRadius = cfg.postBloomRadius;
 
   rc.postFx.enableDither = cfg.postDither;
-  rc.postFx.ditherStrength = cfg.ditherStrength;
+  rc.postFx.ditherStrength = (cfg.postDitherStrength >= 0.0f) ? cfg.postDitherStrength : cfg.ditherStrength;
   rc.postFx.ditherBits = cfg.ditherBits;
 
   // Derive a stable default seed from the world seed unless explicitly overridden.
