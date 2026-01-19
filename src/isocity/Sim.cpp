@@ -357,6 +357,20 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
   s.transitCommuteCoverage = 0.0f;
   s.transitCost = 0;
 
+  // --- Derived public services / civic accessibility stats ---
+  s.servicesEducationFacilities = 0;
+  s.servicesHealthFacilities = 0;
+  s.servicesSafetyFacilities = 0;
+  s.servicesEducationSatisfaction = 0.0f;
+  s.servicesHealthSatisfaction = 0.0f;
+  s.servicesSafetySatisfaction = 0.0f;
+  s.servicesOverallSatisfaction = 0.0f;
+  s.servicesMaintenanceCost = 0;
+
+  bool servicesActive = false;
+  float servicesOverallSat = 0.0f;
+  int servicesMaint = 0;
+
   // Traffic/commute model: estimate how far (and how congested) the average commute is.
   // This is a derived system (no agents yet): we run a multi-source road search from job access points
   // over the road network and route commuters along parent pointers back to the jobs.
@@ -781,6 +795,46 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
   const LandValueResult lv = ComputeLandValue(world, lvc, &trafficRoad, roadToEdge);
   s.avgLandValue = AvgLandValueNonWater(world, lv);
 
+  // Public services / civic accessibility (optional).
+  //
+  // This is a headless accessibility-to-satisfaction field driven by explicit
+  // service facility tiles (schools, hospitals, etc).
+  {
+    const std::vector<ServiceFacility> facilities = ExtractServiceFacilitiesFromWorld(world);
+    const bool autoEnable = !facilities.empty();
+
+    if (m_servicesModel.enabled || autoEnable) {
+      ServicesModelSettings cfg = m_servicesModel;
+      cfg.enabled = true;
+      // The simulator may compute ZoneAccessMap / road-to-edge masks for other systems
+      // based on the *global* outside-connection rule (m_cfg.requireOutsideConnection).
+      //
+      // The services model has its own outside-connection toggle. If it differs from the
+      // global sim setting, we must not reuse those caches or we can over/underestimate
+      // accessibility (especially for disconnected road components).
+      const bool reuseAccessCaches = (cfg.requireOutsideConnection == m_cfg.requireOutsideConnection);
+      const ZoneAccessMap* servicesZoneAccess = reuseAccessCaches ? zoneAccess : nullptr;
+      const std::vector<std::uint8_t>* servicesRoadToEdge =
+        (reuseAccessCaches && cfg.requireOutsideConnection) ? roadToEdge : nullptr;
+
+      const ServicesResult sr = ComputeServices(world, cfg, facilities, servicesZoneAccess, servicesRoadToEdge);
+
+      s.servicesEducationFacilities = sr.activeFacilities[static_cast<std::size_t>(ServiceType::Education)];
+      s.servicesHealthFacilities = sr.activeFacilities[static_cast<std::size_t>(ServiceType::Health)];
+      s.servicesSafetyFacilities = sr.activeFacilities[static_cast<std::size_t>(ServiceType::Safety)];
+
+      s.servicesEducationSatisfaction = sr.educationSatisfaction;
+      s.servicesHealthSatisfaction = sr.healthSatisfaction;
+      s.servicesSafetySatisfaction = sr.safetySatisfaction;
+      s.servicesOverallSatisfaction = sr.overallSatisfaction;
+
+      servicesActive = true;
+      servicesOverallSat = sr.overallSatisfaction;
+      servicesMaint = sr.maintenanceCostPerDay;
+      s.servicesMaintenanceCost = servicesMaint;
+    }
+  }
+
   // Economy snapshot (does NOT mutate money here; that's handled in step()).
   // Taxes scale by land value so attractive areas generate more revenue.
   const float lvBase = 0.75f;
@@ -862,7 +916,7 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
     }
   }
 
-  const int maintenance = roadMaint + parkMaint;
+  const int maintenance = roadMaint + parkMaint + servicesMaint;
 
   // Trade: compute import cost + export revenue.
   //
@@ -927,7 +981,14 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
   const float inflationPenalty = std::min(0.06f, std::max(0.0f, s.economyInflation) * 1.25f);
   const float lvBonus = std::clamp((s.avgLandValue - 0.50f) * 0.10f, -0.05f, 0.05f);
 
-  s.happiness = Clamp01(0.45f + parkBonus + lvBonus - unemployment * 0.35f - commutePenalty - congestionPenalty - goodsPenalty - taxPenalty - inflationPenalty);
+  float servicesBonus = 0.0f;
+  if (servicesActive && scan.population > 0) {
+    const float sat = std::clamp(servicesOverallSat, 0.0f, 1.0f);
+    // Neutral around 0.5; modest boost/penalty range.
+    servicesBonus = std::clamp((sat - 0.5f) * 0.20f, -0.10f, 0.10f);
+  }
+
+  s.happiness = Clamp01(0.45f + parkBonus + lvBonus + servicesBonus - unemployment * 0.35f - commutePenalty - congestionPenalty - goodsPenalty - taxPenalty - inflationPenalty);
 
   // Demand meter (for UI/debug): recompute using the newly derived happiness.
   const float jobPressure = (scan.housingCap > 0)

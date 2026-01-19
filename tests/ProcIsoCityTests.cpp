@@ -24,6 +24,8 @@
 #include "isocity/Json.hpp"
 #include "isocity/Compression.hpp"
 #include "isocity/Export.hpp"
+#include "isocity/FloodRisk.hpp"
+#include "isocity/DepressionFill.hpp"
 #include "isocity/GfxCanvas.hpp"
 #include "isocity/GfxPalette.hpp"
 #include "isocity/GfxFacilities.hpp"
@@ -3124,6 +3126,103 @@ void TestExportPpmLayers()
   EXPECT_EQ(up.rgb[idx30 + 0], terrain.rgb[idx10 + 0]);
   EXPECT_EQ(up.rgb[idx30 + 1], terrain.rgb[idx10 + 1]);
   EXPECT_EQ(up.rgb[idx30 + 2], terrain.rgb[idx10 + 2]);
+}
+
+void TestExportTileMetricsCsv()
+{
+  // Use a small generated world to exercise a variety of tile types.
+  ProcGenConfig pc{};
+  World w = GenerateWorld(24, 18, 123u, pc);
+
+  // Derive baseline stats.
+  SimConfig sc{};
+  sc.requireOutsideConnection = false;
+  Simulator sim(sc);
+  sim.refreshDerivedStats(w);
+
+  // Derived metrics buffers.
+  TrafficConfig tc{};
+  tc.requireOutsideConnection = false;
+
+  const float employedShare = (w.stats().population > 0)
+                                  ? static_cast<float>(w.stats().employed) / static_cast<float>(w.stats().population)
+                                  : 0.0f;
+  const TrafficResult traffic = ComputeCommuteTraffic(w, tc, employedShare, nullptr);
+
+  GoodsConfig gc{};
+  gc.requireOutsideConnection = false;
+  gc.allowImports = true;
+  gc.allowExports = true;
+  const GoodsResult goods = ComputeGoodsFlow(w, gc, nullptr);
+
+  LandValueConfig lc{};
+  lc.requireOutsideConnection = false;
+  const LandValueResult lv = ComputeLandValue(w, lc, &traffic, nullptr);
+
+  // Flood / ponding inputs.
+  std::vector<float> heights(static_cast<std::size_t>(w.width()) * static_cast<std::size_t>(w.height()), 0.0f);
+  std::vector<std::uint8_t> drainMask(heights.size(), 0);
+  for (int y = 0; y < w.height(); ++y) {
+    for (int x = 0; x < w.width(); ++x) {
+      const std::size_t i = static_cast<std::size_t>(y) * static_cast<std::size_t>(w.width()) + static_cast<std::size_t>(x);
+      heights[i] = w.at(x, y).height;
+      drainMask[i] = (w.at(x, y).terrain == Terrain::Water) ? 1 : 0;
+    }
+  }
+
+  SeaFloodConfig sfc{};
+  sfc.requireEdgeConnection = true;
+  sfc.eightConnected = false;
+  const SeaFloodResult sea = ComputeSeaLevelFlood(heights, w.width(), w.height(), pc.waterLevel, sfc);
+
+  DepressionFillConfig dfc{};
+  dfc.includeEdges = true;
+  dfc.epsilon = 0.0f;
+  const DepressionFillResult pond = FillDepressionsPriorityFlood(heights, w.width(), w.height(), &drainMask, dfc);
+
+  // Export to a temp file.
+  const fs::path dir = fs::temp_directory_path() / "proc_isocity_tests";
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+
+  const fs::path outPath = dir / "tile_metrics.csv";
+  std::string err;
+
+  TileMetricsCsvInputs inputs;
+  inputs.landValue = &lv;
+  inputs.traffic = &traffic;
+  inputs.goods = &goods;
+  inputs.seaFlood = &sea;
+  inputs.ponding = &pond;
+
+  TileMetricsCsvOptions opt;
+  opt.includeLandValue = true;
+  opt.includeLandValueComponents = true;
+  opt.includeTraffic = true;
+  opt.includeGoods = true;
+  opt.includeFlood = true;
+  opt.includePonding = true;
+
+  EXPECT_TRUE(WriteTileMetricsCsv(w, outPath.string(), err, inputs, opt));
+  EXPECT_TRUE(err.empty());
+
+  std::ifstream f(outPath);
+  EXPECT_TRUE(static_cast<bool>(f));
+
+  std::string header;
+  std::getline(f, header);
+  EXPECT_TRUE(header.find("land_value") != std::string::npos);
+  EXPECT_TRUE(header.find("commute_traffic") != std::string::npos);
+  EXPECT_TRUE(header.find("goods_fill") != std::string::npos);
+  EXPECT_TRUE(header.find("flood_depth") != std::string::npos);
+  EXPECT_TRUE(header.find("ponding_depth") != std::string::npos);
+
+  int dataRows = 0;
+  std::string line;
+  while (std::getline(f, line)) {
+    if (!line.empty()) ++dataRows;
+  }
+  EXPECT_EQ(dataRows, w.width() * w.height());
 }
 
 void TestExportIsoOverview()
@@ -7966,6 +8065,7 @@ int main()
   TestAutoDistrictsSeparatesDisconnectedRoadComponents();
   TestAutoDistrictsFillAllTilesIsDeterministic();
   TestExportPpmLayers();
+  TestExportTileMetricsCsv();
   TestExportIsoOverview();
   TestExportIsoOverviewAtmosphere();
   TestExport3DHeightfieldAndSkirt();

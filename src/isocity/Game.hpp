@@ -5,6 +5,9 @@
 #include "isocity/EditHistory.hpp"
 #include "isocity/ReplayCapture.hpp"
 #include "isocity/Export.hpp"
+#include "isocity/Dossier.hpp"
+#include "isocity/SeedMiner.hpp"
+#include "isocity/ServiceOptimizer.hpp"
 #include "isocity/FloodRisk.hpp"
 #include "isocity/DepressionFill.hpp"
 #include "isocity/EvacuationScenario.hpp"
@@ -34,7 +37,9 @@
 #include "isocity/World.hpp"
 
 #include <cstdint>
+#include <deque>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -137,6 +142,21 @@ private:
 
   // Debug/developer console (toggle with F4).
   void setupDevConsole();
+
+  // City dossier export (headless) - runs asynchronously so large exports
+  // do not stall the render thread.
+  void updateDossierExportJob();
+
+  // Seed mining integration (headless).
+  void updateSeedMining(float dt);
+
+  // Headless Lab panel (seed mining + dossier export). Toggle with Ctrl+F2.
+  void drawHeadlessLabPanel(int x0, int y0);
+
+  // Queue dossier exports (processed asynchronously).
+  void queueDossierCurrentWorld(CityDossierConfig cfg, const char* toastLabel = nullptr);
+  void queueDossierSeeds(CityDossierConfig cfg, std::vector<std::uint64_t> seeds, int bakeDays,
+                         const char* toastLabel = nullptr);
 
   // AutoBuild bot (procedural city growth automation).
   void runAutoBuild(int days, const AutoBuildConfig& cfg, const char* toastPrefix = nullptr);
@@ -303,6 +323,27 @@ private:
   bool m_showTrafficModel = false;
   int m_trafficModelSelection = 0;
 
+  // Public services panel + optimizer (experimental).
+  //
+  // This is in-progress scaffolding that exposes the headless services model
+  // and ServiceOptimizer inside the interactive app.
+  bool m_showServicesPanel = false;
+  int m_servicesSelection = 0;
+  bool m_showServicesOverlay = false;
+
+  // Cached services satisfaction fields (heatmaps), computed on-demand.
+  bool m_servicesHeatmapsDirty = true;
+  float m_servicesHeatmapsTimer = 0.0f;
+  ServicesResult m_servicesHeatmaps;
+
+  // Cached optimizer plan (where to place the next facilities).
+  bool m_servicesPlanDirty = true;
+  bool m_servicesPlanValid = false;
+  ServiceOptimizerConfig m_servicesPlanCfg{};
+  ServiceOptimizerResult m_servicesPlan{};
+  int m_servicesPlanSelection = 0;
+  Tool m_servicesPlanTool = Tool::School;
+
   // District UI (toggle with F7). Districts are a lightweight per-tile label (0..kDistrictCount-1)
   // that can be used by the sim to apply per-district policy multipliers (taxes/maintenance).
   bool m_showDistrictPanel = false;
@@ -315,6 +356,9 @@ private:
   bool m_showReport = false;
   int m_reportPage = 0;
   std::vector<CityHistorySample> m_cityHistory;
+  // Full Stats history for headless exports (dossier / analysis tooling).
+  // This mirrors m_cityHistory but stores the complete Stats struct for each sampled day.
+  std::vector<Stats> m_tickStatsHistory;
   int m_cityHistoryMax = 240; // max stored days
 
   // UI minimap overlay (toggle with M). Clicking the minimap recenters the camera.
@@ -595,6 +639,12 @@ private:
     Pollution,
     TrafficSpill,
 
+    // Public services satisfaction (derived from the services model).
+    ServicesOverall,
+    ServicesEducation,
+    ServicesHealth,
+    ServicesSafety,
+
     // Sea-level coastal flooding depth (derived from the heightfield).
     FloodDepth,
 
@@ -760,6 +810,44 @@ private:
 
   DevConsole m_console;
 
+  // Headless Lab panel (Ctrl+F2): integrates headless tools into the base game layer.
+  bool m_showHeadlessLab = false;
+  int m_headlessLabTab = 0; // 0=Mining, 1=Dossier
+
+  // Seed mining (headless) integrated into the base game.
+  // This runs incrementally (optionally auto-stepped each frame) so you can
+  // search for interesting seeds without leaving the interactive app.
+  std::unique_ptr<MineSession> m_mineSession;
+  bool m_mineAutoRun = false;
+  int m_mineAutoStepsPerFrame = 1;
+  float m_mineAutoBudgetMs = 8.0f;
+  double m_mineLastAutoStepMs = 0.0;
+  MineObjective m_mineObjective = MineObjective::Balanced;
+  int m_mineTopK = 20;
+  bool m_mineTopDiverse = true;
+
+  // City Lab UI state for mining.
+  MineConfig m_labMineCfg{};
+  int m_labMineTopScroll = 0;
+  int m_labMineTopSelection = 0;
+  int m_labMineBakeDays = 120;
+  int m_labMineBatchExportN = 5;
+
+  // Cached top-K list (avoid re-sorting every frame).
+  int m_labMineTopCacheIndex = -1;
+  int m_labMineTopCacheTopK = 0;
+  bool m_labMineTopCacheDiverse = true;
+  std::vector<int> m_labMineTopIndices;
+
+  // Manual stepping requests (used by dev console and future UI) so expensive
+  // mining runs can be budgeted per frame instead of blocking.
+  int m_mineManualStepRequests = 0;
+
+  // Deferred mine load: resetWorld is applied at the start of the next frame
+  // to avoid mutating world state from inside console callbacks/UI handlers.
+  bool m_pendingMineLoadSeed = false;
+  std::uint64_t m_pendingMineLoadSeedValue = 0;
+
   // Persistent ScriptRunner variables used by the in-game dev console `script` command.
   //
   // This lets you run a sequence of script files/commands that share a small amount
@@ -782,6 +870,47 @@ private:
   bool m_pendingMapLayersExport = false;
   std::string m_pendingMapLayersPrefix;
   int m_pendingMapLayersMaxSize = 4096;
+
+  // City dossier export (headless): images + CSV/JSON + HTML using the same exporter as
+  // proc_isocity_dossier. Requests are queued and processed asynchronously (so exports
+  // don't stall the render thread).
+  struct DossierRequest {
+    enum class Kind : std::uint8_t { CurrentWorld = 0, SeedBake = 1 };
+    Kind kind = Kind::CurrentWorld;
+
+    CityDossierConfig cfg;
+
+    // Snapshot/config for export.
+    ProcGenConfig procCfg{};
+    SimConfig simCfg{};
+    std::vector<Stats> ticks;
+    World world;
+
+    // Optional: bake one or more seeds (generate+simulate) without touching the
+    // interactive world, then export dossiers for each.
+    std::vector<std::uint64_t> seeds;
+    int bakeDays = 0;
+    int w = 0;
+    int h = 0;
+  };
+
+  std::deque<DossierRequest> m_dossierQueue;
+
+  // City Lab dossier UI settings (presets + quick options).
+  int m_labDossierPreset = 0;      // 0=Full, 1=Fast
+  int m_labDossierExportScale = 2; // 1..6
+  bool m_labDossierIso = true;
+  bool m_labDossier3d = false;
+  int m_labDossierFormat = 0;      // 0=png, 1=ppm
+
+  // Last completed dossier export (for UI/console feedback).
+  bool m_lastDossierOk = false;
+  std::string m_lastDossierOutDir;
+  std::string m_lastDossierMsg;
+
+  // Background dossier export job (async)
+  struct DossierJob;
+  std::unique_ptr<DossierJob> m_dossierJob;
 
   // Software 3D render export (headless CPU renderer in Export3D/Soft3D).
   bool m_pendingRender3D = false;

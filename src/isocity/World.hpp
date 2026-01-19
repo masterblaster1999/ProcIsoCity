@@ -26,6 +26,12 @@ enum class Overlay : std::uint8_t {
   Commercial = 3,
   Industrial = 4,
   Park = 5,
+
+  // Civic/service buildings (single-tile facilities).
+  School = 6,
+  Hospital = 7,
+  PoliceStation = 8,
+  FireStation = 9,
 };
 
 enum class Tool : std::uint8_t {
@@ -35,6 +41,10 @@ enum class Tool : std::uint8_t {
   Commercial,
   Industrial,
   Park,
+  School,
+  Hospital,
+  PoliceStation,
+  FireStation,
   Bulldoze,
 
   // Terraforming (visual elevation editing).
@@ -116,6 +126,21 @@ struct Stats {
   int transitRiders = 0;
   float transitModeShare = 0.0f;        // 0..1 share of commuters using transit
   float transitCommuteCoverage = 0.0f;  // 0..1 share of commute demand on served corridors
+
+  // --- Derived public services / civic accessibility stats (recomputed by the simulator; not persisted in saves) ---
+  // Facility counts (active/enabled) by type.
+  int servicesEducationFacilities = 0;
+  int servicesHealthFacilities = 0;
+  int servicesSafetyFacilities = 0;
+
+  // Demand-weighted satisfaction (0..1).
+  float servicesEducationSatisfaction = 0.0f;
+  float servicesHealthSatisfaction = 0.0f;
+  float servicesSafetySatisfaction = 0.0f;
+  float servicesOverallSatisfaction = 0.0f;
+
+  // Per-day maintenance cost for active service facilities.
+  int servicesMaintenanceCost = 0;
 
   // --- Derived goods/logistics stats (recomputed by the simulator; not persisted in saves) ---
   int goodsProduced = 0;

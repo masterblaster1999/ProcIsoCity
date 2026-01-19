@@ -12,6 +12,9 @@
 
 namespace isocity {
 
+struct SeaFloodResult;
+struct DepressionFillResult;
+
 // Small headless export utilities.
 // Intended for:
 //  - CLI tooling / batch simulation pipelines
@@ -36,6 +39,12 @@ enum class ExportLayer : std::uint8_t {
 
   // Depression-fill depth (Priority-Flood): ponding potential in closed basins.
   PondingDepth = 9,
+
+  // Public services / civic accessibility satisfaction (0..1).
+  ServicesOverall = 10,
+  ServicesEducation = 11,
+  ServicesHealth = 12,
+  ServicesSafety = 13,
 };
 
 struct PpmImage {
@@ -578,5 +587,43 @@ bool WritePpm(const std::string& path, const PpmImage& img, std::string& outErro
 //
 // Returns true on success; on failure, outError contains a human-friendly error.
 bool WriteTilesCsv(const World& world, const std::string& path, std::string& outError);
+
+struct TileMetricsCsvInputs {
+  const LandValueResult* landValue = nullptr;
+  const TrafficResult* traffic = nullptr;
+  const GoodsResult* goods = nullptr;
+  const SeaFloodResult* seaFlood = nullptr;
+  const DepressionFillResult* ponding = nullptr;
+};
+
+struct TileMetricsCsvOptions {
+  bool includeLandValue = true;
+  bool includeLandValueComponents = true;
+  bool includeTraffic = true;
+  bool includeGoods = true;
+  bool includeFlood = true;
+  bool includePonding = true;
+
+  // Float precision for heights/metrics.
+  int floatPrecision = 6;
+};
+
+// Write a per-tile CSV containing base tile fields plus optional derived metrics.
+//
+// Base columns (always written):
+//   x,y,terrain,overlay,level,district,height,variation,occupants
+//
+// Optional metric columns (enabled by TileMetricsCsvOptions and present when the
+// corresponding input pointer is non-null):
+//   - land value: land_value,park_amenity,water_amenity,pollution,traffic_penalty
+//   - traffic: commute_traffic
+//   - goods: goods_traffic,goods_fill
+//   - flood: flooded,flood_depth
+//   - ponding: ponding_depth
+//
+// Returns true on success; on failure, outError contains a human-friendly error.
+bool WriteTileMetricsCsv(const World& world, const std::string& path, std::string& outError,
+                         const TileMetricsCsvInputs& inputs = {},
+                         const TileMetricsCsvOptions& opt = {});
 
 } // namespace isocity

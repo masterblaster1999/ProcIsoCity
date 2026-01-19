@@ -2,6 +2,8 @@
 
 #include "isocity/Road.hpp"
 
+#include "isocity/Random.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <vector>
@@ -27,6 +29,10 @@ const char* ToString(Overlay o)
   case Overlay::Commercial: return "Commercial";
   case Overlay::Industrial: return "Industrial";
   case Overlay::Park: return "Park";
+  case Overlay::School: return "School";
+  case Overlay::Hospital: return "Hospital";
+  case Overlay::PoliceStation: return "PoliceStation";
+  case Overlay::FireStation: return "FireStation";
   default: return "UnknownOverlay";
   }
 }
@@ -40,6 +46,10 @@ const char* ToString(Tool t)
   case Tool::Commercial: return "Commercial";
   case Tool::Industrial: return "Industrial";
   case Tool::Park: return "Park";
+  case Tool::School: return "School";
+  case Tool::Hospital: return "Hospital";
+  case Tool::PoliceStation: return "PoliceStation";
+  case Tool::FireStation: return "FireStation";
   case Tool::Bulldoze: return "Bulldoze";
   case Tool::RaiseTerrain: return "Raise";
   case Tool::LowerTerrain: return "Lower";
@@ -260,6 +270,13 @@ void World::setOverlay(Overlay overlay, int x, int y)
     if (before != Overlay::Road) t.level = 1;
     t.level = static_cast<std::uint8_t>(ClampRoadLevel(static_cast<int>(t.level)));
     t.occupants = 0;
+  } else if (overlay == Overlay::School || overlay == Overlay::Hospital || overlay == Overlay::PoliceStation ||
+             overlay == Overlay::FireStation) {
+    // Service facilities use level 1..3 to represent capacity/upgrade level.
+    if (before != overlay) t.level = 1;
+    const int level = std::clamp(static_cast<int>(t.level), 1, 3);
+    t.level = static_cast<std::uint8_t>(level);
+    t.occupants = 0;
   } else {
     // Non-zones and parks don't currently use the level field.
     t.level = 1;
@@ -357,7 +374,49 @@ ToolApplyResult World::applyTool(Tool tool, int x, int y)
     return applyRoad(x, y, 1);
   } break;
 
-  case Tool::Park: {
+    case Tool::School:
+  case Tool::Hospital:
+  case Tool::PoliceStation:
+  case Tool::FireStation: {
+    Overlay svc = Overlay::School;
+    if (tool == Tool::Hospital) svc = Overlay::Hospital;
+    if (tool == Tool::PoliceStation) svc = Overlay::PoliceStation;
+    if (tool == Tool::FireStation) svc = Overlay::FireStation;
+
+    // Service facilities require direct road adjacency.
+    if (!hasAdjacentRoad(x, y)) return ToolApplyResult::BlockedNoRoad;
+
+    auto buildCostForLevel = [&](int lvl) -> int {
+      // A small but noticeable capital cost curve.
+      lvl = std::clamp(lvl, 1, 3);
+      return 25 + 20 * (lvl - 1);
+    };
+
+    if (t.overlay == svc) {
+      const int cur = std::clamp<int>(static_cast<int>(t.level), 1, 3);
+      if (cur >= 3) return ToolApplyResult::Noop;
+      const int target = cur + 1;
+      const int cost = buildCostForLevel(target) - buildCostForLevel(cur);
+      if (!spend(cost)) return ToolApplyResult::InsufficientFunds;
+      t.level = static_cast<std::uint8_t>(target);
+      return ToolApplyResult::Applied;
+    }
+
+    // Don't overwrite other content; bulldoze first.
+    if (t.overlay != Overlay::None) return ToolApplyResult::BlockedOccupied;
+
+    const int cost = buildCostForLevel(1);
+    if (!spend(cost)) return ToolApplyResult::InsufficientFunds;
+
+    setOverlay(svc, x, y);
+    // Stable variation bits so facilities don't all look identical.
+    const std::uint32_t seed32 = static_cast<std::uint32_t>(m_seed & 0xFFFFFFFFu) ^
+                            (static_cast<std::uint32_t>(static_cast<std::uint8_t>(tool)) * 0x9E3779B9u);
+    t.variation = static_cast<std::uint8_t>(HashCoords32(x, y, seed32) & 0xFFu);
+    return ToolApplyResult::Applied;
+  } break;
+
+case Tool::Park: {
     if (t.overlay == Overlay::Park) return ToolApplyResult::Noop;
     // Parks also shouldn't replace existing content; bulldoze first.
     if (t.overlay != Overlay::None) return ToolApplyResult::BlockedOccupied;

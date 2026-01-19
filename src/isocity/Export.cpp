@@ -5,6 +5,8 @@
 #include "isocity/Random.hpp"
 #include "isocity/ZoneMetrics.hpp"
 
+#include "isocity/Services.hpp"
+
 #include "isocity/FloodRisk.hpp"
 #include "isocity/DepressionFill.hpp"
 
@@ -504,6 +506,18 @@ inline void OverlayColor(const Tile& t, std::uint8_t& r, std::uint8_t& g, std::u
   case Overlay::Park:
     r = 40; g = 140; b = 60;
     break;
+  case Overlay::School:
+    r = 80; g = 150; b = 255;
+    break;
+  case Overlay::Hospital:
+    r = 255; g = 90; b = 90;
+    break;
+  case Overlay::PoliceStation:
+    r = 130; g = 120; b = 230;
+    break;
+  case Overlay::FireStation:
+    r = 255; g = 120; b = 60;
+    break;
   case Overlay::None:
   default:
     // Keep base terrain.
@@ -688,6 +702,7 @@ struct TileColorContext {
   const LandValueResult* landValue = nullptr;
   const TrafficResult* traffic = nullptr;
   const GoodsResult* goods = nullptr;
+  const ServicesResult* services = nullptr;
 
   std::uint16_t maxTraffic = 0;
   std::uint16_t maxGoodsTraffic = 0;
@@ -853,6 +868,48 @@ inline void ComputeTileColor(const World& world, int x, int y, ExportLayer layer
     HeatRampBlue(depth01, r, g, b);
   } break;
 
+  case ExportLayer::ServicesOverall:
+  case ExportLayer::ServicesEducation:
+  case ExportLayer::ServicesHealth:
+  case ExportLayer::ServicesSafety: {
+    // Public services / civic accessibility satisfaction.
+    // Background: terrain with height shading.
+    MulPixel(r, g, b, shade);
+
+    // Always highlight facility tiles so it's obvious where supply comes from.
+    if (t.overlay == Overlay::School || t.overlay == Overlay::Hospital ||
+        t.overlay == Overlay::PoliceStation || t.overlay == Overlay::FireStation) {
+      OverlayColor(t, r, g, b);
+      break;
+    }
+
+    const bool isZone = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
+                         t.overlay == Overlay::Industrial);
+    if (!isZone) break;
+
+    if (ctx.services) {
+      const std::size_t i = FlatIdx(x, y, ctx.w);
+      const std::size_t n = static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h);
+
+      const std::vector<float>* field = nullptr;
+      if (layer == ExportLayer::ServicesOverall) field = &ctx.services->overall;
+      else if (layer == ExportLayer::ServicesEducation) field = &ctx.services->education;
+      else if (layer == ExportLayer::ServicesHealth) field = &ctx.services->health;
+      else if (layer == ExportLayer::ServicesSafety) field = &ctx.services->safety;
+
+      if (field && field->size() == n && i < field->size()) {
+        const float v = (*field)[i];
+        std::uint8_t hr, hg, hb;
+        HeatRampRedYellowGreen(v, hr, hg, hb);
+        // Blend so terrain context still shows through.
+        r = static_cast<std::uint8_t>((static_cast<int>(r) + static_cast<int>(hr) * 2) / 3);
+        g = static_cast<std::uint8_t>((static_cast<int>(g) + static_cast<int>(hg) * 2) / 3);
+        b = static_cast<std::uint8_t>((static_cast<int>(b) + static_cast<int>(hb) * 2) / 3);
+      }
+    }
+  } break;
+
+
   default:
     break;
   }
@@ -956,6 +1013,22 @@ bool ParseExportLayer(const std::string& s, ExportLayer& outLayer)
     outLayer = ExportLayer::PondingDepth;
     return true;
   }
+  if (k == "services" || k == "service" || k == "services_overall" || k == "servicesoverall" || k == "svc") {
+    outLayer = ExportLayer::ServicesOverall;
+    return true;
+  }
+  if (k == "services_education" || k == "service_education" || k == "servicesedu" || k == "services_edu" || k == "svc_education" || k == "svc_edu") {
+    outLayer = ExportLayer::ServicesEducation;
+    return true;
+  }
+  if (k == "services_health" || k == "service_health" || k == "serviceshealth" || k == "services_h" || k == "svc_health" || k == "svc_h") {
+    outLayer = ExportLayer::ServicesHealth;
+    return true;
+  }
+  if (k == "services_safety" || k == "service_safety" || k == "servicessafety" || k == "services_s" || k == "svc_safety" || k == "svc_s") {
+    outLayer = ExportLayer::ServicesSafety;
+    return true;
+  }
   return false;
 }
 
@@ -971,6 +1044,11 @@ const char* ExportLayerName(ExportLayer layer)
   case ExportLayer::GoodsFill: return "goods_fill";
   case ExportLayer::District: return "district";
   case ExportLayer::FloodDepth: return "flood_depth";
+  case ExportLayer::PondingDepth: return "ponding_depth";
+  case ExportLayer::ServicesOverall: return "services";
+  case ExportLayer::ServicesEducation: return "services_education";
+  case ExportLayer::ServicesHealth: return "services_health";
+  case ExportLayer::ServicesSafety: return "services_safety";
   default: return "unknown";
   }
 }
@@ -1017,7 +1095,27 @@ PpmImage RenderPpmLayer(const World& world, ExportLayer layer, const LandValueRe
     havePonding = true;
   }
 
+
+  ServicesResult services{};
+  bool haveServices = false;
+  if (layer == ExportLayer::ServicesOverall || layer == ExportLayer::ServicesEducation ||
+      layer == ExportLayer::ServicesHealth || layer == ExportLayer::ServicesSafety) {
+    ServicesModelSettings cfg{};
+    cfg.enabled = true;
+    // Keep exports deterministic and reasonably aligned with the in-game defaults.
+    cfg.requireOutsideConnection = true;
+    cfg.weightMode = IsochroneWeightMode::TravelTime;
+    cfg.catchmentRadiusSteps = 18;
+
+    const std::vector<ServiceFacility> facilities = ExtractServiceFacilitiesFromWorld(world);
+    services = ComputeServices(world, cfg, facilities);
+    haveServices = true;
+  }
+
   TileColorContext ctx = MakeTileColorContext(world, landValue, traffic, goods);
+  if (haveServices) {
+    ctx.services = &services;
+  }
   if (haveSeaFlood) {
     ctx.seaFloodDepth = &seaFlood.depth;
     ctx.seaFloodMaxDepth = seaFlood.maxDepth;
@@ -1136,7 +1234,26 @@ IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const
     havePonding = true;
   }
 
+
+  ServicesResult services{};
+  bool haveServices = false;
+  if (layer == ExportLayer::ServicesOverall || layer == ExportLayer::ServicesEducation ||
+      layer == ExportLayer::ServicesHealth || layer == ExportLayer::ServicesSafety) {
+    ServicesModelSettings cfg{};
+    cfg.enabled = true;
+    cfg.requireOutsideConnection = true;
+    cfg.weightMode = IsochroneWeightMode::TravelTime;
+    cfg.catchmentRadiusSteps = 18;
+
+    const std::vector<ServiceFacility> facilities = ExtractServiceFacilitiesFromWorld(world);
+    services = ComputeServices(world, cfg, facilities);
+    haveServices = true;
+  }
+
   TileColorContext ctx = MakeTileColorContext(world, landValue, traffic, goods);
+  if (haveServices) {
+    ctx.services = &services;
+  }
   if (haveSeaFlood) {
     ctx.seaFloodDepth = &seaFlood.depth;
     ctx.seaFloodMaxDepth = seaFlood.maxDepth;
@@ -2823,6 +2940,149 @@ bool WriteTilesCsv(const World& world, const std::string& path, std::string& out
         << static_cast<double>(t.height) << ','
         << static_cast<int>(t.variation) << ','
         << static_cast<int>(t.occupants) << '\n';
+    }
+  }
+
+  if (!f) {
+    outError = "Failed while writing file";
+    return false;
+  }
+  return true;
+}
+
+bool WriteTileMetricsCsv(const World& world, const std::string& path, std::string& outError,
+                         const TileMetricsCsvInputs& inputs, const TileMetricsCsvOptions& opt)
+{
+  outError.clear();
+
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) {
+    outError = "Invalid world dimensions";
+    return false;
+  }
+
+  const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+
+  auto validateGridSize = [&](const char* name, int bw, int bh, std::size_t sz) -> bool {
+    if (bw != w || bh != h) {
+      outError = std::string(name) + " dimensions do not match world";
+      return false;
+    }
+    if (sz != n) {
+      outError = std::string(name) + " size does not match world";
+      return false;
+    }
+    return true;
+  };
+
+  if (inputs.landValue && opt.includeLandValue) {
+    if (!validateGridSize("LandValueResult", inputs.landValue->w, inputs.landValue->h, inputs.landValue->value.size())) {
+      return false;
+    }
+    if (opt.includeLandValueComponents) {
+      if (inputs.landValue->parkAmenity.size() != n || inputs.landValue->waterAmenity.size() != n ||
+          inputs.landValue->pollution.size() != n || inputs.landValue->traffic.size() != n) {
+        outError = "LandValueResult component arrays do not match world";
+        return false;
+      }
+    }
+  }
+
+  if (inputs.traffic && opt.includeTraffic) {
+    if (inputs.traffic->roadTraffic.size() != n) {
+      outError = "TrafficResult size does not match world";
+      return false;
+    }
+  }
+
+  if (inputs.goods && opt.includeGoods) {
+    if (inputs.goods->roadGoodsTraffic.size() != n || inputs.goods->commercialFill.size() != n) {
+      outError = "GoodsResult size does not match world";
+      return false;
+    }
+  }
+
+  if (inputs.seaFlood && opt.includeFlood) {
+    if (!validateGridSize("SeaFloodResult", inputs.seaFlood->w, inputs.seaFlood->h, inputs.seaFlood->depth.size())) {
+      return false;
+    }
+    if (inputs.seaFlood->flooded.size() != n) {
+      outError = "SeaFloodResult flooded mask does not match world";
+      return false;
+    }
+  }
+
+  if (inputs.ponding && opt.includePonding) {
+    if (!validateGridSize("DepressionFillResult", inputs.ponding->w, inputs.ponding->h, inputs.ponding->depth.size())) {
+      return false;
+    }
+  }
+
+  std::ofstream f(path, std::ios::binary);
+  if (!f) {
+    outError = "Failed to open file for writing";
+    return false;
+  }
+
+  f << "x,y,terrain,overlay,level,district,height,variation,occupants";
+  if (opt.includeLandValue && inputs.landValue) {
+    f << ",land_value";
+    if (opt.includeLandValueComponents) {
+      f << ",park_amenity,water_amenity,pollution,traffic_penalty";
+    }
+  }
+  if (opt.includeTraffic && inputs.traffic) {
+    f << ",commute_traffic";
+  }
+  if (opt.includeGoods && inputs.goods) {
+    f << ",goods_traffic,goods_fill";
+  }
+  if (opt.includeFlood && inputs.seaFlood) {
+    f << ",flooded,flood_depth";
+  }
+  if (opt.includePonding && inputs.ponding) {
+    f << ",ponding_depth";
+  }
+  f << "\n";
+
+  const int prec = std::clamp(opt.floatPrecision, 0, 12);
+  f << std::fixed << std::setprecision(prec);
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const Tile& t = world.at(x, y);
+      const std::size_t i = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+      f << x << ',' << y << ',' << ToString(t.terrain) << ',' << ToString(t.overlay) << ','
+        << static_cast<int>(t.level) << ',' << static_cast<int>(t.district) << ','
+        << static_cast<double>(t.height) << ','
+        << static_cast<int>(t.variation) << ','
+        << static_cast<int>(t.occupants);
+
+      if (opt.includeLandValue && inputs.landValue) {
+        f << ',' << static_cast<double>(inputs.landValue->value[i]);
+        if (opt.includeLandValueComponents) {
+          f << ',' << static_cast<double>(inputs.landValue->parkAmenity[i]);
+          f << ',' << static_cast<double>(inputs.landValue->waterAmenity[i]);
+          f << ',' << static_cast<double>(inputs.landValue->pollution[i]);
+          f << ',' << static_cast<double>(inputs.landValue->traffic[i]);
+        }
+      }
+      if (opt.includeTraffic && inputs.traffic) {
+        f << ',' << static_cast<int>(inputs.traffic->roadTraffic[i]);
+      }
+      if (opt.includeGoods && inputs.goods) {
+        f << ',' << static_cast<int>(inputs.goods->roadGoodsTraffic[i]);
+        f << ',' << static_cast<int>(inputs.goods->commercialFill[i]);
+      }
+      if (opt.includeFlood && inputs.seaFlood) {
+        f << ',' << static_cast<int>(inputs.seaFlood->flooded[i]);
+        f << ',' << static_cast<double>(inputs.seaFlood->depth[i]);
+      }
+      if (opt.includePonding && inputs.ponding) {
+        f << ',' << static_cast<double>(inputs.ponding->depth[i]);
+      }
+      f << '\n';
     }
   }
 

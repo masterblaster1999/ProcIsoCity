@@ -133,6 +133,8 @@ add_library(isocity_core
   src/isocity/Wayfinding.cpp
   src/isocity/Json.cpp
   src/isocity/ConfigIO.cpp
+  src/isocity/SeedMiner.cpp
+  src/isocity/Dossier.cpp
 )
 
 target_include_directories(isocity_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -713,6 +715,27 @@ if (PROCISOCITY_BUILD_CLI)
   target_link_libraries(proc_isocity_districtreport PRIVATE isocity_core)
 
   procisocity_set_strict_warnings(proc_isocity_districtreport)
+
+  # Dossier tool (headless): one-command export of images + CSV/JSON + HTML.
+  add_executable(proc_isocity_dossier
+    src/cli/dossier.cpp
+  )
+
+  target_include_directories(proc_isocity_dossier PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_dossier PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_dossier)
+
+  # Seed miner tool (headless): batch-generate/simulate seeds, compute KPIs, and rank by objective.
+  add_executable(proc_isocity_mine
+    src/cli/mine.cpp
+  )
+
+  target_include_directories(proc_isocity_mine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_mine PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_mine)
+
 
   # Map export tool (headless): export a world as a single GeoJSON FeatureCollection.
   add_executable(proc_isocity_mapexport

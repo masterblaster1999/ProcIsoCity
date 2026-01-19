@@ -24,6 +24,7 @@
 #include "isocity/GfxPalette.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cstring>
@@ -34,9 +35,50 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <string>
+#include <thread>
 
 namespace isocity {
+
+struct Game::DossierJob {
+  CityDossierConfig cfg;
+  ProcGenConfig procCfg;
+  SimConfig simCfg;
+
+  // Snapshot export (current interactive world).
+  std::vector<Stats> ticks;
+  World world;
+
+  // Seed-bake export (generate+simulate in the worker thread).
+  std::vector<std::uint64_t> seeds;
+  int bakeDays = 0;
+  int w = 0;
+  int h = 0;
+
+  std::thread worker;
+  std::atomic<bool> cancel{false};
+  std::atomic<bool> done{false};
+  std::atomic<int> stepIndex{0};
+  std::atomic<int> stepCount{0};
+
+  // Batch progress (seed-bake mode).
+  std::atomic<int> seedIndex{0};
+  std::atomic<int> seedCount{0};
+  int okSeeds = 0;
+  int failSeeds = 0;
+
+  std::mutex mutex;
+  std::string stage;
+  bool ok = false;
+  CityDossierResult res;
+  std::string err;
+
+  ~DossierJob()
+  {
+    if (worker.joinable()) worker.join();
+  }
+};
 
 namespace {
 // Slot 1 uses the legacy filename so existing quick-saves keep working.
@@ -79,6 +121,11 @@ constexpr int kWayfindingPanelW = 420;
 constexpr int kWayfindingPanelH = 386;
 constexpr int kAutoBuildPanelW = 460;
 constexpr int kAutoBuildPanelH = 420;
+constexpr int kServicesPanelW = 460;
+constexpr int kServicesPanelH = 420;
+constexpr int kHeadlessLabPanelW = 460;
+constexpr int kHeadlessLabPanelH = 520;
+
 
 // Simple flow-dock for stacking panels on the right. When vertical space runs out it wraps to a new
 // column to the left, keeping panels on-screen without overlap.
@@ -677,7 +724,34 @@ Game::Game(Config cfg)
   m_3dPreviewCfg.supersample = 1;
   m_3dPreviewCfg.outlineAlpha = 0.70f;
 
+  // --- Public services optimizer defaults (experimental; in-game integration scaffolding) ---
+  m_servicesPlanCfg = ServiceOptimizerConfig{};
+  m_servicesPlanCfg.modelCfg = m_sim.servicesModel();
+  m_servicesPlanCfg.modelCfg.enabled = true;
+  // Keep the outside-connection rule consistent with the main sim by default.
+  m_servicesPlanCfg.modelCfg.requireOutsideConnection = m_sim.config().requireOutsideConnection;
+  m_servicesPlanCfg.type = ServiceType::Education;
+  m_servicesPlanCfg.facilitiesToAdd = 8;
+  m_servicesPlanCfg.facilityLevel = 1;
+  m_servicesPlanCfg.candidateLimit = 700;
+  m_servicesPlanCfg.requireEmptyLand = true;
+  m_servicesPlanCfg.requireStableAccessRoad = true;
+  m_servicesPlanCfg.minSeparationMilli = 0;
+  m_servicesPlanCfg.considerOnlySameTypeExisting = true;
+
   resetWorld(m_cfg.seed);
+
+  // --- City Lab defaults (headless tools integrated into the interactive app) ---
+  m_labMineCfg.w = m_world.width();
+  m_labMineCfg.h = m_world.height();
+  m_labMineCfg.samples = 200;
+  m_labMineCfg.days = 120;
+  m_labMineCfg.seedStart = 1;
+  m_labMineCfg.seedStep = 1;
+  m_labMineCfg.objective = m_mineObjective;
+  m_labMineCfg.hydrologyEnabled = true;
+  m_labMineCfg.seaLevelOverride = std::numeric_limits<float>::quiet_NaN();
+  m_labMineBakeDays = m_labMineCfg.days;
 
   // Camera
   m_camera.zoom = 1.0f;
@@ -4123,6 +4197,730 @@ void Game::setupDevConsole()
       });
 
   m_console.registerCommand(
+      "dossier",
+      "dossier [outDir] [scale=N] [fmt=png|ppm] [iso=0|1] [3d=0|1] [layers=...] [isolayers=...] - export a city dossier bundle (queued)",
+      [this, toLower, parseI32](DevConsole& c, const DevConsole::Args& args) {
+        namespace fs = std::filesystem;
+        fs::create_directories("captures");
+
+        CityDossierConfig cfg;
+        cfg.outDir = fs::path(TextFormat("captures/dossier_seed%llu_%s",
+                                         static_cast<unsigned long long>(m_cfg.seed),
+                                         FileTimestamp().c_str()));
+
+        // Reasonable defaults for interactive use.
+        cfg.exportScale = 2;
+        cfg.format = "png";
+        cfg.exportIso = true;
+        cfg.export3d = false;
+
+        // Make software 3D fast enough to be usable (users can override with 3d=1 and tweak later).
+        cfg.render3dCfg.width = 960;
+        cfg.render3dCfg.height = 540;
+        cfg.render3dCfg.supersample = 2;
+        cfg.render3dCfg.projection = Render3DConfig::Projection::IsometricOrtho;
+        cfg.render3dCfg.timeOfDay = 0.42f;
+        cfg.render3dCfg.windDirDeg = 125.0f;
+        cfg.render3dCfg.rainStrength = 0.10f;
+        cfg.render3dCfg.cloudStrength = 0.25f;
+        cfg.render3dCfg.postGrade = true;
+        cfg.render3dCfg.postVignette = true;
+        cfg.render3dCfg.postBloom = true;
+        cfg.render3dCfg.postBloomStrength = 0.12f;
+        cfg.render3dCfg.postBloomRadius = 0.80f;
+        cfg.render3dCfg.postDither = true;
+        cfg.render3dCfg.postDitherStrength = 0.22f;
+
+        bool outDirSet = false;
+
+        auto parseBool = [&](const std::string& v, bool& out) -> bool {
+          const std::string t = toLower(v);
+          if (t == "1" || t == "true" || t == "on" || t == "yes") { out = true; return true; }
+          if (t == "0" || t == "false" || t == "off" || t == "no") { out = false; return true; }
+          return false;
+        };
+
+        auto parseLayerList = [&](const std::string& csv, std::vector<ExportLayer>& outLayers) -> bool {
+          outLayers.clear();
+          std::string token;
+          for (std::size_t i = 0; i <= csv.size(); ++i) {
+            if (i == csv.size() || csv[i] == ',') {
+              if (!token.empty()) {
+                ExportLayer l;
+                if (!ParseExportLayer(token, l)) {
+                  return false;
+                }
+                outLayers.push_back(l);
+                token.clear();
+              }
+              continue;
+            }
+            token.push_back(csv[i]);
+          }
+          return !outLayers.empty();
+        };
+
+        for (std::size_t i = 0; i < args.size(); ++i) {
+          const std::string a = args[i];
+          const std::size_t eq = a.find('=');
+          if (eq != std::string::npos) {
+            const std::string k = toLower(a.substr(0, eq));
+            const std::string v = a.substr(eq + 1);
+
+            if (k == "scale" || k == "s") {
+              int sc = 0;
+              if (!parseI32(v, sc) || sc < 1 || sc > 16) {
+                c.print("Bad scale. Expected 1..16");
+                return;
+              }
+              cfg.exportScale = sc;
+              continue;
+            }
+
+            if (k == "fmt" || k == "format") {
+              cfg.format = toLower(v);
+              continue;
+            }
+
+            if (k == "iso") {
+              bool b = cfg.exportIso;
+              if (!parseBool(v, b)) {
+                c.print("Bad iso. Use iso=0|1");
+                return;
+              }
+              cfg.exportIso = b;
+              continue;
+            }
+
+            if (k == "3d" || k == "render3d") {
+              bool b = cfg.export3d;
+              if (!parseBool(v, b)) {
+                c.print("Bad 3d. Use 3d=0|1");
+                return;
+              }
+              cfg.export3d = b;
+              continue;
+            }
+
+            if (k == "layers") {
+              if (!parseLayerList(v, cfg.layers2d)) {
+                c.print("Bad layers list. Example: layers=terrain,overlay,landvalue");
+                return;
+              }
+              continue;
+            }
+
+            if (k == "isolayers" || k == "iso_layers") {
+              if (!parseLayerList(v, cfg.layersIso)) {
+                c.print("Bad isolayers list. Example: isolayers=overlay,landvalue");
+                return;
+              }
+              continue;
+            }
+
+            if (k == "tilemetrics" || k == "tile_metrics") {
+              bool b = cfg.writeTileMetricsCsv;
+              if (!parseBool(v, b)) {
+                c.print("Bad tilemetrics. Use tilemetrics=0|1");
+                return;
+              }
+              cfg.writeTileMetricsCsv = b;
+              continue;
+            }
+
+            if (k == "ticks") {
+              bool b = cfg.writeTicksCsv;
+              if (!parseBool(v, b)) {
+                c.print("Bad ticks. Use ticks=0|1");
+                return;
+              }
+              cfg.writeTicksCsv = b;
+              continue;
+            }
+
+            if (k == "world" || k == "worldbin") {
+              bool b = cfg.writeWorldBinary;
+              if (!parseBool(v, b)) {
+                c.print("Bad world. Use world=0|1");
+                return;
+              }
+              cfg.writeWorldBinary = b;
+              continue;
+            }
+
+            if (k == "html") {
+              bool b = cfg.writeHtml;
+              if (!parseBool(v, b)) {
+                c.print("Bad html. Use html=0|1");
+                return;
+              }
+              cfg.writeHtml = b;
+              // Keep summary.json if html is requested.
+              if (cfg.writeHtml) cfg.writeSummaryJson = true;
+              continue;
+            }
+
+            c.print("Unknown option: " + a);
+            continue;
+          }
+
+          // Positional: first non key=value token is treated as the output dir.
+          if (!outDirSet) {
+            cfg.outDir = fs::path(a);
+            outDirSet = true;
+            continue;
+          }
+
+          c.print("Unexpected arg: " + a);
+          return;
+        }
+
+        if (cfg.outDir.empty()) {
+          c.print("Usage: dossier [outDir] [scale=N] [fmt=png|ppm] [iso=0|1] [3d=0|1] [layers=...] [isolayers=...]");
+          return;
+        }
+
+        endPaintStroke();
+        const std::string outDirStr = cfg.outDir.string();
+        queueDossierCurrentWorld(std::move(cfg));
+        c.print(std::string("queued: ") + outDirStr);
+      });
+
+
+  m_console.registerCommand(
+      "dossier_status",
+      "dossier_status - show background dossier export status",
+      [this](DevConsole& c, const DevConsole::Args& /*args*/) {
+        if (m_dossierJob) {
+          int si = m_dossierJob->stepIndex.load(std::memory_order_relaxed);
+          int sc = m_dossierJob->stepCount.load(std::memory_order_relaxed);
+          int seedI = m_dossierJob->seedIndex.load(std::memory_order_relaxed);
+          int seedC = m_dossierJob->seedCount.load(std::memory_order_relaxed);
+          bool cancel = m_dossierJob->cancel.load(std::memory_order_relaxed);
+          std::string stage;
+          {
+            std::lock_guard<std::mutex> lock(m_dossierJob->mutex);
+            stage = m_dossierJob->stage;
+          }
+
+          std::string seedPrefix;
+          if (seedC > 0) {
+            seedPrefix = TextFormat("[seed %d/%d] ", seedI, seedC);
+          }
+
+          if (sc > 0) {
+            const float pct = 100.0f * (static_cast<float>(si) / static_cast<float>(sc));
+            c.print(TextFormat("dossier: %s%s  %d/%d (%.1f%%)%s", seedPrefix.c_str(), stage.c_str(), si, sc,
+                               static_cast<double>(pct), cancel ? "  [cancel requested]" : ""));
+          } else {
+            c.print(std::string("dossier: ") + seedPrefix + stage + (cancel ? "  [cancel requested]" : ""));
+          }
+
+          if (!m_dossierQueue.empty()) {
+            c.print(TextFormat("dossier: %d job(s) queued", (int)m_dossierQueue.size()));
+          }
+          return;
+        }
+
+        if (!m_dossierQueue.empty()) {
+          const auto& next = m_dossierQueue.front();
+          c.print(TextFormat("dossier: queued %d job(s) (next outDir=%s)", (int)m_dossierQueue.size(),
+                             next.cfg.outDir.string().c_str()));
+          return;
+        }
+
+        if (!m_lastDossierMsg.empty()) {
+          c.print(std::string("dossier: (idle)  last: ") + m_lastDossierMsg);
+        } else {
+          c.print("dossier: (idle)");
+        }
+      });
+
+  
+
+  m_console.registerCommand(
+      "dossier_cancel",
+      "dossier_cancel - request cancellation of the background dossier export",
+      [this](DevConsole& c, const DevConsole::Args& /*args*/) {
+        if (!m_dossierJob) {
+          c.print("dossier: (idle)");
+          return;
+        }
+        m_dossierJob->cancel.store(true, std::memory_order_relaxed);
+        showToast("Dossier cancel requested", 1.8f);
+        c.print("dossier: cancel requested");
+        if (!m_dossierQueue.empty()) {
+          c.print(TextFormat("dossier: %d job(s) still queued", (int)m_dossierQueue.size()));
+        }
+      });
+
+  m_console.registerCommand(
+      "dossier_clear",
+      "dossier_clear - clear queued dossier requests (does not cancel the active job)",
+      [this](DevConsole& c, const DevConsole::Args& /*args*/) {
+        const int n = static_cast<int>(m_dossierQueue.size());
+        m_dossierQueue.clear();
+        c.print(TextFormat("dossier: cleared %d queued job(s)", n));
+        showToast(TextFormat("Cleared %d dossier job(s)", n), 1.6f);
+      });
+
+  m_console.registerCommand(
+      "mine",
+      "mine <begin|stop|status|step|auto|top|load|export> ... - seed mining (headless) integrated into the app",
+      [this, toLower, parseI32, parseU64, parseF32, joinArgs](DevConsole& c, const DevConsole::Args& args) {
+        auto usage = [&]() {
+          c.print("Seed mining (headless) - uses the same core as proc_isocity_mine");
+          c.print("Usage:");
+          c.print("  mine begin <samples> [objective] [key=value...]  - start a new mining session (auto-runs)");
+          c.print("       keys: days=N seed_start=U64 seed_step=U64 hydro=0|1 sea=0..1 topK=N diverse=0|1");
+          c.print("  mine status                                 - show status / best seed so far");
+          c.print("  mine auto on|off|toggle [steps=N] [budget=MS] - enable/disable auto-stepping each frame");
+          c.print("  mine step [N]                               - synchronously mine N samples now");
+          c.print("  mine top [K] [diverse=0|1]                  - list top seeds by score");
+          c.print("  mine load <rank>                            - reset the game world to the Nth best seed (rank starts at 1)");
+          c.print("  mine export <path.csv|path.json>            - export mined records");
+          c.print("  mine stop                                  - stop and discard the current session");
+          c.print("Objectives: balanced, growth, resilient, chaos");
+        };
+
+        if (args.empty()) {
+          usage();
+          return;
+        }
+
+        const std::string sub = toLower(args[0]);
+
+        auto parseBool = [&](const std::string& v, bool& out) -> bool {
+          const std::string t = toLower(v);
+          if (t == "1" || t == "true" || t == "on" || t == "yes") { out = true; return true; }
+          if (t == "0" || t == "false" || t == "off" || t == "no") { out = false; return true; }
+          if (t == "toggle") { out = !out; return true; }
+          return false;
+        };
+
+        auto bestRecord = [&]() -> const MineRecord* {
+          if (!m_mineSession) return nullptr;
+          const auto& recs = m_mineSession->records();
+          if (recs.empty()) return nullptr;
+          const MineRecord* best = &recs[0];
+          for (const MineRecord& r : recs) {
+            if (r.score > best->score) best = &r;
+          }
+          return best;
+        };
+
+        if (sub == "help" || sub == "?" || sub == "-h" || sub == "--help") {
+          usage();
+          return;
+        }
+
+        if (sub == "stop" || sub == "cancel" || sub == "reset") {
+          m_mineSession.reset();
+          m_mineAutoRun = false;
+          m_mineLastAutoStepMs = 0.0;
+          showToast("Mining stopped", 1.5f);
+          c.print("mine: stopped");
+          return;
+        }
+
+        if (sub == "status") {
+          if (!m_mineSession) {
+            c.print("mine: (idle)");
+            return;
+          }
+
+          const MineConfig& mc = m_mineSession->config();
+          c.print(TextFormat(
+              "mine: %d/%d  objective=%s  size=%dx%d  days=%d  hydro=%s  auto=%s  manual=%d  stepsFrame=%d  budget=%.1fms  last=%.2fms",
+              m_mineSession->index(), m_mineSession->total(), MineObjectiveName(mc.objective), mc.w, mc.h, mc.days,
+              mc.hydrologyEnabled ? "on" : "off", m_mineAutoRun ? "on" : "off", std::max(0, m_mineManualStepRequests),
+              m_mineAutoStepsPerFrame, m_mineAutoBudgetMs, m_mineLastAutoStepMs));
+
+          if (const MineRecord* best = bestRecord()) {
+            c.print(TextFormat("best: score=%.4f seed=%llu pop=%d hap=%.1f land=%.1f commute=%.2fmin flood=%.2f%% pond=%.2f%%",
+                               best->score, static_cast<unsigned long long>(best->seed), best->stats.population,
+                               best->stats.happiness, best->stats.avgLandValue, best->stats.avgCommuteTime,
+                               best->seaFloodFrac * 100.0, best->pondFrac * 100.0));
+          }
+          return;
+        }
+
+        if (sub == "auto") {
+          if (args.size() == 1) {
+            c.print(TextFormat("mine auto: %s  stepsFrame=%d  budget=%.1fms  last=%.2fms",
+                               m_mineAutoRun ? "on" : "off", m_mineAutoStepsPerFrame, m_mineAutoBudgetMs,
+                               m_mineLastAutoStepMs));
+            return;
+          }
+
+          bool toggled = false;
+          // First token may be on/off/toggle.
+          {
+            bool b = m_mineAutoRun;
+            if (parseBool(args[1], b)) {
+              m_mineAutoRun = b;
+              toggled = true;
+            }
+          }
+
+          for (std::size_t i = toggled ? 2 : 1; i < args.size(); ++i) {
+            const std::string a = args[i];
+            const std::size_t eq = a.find('=');
+            if (eq == std::string::npos) {
+              c.print("Expected key=value (steps=N budget=MS)");
+              return;
+            }
+            const std::string k = toLower(a.substr(0, eq));
+            const std::string v = a.substr(eq + 1);
+            if (k == "steps" || k == "stepsframe") {
+              int n = 0;
+              if (!parseI32(v, n) || n < 1 || n > 64) {
+                c.print("Bad steps. Expected 1..64");
+                return;
+              }
+              m_mineAutoStepsPerFrame = n;
+              continue;
+            }
+            if (k == "budget" || k == "budget_ms") {
+              float ms = 0.0f;
+              if (!parseF32(v, ms) || ms < 0.0f || ms > 1000.0f) {
+                c.print("Bad budget. Expected 0..1000");
+                return;
+              }
+              m_mineAutoBudgetMs = ms;
+              continue;
+            }
+            c.print("Unknown key: " + k);
+            return;
+          }
+
+          c.print(TextFormat("mine auto: %s  stepsFrame=%d  budget=%.1fms",
+                             m_mineAutoRun ? "on" : "off", m_mineAutoStepsPerFrame, m_mineAutoBudgetMs));
+          return;
+        }
+
+        if (sub == "step") {
+          if (!m_mineSession) {
+            c.print("mine: no active session. Use 'mine begin'.");
+            return;
+          }
+          int n = 1;
+          if (args.size() >= 2) {
+            if (!parseI32(args[1], n) || n < 1) {
+              c.print("Usage: mine step [N]");
+              return;
+            }
+          }
+
+          // Queue manual step requests so large values don't stall the current frame.
+          const int maxQueue = 1000000;
+          const int before = std::max(0, m_mineManualStepRequests);
+          const int after = std::clamp(before + n, 0, maxQueue);
+          m_mineManualStepRequests = after;
+
+          c.print(TextFormat("mine: queued %d steps (pending=%d)  (%d/%d)", n, m_mineManualStepRequests,
+                             m_mineSession->index(), m_mineSession->total()));
+          showToast(TextFormat("Queued %d mine steps (pending=%d)", n, m_mineManualStepRequests), 1.5f);
+          return;
+        }
+
+        if (sub == "top") {
+          if (!m_mineSession) {
+            c.print("mine: no active session.");
+            return;
+          }
+          int k = m_mineTopK;
+          bool diverse = m_mineTopDiverse;
+
+          for (std::size_t i = 1; i < args.size(); ++i) {
+            if (i == 1) {
+              int v = 0;
+              if (parseI32(args[i], v)) {
+                k = v;
+                continue;
+              }
+            }
+            const std::size_t eq = args[i].find('=');
+            if (eq == std::string::npos) {
+              c.print("Usage: mine top [K] [diverse=0|1]");
+              return;
+            }
+            const std::string key = toLower(args[i].substr(0, eq));
+            const std::string val = args[i].substr(eq + 1);
+            if (key == "diverse") {
+              bool b = diverse;
+              if (!parseBool(val, b)) {
+                c.print("Bad diverse. Use diverse=0|1");
+                return;
+              }
+              diverse = b;
+              continue;
+            }
+            c.print("Unknown key: " + key);
+            return;
+          }
+
+          k = std::clamp(k, 1, 1000);
+          m_mineTopK = k;
+          m_mineTopDiverse = diverse;
+
+          const auto& recs = m_mineSession->records();
+          const auto idxs = SelectTopIndices(recs, k, diverse);
+          c.print(TextFormat("Top %d seeds (%s):", static_cast<int>(idxs.size()), diverse ? "diverse" : "best"));
+          for (std::size_t i = 0; i < idxs.size(); ++i) {
+            const MineRecord& r = recs[static_cast<std::size_t>(idxs[i])];
+            c.print(TextFormat(
+                "  %2d) score=%.4f seed=%llu pop=%d hap=%.1f land=%.1f commute=%.2fmin flood=%.2f%% pond=%.2f%%",
+                static_cast<int>(i + 1), r.score, static_cast<unsigned long long>(r.seed), r.stats.population,
+                r.stats.happiness, r.stats.avgLandValue, r.stats.avgCommuteTime, r.seaFloodFrac * 100.0,
+                r.pondFrac * 100.0));
+          }
+          return;
+        }
+
+        if (sub == "load") {
+          if (!m_mineSession) {
+            c.print("mine: no active session.");
+            return;
+          }
+          if (args.size() < 2) {
+            c.print("Usage: mine load <rank>");
+            return;
+          }
+          int rank = 0;
+          if (!parseI32(args[1], rank) || rank < 1) {
+            c.print("Bad rank. Rank starts at 1.");
+            return;
+          }
+
+          const auto& recs = m_mineSession->records();
+          if (recs.empty()) {
+            c.print("mine: no records yet.");
+            return;
+          }
+
+          const int k = std::max(1, m_mineTopK);
+          const auto idxs = SelectTopIndices(recs, k, m_mineTopDiverse);
+          if (rank > static_cast<int>(idxs.size())) {
+            c.print(TextFormat("Rank out of range. Have %d records in top list.", static_cast<int>(idxs.size())));
+            return;
+          }
+
+          const MineRecord& r = recs[static_cast<std::size_t>(idxs[static_cast<std::size_t>(rank - 1)])];
+          // Only allow load when dimensions match the current game map.
+          if (r.w != m_world.width() || r.h != m_world.height()) {
+            c.print(TextFormat("mine: cannot load (record size %dx%d != current %dx%d)", r.w, r.h, m_world.width(), m_world.height()));
+            return;
+          }
+
+          const std::uint64_t seed = r.seed;
+          c.print(TextFormat("mine: loading rank %d seed=%llu (score=%.4f)", rank, static_cast<unsigned long long>(seed), r.score));
+          showToast(TextFormat("Loading mined seed %llu", static_cast<unsigned long long>(seed)), 2.0f);
+          // Defer world mutation to the start of the next frame (safer for callbacks/UI).
+          endPaintStroke();
+          m_pendingMineLoadSeed = true;
+          m_pendingMineLoadSeedValue = seed;
+          return;
+        }
+
+        if (sub == "export") {
+          if (!m_mineSession) {
+            c.print("mine: no active session.");
+            return;
+          }
+          const auto& recs = m_mineSession->records();
+          if (recs.empty()) {
+            c.print("mine: no records yet.");
+            return;
+          }
+
+          std::string pathOut;
+          if (args.size() >= 2) {
+            pathOut = joinArgs(args, 1);
+          } else {
+            pathOut = TextFormat("captures/mine_seed%llu_%s.csv", static_cast<unsigned long long>(m_cfg.seed), FileTimestamp().c_str());
+          }
+
+          namespace fs = std::filesystem;
+          {
+            std::error_code ec;
+            const fs::path parent = fs::path(pathOut).parent_path();
+            if (!parent.empty()) fs::create_directories(parent, ec);
+          }
+
+          const fs::path p(pathOut);
+          const std::string ext = toLower(p.extension().string());
+
+          if (ext == ".json") {
+            JsonValue root = JsonValue::MakeObject();
+            root.objectValue["objective"] = JsonValue::MakeString(MineObjectiveName(m_mineSession->config().objective));
+            root.objectValue["total"] = JsonValue::MakeNumber(m_mineSession->total());
+            JsonValue arr = JsonValue::MakeArray();
+            arr.arrayValue.reserve(recs.size());
+            for (const MineRecord& r : recs) {
+              arr.arrayValue.push_back(MineRecordToJson(r));
+            }
+            root.objectValue["records"] = std::move(arr);
+
+            std::string err;
+            const bool ok = WriteJsonFile(pathOut, root, err, JsonWriteOptions{true, 2, true});
+            c.print(ok ? (std::string("mine: wrote ") + pathOut)
+                       : (std::string("mine: export failed: ") + (err.empty() ? pathOut : err)));
+            showToast(ok ? (std::string("Exported: ") + pathOut)
+                         : (std::string("Export failed: ") + (err.empty() ? pathOut : err)),
+                     3.0f);
+            return;
+          }
+
+          // Default: CSV.
+          {
+            std::ofstream f(pathOut);
+            if (!f) {
+              c.print("mine: could not open: " + pathOut);
+              return;
+            }
+            WriteMineCsvHeader(f);
+            for (const MineRecord& r : recs) {
+              WriteMineCsvRow(f, r);
+            }
+          }
+
+          c.print("mine: wrote " + pathOut);
+          showToast("Exported: " + pathOut, 3.0f);
+          return;
+        }
+
+        if (sub == "begin" || sub == "start") {
+          if (args.size() < 2) {
+            usage();
+            return;
+          }
+
+          MineConfig mc;
+          mc.w = m_world.width();
+          mc.h = m_world.height();
+          mc.objective = m_mineObjective;
+          mc.samples = 0;
+
+          // Defaults suitable for interactive exploration.
+          mc.days = 120;
+          mc.seedStart = 1;
+          mc.seedStep = 1;
+          mc.hydrologyEnabled = true;
+
+          // First positional is samples; second positional may be objective.
+          int samples = 0;
+          if (!parseI32(args[1], samples) || samples < 1) {
+            c.print("mine begin: bad samples");
+            return;
+          }
+          mc.samples = samples;
+
+          std::size_t i = 2;
+          if (i < args.size()) {
+            MineObjective obj;
+            if (ParseMineObjective(args[i], obj)) {
+              mc.objective = obj;
+              m_mineObjective = obj;
+              ++i;
+            }
+          }
+
+          for (; i < args.size(); ++i) {
+            const std::string a = args[i];
+            const std::size_t eq = a.find('=');
+            if (eq == std::string::npos) {
+              c.print("mine begin: expected key=value");
+              return;
+            }
+            const std::string k = toLower(a.substr(0, eq));
+            const std::string v = a.substr(eq + 1);
+
+            if (k == "days") {
+              int d = 0;
+              if (!parseI32(v, d) || d < 1 || d > 100000) {
+                c.print("Bad days");
+                return;
+              }
+              mc.days = d;
+              continue;
+            }
+            if (k == "seed_start" || k == "seed" || k == "start") {
+              std::uint64_t s0 = 0;
+              if (!parseU64(v, s0)) {
+                c.print("Bad seed_start");
+                return;
+              }
+              mc.seedStart = s0;
+              continue;
+            }
+            if (k == "seed_step" || k == "step") {
+              std::uint64_t st = 0;
+              if (!parseU64(v, st) || st == 0) {
+                c.print("Bad seed_step");
+                return;
+              }
+              mc.seedStep = st;
+              continue;
+            }
+            if (k == "hydro" || k == "hydrology") {
+              bool b = mc.hydrologyEnabled;
+              if (!parseBool(v, b)) {
+                c.print("Bad hydro. Use hydro=0|1");
+                return;
+              }
+              mc.hydrologyEnabled = b;
+              continue;
+            }
+            if (k == "sea" || k == "sealevel" || k == "sea_level") {
+              float s = 0.0f;
+              if (!parseF32(v, s)) {
+                c.print("Bad sea. Use sea=0..1");
+                return;
+              }
+              mc.seaLevelOverride = s;
+              continue;
+            }
+            if (k == "topk") {
+              int t = 0;
+              if (!parseI32(v, t) || t < 1 || t > 1000) {
+                c.print("Bad topK");
+                return;
+              }
+              m_mineTopK = t;
+              continue;
+            }
+            if (k == "diverse") {
+              bool b = m_mineTopDiverse;
+              if (!parseBool(v, b)) {
+                c.print("Bad diverse. Use diverse=0|1");
+                return;
+              }
+              m_mineTopDiverse = b;
+              continue;
+            }
+            c.print("Unknown key: " + k);
+            return;
+          }
+
+          // Create a new session.
+          m_mineSession = std::make_unique<MineSession>(mc, m_procCfg, m_sim.config());
+          m_mineAutoRun = true;
+          m_mineLastAutoStepMs = 0.0;
+
+          c.print(TextFormat(
+              "mine: started  objective=%s  samples=%d  days=%d  seedStart=%llu  seedStep=%llu  size=%dx%d  hydro=%s",
+              MineObjectiveName(mc.objective), mc.samples, mc.days, static_cast<unsigned long long>(mc.seedStart),
+              static_cast<unsigned long long>(mc.seedStep), mc.w, mc.h, mc.hydrologyEnabled ? "on" : "off"));
+          showToast("Seed mining started (auto)", 2.0f);
+          return;
+        }
+
+        c.print("mine: unknown subcommand: " + sub);
+        usage();
+      });
+
+  m_console.registerCommand(
       "tiles_csv",
       "tiles_csv [path] - export per-tile world data to CSV (x,y,terrain,overlay,level,district,height,variation,occupants)",
       [this, joinArgs](DevConsole& c, const DevConsole::Args& args) {
@@ -6226,6 +7024,335 @@ bool Game::saveVisualPrefsFile(const std::string& path, bool toast)
   return true;
 }
 
+
+void Game::queueDossierCurrentWorld(CityDossierConfig cfg, const char* toastLabel)
+{
+  if (cfg.outDir.empty()) {
+    showToast("dossier: outDir is empty", 2.0f);
+    m_console.print("dossier: outDir is empty");
+    return;
+  }
+
+  if (m_dossierQueue.size() >= static_cast<std::size_t>(kDossierQueueMax)) {
+    showToast("Dossier queue full", 2.0f);
+    m_console.print("dossier: queue full");
+    return;
+  }
+
+  DossierRequest req;
+  req.kind = DossierRequest::Kind::CurrentWorld;
+  req.cfg = std::move(cfg);
+  req.procCfg = m_procCfg;
+  req.simCfg = m_sim.config();
+
+  // Snapshot tick history (prefer full Stats history so the dossier graphs match the in-game report).
+  req.ticks = m_tickStatsHistory;
+  if (req.ticks.empty()) {
+    req.ticks.push_back(m_world.stats());
+  }
+
+  // Copy the world for thread safety.
+  req.world = m_world;
+
+  m_dossierQueue.push_back(std::move(req));
+
+  const std::string p = m_dossierQueue.back().cfg.outDir.string();
+  if (toastLabel) {
+    showToast(std::string(toastLabel) + ": " + p, 2.0f);
+  } else {
+    showToast(std::string("Queued dossier: ") + p, 2.0f);
+  }
+  m_console.print(std::string("dossier: queued ") + p);
+}
+
+void Game::queueDossierSeeds(CityDossierConfig cfg, std::vector<std::uint64_t> seeds, int bakeDays,
+                            const char* toastLabel)
+{
+  if (seeds.empty()) {
+    showToast("dossier: no seeds to export", 2.0f);
+    m_console.print("dossier: no seeds to export");
+    return;
+  }
+
+  if (cfg.outDir.empty()) {
+    showToast("dossier: outDir is empty", 2.0f);
+    m_console.print("dossier: outDir is empty");
+    return;
+  }
+
+  if (m_dossierQueue.size() >= static_cast<std::size_t>(kDossierQueueMax)) {
+    showToast("Dossier queue full", 2.0f);
+    m_console.print("dossier: queue full");
+    return;
+  }
+
+  DossierRequest req;
+  req.kind = DossierRequest::Kind::SeedBake;
+  req.cfg = std::move(cfg);
+  req.procCfg = m_procCfg;
+  req.simCfg = m_sim.config();
+  req.seeds = std::move(seeds);
+  req.bakeDays = std::max(0, bakeDays);
+  req.w = m_world.width();
+  req.h = m_world.height();
+
+  m_dossierQueue.push_back(std::move(req));
+
+  const auto& back = m_dossierQueue.back();
+  if (toastLabel) {
+    showToast(std::string(toastLabel) + ": " + back.cfg.outDir.string(), 2.0f);
+  } else if (back.seeds.size() == 1) {
+    showToast(std::string("Queued seed dossier: ") + HexU64(back.seeds[0]), 2.0f);
+  } else {
+    showToast(std::string("Queued ") + std::to_string(back.seeds.size()) + " seed dossiers", 2.0f);
+  }
+  m_console.print(std::string("dossier: queued seeds -> ") + back.cfg.outDir.string());
+}
+
+void Game::updateDossierExportJob()
+{
+  // Surface completion first (so a completed job can chain into the next queued request on the same frame).
+  if (m_dossierJob && m_dossierJob->done.load(std::memory_order_relaxed)) {
+    if (m_dossierJob->worker.joinable()) {
+      m_dossierJob->worker.join();
+    }
+
+    bool ok = false;
+    bool cancelled = m_dossierJob->cancel.load(std::memory_order_relaxed);
+    CityDossierResult res;
+    std::string err;
+    int okSeeds = 0;
+    int failSeeds = 0;
+    int seedCount = m_dossierJob->seedCount.load(std::memory_order_relaxed);
+
+    {
+      std::lock_guard<std::mutex> lock(m_dossierJob->mutex);
+      ok = m_dossierJob->ok;
+      res = m_dossierJob->res;
+      err = m_dossierJob->err;
+      okSeeds = m_dossierJob->okSeeds;
+      failSeeds = m_dossierJob->failSeeds;
+    }
+
+    std::string msg;
+
+    if (m_dossierJob->seeds.empty()) {
+      // Single-world export.
+      if (ok) {
+        const std::string p = res.outDir.string();
+        msg = std::string("Dossier exported: ") + p;
+      } else if (cancelled || err == "Cancelled") {
+        msg = "Dossier export cancelled";
+      } else {
+        msg = err.empty() ? std::string("Dossier export failed")
+                          : (std::string("Dossier export failed: ") + err);
+      }
+
+      m_lastDossierOutDir = ok ? res.outDir.string() : m_dossierJob->cfg.outDir.string();
+    } else {
+      // Seed-bake/batch export.
+      const int total = seedCount;
+      const std::string base = m_dossierJob->cfg.outDir.string();
+
+      if (cancelled) {
+        msg = std::string("Seed dossier batch cancelled (") + std::to_string(okSeeds) + "/" +
+              std::to_string(total) + "): " + base;
+      } else if (failSeeds == 0) {
+        msg = std::string("Seed dossiers exported (") + std::to_string(okSeeds) + "/" +
+              std::to_string(total) + "): " + base;
+      } else {
+        msg = std::string("Seed dossier batch failed (") + std::to_string(okSeeds) + "/" +
+              std::to_string(total) + ", " + std::to_string(failSeeds) +
+              " failed): " + base;
+        if (!err.empty()) {
+          msg += std::string(" (e.g. ") + err + ")";
+        }
+      }
+
+      m_lastDossierOutDir = base;
+    }
+
+    m_lastDossierOk = ok;
+    m_lastDossierMsg = msg;
+
+    showToast(msg, 4.0f);
+    m_console.print(std::string("dossier: ") + msg);
+
+    m_dossierJob.reset();
+  }
+
+  // Start a new job if we're idle and there is queued work.
+  if (m_dossierJob || m_dossierQueue.empty()) return;
+
+  DossierRequest req = std::move(m_dossierQueue.front());
+  m_dossierQueue.pop_front();
+
+  auto job = std::make_unique<DossierJob>();
+  job->cfg = std::move(req.cfg);
+  job->procCfg = req.procCfg;
+  job->simCfg = req.simCfg;
+
+  if (req.kind == DossierRequest::Kind::CurrentWorld) {
+    job->ticks = std::move(req.ticks);
+    job->world = std::move(req.world);
+  } else {
+    job->seeds = std::move(req.seeds);
+    job->bakeDays = req.bakeDays;
+    job->w = req.w;
+    job->h = req.h;
+    job->seedIndex.store(0, std::memory_order_relaxed);
+    job->seedCount.store(static_cast<int>(job->seeds.size()), std::memory_order_relaxed);
+  }
+
+  DossierJob* jp = job.get();
+
+  jp->worker = std::thread([jp]() {
+    CityDossierResult lastRes;
+    std::string firstErr;
+
+    auto setStage = [jp](const std::string& s) {
+      std::lock_guard<std::mutex> lock(jp->mutex);
+      jp->stage = s;
+    };
+
+    // Export callback (runs in worker thread).
+    auto progress = [jp](const CityDossierProgress& p) -> bool {
+      jp->stepIndex.store(p.stepIndex, std::memory_order_relaxed);
+      jp->stepCount.store(p.stepCount, std::memory_order_relaxed);
+      {
+        std::lock_guard<std::mutex> lock(jp->mutex);
+        jp->stage = p.stage;
+      }
+      return !jp->cancel.load(std::memory_order_relaxed);
+    };
+
+    bool ok = true;
+
+    if (jp->seeds.empty()) {
+      std::string err;
+      const bool wrote = WriteCityDossier(jp->world, jp->procCfg, jp->simCfg, jp->ticks, jp->cfg, &lastRes, err, progress);
+      if (!wrote && !err.empty()) {
+        firstErr = err;
+      }
+      ok = wrote;
+    } else {
+      const int total = static_cast<int>(jp->seeds.size());
+      jp->seedCount.store(total, std::memory_order_relaxed);
+
+      int okSeeds = 0;
+      int failSeeds = 0;
+
+      for (int i = 0; i < total; ++i) {
+        if (jp->cancel.load(std::memory_order_relaxed)) {
+          ok = false;
+          break;
+        }
+
+        const std::uint64_t seed = jp->seeds[static_cast<std::size_t>(i)];
+        jp->seedIndex.store(i + 1, std::memory_order_relaxed);
+
+        // --- Bake / simulate ---
+        const int bakeDays = std::max(0, jp->bakeDays);
+        jp->stepIndex.store(0, std::memory_order_relaxed);
+        jp->stepCount.store(std::max(1, bakeDays), std::memory_order_relaxed);
+        setStage(std::string("seed ") + std::to_string(i + 1) + "/" + std::to_string(total) + ": baking");
+
+        World w = GenerateWorld(jp->w, jp->h, seed, jp->procCfg);
+
+        Simulator sim(jp->simCfg);
+        sim.refreshDerivedStats(w);
+
+        std::vector<Stats> ticks;
+        ticks.reserve(static_cast<std::size_t>(bakeDays) + 1);
+        ticks.push_back(w.stats());
+
+        for (int d = 0; d < bakeDays; ++d) {
+          if (jp->cancel.load(std::memory_order_relaxed)) break;
+          sim.stepOnce(w);
+          ticks.push_back(w.stats());
+          jp->stepIndex.store(d + 1, std::memory_order_relaxed);
+          jp->stepCount.store(std::max(1, bakeDays), std::memory_order_relaxed);
+
+          // Update stage a bit less often to reduce mutex churn.
+          if (d == 0 || d == bakeDays - 1 || ((d + 1) % 8 == 0)) {
+            setStage(std::string("seed ") + std::to_string(i + 1) + "/" + std::to_string(total) + ": baking " +
+                     std::to_string(d + 1) + "/" + std::to_string(bakeDays));
+          }
+        }
+
+        if (jp->cancel.load(std::memory_order_relaxed)) {
+          ok = false;
+          break;
+        }
+
+        // --- Export dossier ---
+        CityDossierConfig cfg = jp->cfg;
+        if (total > 1) {
+          cfg.outDir = jp->cfg.outDir / (std::string("seed_") + HexU64(seed));
+        }
+
+        auto progressSeed = [jp, i, total](const CityDossierProgress& p) -> bool {
+          jp->stepIndex.store(p.stepIndex, std::memory_order_relaxed);
+          jp->stepCount.store(p.stepCount, std::memory_order_relaxed);
+          {
+            std::lock_guard<std::mutex> lock(jp->mutex);
+            jp->stage = std::string("seed ") + std::to_string(i + 1) + "/" + std::to_string(total) + ": " + p.stage;
+          }
+          return !jp->cancel.load(std::memory_order_relaxed);
+        };
+
+        std::string err;
+        CityDossierResult res;
+        const bool wrote = WriteCityDossier(w, jp->procCfg, jp->simCfg, ticks, cfg, &res, err, progressSeed);
+        lastRes = res;
+
+        if (wrote) {
+          ++okSeeds;
+        } else {
+          ++failSeeds;
+          ok = false;
+          if (firstErr.empty()) {
+            firstErr = err.empty() ? (std::string("seed ") + HexU64(seed) + ": export failed")
+                                   : (std::string("seed ") + HexU64(seed) + ": " + err);
+          }
+
+          // Continue batch even if one fails; user can inspect partial results.
+        }
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(jp->mutex);
+        jp->okSeeds = okSeeds;
+        jp->failSeeds = failSeeds;
+      }
+
+      // Consider it ok only if all seeds succeeded and we were not cancelled.
+      ok = (failSeeds == 0) && !jp->cancel.load(std::memory_order_relaxed);
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(jp->mutex);
+      jp->ok = ok;
+      jp->res = lastRes;
+      jp->err = firstErr;
+    }
+
+    jp->done.store(true, std::memory_order_relaxed);
+  });
+
+  m_dossierJob = std::move(job);
+
+  if (m_dossierJob->seeds.empty()) {
+    showToast(std::string("Dossier export started: ") + m_dossierJob->cfg.outDir.string(), 2.0f);
+    m_console.print(std::string("dossier: started ") + m_dossierJob->cfg.outDir.string());
+  } else {
+    showToast(std::string("Seed dossier export started (") + std::to_string(m_dossierJob->seeds.size()) +
+             " seeds): " + m_dossierJob->cfg.outDir.string(), 2.0f);
+    m_console.print(std::string("dossier: started seeds -> ") + m_dossierJob->cfg.outDir.string());
+  }
+}
+
+
 void Game::updateVisualPrefsAutosave(float dt)
 {
   if (!m_visualPrefsAutosave) return;
@@ -6250,16 +7377,83 @@ void Game::updateVisualPrefsAutosave(float dt)
   }
 }
 
+void Game::updateSeedMining(float /*dt*/)
+{
+  if (!m_mineSession) return;
+
+  // If the session is finished, ensure we stop auto-running and surface a message once.
+  if (m_mineSession->done()) {
+    if (m_mineAutoRun) {
+      m_mineAutoRun = false;
+      m_console.print("mine: complete. use 'mine top' to list results");
+      showToast(TextFormat("Seed mining complete (%d samples)", m_mineSession->total()), 2.5f);
+    }
+    // Clear any pending manual steps.
+    m_mineManualStepRequests = 0;
+    return;
+  }
+
+  // Manual stepping: queued by console/UI so large requests don't stall a frame.
+  int manualRemaining = std::max(0, m_mineManualStepRequests);
+  int autoRemaining = m_mineAutoRun ? std::max(1, m_mineAutoStepsPerFrame) : 0;
+
+  if (manualRemaining <= 0 && autoRemaining <= 0) return;
+
+  const double budgetMs = std::max(0.0, static_cast<double>(m_mineAutoBudgetMs));
+  // If no budget is configured, enforce a conservative hard cap to avoid long stalls.
+  const int hardCap = (budgetMs <= 0.0) ? 256 : 1000000000;
+
+  const auto t0 = std::chrono::steady_clock::now();
+
+  int producedTotal = 0;
+  int iterations = 0;
+  while ((manualRemaining > 0 || autoRemaining > 0) && !m_mineSession->done()) {
+    if (iterations >= hardCap) break;
+
+    const bool consumeManual = (manualRemaining > 0);
+    const int produced = m_mineSession->step(1);
+    if (produced <= 0) break;
+
+    producedTotal += produced;
+    iterations += produced;
+
+    if (consumeManual) {
+      manualRemaining -= produced;
+    } else {
+      autoRemaining -= produced;
+    }
+
+    if (budgetMs > 0.0) {
+      const auto tNow = std::chrono::steady_clock::now();
+      const double elapsed = std::chrono::duration<double, std::milli>(tNow - t0).count();
+      if (elapsed >= budgetMs) break;
+    }
+  }
+
+  const auto t1 = std::chrono::steady_clock::now();
+  m_mineLastAutoStepMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+  // Commit remaining manual requests.
+  m_mineManualStepRequests = std::max(0, manualRemaining);
+
+  if (m_mineSession->done()) {
+    m_mineAutoRun = false;
+    m_mineManualStepRequests = 0;
+    m_console.print("mine: complete. use 'mine top' to list results");
+    showToast(TextFormat("Seed mining complete (%d samples)", m_mineSession->total()), 2.5f);
+  }
+}
 
 void Game::clearHistory()
 {
   m_cityHistory.clear();
+  m_tickStatsHistory.clear();
 }
 
 void Game::recordHistorySample(const Stats& s)
 {
   // Avoid recording duplicate days (can happen when resetting/loading).
-  if (!m_cityHistory.empty() && m_cityHistory.back().day == s.day) return;
+  if (!m_tickStatsHistory.empty() && m_tickStatsHistory.back().day == s.day) return;
 
   CityHistorySample hs{};
   hs.day = s.day;
@@ -6280,11 +7474,15 @@ void Game::recordHistorySample(const Stats& s)
   hs.goodsSatisfaction = s.goodsSatisfaction;
 
   m_cityHistory.push_back(hs);
+  m_tickStatsHistory.push_back(s);
 
   // Keep a bounded history window (simple ring behavior).
   const int maxDays = std::max(16, m_cityHistoryMax);
   while (static_cast<int>(m_cityHistory.size()) > maxDays) {
     m_cityHistory.erase(m_cityHistory.begin());
+  }
+  while (static_cast<int>(m_tickStatsHistory.size()) > maxDays) {
+    m_tickStatsHistory.erase(m_tickStatsHistory.begin());
   }
 }
 
@@ -12523,7 +13721,11 @@ void Game::handleInput(float dt)
   }
 
   if (IsKeyPressed(KEY_F2)) {
-    if (shift) {
+    if (ctrl) {
+      m_showHeadlessLab = !m_showHeadlessLab;
+      ui::ClearActiveWidget();
+      showToast(m_showHeadlessLab ? "City Lab: ON" : "City Lab: OFF");
+    } else if (shift) {
       const bool enabled = !m_renderer.dayNightEnabled();
       m_renderer.setDayNightEnabled(enabled);
       showToast(enabled ? "Day/night lighting: ON" : "Day/night lighting: OFF");
@@ -14149,6 +15351,15 @@ void Game::updateAutosave(float dt)
 
 void Game::update(float dt)
 {
+  // Deferred mine loads are applied at the start of the next frame.
+  if (m_pendingMineLoadSeed) {
+    const std::uint64_t seed = m_pendingMineLoadSeedValue;
+    m_pendingMineLoadSeed = false;
+    m_pendingMineLoadSeedValue = 0;
+    resetWorld(seed);
+  }
+
+
   // Pause simulation while actively painting so an undoable "stroke" doesn't
   // accidentally include sim-driven money changes.
   if (!m_painting && !m_simPaused) {
@@ -14237,6 +15448,8 @@ void Game::update(float dt)
 
   // Optional dynamic resolution scaling for the world layer.
   updateDynamicWorldRenderScale(dt);
+  updateDossierExportJob();
+  updateSeedMining(dt);
   updateVisualPrefsAutosave(dt);
 }
 
@@ -16741,6 +17954,11 @@ void Game::draw()
     drawAutoBuildPanel(static_cast<int>(rect.x), static_cast<int>(rect.y));
   }
 
+  if (m_showHeadlessLab) {
+    const Rectangle rect = rightDock.alloc(kHeadlessLabPanelW, kHeadlessLabPanelH);
+    drawHeadlessLabPanel(static_cast<int>(rect.x), static_cast<int>(rect.y));
+  }
+
   drawVideoSettingsPanel(uiW, uiH);
 
   drawReportPanel(uiW, uiH);
@@ -17125,8 +18343,612 @@ void Game::draw()
              4.0f);
   }
 
+  // City dossier export runs asynchronously (see updateDossierExportJob).
 
   EndDrawing();
+}
+
+
+void Game::drawHeadlessLabPanel(int x0, int y0)
+{
+  const ui::Theme& uiTh = ui::GetTheme();
+  const float uiTime = static_cast<float>(GetTime());
+  const Vector2 mouseUi = mouseUiPosition(m_uiScale);
+
+  const int panelW = kHeadlessLabPanelW;
+  const int panelH = kHeadlessLabPanelH;
+
+  // Keep the mining defaults tracking the current map size.
+  m_labMineCfg.w = m_world.width();
+  m_labMineCfg.h = m_world.height();
+
+  const Rectangle panelR{static_cast<float>(x0), static_cast<float>(y0), static_cast<float>(panelW),
+                         static_cast<float>(panelH)};
+  ui::DrawPanel(panelR, uiTime, true);
+  ui::DrawPanelHeader(panelR, "City Lab", uiTime, true);
+
+  // Header actions.
+  {
+    const Rectangle closeR{panelR.x + panelR.width - 72.0f, panelR.y + 10.0f, 60.0f, 18.0f};
+    if (ui::Button(9200, closeR, "Close", mouseUi, uiTime, true)) {
+      m_showHeadlessLab = false;
+      ui::ClearActiveWidget();
+      showToast("City Lab: OFF", 1.5f);
+      return;
+    }
+  }
+
+  int y = y0 + 42;
+  const int leftPad = 10;
+  const int innerPad = 8;
+  const int innerX = x0 + leftPad;
+  const int innerW = panelW - 2 * leftPad;
+
+  // Tabs.
+  {
+    const int tabGap = 6;
+    const int tabH = 20;
+    const int tabW = (innerW - tabGap) / 2;
+    const Rectangle tabMineR{static_cast<float>(innerX), static_cast<float>(y), static_cast<float>(tabW),
+                             static_cast<float>(tabH)};
+    const Rectangle tabDosR{static_cast<float>(innerX + tabW + tabGap), static_cast<float>(y),
+                            static_cast<float>(tabW), static_cast<float>(tabH)};
+
+    if (ui::Button(9201, tabMineR, "Mining", mouseUi, uiTime, true, m_headlessLabTab == 0)) {
+      m_headlessLabTab = 0;
+      ui::ClearActiveWidget();
+    }
+    if (ui::Button(9202, tabDosR, "Dossier", mouseUi, uiTime, true, m_headlessLabTab == 1)) {
+      m_headlessLabTab = 1;
+      ui::ClearActiveWidget();
+    }
+
+    y += tabH + 10;
+  }
+
+  auto makeDossierCfg = [&](const std::filesystem::path& outDir) {
+    CityDossierConfig cfg;
+    cfg.outDir = outDir;
+    cfg.exportScale = std::clamp(m_labDossierExportScale, 1, 4);
+    cfg.exportIso = m_labDossierIso;
+    cfg.export3d = m_labDossier3d;
+    cfg.format = (m_labDossierFormat == 1) ? "ppm" : "png";
+
+    if (m_labDossierPreset == 1) {
+      // Fast preset: fewer layers, smaller footprint.
+      cfg.layers2d = {
+          ExportLayer2D::Terrain,
+          ExportLayer2D::Overlay,
+          ExportLayer2D::Height,
+          ExportLayer2D::LandValue,
+          ExportLayer2D::FloodDepth,
+      };
+      cfg.export3dPreview = false;
+    }
+
+    return cfg;
+  };
+
+  // ---------------------------------------------------------------------------
+  // Mining tab
+  // ---------------------------------------------------------------------------
+  if (m_headlessLabTab == 0) {
+    const Rectangle cfgR{static_cast<float>(innerX), static_cast<float>(y), static_cast<float>(innerW), 198.0f};
+    ui::DrawPanelInset(cfgR, uiTime, true);
+
+    const int labelW = 120;
+    const int labelX = innerX + innerPad;
+    const int ctrlX = labelX + labelW;
+    const int ctrlW = innerW - 2 * innerPad - labelW;
+
+    int cy = y + innerPad;
+
+    // Title / current map.
+    {
+      ui::Text(labelX, cy, 14, TextFormat("Map: %dx%d  |  Seed: %llu", m_world.width(), m_world.height(),
+                                         static_cast<unsigned long long>(m_cfg.seed)),
+               uiTh.text);
+      cy += 20;
+    }
+
+    // Objective (cycle).
+    {
+      ui::Text(labelX, cy + 2, 14, "Objective", uiTh.textDim);
+      const Rectangle btnR{static_cast<float>(ctrlX), static_cast<float>(cy), static_cast<float>(ctrlW), 18.0f};
+      if (ui::Button(9210, btnR, MineObjectiveName(m_labMineCfg.objective), mouseUi, uiTime, true)) {
+        // Cycle objective.
+        switch (m_labMineCfg.objective) {
+          case MineObjective::Balanced: m_labMineCfg.objective = MineObjective::Growth; break;
+          case MineObjective::Growth: m_labMineCfg.objective = MineObjective::Resilient; break;
+          case MineObjective::Resilient: m_labMineCfg.objective = MineObjective::Chaos; break;
+          case MineObjective::Chaos: m_labMineCfg.objective = MineObjective::Balanced; break;
+        }
+        m_mineObjective = m_labMineCfg.objective;
+      }
+      cy += 22;
+    }
+
+    // Samples.
+    {
+      ui::Text(labelX, cy + 2, 14, "Samples", uiTh.textDim);
+      ui::SliderInt(9211, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), static_cast<float>(ctrlW), 18.0f},
+                    m_labMineCfg.samples, 10, 5000, mouseUi, uiTime);
+      cy += 22;
+    }
+
+    // Days.
+    {
+      ui::Text(labelX, cy + 2, 14, "Days", uiTh.textDim);
+      ui::SliderInt(9212, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), static_cast<float>(ctrlW), 18.0f},
+                    m_labMineCfg.days, 0, 365, mouseUi, uiTime);
+      cy += 22;
+    }
+
+    // Hydrology metrics toggle.
+    {
+      ui::Text(labelX, cy + 2, 14, "Hydrology", uiTh.textDim);
+      ui::Toggle(9213, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), 120.0f, 18.0f},
+                 m_labMineCfg.hydrologyEnabled, mouseUi, uiTime);
+      ui::Text(ctrlX + 128, cy + 2, 14, "(flood/pond scoring)", uiTh.textDim);
+      cy += 22;
+    }
+
+    // Sea level override.
+    {
+      bool seaOverride = !std::isnan(m_labMineCfg.seaLevelOverride);
+      const bool was = seaOverride;
+      ui::Text(labelX, cy + 2, 14, "Sea override", uiTh.textDim);
+      ui::Toggle(9214, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), 120.0f, 18.0f}, seaOverride,
+                 mouseUi, uiTime);
+      if (seaOverride != was) {
+        if (seaOverride)
+          m_labMineCfg.seaLevelOverride = m_procCfg.seaLevel;
+        else
+          m_labMineCfg.seaLevelOverride = std::numeric_limits<float>::quiet_NaN();
+      }
+      if (seaOverride) {
+        float sea = m_labMineCfg.seaLevelOverride;
+        ui::SliderFloat(9215,
+                        Rectangle{static_cast<float>(ctrlX + 128), static_cast<float>(cy),
+                                  static_cast<float>(ctrlW - 128), 18.0f},
+                        sea, 0.0f, 1.0f, mouseUi, uiTime);
+        m_labMineCfg.seaLevelOverride = sea;
+      }
+      cy += 22;
+    }
+
+    // Seed start controls.
+    {
+      ui::Text(labelX, cy + 2, 14, "Seed start", uiTh.textDim);
+      const std::string seedStr = HexU64(m_labMineCfg.seedStart);
+
+      const int btnW = 46;
+      const int btnGap = 4;
+      const int totalBtnW = btnW * 3 + btnGap * 2;
+      const int seedTextW = std::max(0, ctrlW - totalBtnW - 6);
+
+      ui::Text(ctrlX, cy + 2, 14, seedStr, uiTh.text, false, true, 1);
+
+      const int bx = ctrlX + seedTextW + 6;
+      const Rectangle b1{static_cast<float>(bx), static_cast<float>(cy), static_cast<float>(btnW), 18.0f};
+      const Rectangle b2{static_cast<float>(bx + btnW + btnGap), static_cast<float>(cy), static_cast<float>(btnW),
+                         18.0f};
+      const Rectangle b3{static_cast<float>(bx + (btnW + btnGap) * 2), static_cast<float>(cy),
+                         static_cast<float>(btnW), 18.0f};
+
+      if (ui::Button(9216, b1, "@1", mouseUi, uiTime, true))
+        m_labMineCfg.seedStart = 1;
+      if (ui::Button(9217, b2, "@city", mouseUi, uiTime, true))
+        m_labMineCfg.seedStart = m_cfg.seed;
+      if (ui::Button(9218, b3, "rand", mouseUi, uiTime, true))
+        m_labMineCfg.seedStart = TimeSeed();
+
+      cy += 22;
+    }
+
+    // Seed step.
+    {
+      ui::Text(labelX, cy + 2, 14, "Seed step", uiTh.textDim);
+      ui::SliderInt(9219, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), static_cast<float>(ctrlW), 18.0f},
+                    m_labMineCfg.seedStep, 1, 128, mouseUi, uiTime);
+      cy += 22;
+    }
+
+    // Top seeds filtering.
+    {
+      ui::Text(labelX, cy + 2, 14, "Top K", uiTh.textDim);
+      ui::SliderInt(9220, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), static_cast<float>(ctrlW), 18.0f},
+                    m_mineTopK, 1, 200, mouseUi, uiTime);
+      cy += 22;
+
+      ui::Text(labelX, cy + 2, 14, "Diverse", uiTh.textDim);
+      ui::Toggle(9221, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), 120.0f, 18.0f}, m_mineTopDiverse,
+                 mouseUi, uiTime);
+      cy += 22;
+    }
+
+    // Auto-run controls.
+    {
+      ui::Text(labelX, cy + 2, 14, "Auto-run", uiTh.textDim);
+      ui::Toggle(9222, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), 120.0f, 18.0f}, m_mineAutoRun,
+                 mouseUi, uiTime);
+      cy += 22;
+
+      ui::Text(labelX, cy + 2, 14, "Steps/frame", uiTh.textDim);
+      ui::SliderInt(9223, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), static_cast<float>(ctrlW), 18.0f},
+                    m_mineAutoStepsPerFrame, 1, 50, mouseUi, uiTime);
+      cy += 22;
+
+      ui::Text(labelX, cy + 2, 14, "Budget ms", uiTh.textDim);
+      ui::SliderFloat(9224, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), static_cast<float>(ctrlW), 18.0f},
+                      m_mineAutoBudgetMs, 0.5f, 33.0f, mouseUi, uiTime);
+      cy += 22;
+    }
+
+    // Session controls.
+    {
+      const bool hasSession = static_cast<bool>(m_mineSession);
+      const int btnH = 18;
+      const int btnGap = 6;
+      const int btnW = (innerW - innerPad * 2 - btnGap) / 2;
+      const int bx = innerX + innerPad;
+      const int by = y0 + 42 + 20 + 10 + static_cast<int>(cfgR.height) - innerPad - btnH;
+
+      const Rectangle startR{static_cast<float>(bx), static_cast<float>(by), static_cast<float>(btnW),
+                             static_cast<float>(btnH)};
+      const Rectangle resetR{static_cast<float>(bx + btnW + btnGap), static_cast<float>(by), static_cast<float>(btnW),
+                             static_cast<float>(btnH)};
+
+      if (!hasSession) {
+        if (ui::Button(9225, startR, "Start mining", mouseUi, uiTime, true)) {
+          endPaintStroke();
+          m_mineSession = std::make_unique<MineSession>(m_labMineCfg, m_procCfg, m_sim.config());
+          m_labMineTopCacheIndex = -1;
+          m_labMineTopIndices.clear();
+          m_labMineTopSelection = 0;
+          m_labMineTopScroll = 0;
+          showToast("Mine session started", 2.0f);
+        }
+        ui::Button(9226, resetR, "Reset", mouseUi, uiTime, false);
+      } else {
+        const char* pauseLabel = m_mineAutoRun ? "Pause" : "Resume";
+        if (ui::Button(9225, startR, pauseLabel, mouseUi, uiTime, true)) {
+          m_mineAutoRun = !m_mineAutoRun;
+        }
+        if (ui::Button(9226, resetR, "Clear session", mouseUi, uiTime, true)) {
+          m_mineSession.reset();
+          m_labMineTopCacheIndex = -1;
+          m_labMineTopIndices.clear();
+          m_labMineTopSelection = 0;
+          m_labMineTopScroll = 0;
+          showToast("Mine session cleared", 2.0f);
+        }
+      }
+    }
+
+    y += static_cast<int>(cfgR.height) + 10;
+
+    // Status line + manual stepping.
+    {
+      const bool hasSession = static_cast<bool>(m_mineSession);
+      if (!hasSession) {
+        ui::Text(innerX + 4, y, 14, "Session: (none)", uiTh.textDim);
+        y += 22;
+      } else {
+        const int idx = m_mineSession->index();
+        const int total = m_mineSession->total();
+        ui::Text(innerX + 4, y, 14,
+                 TextFormat("Session: %d / %d  |  last %.2f ms", idx, total, m_mineLastStepMs), uiTh.text);
+        y += 22;
+
+        const int btnH = 18;
+        const int btnW = (innerW - 6) / 2;
+        const Rectangle step1R{static_cast<float>(innerX), static_cast<float>(y), static_cast<float>(btnW),
+                               static_cast<float>(btnH)};
+        const Rectangle step10R{static_cast<float>(innerX + btnW + 6), static_cast<float>(y),
+                                static_cast<float>(btnW), static_cast<float>(btnH)};
+
+        if (ui::Button(9227, step1R, "Step +1", mouseUi, uiTime, true))
+          m_mineManualStepRequests += 1;
+        if (ui::Button(9228, step10R, "Step +10", mouseUi, uiTime, true))
+          m_mineManualStepRequests += 10;
+
+        y += 24;
+      }
+    }
+
+    // Top seeds list.
+    {
+      const Rectangle listR{static_cast<float>(innerX), static_cast<float>(y), static_cast<float>(innerW), 200.0f};
+      ui::DrawPanelInset(listR, uiTime, true);
+
+      if (!m_mineSession) {
+        ui::Text(innerX + 10, y + 10, 14, "Top seeds will appear here once mining starts.", uiTh.textDim);
+        y += static_cast<int>(listR.height) + 10;
+      } else {
+        const int curIdx = m_mineSession->index();
+        if (curIdx != m_labMineTopCacheIndex || m_mineTopK != m_labMineTopCacheTopK ||
+            m_mineTopDiverse != m_labMineTopCacheDiverse) {
+          m_labMineTopIndices = SelectTopIndices(m_mineSession->records(), m_mineTopK, m_mineTopDiverse);
+          m_labMineTopCacheIndex = curIdx;
+          m_labMineTopCacheTopK = m_mineTopK;
+          m_labMineTopCacheDiverse = m_mineTopDiverse;
+          m_labMineTopSelection = std::clamp(m_labMineTopSelection, 0, std::max(0, (int)m_labMineTopIndices.size() - 1));
+          m_labMineTopScroll = std::clamp(m_labMineTopScroll, 0, std::max(0, (int)m_labMineTopIndices.size() - 1));
+        }
+
+        const int rowH = 22;
+        const int rows = (int)m_labMineTopIndices.size();
+        const int viewRows = (int)((listR.height - 16) / rowH);
+
+        m_labMineTopScroll = std::clamp(m_labMineTopScroll, 0, std::max(0, rows - viewRows));
+
+        // Scrollbar.
+        const Rectangle barR{listR.x + listR.width - 12.0f, listR.y + 8.0f, 10.0f, listR.height - 16.0f};
+        ui::ScrollbarV(9230, barR, rows, viewRows, m_labMineTopScroll, mouseUi, uiTime);
+
+        const Rectangle contentR = ui::ContentRectWithScrollbar(listR);
+
+        const int baseX = (int)contentR.x + 6;
+        int ry = (int)contentR.y + 8;
+
+        const int start = m_labMineTopScroll;
+        const int end = std::min(rows, start + viewRows);
+
+        for (int i = start; i < end; ++i) {
+          const int topIdx = m_labMineTopIndices[i];
+          const MineRecord& r = m_mineSession->records().at(topIdx);
+          const bool selected = (i == m_labMineTopSelection);
+
+          Rectangle rowR{contentR.x + 2.0f, (float)ry - 2.0f, contentR.width - 6.0f, (float)rowH};
+          if (selected)
+            DrawRectangleRec(rowR, uiTh.accentHi);
+
+          if (CheckCollisionPointRec(mouseUi, rowR) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            m_labMineTopSelection = i;
+          }
+
+          const float floodPct = r.seaFloodFrac * 100.0f;
+          const float pondPct = r.pondFrac * 100.0f;
+
+          ui::Text(baseX, ry, 14,
+                   TextFormat("#%d  %s  score %.2f  pop %.0f  hap %.0f  flood %.1f%% pond %.1f%%", i + 1,
+                              HexU64(r.seed).c_str(), r.score, r.stats.population, r.stats.happiness, floodPct, pondPct),
+                   selected ? uiTh.text : uiTh.textDim, false, true, 1);
+
+          ry += rowH;
+        }
+
+        y += static_cast<int>(listR.height) + 10;
+
+        // Actions.
+        const int btnH = 18;
+        const int btnGap = 6;
+        const int btnW = (innerW - btnGap * 3) / 4;
+        const int bx = innerX;
+
+        const bool hasSelection = !m_labMineTopIndices.empty() && m_labMineTopSelection >= 0 &&
+                                  m_labMineTopSelection < (int)m_labMineTopIndices.size();
+        std::uint64_t selectedSeed = 0;
+        if (hasSelection) {
+          const int topIdx = m_labMineTopIndices[m_labMineTopSelection];
+          selectedSeed = m_mineSession->records().at(topIdx).seed;
+        }
+
+        const Rectangle loadR{static_cast<float>(bx), static_cast<float>(y), static_cast<float>(btnW),
+                              static_cast<float>(btnH)};
+        const Rectangle csvR{static_cast<float>(bx + (btnW + btnGap)), static_cast<float>(y), static_cast<float>(btnW),
+                             static_cast<float>(btnH)};
+        const Rectangle dosR{static_cast<float>(bx + (btnW + btnGap) * 2), static_cast<float>(y),
+                             static_cast<float>(btnW), static_cast<float>(btnH)};
+        const Rectangle batchR{static_cast<float>(bx + (btnW + btnGap) * 3), static_cast<float>(y),
+                               static_cast<float>(btnW), static_cast<float>(btnH)};
+
+        if (ui::Button(9231, loadR, "Load", mouseUi, uiTime, hasSelection)) {
+          m_pendingMineLoadSeed = true;
+          m_pendingMineLoadSeedValue = selectedSeed;
+          showToast(std::string("Loading seed ") + HexU64(selectedSeed), 2.0f);
+        }
+
+        if (ui::Button(9232, csvR, "CSV", mouseUi, uiTime, true)) {
+          const std::string path = TextFormat("captures/mine_%s_%s.csv", MineObjectiveName(m_mineSession->config().objective),
+                                              FileTimestamp().c_str());
+          std::ofstream f(path);
+          if (!f) {
+            showToast(std::string("Mine CSV failed: ") + path, 3.0f);
+          } else {
+            WriteMineCsvHeader(f);
+            for (const MineRecord& r : m_mineSession->records()) {
+              WriteMineCsvRow(f, r);
+            }
+            showToast(std::string("Mine CSV: ") + path, 3.0f);
+          }
+        }
+
+        if (ui::Button(9233, dosR, "Dossier", mouseUi, uiTime, hasSelection)) {
+          const std::filesystem::path outDir = std::filesystem::path("captures") /
+                                              (std::string("dossier_mined_") + HexU64(selectedSeed) + "_" +
+                                               FileTimestamp());
+          CityDossierConfig cfg = makeDossierCfg(outDir);
+          queueDossierSeeds(std::move(cfg), {selectedSeed}, m_labMineBakeDays, "Queued dossier");
+        }
+
+        if (ui::Button(9234, batchR, "Batch", mouseUi, uiTime, true)) {
+          const int n = std::clamp(m_labMineBatchExportN, 1, 50);
+          const int count = std::min(n, (int)m_labMineTopIndices.size());
+          if (count <= 0) {
+            showToast("Batch: no top seeds yet", 2.0f);
+          } else {
+            std::vector<std::uint64_t> seeds;
+            seeds.reserve(count);
+            for (int i = 0; i < count; ++i) {
+              const int topIdx = m_labMineTopIndices[i];
+              seeds.push_back(m_mineSession->records().at(topIdx).seed);
+            }
+
+            const std::filesystem::path outDir =
+                std::filesystem::path("captures") / (std::string("dossiers_mined_") + FileTimestamp());
+            CityDossierConfig cfg = makeDossierCfg(outDir);
+            queueDossierSeeds(std::move(cfg), std::move(seeds), m_labMineBakeDays, "Queued batch");
+          }
+        }
+
+        y += 24;
+
+        // Batch controls.
+        ui::Text(innerX + 4, y + 2, 14, "Batch: top N", uiTh.textDim);
+        ui::SliderInt(9235, Rectangle{static_cast<float>(innerX + 120), static_cast<float>(y), 80.0f, 18.0f},
+                      m_labMineBatchExportN, 1, 50, mouseUi, uiTime);
+        ui::Text(innerX + 210, y + 2, 14, "Bake days", uiTh.textDim);
+        ui::SliderInt(9236, Rectangle{static_cast<float>(innerX + 300), static_cast<float>(y), 120.0f, 18.0f},
+                      m_labMineBakeDays, 0, 365, mouseUi, uiTime);
+
+        y += 24;
+      }
+    }
+
+    return;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Dossier tab
+  // ---------------------------------------------------------------------------
+  {
+    const Rectangle cfgR{static_cast<float>(innerX), static_cast<float>(y), static_cast<float>(innerW), 210.0f};
+    ui::DrawPanelInset(cfgR, uiTime, true);
+
+    const int labelX = innerX + innerPad;
+    const int labelW = 120;
+    const int ctrlX = labelX + labelW;
+    const int ctrlW = innerW - 2 * innerPad - labelW;
+
+    int cy = y + innerPad;
+
+    // Preset.
+    {
+      ui::Text(labelX, cy + 2, 14, "Preset", uiTh.textDim);
+      const Rectangle btnR{static_cast<float>(ctrlX), static_cast<float>(cy), static_cast<float>(ctrlW), 18.0f};
+      const char* name = (m_labDossierPreset == 1) ? "Fast" : "Full";
+      if (ui::Button(9300, btnR, name, mouseUi, uiTime, true)) {
+        m_labDossierPreset = (m_labDossierPreset == 1) ? 0 : 1;
+      }
+      cy += 22;
+    }
+
+    // Export scale.
+    {
+      ui::Text(labelX, cy + 2, 14, "Scale", uiTh.textDim);
+      ui::SliderInt(9301, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), static_cast<float>(ctrlW), 18.0f},
+                    m_labDossierExportScale, 1, 4, mouseUi, uiTime);
+      cy += 22;
+    }
+
+    // Iso + 3D toggles.
+    {
+      ui::Text(labelX, cy + 2, 14, "Iso", uiTh.textDim);
+      ui::Toggle(9302, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), 120.0f, 18.0f}, m_labDossierIso,
+                 mouseUi, uiTime);
+      cy += 22;
+
+      ui::Text(labelX, cy + 2, 14, "3D", uiTh.textDim);
+      ui::Toggle(9303, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), 120.0f, 18.0f}, m_labDossier3d,
+                 mouseUi, uiTime);
+      ui::Text(ctrlX + 128, cy + 2, 14, "(slow)", uiTh.textDim);
+      cy += 22;
+    }
+
+    // Format.
+    {
+      ui::Text(labelX, cy + 2, 14, "Format", uiTh.textDim);
+      const Rectangle btnR{static_cast<float>(ctrlX), static_cast<float>(cy), static_cast<float>(ctrlW), 18.0f};
+      const char* fmtName = (m_labDossierFormat == 1) ? "PPM" : "PNG";
+      if (ui::Button(9304, btnR, fmtName, mouseUi, uiTime, true)) {
+        m_labDossierFormat = (m_labDossierFormat == 1) ? 0 : 1;
+      }
+      cy += 22;
+    }
+
+    // Export actions.
+    {
+      const int btnH = 18;
+      const int btnGap = 6;
+      const int btnW = (innerW - innerPad * 2 - btnGap) / 2;
+      const int bx = innerX + innerPad;
+
+      const Rectangle expR{static_cast<float>(bx), static_cast<float>(cy), static_cast<float>(btnW),
+                           static_cast<float>(btnH)};
+      const Rectangle clearR{static_cast<float>(bx + btnW + btnGap), static_cast<float>(cy), static_cast<float>(btnW),
+                             static_cast<float>(btnH)};
+
+      if (ui::Button(9305, expR, "Export current", mouseUi, uiTime, true)) {
+        const std::filesystem::path outDir =
+            std::filesystem::path("captures") /
+            (std::string("dossier_seed") + HexU64(m_cfg.seed) + "_" + FileTimestamp());
+        CityDossierConfig cfg = makeDossierCfg(outDir);
+        queueDossierCurrentWorld(std::move(cfg), "Queued dossier");
+      }
+
+      if (ui::Button(9306, clearR, "Clear queue", mouseUi, uiTime, !m_dossierQueue.empty())) {
+        const int n = (int)m_dossierQueue.size();
+        m_dossierQueue.clear();
+        showToast(TextFormat("Dossier queue cleared (%d)", n), 2.0f);
+      }
+
+      cy += 24;
+    }
+
+    y += static_cast<int>(cfgR.height) + 10;
+
+    // Job status.
+    {
+      if (m_dossierJob) {
+        std::string stage;
+        {
+          std::lock_guard<std::mutex> lk(m_dossierJob->mutex);
+          stage = m_dossierJob->stage;
+        }
+
+        const int si = m_dossierJob->stepIndex.load(std::memory_order_relaxed);
+        const int sc = m_dossierJob->stepCount.load(std::memory_order_relaxed);
+        const int seedI = m_dossierJob->seedIndex.load(std::memory_order_relaxed);
+        const int seedC = m_dossierJob->seedCount.load(std::memory_order_relaxed);
+
+        if (seedC > 0)
+          ui::Text(innerX + 4, y, 14, TextFormat("Running: seed %d/%d", seedI, seedC), uiTh.text);
+        else
+          ui::Text(innerX + 4, y, 14, "Running:", uiTh.text);
+
+        y += 18;
+        ui::Text(innerX + 4, y, 14, stage.empty() ? "(working...)" : stage, uiTh.textDim, false, true, 2);
+        y += 18;
+
+        if (sc > 0)
+          ui::Text(innerX + 4, y, 14, TextFormat("Progress: %d / %d", si, sc), uiTh.textDim);
+        else
+          ui::Text(innerX + 4, y, 14, TextFormat("Progress: %d", si), uiTh.textDim);
+
+        const Rectangle cancelR{static_cast<float>(innerX + innerW - 90), static_cast<float>(y - 2), 86.0f, 18.0f};
+        if (ui::Button(9307, cancelR, "Cancel", mouseUi, uiTime, true)) {
+          m_dossierJob->cancel.store(true, std::memory_order_relaxed);
+          showToast("Dossier: cancel requested", 2.0f);
+        }
+
+        y += 22;
+      } else {
+        ui::Text(innerX + 4, y, 14, "Status: idle", uiTh.textDim);
+        y += 18;
+
+        if (!m_lastDossierMsg.empty()) {
+          ui::Text(innerX + 4, y, 14, m_lastDossierMsg, m_lastDossierOk ? uiTh.text : uiTh.bad, false, true, 3);
+          y += 18;
+        }
+      }
+
+      if (!m_dossierQueue.empty()) {
+        ui::Text(innerX + 4, y, 14, TextFormat("Queue: %d job(s)", (int)m_dossierQueue.size()), uiTh.textDim);
+      }
+    }
+  }
 }
 
 } // namespace isocity

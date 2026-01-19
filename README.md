@@ -34,6 +34,39 @@ cmake --build build -j
 ./build/proc_isocity
 ```
 
+### In-game dev console (F4)
+
+The interactive app ships with a small dev console (toggle with **F4**) that now exposes a couple of the headless tools directly in-game:
+
+- **City dossier export** (same artifact format as `proc_isocity_dossier`):
+
+  ```
+  dossier
+  dossier captures/my_dossier scale=4 iso=1 3d=0
+  dossier captures/my_dossier layers=terrain,overlay,landvalue,traffic,goods_fill,district,flood_depth,ponding_depth
+  ```
+
+- **Seed mining** (same core as `proc_isocity_mine`), with background auto-stepping while the game is open:
+
+  ```
+  mine begin 500 resilient days=180
+  mine status
+  mine top 20 diverse=1
+  mine load 1
+  mine export captures/mine_top.json
+  ```
+
+Exports are written to the `captures/` folder by default.
+
+### City Lab panel (Ctrl+F2)
+
+There's also a small in-game UI panel to run the same headless workflows **without typing console commands**:
+
+- start/pause seed mining, browse the current top-ranked seeds, and load one into the live game
+- export a **city dossier** for the current world (or batch-export dossiers for mined seeds)
+
+All exports still go to `captures/` by default.
+
 ### 4) Tests (headless, optional)
 
 You can build and run a small set of **headless** tests (no raylib dependency). This is handy for CI or for quickly validating core logic changes on machines without graphics/system deps.
@@ -48,7 +81,7 @@ ctest --test-dir build-tests --output-on-failure
 
 - `PROCISOCITY_BUILD_APP` (default: ON) — build the interactive raylib app (`proc_isocity`).
 - `PROCISOCITY_BUILD_TESTS` (default: OFF) — build `proc_isocity_tests` and enable `ctest`.
-- `PROCISOCITY_BUILD_CLI` (default: ON) — build headless command-line tools (`proc_isocity_cli`, `proc_isocity_diff`, `proc_isocity_imagediff`, `proc_isocity_inspect`, `proc_isocity_config`, `proc_isocity_patch`, `proc_isocity_script`, `proc_isocity_replay`, `proc_isocity_blueprint`, `proc_isocity_suite`, `proc_isocity_transform`, `proc_isocity_roadgraph`, `proc_isocity_roadcentrality`, `proc_isocity_blocks`, `proc_isocity_mesh`, `proc_isocity_timelapse`, `proc_isocity_streetnames`, `proc_isocity_cartography`, `proc_isocity_wayfind`, `proc_isocity_tour`, `proc_isocity_mapexport`, `proc_isocity_osmimport`, `proc_isocity_tileset`).
+- `PROCISOCITY_BUILD_CLI` (default: ON) — build headless command-line tools (includes `proc_isocity_cli`, `proc_isocity_dossier`, `proc_isocity_mine`, and many more; see below).
 - `PROCISOCITY_USE_SYSTEM_RAYLIB` (default: OFF) — when building the app, use a system raylib instead of FetchContent.
 
 ### Headless CLI tools (optional)
@@ -88,6 +121,30 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
     --export-iso overlay iso_{seed}.ppm --iso-tile 16x8 --iso-height 14 \
     --export-3d overlay view3d_{seed}.png --3d-size 1280x720 --3d-proj iso --3d-ssaa 2 \
     --3d-ao 1 --3d-edge 1 --3d-tonemap 1 --3d-dither 1 --3d-post-seed 1337 --batch 3
+  ```
+
+- `proc_isocity_dossier`: one-command **"city dossier"** exporter — runs generation / simulation and then writes a
+  self-contained folder containing:
+  - `index.html` (offline-friendly viewer with layer switcher + optional per-tile inspector)
+  - `summary.json` (includes config, hash, and tick snapshots)
+  - `ticks.csv` (per-day stats)
+  - `tile_metrics.csv` (per-tile base + derived metrics: land value, traffic, goods, flood/ponding)
+  - `world.bin` (final save)
+  - a set of map images (`map_*.png`, optional `iso_*.png`, optional `view3d_overlay.png`)
+
+  ```bash
+  ./build/proc_isocity_dossier --seed 1 --size 128x128 --days 120 --out-dir dossier_out \
+    --scale 4 --layers terrain,overlay,landvalue,traffic,goods_fill,district,flood_depth,ponding_depth \
+    --iso 1 --iso-layers overlay,landvalue
+  ```
+
+- `proc_isocity_mine`: batch-run procedural seeds, simulate, compute a KPI CSV, and output the **best seeds** (optionally diversity-selected).
+  Useful for finding "hero" cities for screenshots, or "pathological" cities for stress/regression tests (`--objective chaos`).
+
+  ```bash
+  # Find resilient, high-quality seeds (MMR diverse selection)
+  ./build/proc_isocity_mine --seed-start 1 --samples 500 --size 128x128 --days 180 \
+    --objective resilient --top 20 --diverse 1 --csv mine.csv --json mine_top.json --manifest top_seeds.txt
   ```
 
 - `proc_isocity_timelapse`: generate a deterministic **isometric frame sequence** by stepping the simulator forward.

@@ -317,4 +317,38 @@ ServicesResult ComputeServices(const World& world, const ServicesModelSettings& 
   return out;
 }
 
+std::vector<ServiceFacility> ExtractServiceFacilitiesFromWorld(const World& world)
+{
+  std::vector<ServiceFacility> out;
+  out.reserve(64);
+
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      const Tile& t = world.at(x, y);
+      ServiceType type;
+      bool isFacility = true;
+
+      switch (t.overlay) {
+        case Overlay::School: type = ServiceType::Education; break;
+        case Overlay::Hospital: type = ServiceType::Health; break;
+        case Overlay::PoliceStation: type = ServiceType::Safety; break;
+        case Overlay::FireStation: type = ServiceType::Safety; break;
+        default: isFacility = false; break;
+      }
+
+      if (!isFacility) continue;
+
+      ServiceFacility f;
+      f.tile = Point{x, y};
+      f.type = type;
+      // Clamp defensively; saves/scripts might produce odd values.
+      f.level = static_cast<std::uint8_t>(std::clamp<int>(static_cast<int>(t.level), 1, 3));
+      f.enabled = true;
+      out.push_back(f);
+    }
+  }
+
+  return out;
+}
+
 } // namespace isocity

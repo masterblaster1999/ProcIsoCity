@@ -3048,6 +3048,10 @@ Color MinimapColorForTile(const isocity::Tile& t, const GfxPalette& pal)
   case Overlay::Residential: return LerpColor(base, toColor(pal.overlayResidential), 0.80f);
   case Overlay::Commercial: return LerpColor(base, toColor(pal.overlayCommercial), 0.80f);
   case Overlay::Industrial: return LerpColor(base, toColor(pal.overlayIndustrial), 0.80f);
+  case Overlay::School: return LerpColor(base, Color{80, 160, 255, 255}, 0.90f);
+  case Overlay::Hospital: return LerpColor(base, Color{245, 245, 245, 255}, 0.90f);
+  case Overlay::PoliceStation: return LerpColor(base, Color{110, 110, 200, 255}, 0.90f);
+  case Overlay::FireStation: return LerpColor(base, Color{230, 90, 70, 255}, 0.90f);
   default: break;
   }
   return base;
@@ -8858,7 +8862,7 @@ void Renderer::drawHUD(const World& world, const Camera2D& camera, Tool tool, in
         if (tipR.height > 12.0f) {
           ui::TextBox(
             tipR, 14,
-            "More: F4 console | F5 save/menu | M minimap | L heatmap | F1 report | F2 cache | F3 model | Shift+F3 weather | F11 fullscreen. "
+            "More: F4 console | F5 save/menu | M minimap | L heatmap | F1 report | F2 cache | Ctrl+F2 lab | F3 model | Shift+F3 weather | F11 fullscreen. "
             "Tip: re-place a zone to upgrade. Road: U selects class (paint to upgrade), Shift+drag builds path. Terraform: Shift=strong, Ctrl=fine. "
             "District: Alt+click pick, Shift+click fill.",
             uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1, /*wrap=*/true, /*clip=*/true);

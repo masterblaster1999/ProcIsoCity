@@ -162,4 +162,11 @@ ServicesResult ComputeServices(const World& world, const ServicesModelSettings& 
                                const ZoneAccessMap* precomputedZoneAccess = nullptr,
                                const std::vector<std::uint8_t>* precomputedRoadToEdge = nullptr);
 
+// Convenience: scan the World for service/civic facility tiles and build a facility list
+// suitable for ComputeServices().
+//
+// This makes it easy to hook the services model into the simulator without introducing
+// a separate entity system yet.
+std::vector<ServiceFacility> ExtractServiceFacilitiesFromWorld(const World& world);
+
 } // namespace isocity
