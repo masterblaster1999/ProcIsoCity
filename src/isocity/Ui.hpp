@@ -33,10 +33,17 @@ struct Theme {
   Color accent = Color{120, 220, 255, 255};
   Color accentDim = Color{120, 220, 255, 90};
 
+  // Bright/highlight accent (e.g. selected rows).
+  // This is derived from `accent` and intentionally semi-transparent.
+  Color accentHi = Color{170, 240, 255, 110};
+
   // Semantic accents used by charts and status badges.
   // These are intentionally not user-editable (they communicate meaning).
   Color accentOk = Color{90, 220, 150, 255};
   Color accentBad = Color{230, 90, 90, 255};
+
+  // Back-compat alias used by some UI call-sites (older code expects theme.bad).
+  Color bad = Color{230, 90, 90, 255};
 
   // Subtle gridline color (used for charts/tables).
   Color grid = Color{255, 255, 255, 30};
@@ -180,6 +187,17 @@ inline bool SliderInt(int id, Rectangle r, int& ioValue, int minValue, int maxVa
                       Vector2 mouseUi, float timeSec, bool enabled = true)
 {
   return SliderInt(id, r, ioValue, minValue, maxValue, 1, mouseUi, timeSec, enabled);
+}
+
+// 64-bit unsigned integer slider (snaps to step).
+bool SliderU64(int id, Rectangle r, std::uint64_t& ioValue, std::uint64_t minValue, std::uint64_t maxValue,
+               std::uint64_t step, Vector2 mouseUi, float timeSec, bool enabled = true);
+
+// Convenience overload: u64 slider with implicit step=1.
+inline bool SliderU64(int id, Rectangle r, std::uint64_t& ioValue, std::uint64_t minValue, std::uint64_t maxValue,
+                      Vector2 mouseUi, float timeSec, bool enabled = true)
+{
+  return SliderU64(id, r, ioValue, minValue, maxValue, 1ULL, mouseUi, timeSec, enabled);
 }
 
 // Simple button.

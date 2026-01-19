@@ -1414,6 +1414,53 @@ bool SliderInt(int id, Rectangle r, int& ioValue, int minValue, int maxValue, in
   return changed;
 }
 
+bool SliderU64(int id, Rectangle r, std::uint64_t& ioValue, std::uint64_t minValue, std::uint64_t maxValue,
+               std::uint64_t step, Vector2 mouseUi, float timeSec, bool enabled)
+{
+  if (maxValue < minValue) std::swap(maxValue, minValue);
+
+  step = std::max<std::uint64_t>(1ULL, step);
+
+  const std::uint64_t old = ioValue;
+  ioValue = std::clamp(ioValue, minValue, maxValue);
+
+  // Map the integer range to a normalized [0,1] slider.
+  const double range = static_cast<double>(maxValue - minValue);
+  float frac = 0.0f;
+  if (range > 0.0) {
+    frac = static_cast<float>(static_cast<double>(ioValue - minValue) / range);
+    if (frac < 0.0f) frac = 0.0f;
+    if (frac > 1.0f) frac = 1.0f;
+  }
+
+  const bool moved = SliderFloat(id, r, frac, 0.0f, 1.0f, mouseUi, timeSec, enabled);
+
+  // Convert back to integer space and quantize to step.
+  if (range <= 0.0) {
+    ioValue = minValue;
+    return (ioValue != old);
+  }
+
+  const double raw = static_cast<double>(minValue) + static_cast<double>(frac) * range;
+  const double stepD = static_cast<double>(step);
+  const double baseD = static_cast<double>(minValue);
+
+  double q = std::round((raw - baseD) / stepD) * stepD + baseD;
+  if (q < baseD) q = baseD;
+  const double maxD = static_cast<double>(maxValue);
+  if (q > maxD) q = maxD;
+
+  std::uint64_t out = static_cast<std::uint64_t>(std::llround(q));
+  out = std::clamp(out, minValue, maxValue);
+
+  const bool changed = (out != old);
+  ioValue = out;
+
+  (void)moved;
+  return changed;
+}
+
+
 
 
 bool Button(int id, Rectangle r, std::string_view label, Vector2 mouseUi, float timeSec,

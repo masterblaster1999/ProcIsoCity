@@ -12926,7 +12926,7 @@ void Game::drawAutoBuildPanel(int x0, int y0)
 {
   const float uiScale = m_uiScale;
   const Vector2 mouseUi = mouseUiPosition(uiScale);
-  const float uiTime = GetTime();
+  const float uiTime = static_cast<float>(GetTime());
   const auto& uiTh = ui::GetTheme();
 
   const int panelW = kAutoBuildPanelW;
@@ -13020,7 +13020,7 @@ void Game::drawAutoBuildPanel(int x0, int y0)
   const float widgetX = contentR.x + contentR.width - widgetW - 6.0f;
 
   auto drawHeading = [&](int yRow, const char* label) {
-    ui::Text(static_cast<int>(rowX), yRow + 4, 15, label, uiTh.textDim, true, false, 1.0f);
+    ui::Text(static_cast<int>(rowX), yRow + 4, 15, label, uiTh.textDim, true, false, 1);
   };
 
   auto drawBoolRow = [&](int id, int yRow, const char* label, bool& v, bool enabled) {
@@ -18552,8 +18552,8 @@ void Game::drawHeadlessLabPanel(int x0, int y0)
     // Seed step.
     {
       ui::Text(labelX, cy + 2, 14, "Seed step", uiTh.textDim);
-      ui::SliderInt(9219, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), static_cast<float>(ctrlW), 18.0f},
-                    m_labMineCfg.seedStep, 1, 128, mouseUi, uiTime);
+      ui::SliderU64(9219, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), static_cast<float>(ctrlW), 18.0f},
+                     m_labMineCfg.seedStep, 1ULL, 128ULL, mouseUi, uiTime);
       cy += 22;
     }
 
@@ -18711,8 +18711,8 @@ void Game::drawHeadlessLabPanel(int x0, int y0)
             m_labMineTopSelection = i;
           }
 
-          const float floodPct = r.seaFloodFrac * 100.0f;
-          const float pondPct = r.pondFrac * 100.0f;
+          const float floodPct = static_cast<float>(r.seaFloodFrac * 100.0);
+          const float pondPct = static_cast<float>(r.pondFrac * 100.0);
 
           ui::Text(baseX, ry, 14,
                    TextFormat("#%d  %s  score %.2f  pop %.0f  hap %.0f  flood %.1f%% pond %.1f%%", i + 1,

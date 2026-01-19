@@ -648,14 +648,13 @@ inline void ApplyPostFx(PpmImage& img, const std::vector<float>& depth, const So
 
     if (strength > 1e-6f && radius > 1e-6f)
     {
-      const int nPix = w * h;
-      std::vector<float> bloom(3 * nPix, 0.0f);
-      std::vector<float> tmp(3 * nPix, 0.0f);
+      std::vector<float> bloom(nPix * 3u, 0.0f);
+      std::vector<float> tmp(nPix * 3u, 0.0f);
 
       const float invRange = 1.0f / std::max(1e-6f, 1.0f - threshold);
 
       // Bright pass.
-      for (int i = 0; i < nPix; ++i)
+      for (std::size_t i = 0; i < nPix; ++i)
       {
         const float r = lin[i * 3 + 0];
         const float g = lin[i * 3 + 1];
@@ -723,7 +722,7 @@ inline void ApplyPostFx(PpmImage& img, const std::vector<float>& depth, const So
       }
 
       // Additive blend back into the main buffer.
-      for (int i = 0; i < nPix; ++i)
+      for (std::size_t i = 0; i < nPix; ++i)
       {
         lin[i * 3 + 0] = ClampF(lin[i * 3 + 0] + strength * bloom[i * 3 + 0], 0.0f, 1.0f);
         lin[i * 3 + 1] = ClampF(lin[i * 3 + 1] + strength * bloom[i * 3 + 1], 0.0f, 1.0f);
