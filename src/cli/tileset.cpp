@@ -170,7 +170,7 @@ void PrintHelp()
       << "  --outline-holes <0|1> If 1, include holes; if 0, strip holes (default: 1).\n"
       << "  --outline-svg-scale <n> Scale factor for the SVG output dimensions (default: 1).\n"
       << "  --seed <u64>         Seed for graphics (default: 1). Accepts 0x... hex.\n"
-      << "  --theme <name>       classic|autumn|desert|noir|neon|pastel (default: classic).\n"
+      << "  --theme <name>       classic|autumn|desert|noir|neon|pastel|space_colony|procedural|procedural_muted|procedural_vibrant (default: classic).\n"
       << "  --tile <WxH>         Tile size (default: 64x32).\n"
       << "  --pack <mode>        Atlas packing: grid|maxrects (default: grid).\n"
       << "  --cols <n>           Atlas columns for grid packing (default: 32).\n"

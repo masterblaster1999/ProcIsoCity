@@ -6725,6 +6725,9 @@ void Game::adjustVideoSettings(int dir)
         GfxTheme::Neon,
         GfxTheme::Pastel,
         GfxTheme::SpaceColony,
+        GfxTheme::Procedural,
+        GfxTheme::ProceduralMuted,
+        GfxTheme::ProceduralVibrant,
       };
 
       const int n = static_cast<int>(sizeof(kThemes) / sizeof(kThemes[0]));
@@ -6741,7 +6744,9 @@ void Game::adjustVideoSettings(int dir)
       const int nextIdx = (idx + step + n) % n;
       const GfxTheme next = kThemes[nextIdx];
 
-      m_renderer.setGfxTheme(next);      auto themeLabel = [](GfxTheme t) -> const char* {
+      m_renderer.setGfxTheme(next);
+
+      auto themeLabel = [](GfxTheme t) -> const char* {
         switch (t) {
           case GfxTheme::Classic: return "Classic";
           case GfxTheme::Autumn: return "Autumn";
@@ -6750,6 +6755,9 @@ void Game::adjustVideoSettings(int dir)
           case GfxTheme::Neon: return "Neon";
           case GfxTheme::Pastel: return "Pastel";
           case GfxTheme::SpaceColony: return "Space Colony";
+          case GfxTheme::Procedural: return "Procedural";
+          case GfxTheme::ProceduralMuted: return "Procedural (Muted)";
+          case GfxTheme::ProceduralVibrant: return "Procedural (Vibrant)";
           default: return "Classic";
         }
       };
@@ -15961,6 +15969,9 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
         case GfxTheme::Neon: return "Neon";
         case GfxTheme::Pastel: return "Pastel";
         case GfxTheme::SpaceColony: return "Space Colony";
+        case GfxTheme::Procedural: return "Procedural";
+        case GfxTheme::ProceduralMuted: return "Procedural (Muted)";
+        case GfxTheme::ProceduralVibrant: return "Procedural (Vibrant)";
         default: return "Classic";
       }
     };

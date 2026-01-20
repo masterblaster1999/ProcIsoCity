@@ -35,7 +35,7 @@ void main()
 //
 // Effects (all optional):
 //  - Per-channel quantization (u_bits)
-//  - Ordered dithering (Bayer 4x4) to mask quantization banding (u_dither)
+//  - Ordered dithering (Bayer 8x8) to mask quantization banding (u_dither)
 //  - Temporal grain (u_grain)
 //  - Vignette (u_vignette)
 //  - Radial chromatic aberration (u_chroma)
@@ -162,35 +162,48 @@ vec4 lensRainLayer(vec2 p, float cellSize, float radius, float trailLen,
     return vec4(offSum, mask, hi);
 }
 
-float bayer4(vec2 pixel, float seed)
+float bayer8(vec2 pixel, float seed)
 {
-    // 4x4 Bayer matrix (normalized to [0,1)).
-    // Layout:
-    //  0  8  2 10
-    // 12  4 14  6
-    //  3 11  1  9
-    // 15  7 13  5
-    ivec2 p = ivec2(int(floor(pixel.x)) & 3, int(floor(pixel.y)) & 3);
+    // 8x8 Bayer matrix (normalized to [0,1)). Generated procedurally.
+    // We use the classic recursive Bayer construction with the 2x2 base:
+    //  0 2
+    //  3 1
+    // and expand it to 8x8.
+    ivec2 p = ivec2(int(floor(pixel.x)) & 7, int(floor(pixel.y)) & 7);
 
-    // Seeded permutation: shift and optionally transpose the 4x4 matrix.
+    // Seeded permutation: shift + transpose + flips.
     // This keeps the same distribution as Bayer dithering but avoids a
     // "one true" dither pattern across all worlds.
-    int si = int(seed * 65535.0);
-    int s = si & 15;
-    int ox = s & 3;
-    int oy = (s >> 2) & 3;
-    p = ivec2((p.x + ox) & 3, (p.y + oy) & 3);
-    if ((s & 8) != 0) {
+    //
+    // Note: u_seed is a float in [0,1). We hash it into a stable 24-bit integer.
+    int si = int(floor(hash12(vec2(seed * 173.3, seed * 941.7)) * 16777216.0));
+    int ox = si & 7;
+    int oy = (si >> 3) & 7;
+    int flags = (si >> 6) & 7;
+
+    p = ivec2((p.x + ox) & 7, (p.y + oy) & 7);
+    if ((flags & 1) != 0) {
         int tmp = p.x;
         p.x = p.y;
         p.y = tmp;
     }
-    int idx = p.x + p.y * 4;
-    int m[16] = int[16](0, 8, 2, 10,
-                        12, 4, 14, 6,
-                        3, 11, 1, 9,
-                        15, 7, 13, 5);
-    return (float(m[idx]) + 0.5) / 16.0;
+    if ((flags & 2) != 0) p.x = 7 - p.x;
+    if ((flags & 4) != 0) p.y = 7 - p.y;
+
+    int x = p.x;
+    int y = p.y;
+
+    // Compute Bayer index in [0..63].
+    // Each bit-plane contributes a 2-bit quadrant code.
+    int v = 0;
+    for (int bit = 0; bit < 3; ++bit) {
+        int bx = (x >> bit) & 1;
+        int by = (y >> bit) & 1;
+        int q = ((bx ^ by) << 1) | by; // 0,2,3,1
+        v = v * 4 + q;
+    }
+
+    return (float(v) + 0.5) / 64.0;
 }
 
 float luma(vec3 c)
@@ -441,7 +454,7 @@ void main()
     int bits = clamp(u_bits, 2, 8);
     float levels = pow(2.0, float(bits)) - 1.0;
 
-    float b = bayer4(gl_FragCoord.xy, u_seed);
+    float b = bayer8(gl_FragCoord.xy, u_seed);
     float d = (b - 0.5) * u_dither;
 
     col = floor(col * levels + d + 0.5) / levels;

@@ -245,6 +245,36 @@ inline std::uint32_t HashPixel(std::uint32_t seed, int x, int y)
   return Hash32(seed ^ (ux * 0x9e3779b9u) ^ (uy * 0x85ebca6bu));
 }
 
+
+
+inline int Bayer8Index(int x, int y)
+{
+  // Compute an 8x8 Bayer index in [0..63] procedurally.
+  // Uses the classic recursive Bayer construction with the 2x2 base:
+  //  0 2
+  //  3 1
+  // Expanded to 8x8 by accumulating 2-bit quadrant codes from each bit-plane.
+  int v = 0;
+  for (int bit = 0; bit < 3; ++bit) {
+    const int bx = (x >> bit) & 1;
+    const int by = (y >> bit) & 1;
+    const int q = ((bx ^ by) << 1) | by; // 0,2,3,1
+    v = v * 4 + q;
+  }
+  return v;
+}
+
+inline int Bayer8IndexPermuted(int x, int y, int ox, int oy, int flags)
+{
+  // Apply a small seeded permutation (shift/transpose/flip) so different worlds
+  // don't share a single globally aligned dither grid.
+  int px = (x + ox) & 7;
+  int py = (y + oy) & 7;
+  if ((flags & 1) != 0) std::swap(px, py);
+  if ((flags & 2) != 0) px = 7 - px;
+  if ((flags & 4) != 0) py = 7 - py;
+  return Bayer8Index(px, py);
+}
 inline void Clear(PpmImage& img, std::uint8_t r, std::uint8_t g, std::uint8_t b)
 {
   img.rgb.assign(static_cast<std::size_t>(img.width) * static_cast<std::size_t>(img.height) * 3u, 0);
@@ -795,16 +825,13 @@ inline void ApplyPostFx(PpmImage& img, const std::vector<float>& depth, const So
     const float invLevels = 1.0f / static_cast<float>(levels);
     const float dStr = ClampF(fx.ditherStrength, 0.0f, 1.0f);
 
-    // 4x4 Bayer matrix values in [0..15].
-    static constexpr int bayer4[4][4] = {
-        {0, 8, 2, 10},
-        {12, 4, 14, 6},
-        {3, 11, 1, 9},
-        {15, 7, 13, 5},
-    };
-
-    const int ox = static_cast<int>((fx.postSeed >> 0) & 3u);
-    const int oy = static_cast<int>((fx.postSeed >> 2) & 3u);
+    // 8x8 Bayer matrix values in [0..63], generated procedurally.
+    // We apply a small seeded permutation (shift/flip/transpose) so different worlds
+    // don't share a single globally aligned dither grid.
+    const std::uint32_t perm = Hash32(fx.postSeed ^ 0xA511E9B3u);
+    const int ox = static_cast<int>((perm >> 0) & 7u);
+    const int oy = static_cast<int>((perm >> 3) & 7u);
+    const int flags = static_cast<int>((perm >> 6) & 7u);
 
     for (int y = 0; y < h; ++y) {
       for (int x = 0; x < w; ++x) {
@@ -818,8 +845,8 @@ inline void ApplyPostFx(PpmImage& img, const std::vector<float>& depth, const So
         float sb = LinearToSrgb01(b);
 
         if (fx.enableDither) {
-          const int bv = bayer4[(y + oy) & 3][(x + ox) & 3];
-          const float d = (static_cast<float>(bv) + 0.5f) / 16.0f - 0.5f; // [-0.5..0.5]
+          const int bv = Bayer8IndexPermuted(x, y, ox, oy, flags);
+          const float d = (static_cast<float>(bv) + 0.5f) / 64.0f - 0.5f; // [-0.5..0.5]
           const float delta = d * dStr * invLevels;
           sr += delta;
           sg += delta;
@@ -846,20 +873,19 @@ inline void ApplyPostFx(PpmImage& img, const std::vector<float>& depth, const So
     const float invLevels = 1.0f / static_cast<float>(levels);
     const float dStr = ClampF(fx.ditherStrength, 0.0f, 1.0f);
 
-    static constexpr int bayer4[4][4] = {
-        {0, 8, 2, 10},
-        {12, 4, 14, 6},
-        {3, 11, 1, 9},
-        {15, 7, 13, 5},
-    };
-    const int ox = static_cast<int>((fx.postSeed >> 0) & 3u);
-    const int oy = static_cast<int>((fx.postSeed >> 2) & 3u);
+    // 8x8 Bayer matrix values in [0..63], generated procedurally.
+    // We apply a small seeded permutation (shift/flip/transpose) so different worlds
+    // don't share a single globally aligned dither grid.
+    const std::uint32_t perm = Hash32(fx.postSeed ^ 0xA511E9B3u);
+    const int ox = static_cast<int>((perm >> 0) & 7u);
+    const int oy = static_cast<int>((perm >> 3) & 7u);
+    const int flags = static_cast<int>((perm >> 6) & 7u);
 
     for (int y = 0; y < h; ++y) {
       for (int x = 0; x < w; ++x) {
         const std::size_t i = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
-        const int bv = bayer4[(y + oy) & 3][(x + ox) & 3];
-        const float d = (static_cast<float>(bv) + 0.5f) / 16.0f - 0.5f;
+        const int bv = Bayer8IndexPermuted(x, y, ox, oy, flags);
+        const float d = (static_cast<float>(bv) + 0.5f) / 64.0f - 0.5f;
         const float delta = d * dStr * invLevels;
 
         for (int c = 0; c < 3; ++c) {

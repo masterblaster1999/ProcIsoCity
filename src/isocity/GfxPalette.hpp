@@ -18,6 +18,9 @@ struct Rgba8 {
 //
 // Classic attempts to match the existing in-app colors so that enabling the
 // palette system doesn't radically change the project's default appearance.
+//
+// Procedural* themes are a "theme family": instead of fixed baselines, the
+// palette seed is used to synthesize a new coherent set of baseline hues.
 enum class GfxTheme : std::uint8_t {
   Classic = 0,
   Autumn = 1,
@@ -26,6 +29,11 @@ enum class GfxTheme : std::uint8_t {
   Neon = 4,
   Pastel = 5,
   SpaceColony = 6,
+
+  // Seed-driven palette families.
+  Procedural = 7,
+  ProceduralMuted = 8,
+  ProceduralVibrant = 9,
 };
 
 struct GfxPalette {

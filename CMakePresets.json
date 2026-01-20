@@ -1,0 +1,54 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 22,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "default",
+      "displayName": "Default (app + CLI)",
+      "description": "Build the interactive app and headless CLI tools.",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "cli",
+      "displayName": "CLI only (headless)",
+      "description": "Build headless command-line tools only (no raylib).",
+      "binaryDir": "${sourceDir}/build-cli",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "PROCISOCITY_BUILD_APP": "OFF",
+        "PROCISOCITY_BUILD_CLI": "ON",
+        "PROCISOCITY_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "tests",
+      "displayName": "Tests (headless)",
+      "description": "Build and run headless tests (no raylib).",
+      "binaryDir": "${sourceDir}/build-tests",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "PROCISOCITY_BUILD_APP": "OFF",
+        "PROCISOCITY_BUILD_CLI": "OFF",
+        "PROCISOCITY_BUILD_TESTS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "default", "configurePreset": "default" },
+    { "name": "cli", "configurePreset": "cli" },
+    { "name": "tests", "configurePreset": "tests" }
+  ],
+  "testPresets": [
+    { "name": "tests", "configurePreset": "tests", "outputOnFailure": true }
+  ]
+}

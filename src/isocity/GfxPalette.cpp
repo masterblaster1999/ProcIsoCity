@@ -3,6 +3,7 @@
 #include "isocity/Random.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -106,6 +107,11 @@ static float ThemeSat(GfxTheme t)
   case GfxTheme::Pastel: return 0.35f;
   case GfxTheme::Neon: return 0.95f;
   case GfxTheme::SpaceColony: return 0.60f;
+
+  case GfxTheme::ProceduralMuted: return 0.45f;
+  case GfxTheme::ProceduralVibrant: return 0.95f;
+  case GfxTheme::Procedural: return 0.75f;
+
   default: return 0.75f;
   }
 }
@@ -277,6 +283,127 @@ GfxPalette GenerateGfxPalette(std::uint32_t seed, GfxTheme theme)
     deck3.s = 0.05f;
     deck3.v = 0.56f;
     break;
+
+  case GfxTheme::Procedural:
+  case GfxTheme::ProceduralMuted:
+  case GfxTheme::ProceduralVibrant: {
+    // Procedurally synthesize a coherent palette from the seed.
+    //
+    // Strategy:
+    //  - pick a "biome hue" for vegetation (grass)
+    //  - derive water and sand hues relative to that hue so terrain feels cohesive
+    //  - pick zone overlay hues using a simple harmony scheme (triad/complementary/analogous)
+    //  - keep roads mostly neutral with a subtle cool/warm tint
+    const float terrainSat = ThemeSat(theme);
+
+    // Controls that shape the overall "feel".
+    const float dry = rng.nextF01();     // 0 = lush, 1 = arid
+    const float strange = rng.nextF01(); // pushes into more alien hues sometimes
+    const float coolWarm = rng.nextF01();
+    const float season = rng.nextF01();
+
+    // Vegetation hue buckets.
+    if (strange < 0.10f) {
+      grass.h = rng.rangeFloat(290.0f, 340.0f); // magenta/purple alien flora
+    } else if (strange < 0.20f) {
+      grass.h = rng.rangeFloat(150.0f, 210.0f); // teal/cyan flora
+    } else if (season < 0.25f) {
+      grass.h = rng.rangeFloat(60.0f, 95.0f);   // yellow-green / autumn
+    } else {
+      grass.h = rng.rangeFloat(95.0f, 155.0f);  // classic greens
+    }
+
+    // Terrain saturation/value tuned by aridity.
+    grass.s = std::clamp(terrainSat * (0.42f + 0.40f * (1.0f - dry)), 0.0f, 1.0f);
+    grass.v = std::clamp(0.60f + 0.22f * (1.0f - dry) + rng.rangeFloat(-0.02f, 0.02f), 0.0f, 1.0f);
+
+    // Derive sand/water hues from vegetation hue so the palette feels coherent.
+    sand.h = WrapHue(grass.h - 80.0f + rng.rangeFloat(-12.0f, 12.0f));
+    sand.s = std::clamp(terrainSat * (0.10f + 0.22f * dry), 0.0f, 1.0f);
+    sand.v = std::clamp(0.86f + 0.10f * dry, 0.0f, 1.0f);
+
+    water.h = WrapHue(grass.h + 90.0f + rng.rangeFloat(-24.0f, 24.0f));
+    water.s = std::clamp(terrainSat * (0.70f + 0.20f * (1.0f - dry)), 0.0f, 1.0f);
+    water.v = std::clamp(0.58f + 0.28f * (1.0f - dry), 0.0f, 1.0f);
+
+    // --- Zone overlays ---
+    const float baseOverlaySat =
+        (theme == GfxTheme::ProceduralMuted) ? 0.45f :
+        (theme == GfxTheme::ProceduralVibrant) ? 0.85f : 0.65f;
+
+    const float baseOverlayVal =
+        (theme == GfxTheme::ProceduralMuted) ? 0.86f :
+        (theme == GfxTheme::ProceduralVibrant) ? 0.82f : 0.78f;
+
+    // Harmony scheme.
+    const float baseHue = rng.rangeFloat(0.0f, 360.0f);
+    const std::uint32_t scheme = rng.rangeU32(3); // 0=triadic, 1=complementary, 2=analogous
+
+    float hA = baseHue;
+    float hB = baseHue;
+    float hC = baseHue;
+
+    if (scheme == 0) {
+      // Triadic: strong separation.
+      hB = WrapHue(hA + 120.0f);
+      hC = WrapHue(hA + 240.0f);
+    } else if (scheme == 1) {
+      // Complementary + split complement.
+      hB = WrapHue(hA + 180.0f);
+      hC = WrapHue(hA + 210.0f);
+      hA = WrapHue(hA + 30.0f);
+    } else {
+      // Analogous: keep closer hues, but push value differences to keep readability.
+      hB = WrapHue(hA + 35.0f);
+      hC = WrapHue(hA + 70.0f);
+    }
+
+    res = Hsv{hA, baseOverlaySat, baseOverlayVal};
+    com = Hsv{hB, baseOverlaySat, std::clamp(baseOverlayVal * 0.96f, 0.0f, 1.0f)};
+    ind = Hsv{hC, std::clamp(baseOverlaySat + 0.05f, 0.0f, 1.0f), std::clamp(baseOverlayVal + 0.04f, 0.0f, 1.0f)};
+
+    // Parks stay tied to vegetation hue but with enough saturation/value to read.
+    park.h = WrapHue(grass.h + rng.rangeFloat(-8.0f, 8.0f));
+    park.s = std::clamp(baseOverlaySat * 0.90f, 0.30f, 1.0f);
+    park.v = std::clamp(baseOverlayVal * 0.96f, 0.0f, 1.0f);
+
+    // --- Roads / bridges ---
+    const float roadHue = WrapHue(water.h + ((coolWarm < 0.5f) ? -10.0f : 10.0f) + rng.rangeFloat(-6.0f, 6.0f));
+    const float roadV = std::clamp(0.40f - 0.08f * dry, 0.20f, 0.55f);
+
+    asphalt1.h = roadHue;
+    asphalt1.s = 0.10f;
+    asphalt1.v = roadV;
+
+    asphalt2.h = roadHue;
+    asphalt2.s = 0.08f;
+    asphalt2.v = std::clamp(roadV - 0.04f, 0.18f, 0.55f);
+
+    asphalt3.h = roadHue;
+    asphalt3.s = 0.06f;
+    asphalt3.v = std::clamp(roadV - 0.10f, 0.16f, 0.55f);
+
+    // Bridge decks: pick either warm wood-ish or cool metal-ish.
+    if (rng.chance(0.55f)) {
+      deck1.h = WrapHue(sand.h + 4.0f);
+      deck1.s = std::clamp(0.35f * (0.75f + 0.25f * (1.0f - dry)), 0.0f, 1.0f);
+      deck1.v = 0.66f;
+    } else {
+      deck1.h = roadHue;
+      deck1.s = 0.08f;
+      deck1.v = 0.62f;
+    }
+
+    deck2 = deck1;
+    deck2.s *= 0.55f;
+    deck2.v = std::min(0.70f, deck1.v + 0.02f);
+
+    deck3 = deck1;
+    deck3.s *= 0.70f;
+    deck3.v = std::max(0.48f, deck1.v - 0.06f);
+
+    break;
+  }
   }
 
   // Per-theme, per-seed micro-shifts.
@@ -362,16 +489,29 @@ const char* GfxThemeName(GfxTheme t)
   case GfxTheme::Neon: return "neon";
   case GfxTheme::Pastel: return "pastel";
   case GfxTheme::SpaceColony: return "space_colony";
+  case GfxTheme::Procedural: return "procedural";
+  case GfxTheme::ProceduralMuted: return "procedural_muted";
+  case GfxTheme::ProceduralVibrant: return "procedural_vibrant";
   default: return "classic";
   }
 }
 
 bool ParseGfxTheme(const std::string& s, GfxTheme& out)
 {
-  auto lower = [](unsigned char c) { return static_cast<char>(std::tolower(c)); };
-  std::string t;
-  t.resize(s.size());
-  std::transform(s.begin(), s.end(), t.begin(), lower);
+  auto normalize = [](const std::string& in) -> std::string {
+    std::string t;
+    t.reserve(in.size());
+    for (unsigned char c : in) {
+      const char lc = static_cast<char>(std::tolower(c));
+      // Treat common separators as ignorable so users can write:
+      // "space colony", "space-colony", "space_colony", etc.
+      if (lc == ' ' || lc == '\t' || lc == '_' || lc == '-' || lc == '.') continue;
+      t.push_back(lc);
+    }
+    return t;
+  };
+
+  const std::string t = normalize(s);
 
   if (t == "classic" || t == "default" || t == "orig") {
     out = GfxTheme::Classic;
@@ -398,12 +538,25 @@ bool ParseGfxTheme(const std::string& s, GfxTheme& out)
     return true;
   }
 
-
-  if (t == "space" || t == "spacecolony" || t == "space_colony" || t == "colony" ||
+  if (t == "space" || t == "spacecolony" || t == "colony" ||
       t == "lunar" || t == "moon" || t == "mars") {
     out = GfxTheme::SpaceColony;
     return true;
   }
+
+  if (t == "procedural" || t == "proc" || t == "generated" || t == "gen" || t == "random") {
+    out = GfxTheme::Procedural;
+    return true;
+  }
+  if (t == "proceduralmuted" || t == "procmuted" || t == "procmute" || t == "proceduralsoft") {
+    out = GfxTheme::ProceduralMuted;
+    return true;
+  }
+  if (t == "proceduralvibrant" || t == "procvibrant" || t == "procvivid" || t == "proceduralvivid") {
+    out = GfxTheme::ProceduralVibrant;
+    return true;
+  }
+
   return false;
 }
 

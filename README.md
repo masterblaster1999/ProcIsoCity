@@ -28,6 +28,23 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
+### CMake presets (optional)
+
+If you have **CMake 3.22+**, you can use the included `CMakePresets.json` for common builds:
+
+```bash
+# Default (app + CLI)
+cmake --preset default
+cmake --build --preset default --parallel
+
+# Headless tests (no raylib)
+cmake --preset tests
+cmake --build --preset tests --parallel
+ctest --preset tests
+```
+
+Presets also enable `compile_commands.json` by default (handy for editor tooling).
+
 ### 3) Run
 
 ```bash
@@ -302,6 +319,11 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
 
   Notes:
   - `--extrude` is now enforced to be `<= --pad` to prevent overlapping writes between neighboring sprites in tight pack modes.
+
+  Palette themes (`--theme`):
+  - Presets: `classic`, `autumn`, `desert`, `noir`, `neon`, `pastel`, `space_colony`
+  - Seed-driven families: `procedural`, `procedural_muted`, `procedural_vibrant`
+    - These synthesize new baseline hues from the palette seed, so different `--seed` values can yield dramatically different art direction.
 
   ```bash
   ./build/proc_isocity_tileset --out tileset.png --meta tileset.json --html tileset_preview.html \
