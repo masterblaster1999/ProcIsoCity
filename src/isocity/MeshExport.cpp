@@ -114,6 +114,12 @@ bool WriteWorldObjMtl(std::ostream& objOut, std::ostream& mtlOut, const World& w
   WriteMaterial(mtlOut, "mat_ind", 0.95f, 0.55f, 0.20f);
   WriteMaterial(mtlOut, "mat_park", 0.15f, 0.85f, 0.15f);
 
+  // Civic/service facility overlays.
+  WriteMaterial(mtlOut, "mat_school", 0.3137f, 0.5882f, 1.0000f);
+  WriteMaterial(mtlOut, "mat_hospital", 1.0000f, 0.3529f, 0.3529f);
+  WriteMaterial(mtlOut, "mat_police", 0.5098f, 0.4706f, 0.9020f);
+  WriteMaterial(mtlOut, "mat_fire", 1.0000f, 0.4706f, 0.2353f);
+
   WriteMaterial(mtlOut, "mat_cliff", 0.45f, 0.35f, 0.25f);
   WriteMaterial(mtlOut, "mat_building", 0.75f, 0.75f, 0.75f);
   WriteMaterial(mtlOut, "mat_building_res", 0.70f, 0.90f, 0.75f);

@@ -45,6 +45,12 @@ MeshMaterial SurfaceMaterialForTile(const Tile& t)
     case Overlay::Commercial: return MeshMaterial::Commercial;
     case Overlay::Industrial: return MeshMaterial::Industrial;
     case Overlay::Park: return MeshMaterial::Park;
+
+    case Overlay::School: return MeshMaterial::School;
+    case Overlay::Hospital: return MeshMaterial::Hospital;
+    case Overlay::PoliceStation: return MeshMaterial::PoliceStation;
+    case Overlay::FireStation: return MeshMaterial::FireStation;
+
     case Overlay::None: break;
   }
 
@@ -128,6 +134,12 @@ const char* ObjMaterialName(MeshMaterial m)
     case MeshMaterial::Commercial: return "mat_com";
     case MeshMaterial::Industrial: return "mat_ind";
     case MeshMaterial::Park: return "mat_park";
+
+    case MeshMaterial::School: return "mat_school";
+    case MeshMaterial::Hospital: return "mat_hospital";
+    case MeshMaterial::PoliceStation: return "mat_police";
+    case MeshMaterial::FireStation: return "mat_fire";
+
     case MeshMaterial::Cliff: return "mat_cliff";
     case MeshMaterial::Building: return "mat_building";
     case MeshMaterial::BuildingResidential: return "mat_building_res";
@@ -150,6 +162,11 @@ MeshC4 MaterialColor(MeshMaterial m)
     case MeshMaterial::Commercial: return RGB(0.25f, 0.55f, 0.95f);
     case MeshMaterial::Industrial: return RGB(0.95f, 0.55f, 0.20f);
     case MeshMaterial::Park: return RGB(0.15f, 0.85f, 0.15f);
+
+    case MeshMaterial::School: return RGB(0.3137f, 0.5882f, 1.0000f);
+    case MeshMaterial::Hospital: return RGB(1.0000f, 0.3529f, 0.3529f);
+    case MeshMaterial::PoliceStation: return RGB(0.5098f, 0.4706f, 0.9020f);
+    case MeshMaterial::FireStation: return RGB(1.0000f, 0.4706f, 0.2353f);
 
     case MeshMaterial::Cliff: return RGB(0.45f, 0.35f, 0.25f);
 
@@ -370,6 +387,14 @@ bool BuildWorldMeshQuads(const World& world, const MeshExportConfig& cfg, IMeshS
         case Overlay::Residential: return MeshMaterial::BuildingResidential;
         case Overlay::Commercial: return MeshMaterial::BuildingCommercial;
         case Overlay::Industrial: return MeshMaterial::BuildingIndustrial;
+
+        // Render civic/service facilities as tinted buildings so OBJ/glTF exports
+        // stay legible and match 2D overlay colors.
+        case Overlay::School: return MeshMaterial::School;
+        case Overlay::Hospital: return MeshMaterial::Hospital;
+        case Overlay::PoliceStation: return MeshMaterial::PoliceStation;
+        case Overlay::FireStation: return MeshMaterial::FireStation;
+
         default: break;
       }
       return MeshMaterial::Building;
@@ -533,7 +558,9 @@ bool BuildWorldMeshQuads(const World& world, const MeshExportConfig& cfg, IMeshS
         if (!covered.empty() && covered[covIdx(x, y)]) continue;
 
         const Tile& t = world.at(x, y);
-        if (t.overlay != Overlay::Residential && t.overlay != Overlay::Commercial && t.overlay != Overlay::Industrial) {
+        if (t.overlay != Overlay::Residential && t.overlay != Overlay::Commercial && t.overlay != Overlay::Industrial &&
+            t.overlay != Overlay::School && t.overlay != Overlay::Hospital &&
+            t.overlay != Overlay::PoliceStation && t.overlay != Overlay::FireStation) {
           continue;
         }
         if (t.terrain == Terrain::Water) continue;

@@ -18,7 +18,7 @@ namespace isocity {
 // The exporter produces:
 //  - a top surface per tile (terrain OR overlay surface)
 //  - optional "cliff" side walls between tiles whose heights differ
-//  - optional simple box buildings for zone tiles
+//  - optional simple box buildings for zone tiles (and single-tile civic facilities)
 
 struct MeshExportConfig {
   // If non-empty, WriteWorldObjMtl() writes a `mtllib <name>` line.

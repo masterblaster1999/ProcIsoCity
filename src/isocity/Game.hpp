@@ -147,6 +147,9 @@ private:
   // do not stall the render thread.
   void updateDossierExportJob();
 
+  // Mesh export (OBJ/glTF) - runs asynchronously so exports do not stall the render thread.
+  void updateMeshExportJob();
+
   // Seed mining integration (headless).
   void updateSeedMining(float dt);
 
@@ -812,7 +815,7 @@ private:
 
   // Headless Lab panel (Ctrl+F2): integrates headless tools into the base game layer.
   bool m_showHeadlessLab = false;
-  int m_headlessLabTab = 0; // 0=Mining, 1=Dossier
+  int m_headlessLabTab = 0; // 0=Mining, 1=Dossier, 2=Mesh
 
   // Seed mining (headless) integrated into the base game.
   // This runs incrementally (optionally auto-stepped each frame) so you can
@@ -907,6 +910,20 @@ private:
   bool m_lastDossierOk = false;
   std::string m_lastDossierOutDir;
   std::string m_lastDossierMsg;
+
+  // Mesh export UI settings (City Lab).
+  int m_labMeshFormat = 0; // 0=OBJ+MTL, 1=glTF, 2=GLB
+  MeshExportConfig m_labMeshCfg{};
+
+  // Last completed mesh export (for UI/console feedback).
+  bool m_lastMeshOk = false;
+  std::string m_lastMeshPath;
+  std::string m_lastMeshMsg;
+  MeshExportStats m_lastMeshStats{};
+
+  // Background mesh export job (async)
+  struct MeshJob;
+  std::unique_ptr<MeshJob> m_meshJob;
 
   // Background dossier export job (async)
   struct DossierJob;

@@ -38,22 +38,29 @@ struct MeshC4 {
 //  - OBJ material names (mat_*)
 //  - glTF vertex colors (matching the OBJ palette)
 enum class MeshMaterial : std::uint8_t {
-  Water,
-  Sand,
-  Grass,
+  // NOTE: explicit values keep the numeric IDs stable across versions.
+  Water = 0,
+  Sand = 1,
+  Grass = 2,
 
-  Road,
-  Residential,
-  Commercial,
-  Industrial,
-  Park,
+  Road = 3,
+  Residential = 4,
+  Commercial = 5,
+  Industrial = 6,
+  Park = 7,
 
-  Cliff,
+  Cliff = 8,
 
-  Building,
-  BuildingResidential,
-  BuildingCommercial,
-  BuildingIndustrial,
+  Building = 9,
+  BuildingResidential = 10,
+  BuildingCommercial = 11,
+  BuildingIndustrial = 12,
+
+  // Civic/service tiles (single-tile facilities).
+  School = 13,
+  Hospital = 14,
+  PoliceStation = 15,
+  FireStation = 16,
 };
 
 // Returns the OBJ material name (as used in the .mtl file) for a material ID.

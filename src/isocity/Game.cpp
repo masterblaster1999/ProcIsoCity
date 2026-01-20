@@ -5,6 +5,8 @@
 #include "isocity/DistrictStats.hpp"
 #include "isocity/Districting.hpp"
 #include "isocity/Export.hpp"
+
+#include "isocity/GltfExport.hpp"
 #include "isocity/FloodFill.hpp"
 #include "isocity/Hash.hpp"
 #include "isocity/Pathfinding.hpp"
@@ -32,6 +34,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -75,6 +78,31 @@ struct Game::DossierJob {
   std::string err;
 
   ~DossierJob()
+  {
+    if (worker.joinable()) worker.join();
+  }
+};
+
+struct Game::MeshJob {
+  enum class Kind : std::uint8_t { Obj = 0, Gltf = 1, Glb = 2 };
+
+  Kind kind = Kind::Obj;
+  MeshExportConfig cfg;
+  World world;
+
+  // Output paths (OBJ uses both objPath + mtlPath).
+  std::string outPath;
+  std::string mtlPath;
+
+  std::thread worker;
+  std::atomic<bool> done{false};
+
+  std::mutex mutex;
+  bool ok = false;
+  MeshExportStats stats{};
+  std::string err;
+
+  ~MeshJob()
   {
     if (worker.joinable()) worker.join();
   }
@@ -7356,6 +7384,69 @@ void Game::updateDossierExportJob()
 }
 
 
+void Game::updateMeshExportJob()
+{
+  if (!m_meshJob) return;
+  if (!m_meshJob->done.load(std::memory_order_relaxed)) return;
+
+  // Join the worker before reading its results.
+  if (m_meshJob->worker.joinable()) {
+    m_meshJob->worker.join();
+  }
+
+  bool ok = false;
+  MeshExportStats stats{};
+  std::string err;
+  std::string outPath;
+  std::string mtlPath;
+
+  {
+    std::lock_guard<std::mutex> lock(m_meshJob->mutex);
+    ok = m_meshJob->ok;
+    stats = m_meshJob->stats;
+    err = m_meshJob->err;
+    outPath = m_meshJob->outPath;
+    mtlPath = m_meshJob->mtlPath;
+  }
+
+  // Build a compact user-facing label (toasts are width-limited).
+  std::string fileLabel = outPath;
+  try {
+    fileLabel = std::filesystem::path(outPath).filename().string();
+  } catch (...) {
+  }
+
+  std::string msg;
+  if (ok) {
+    msg = TextFormat("Mesh exported: %s  (%llu v, %llu t)", fileLabel.c_str(),
+                     static_cast<unsigned long long>(stats.vertices),
+                     static_cast<unsigned long long>(stats.triangles));
+  } else {
+    msg = err.empty() ? std::string("Mesh export failed") : (std::string("Mesh export failed: ") + err);
+  }
+
+  m_lastMeshOk = ok;
+  m_lastMeshPath = outPath;
+  m_lastMeshMsg = msg;
+  m_lastMeshStats = stats;
+
+  showToast(msg, 4.0f);
+
+  // Console gets full paths for easy copy/paste.
+  if (ok) {
+    if (!mtlPath.empty()) {
+      m_console.print(std::string("mesh: exported ") + outPath + " (mtl " + mtlPath + ")");
+    } else {
+      m_console.print(std::string("mesh: exported ") + outPath);
+    }
+  } else {
+    m_console.print(std::string("mesh: failed ") + (err.empty() ? std::string("(unknown)") : err));
+  }
+
+  m_meshJob.reset();
+}
+
+
 void Game::updateVisualPrefsAutosave(float dt)
 {
   if (!m_visualPrefsAutosave) return;
@@ -13725,9 +13816,17 @@ void Game::handleInput(float dt)
 
   if (IsKeyPressed(KEY_F2)) {
     if (ctrl) {
-      m_showHeadlessLab = !m_showHeadlessLab;
-      ui::ClearActiveWidget();
-      showToast(m_showHeadlessLab ? "City Lab: ON" : "City Lab: OFF");
+      // Ctrl+F2 toggles the City Lab panel. Ctrl+Shift+F2 opens it directly on the Mesh tab.
+      if (shift) {
+        m_showHeadlessLab = true;
+        m_headlessLabTab = 2; // Mesh
+        ui::ClearActiveWidget();
+        showToast("City Lab: Mesh", 1.5f);
+      } else {
+        m_showHeadlessLab = !m_showHeadlessLab;
+        ui::ClearActiveWidget();
+        showToast(m_showHeadlessLab ? "City Lab: ON" : "City Lab: OFF");
+      }
     } else if (shift) {
       const bool enabled = !m_renderer.dayNightEnabled();
       m_renderer.setDayNightEnabled(enabled);
@@ -15452,6 +15551,7 @@ void Game::update(float dt)
   // Optional dynamic resolution scaling for the world layer.
   updateDynamicWorldRenderScale(dt);
   updateDossierExportJob();
+  updateMeshExportJob();
   updateSeedMining(dt);
   updateVisualPrefsAutosave(dt);
 }
@@ -18391,11 +18491,13 @@ void Game::drawHeadlessLabPanel(int x0, int y0)
   {
     const int tabGap = 6;
     const int tabH = 20;
-    const int tabW = (innerW - tabGap) / 2;
+    const int tabW = (innerW - tabGap * 2) / 3;
     const Rectangle tabMineR{static_cast<float>(innerX), static_cast<float>(y), static_cast<float>(tabW),
                              static_cast<float>(tabH)};
     const Rectangle tabDosR{static_cast<float>(innerX + tabW + tabGap), static_cast<float>(y),
                             static_cast<float>(tabW), static_cast<float>(tabH)};
+    const Rectangle tabMeshR{static_cast<float>(innerX + (tabW + tabGap) * 2), static_cast<float>(y),
+                             static_cast<float>(tabW), static_cast<float>(tabH)};
 
     if (ui::Button(9201, tabMineR, "Mining", mouseUi, uiTime, true, m_headlessLabTab == 0)) {
       m_headlessLabTab = 0;
@@ -18403,6 +18505,10 @@ void Game::drawHeadlessLabPanel(int x0, int y0)
     }
     if (ui::Button(9202, tabDosR, "Dossier", mouseUi, uiTime, true, m_headlessLabTab == 1)) {
       m_headlessLabTab = 1;
+      ui::ClearActiveWidget();
+    }
+    if (ui::Button(9203, tabMeshR, "Mesh", mouseUi, uiTime, true, m_headlessLabTab == 2)) {
+      m_headlessLabTab = 2;
       ui::ClearActiveWidget();
     }
 
@@ -18816,7 +18922,7 @@ void Game::drawHeadlessLabPanel(int x0, int y0)
   // ---------------------------------------------------------------------------
   // Dossier tab
   // ---------------------------------------------------------------------------
-  {
+  if (m_headlessLabTab == 1) {
     const Rectangle cfgR{static_cast<float>(innerX), static_cast<float>(y), static_cast<float>(innerW), 210.0f};
     ui::DrawPanelInset(cfgR, uiTime, true);
 
@@ -18949,6 +19055,343 @@ void Game::drawHeadlessLabPanel(int x0, int y0)
 
       if (!m_dossierQueue.empty()) {
         ui::Text(innerX + 4, y, 14, TextFormat("Queue: %d job(s)", (int)m_dossierQueue.size()), uiTh.textDim);
+      }
+    }
+
+  }
+
+  // ---------------------------------------------------------------------------
+  // Mesh tab
+  // ---------------------------------------------------------------------------
+  if (m_headlessLabTab == 2) {
+    const Rectangle cfgR{static_cast<float>(innerX), static_cast<float>(y), static_cast<float>(innerW), 280.0f};
+    ui::DrawPanelInset(cfgR, uiTime, true);
+
+    const int labelX = innerX + innerPad;
+    const int labelW = 120;
+    const int ctrlX = labelX + labelW;
+    const int ctrlW = innerX + innerW - innerPad - ctrlX;
+
+    int cy = y + innerPad;
+
+    ui::Text(innerX + innerPad, cy, 14,
+             TextFormat("Export mesh (seed %llu, day %d)", static_cast<unsigned long long>(m_cfg.seed),
+                        m_world.stats().day),
+             uiTh.text, /*bold=*/true, /*shadow=*/true, 1);
+    cy += 20;
+
+    // Export format (cycle).
+    {
+      ui::Text(labelX, cy + 2, 14, "Format", uiTh.textDim);
+      const Rectangle btnR{static_cast<float>(ctrlX), static_cast<float>(cy), static_cast<float>(ctrlW), 18.0f};
+      const char* fmtName =
+          (m_labMeshFormat == 2) ? "GLB (binary glTF)" : (m_labMeshFormat == 1) ? "glTF (.gltf + .bin)" : "OBJ + MTL";
+      if (ui::Button(9400, btnR, fmtName, mouseUi, uiTime, true)) {
+        m_labMeshFormat = (m_labMeshFormat + 1) % 3;
+      }
+      cy += 22;
+    }
+
+    // Presets.
+    {
+      ui::Text(labelX, cy + 2, 14, "Preset", uiTh.textDim);
+      const int gap = 4;
+      const int bw = (ctrlW - gap * 2) / 3;
+      const Rectangle p0{static_cast<float>(ctrlX), static_cast<float>(cy), static_cast<float>(bw), 18.0f};
+      const Rectangle p1{static_cast<float>(ctrlX + bw + gap), static_cast<float>(cy), static_cast<float>(bw), 18.0f};
+      const Rectangle p2{static_cast<float>(ctrlX + (bw + gap) * 2), static_cast<float>(cy), static_cast<float>(bw), 18.0f};
+
+      if (ui::Button(9401, p0, "Preview", mouseUi, uiTime, true)) {
+        MeshExportConfig cfg;
+        cfg.mergeTopSurfaces = true;
+        cfg.heightQuantization = 0.25f;
+        cfg.includeCliffs = false;
+        cfg.includeBuildings = true;
+        cfg.mergeBuildings = true;
+        m_labMeshCfg = cfg;
+        showToast("Mesh preset: Preview", 1.5f);
+      }
+      if (ui::Button(9402, p1, "Detail", mouseUi, uiTime, true)) {
+        MeshExportConfig cfg;
+        cfg.mergeTopSurfaces = false;
+        cfg.heightQuantization = 0.0f;
+        cfg.includeCliffs = true;
+        cfg.includeBuildings = true;
+        cfg.mergeBuildings = true;
+        m_labMeshCfg = cfg;
+        showToast("Mesh preset: Detail", 1.5f);
+      }
+      if (ui::Button(9403, p2, "Legacy", mouseUi, uiTime, true)) {
+        MeshExportConfig cfg;
+        ApplyLegacyMeshExportDefaults(cfg);
+        m_labMeshCfg = cfg;
+        showToast("Mesh preset: Legacy", 1.5f);
+      }
+
+      cy += 22;
+    }
+
+    // Height scaling.
+    {
+      ui::Text(labelX, cy + 2, 14, "Height", uiTh.textDim);
+      ui::SliderFloat(9404, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), static_cast<float>(ctrlW), 18.0f},
+                      m_labMeshCfg.heightScale, 1.0f, 32.0f, 0.5f, mouseUi, uiTime);
+      cy += 22;
+    }
+
+    // Height quantization.
+    {
+      ui::Text(labelX, cy + 2, 14, "Quantize", uiTh.textDim);
+      ui::SliderFloat(9405, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), static_cast<float>(ctrlW), 18.0f},
+                      m_labMeshCfg.heightQuantization, 0.0f, 1.0f, 0.05f, mouseUi, uiTime);
+      cy += 22;
+    }
+
+    // Merge tops.
+    {
+      ui::Text(labelX, cy + 2, 14, "Merge tops", uiTh.textDim);
+      ui::Toggle(9406, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), 120.0f, 18.0f},
+                 m_labMeshCfg.mergeTopSurfaces, mouseUi, uiTime);
+      cy += 22;
+    }
+
+    // Cliffs.
+    {
+      ui::Text(labelX, cy + 2, 14, "Cliffs", uiTh.textDim);
+      ui::Toggle(9407, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), 120.0f, 18.0f},
+                 m_labMeshCfg.includeCliffs, mouseUi, uiTime);
+      ui::SliderFloat(9408,
+                      Rectangle{static_cast<float>(ctrlX + 128), static_cast<float>(cy),
+                                static_cast<float>(std::max(0, ctrlW - 128)), 18.0f},
+                      m_labMeshCfg.cliffThreshold, 0.0f, 0.20f, 0.01f, mouseUi, uiTime, m_labMeshCfg.includeCliffs);
+      cy += 22;
+    }
+
+    // Buildings.
+    {
+      ui::Text(labelX, cy + 2, 14, "Buildings", uiTh.textDim);
+      ui::Toggle(9409, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), 120.0f, 18.0f},
+                 m_labMeshCfg.includeBuildings, mouseUi, uiTime);
+      cy += 22;
+
+      ui::Text(labelX, cy + 2, 14, "Merge bldgs", uiTh.textDim);
+      ui::Toggle(9410, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), 120.0f, 18.0f},
+                 m_labMeshCfg.mergeBuildings, mouseUi, uiTime, m_labMeshCfg.includeBuildings);
+      cy += 22;
+    }
+
+    // Helper: set crop bounds from the current camera viewport.
+    auto setCropToViewport = [&]() {
+      const int screenW = GetScreenWidth();
+      const int screenH = GetScreenHeight();
+      const float tileW = static_cast<float>(m_cfg.tileWidth);
+      const float tileH = static_cast<float>(m_cfg.tileHeight);
+
+      Vector2 corners[4] = {
+          Vector2{0.0f, 0.0f},
+          Vector2{static_cast<float>(screenW), 0.0f},
+          Vector2{0.0f, static_cast<float>(screenH)},
+          Vector2{static_cast<float>(screenW), static_cast<float>(screenH)},
+      };
+
+      int minX = m_world.width();
+      int minY = m_world.height();
+      int maxX = -1;
+      int maxY = -1;
+      bool any = false;
+
+      for (const Vector2& sc : corners) {
+        const Vector2 wpos = GetScreenToWorld2D(sc, m_camera);
+        const std::optional<Point> t = WorldToTileElevated(wpos, m_world, tileW, tileH, m_elev);
+        if (!t) continue;
+        any = true;
+        minX = std::min(minX, t->x);
+        minY = std::min(minY, t->y);
+        maxX = std::max(maxX, t->x);
+        maxY = std::max(maxY, t->y);
+      }
+
+      if (!any) {
+        showToast("Mesh crop: viewport not over map", 2.0f);
+        return;
+      }
+
+      minX = std::clamp(minX - 1, 0, m_world.width() - 1);
+      minY = std::clamp(minY - 1, 0, m_world.height() - 1);
+      maxX = std::clamp(maxX + 1, 0, m_world.width() - 1);
+      maxY = std::clamp(maxY + 1, 0, m_world.height() - 1);
+
+      m_labMeshCfg.hasCrop = true;
+      m_labMeshCfg.cropX = minX;
+      m_labMeshCfg.cropY = minY;
+      m_labMeshCfg.cropW = (maxX - minX + 1);
+      m_labMeshCfg.cropH = (maxY - minY + 1);
+      m_labMeshCfg.originAtCrop = true;
+
+      showToast(TextFormat("Mesh crop set: x=%d y=%d w=%d h=%d", m_labMeshCfg.cropX, m_labMeshCfg.cropY,
+                           m_labMeshCfg.cropW, m_labMeshCfg.cropH),
+                2.0f);
+    };
+
+    // Crop.
+    {
+      ui::Text(labelX, cy + 2, 14, "Crop", uiTh.textDim);
+      if (ui::Toggle(9411, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), 120.0f, 18.0f},
+                     m_labMeshCfg.hasCrop, mouseUi, uiTime)) {
+        if (m_labMeshCfg.hasCrop) {
+          // Default to full map crop so the config is immediately valid.
+          m_labMeshCfg.cropX = 0;
+          m_labMeshCfg.cropY = 0;
+          m_labMeshCfg.cropW = m_world.width();
+          m_labMeshCfg.cropH = m_world.height();
+          m_labMeshCfg.originAtCrop = false;
+        }
+      }
+
+      const Rectangle viewR{static_cast<float>(ctrlX + 128), static_cast<float>(cy),
+                            static_cast<float>(std::max(0, ctrlW - 128)), 18.0f};
+      if (ui::Button(9412, viewR, "Use viewport", mouseUi, uiTime, true)) {
+        setCropToViewport();
+      }
+      cy += 22;
+
+      if (m_labMeshCfg.hasCrop) {
+        ui::Text(ctrlX + 4, cy, 14,
+                 TextFormat("x=%d y=%d w=%d h=%d%s", m_labMeshCfg.cropX, m_labMeshCfg.cropY, m_labMeshCfg.cropW,
+                            m_labMeshCfg.cropH, m_labMeshCfg.originAtCrop ? " (origin@crop)" : ""),
+                 uiTh.textDim);
+        cy += 18;
+      }
+    }
+
+    // Export actions.
+    {
+      const int btnH = 18;
+      const int btnGap = 6;
+      const int btnW = (innerW - innerPad * 2 - btnGap) / 2;
+      const int bx = innerX + innerPad;
+      const bool busy = (m_meshJob != nullptr);
+
+      const Rectangle expR{static_cast<float>(bx), static_cast<float>(cy), static_cast<float>(btnW),
+                           static_cast<float>(btnH)};
+      const Rectangle resetR{static_cast<float>(bx + btnW + btnGap), static_cast<float>(cy), static_cast<float>(btnW),
+                             static_cast<float>(btnH)};
+
+      if (ui::Button(9450, expR, busy ? "Exporting..." : "Export current", mouseUi, uiTime, !busy)) {
+        namespace fs = std::filesystem;
+        fs::create_directories("captures");
+
+        const int day = m_world.stats().day;
+        const std::string base = TextFormat("captures/mesh_seed%llu_day%d_%s", static_cast<unsigned long long>(m_cfg.seed),
+                                            day, FileTimestamp().c_str());
+
+        std::string outPath;
+        std::string mtlPath;
+        MeshJob::Kind kind = MeshJob::Kind::Obj;
+        if (m_labMeshFormat == 1) {
+          kind = MeshJob::Kind::Gltf;
+          outPath = base + ".gltf";
+        } else if (m_labMeshFormat == 2) {
+          kind = MeshJob::Kind::Glb;
+          outPath = base + ".glb";
+        } else {
+          kind = MeshJob::Kind::Obj;
+          outPath = base + ".obj";
+          mtlPath = base + ".mtl";
+        }
+
+        MeshExportConfig cfg = m_labMeshCfg;
+        cfg.objectName = std::string("city_seed") + HexU64(m_cfg.seed);
+        if (!mtlPath.empty()) {
+          try {
+            cfg.mtlFileName = fs::path(mtlPath).filename().string();
+          } catch (...) {
+          }
+        }
+
+        auto job = std::make_unique<MeshJob>();
+        job->kind = kind;
+        job->cfg = cfg;
+        job->world = m_world; // snapshot
+        job->outPath = outPath;
+        job->mtlPath = mtlPath;
+
+        MeshJob* jp = job.get();
+        jp->worker = std::thread([jp]() {
+          MeshExportStats stats{};
+          std::string err;
+          bool ok = false;
+
+          try {
+            if (jp->kind == MeshJob::Kind::Obj) {
+              ok = ExportWorldObjMtl(jp->outPath, jp->mtlPath, jp->world, jp->cfg, &stats, &err);
+            } else if (jp->kind == MeshJob::Kind::Gltf) {
+              ok = ExportWorldGltf(jp->outPath, jp->world, jp->cfg, &stats, &err);
+            } else {
+              ok = ExportWorldGlb(jp->outPath, jp->world, jp->cfg, &stats, &err);
+            }
+          } catch (const std::exception& e) {
+            ok = false;
+            err = e.what();
+          } catch (...) {
+            ok = false;
+            err = "Unknown error";
+          }
+
+          {
+            std::lock_guard<std::mutex> lock(jp->mutex);
+            jp->ok = ok;
+            jp->stats = stats;
+            jp->err = err;
+          }
+          jp->done.store(true, std::memory_order_relaxed);
+        });
+
+        m_meshJob = std::move(job);
+
+        std::string fileLabel = outPath;
+        try {
+          fileLabel = std::filesystem::path(outPath).filename().string();
+        } catch (...) {
+        }
+        showToast(std::string("Mesh export started: ") + fileLabel, 2.0f);
+        m_console.print(std::string("mesh: start ") + outPath);
+      }
+
+      if (ui::Button(9451, resetR, "Reset", mouseUi, uiTime, !busy)) {
+        m_labMeshCfg = MeshExportConfig{};
+        m_labMeshFormat = 0;
+        showToast("Mesh export settings reset", 1.5f);
+      }
+
+      cy += 24;
+    }
+
+    y += static_cast<int>(cfgR.height) + 10;
+
+    // Job status.
+    {
+      if (m_meshJob) {
+        const char* kindName =
+            (m_meshJob->kind == MeshJob::Kind::Glb) ? "GLB" : (m_meshJob->kind == MeshJob::Kind::Gltf) ? "glTF" : "OBJ";
+        ui::Text(innerX + 4, y, 14, TextFormat("Running: %s", kindName), uiTh.text);
+        y += 18;
+
+        std::string outLabel = m_meshJob->outPath;
+        try {
+          outLabel = std::filesystem::path(m_meshJob->outPath).filename().string();
+        } catch (...) {
+        }
+        ui::Text(innerX + 4, y, 14, outLabel, uiTh.textDim, false, true, 2);
+        y += 18;
+      } else {
+        ui::Text(innerX + 4, y, 14, "Status: idle", uiTh.textDim);
+        y += 18;
+
+        if (!m_lastMeshMsg.empty()) {
+          ui::Text(innerX + 4, y, 14, m_lastMeshMsg, m_lastMeshOk ? uiTh.text : uiTh.bad, false, true, 3);
+          y += 18;
+        }
       }
     }
   }
