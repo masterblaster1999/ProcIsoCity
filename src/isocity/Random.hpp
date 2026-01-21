@@ -35,6 +35,20 @@ struct RNG {
 
   std::uint32_t nextU32() { return static_cast<std::uint32_t>(nextU64() >> 32); }
 
+  // Uniform integer in [0, maxExclusive).
+  // Uses rejection sampling to avoid modulo bias for arbitrary bounds.
+  std::uint32_t rangeU32(std::uint32_t maxExclusive)
+  {
+    if (maxExclusive <= 1u) return 0u;
+
+    // threshold == 2^32 % maxExclusive (computed with unsigned wraparound).
+    const std::uint32_t threshold = static_cast<std::uint32_t>(-maxExclusive) % maxExclusive;
+    while (true) {
+      const std::uint32_t r = nextU32();
+      if (r >= threshold) return r % maxExclusive;
+    }
+  }
+
   // [0, 1)
   float nextF01()
   {
