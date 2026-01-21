@@ -1516,7 +1516,9 @@ int main(int argc, char** argv)
   } else {
     std::vector<CaseResult> all;
     all.resize(cases.size());
-    std::vector<unsigned char> done(cases.size(), 0);
+    // Explicit unsigned-char literal avoids MSVC warning C4244 (narrowing conversion)
+    // emitted from STL internals when initializing the vector.
+    std::vector<unsigned char> done(cases.size(), static_cast<unsigned char>(0));
 
     std::atomic<std::size_t> next{0};
     std::atomic<bool> stop{false};
@@ -1533,7 +1535,7 @@ int main(int argc, char** argv)
           if (failFast && stop.load()) break;
 
           all[i] = ProcessCase(i, cases[i], runOpt, golden, hashGolden, outDir);
-          done[i] = 1;
+          done[i] = static_cast<unsigned char>(1);
 
           if (failFast && !all[i].ok) stop.store(true);
         }

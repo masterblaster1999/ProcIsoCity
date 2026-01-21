@@ -126,7 +126,7 @@ EvacuationResult ComputeEvacuationToEdge(const World& world, const EvacuationCon
   // --- Identify exit road tiles (edge roads) ---
   std::vector<int> exitRoad;
   exitRoad.reserve(static_cast<std::size_t>(w + h) * 2u);
-  std::vector<std::uint8_t> seenExit(n, 0);
+  std::vector<std::uint8_t> seenExit(n, std::uint8_t{0});
 
   auto considerExit = [&](int x, int y) {
     if (!inBounds(x, y)) return;
@@ -167,7 +167,7 @@ EvacuationResult ComputeEvacuationToEdge(const World& world, const EvacuationCon
   out.evacRoadFlow.assign(n, 0);
 
   // --- Residential component Dijkstra (walk inside zones + choose best adjacent reachable road) ---
-  std::vector<std::uint8_t> visitedRes(n, 0);
+  std::vector<std::uint8_t> visitedRes(n, std::uint8_t{0});
   std::vector<int> stamp(n, 0);
   int stampId = 1;
 

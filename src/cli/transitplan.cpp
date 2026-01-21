@@ -582,7 +582,7 @@ int main(int argc, char** argv)
     // Collect unique stop tiles across all planned lines.
     std::vector<int> stopRoadIdx;
     std::vector<Point> stopPoints;
-    std::vector<std::uint8_t> seen(n, 0);
+    std::vector<std::uint8_t> seen(n, std::uint8_t{0});
 
     auto addStop = [&](const Point& p) {
       if (!world.inBounds(p.x, p.y)) return;

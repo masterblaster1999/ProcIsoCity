@@ -204,7 +204,7 @@ float InferCoastalSeaLevel(const World& world)
   if (w <= 0 || h <= 0) return 0.35f;
 
   const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
-  std::vector<std::uint8_t> visited(n, 0);
+  std::vector<std::uint8_t> visited(n, std::uint8_t{0});
   std::vector<std::size_t> stack;
   stack.reserve(static_cast<std::size_t>(w + h) * 2u);
 

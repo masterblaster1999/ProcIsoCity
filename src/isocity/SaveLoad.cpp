@@ -349,7 +349,7 @@ struct ProcGenConfigBinV12 {
   float roadHierarchyStrength = 0.0f;
 };
 
-ProcGenConfigBin ToBin(const ProcGenConfig& cfg)
+[[maybe_unused]] ProcGenConfigBin ToBin(const ProcGenConfig& cfg)
 {
   ProcGenConfigBin b;
   b.terrainScale = cfg.terrainScale;
@@ -362,7 +362,7 @@ ProcGenConfigBin ToBin(const ProcGenConfig& cfg)
   return b;
 }
 
-ProcGenConfigBinV10 ToBinV10(const ProcGenConfig& cfg)
+[[maybe_unused]] ProcGenConfigBinV10 ToBinV10(const ProcGenConfig& cfg)
 {
   ProcGenConfigBinV10 b;
   b.terrainScale = cfg.terrainScale;
@@ -377,7 +377,7 @@ ProcGenConfigBinV10 ToBinV10(const ProcGenConfig& cfg)
   return b;
 }
 
-ProcGenConfigBinV11 ToBinV11(const ProcGenConfig& cfg)
+[[maybe_unused]] ProcGenConfigBinV11 ToBinV11(const ProcGenConfig& cfg)
 {
   ProcGenConfigBinV11 b;
   b.terrainScale = cfg.terrainScale;

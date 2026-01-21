@@ -501,7 +501,7 @@ bool GetRequiredI32(const JsonValue& obj, const char* key, int& out, std::string
   return true;
 }
 
-bool GetRequiredU32(const JsonValue& obj, const char* key, std::uint32_t& out, std::string& err)
+[[maybe_unused]] bool GetRequiredU32(const JsonValue& obj, const char* key, std::uint32_t& out, std::string& err)
 {
   double n = 0.0;
   if (!GetRequiredNumber(obj, key, n, err)) return false;

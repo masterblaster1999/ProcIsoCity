@@ -152,7 +152,7 @@ bool World::wouldZoneHaveRoadAccess(Overlay zoneOverlay, int x, int y) const
   if (w <= 0 || h <= 0) return false;
 
   const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
-  std::vector<std::uint8_t> visited(n, 0);
+  std::vector<std::uint8_t> visited(n, std::uint8_t{0});
   std::vector<int> queue;
   queue.reserve(256);
 

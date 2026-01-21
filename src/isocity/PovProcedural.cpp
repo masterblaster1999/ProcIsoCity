@@ -91,9 +91,13 @@ float ScenicScore8(const World& world, Point p) {
 
 Point RandomRoadTile(const World& world, RNG& rng, int maxTries = 4096) {
   Point p{world.width() / 2, world.height() / 2};
+
+  const std::uint32_t w = static_cast<std::uint32_t>(std::max(1, world.width()));
+  const std::uint32_t h = static_cast<std::uint32_t>(std::max(1, world.height()));
+
   for (int i = 0; i < maxTries; ++i) {
-    const int x = static_cast<int>(rng.nextU32() % static_cast<std::uint32_t>(std::max(1, world.width())));
-    const int y = static_cast<int>(rng.nextU32() % static_cast<std::uint32_t>(std::max(1, world.height())));
+    const int x = static_cast<int>(rng.rangeU32(w));
+    const int y = static_cast<int>(rng.rangeU32(h));
     if (IsRoad(world, x, y)) {
       return Point{x, y};
     }
@@ -187,7 +191,7 @@ std::vector<Point> GeneratePovRoamPath(const World& world, Point startHint, cons
   const int w = world.width();
   const int h = world.height();
   const std::size_t area = static_cast<std::size_t>(std::max(0, w)) * static_cast<std::size_t>(std::max(0, h));
-  std::vector<std::uint8_t> visit(area, 0);
+  std::vector<std::uint8_t> visit(area, std::uint8_t{0});
   auto idxOf = [&](Point p) -> std::size_t {
     return static_cast<std::size_t>(p.y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(p.x);
   };

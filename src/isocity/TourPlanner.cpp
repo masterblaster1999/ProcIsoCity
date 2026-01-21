@@ -100,7 +100,7 @@ static std::vector<std::uint8_t> FloodFillReachableRoads(const World& world, con
 {
   const int w = world.width();
   const int h = world.height();
-  std::vector<std::uint8_t> vis(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), 0);
+  std::vector<std::uint8_t> vis(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), std::uint8_t{0});
   if (!IsRoadTile(world, startRoad)) return vis;
 
   std::queue<Point> q;
@@ -601,7 +601,7 @@ TourPlan BuildProceduralTour(const World& world, const std::string& startQuery,
   if (cfg.includePark) {
     const int w = world.width();
     const int h = world.height();
-    std::vector<std::uint8_t> vis(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), 0);
+    std::vector<std::uint8_t> vis(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), std::uint8_t{0});
     int bestSize = 0;
     double bestCx = 0.0;
     double bestCy = 0.0;
@@ -819,7 +819,7 @@ TourPlan BuildProceduralTour(const World& world, const std::string& startQuery,
   std::vector<Point> picked;
   picked.reserve(static_cast<std::size_t>(std::max(0, cfg.maxStops)));
 
-  std::vector<std::uint8_t> used(candidates.size(), 0);
+  std::vector<std::uint8_t> used(candidates.size(), std::uint8_t{0});
   for (int step = 0; step < cfg.maxStops; ++step) {
     int bestIdx = -1;
     RouteResult bestRoute;

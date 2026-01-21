@@ -45,7 +45,7 @@ DepressionFillResult FillDepressionsPriorityFlood(const std::vector<float>& heig
   out.filled = heights;
   out.depth.assign(static_cast<std::size_t>(n), 0.0f);
 
-  std::vector<std::uint8_t> closed(static_cast<std::size_t>(n), 0);
+  std::vector<std::uint8_t> closed(static_cast<std::size_t>(n), std::uint8_t{0});
   std::priority_queue<Node, std::vector<Node>, NodeCmp> pq;
 
   auto pushSeed = [&](int idx) {

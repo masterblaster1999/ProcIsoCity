@@ -208,13 +208,13 @@ bool ComputeRoadGraphBridgeCut(const RoadGraph& g, int edgeIndex, RoadGraphBridg
     }
   };
 
-  std::vector<std::uint8_t> visA(static_cast<std::size_t>(n), 0);
+  std::vector<std::uint8_t> visA(static_cast<std::size_t>(n), std::uint8_t{0});
   bfs(be.a, visA);
 
   // If we can still reach the other endpoint, then this edge doesn't induce a cut.
   if (visA[static_cast<std::size_t>(be.b)]) return false;
 
-  std::vector<std::uint8_t> visB(static_cast<std::size_t>(n), 0);
+  std::vector<std::uint8_t> visB(static_cast<std::size_t>(n), std::uint8_t{0});
   bfs(be.b, visB);
 
   for (int i = 0; i < n; ++i) {

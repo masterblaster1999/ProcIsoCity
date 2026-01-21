@@ -351,7 +351,7 @@ static int GrowZoneCluster(World& world, Tool zoneTool, Overlay zoneOverlay, int
 
   auto idxOf = [&](int x, int y) -> int { return y * w + x; };
 
-  std::vector<std::uint8_t> seen(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), 0);
+  std::vector<std::uint8_t> seen(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), std::uint8_t{0});
   std::vector<Point> frontier;
   frontier.reserve(static_cast<std::size_t>(maxExtraTiles) + 8u);
 

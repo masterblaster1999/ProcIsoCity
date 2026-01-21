@@ -325,7 +325,7 @@ bool VectorizeLabelGridToPolygons(const std::vector<int>& labels,
       startToEdges[Key(e.x0, e.y0)].push_back(i);
     }
 
-    std::vector<std::uint8_t> used(edges.size(), 0);
+    std::vector<std::uint8_t> used(edges.size(), std::uint8_t{0});
     std::vector<Ring> rings;
 
     for (int i = 0; i < static_cast<int>(edges.size()); ++i) {

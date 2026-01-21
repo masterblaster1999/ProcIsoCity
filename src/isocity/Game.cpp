@@ -7933,7 +7933,7 @@ void Game::rebuildVehiclesRoutingCache()
 
 
   // --- Commute routing: sources are road tiles adjacent to commercial/industrial zones ---
-  std::vector<std::uint8_t> isJobSource(n, 0);
+  std::vector<std::uint8_t> isJobSource(n, std::uint8_t{0});
   m_commuteJobSources.reserve(n / 16);
 
   const int dirs[4][2] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}};
@@ -9328,7 +9328,7 @@ bool Game::tileBlueprintRect(int x0, int y0, int x1, int y1, bool useLibraryTile
 
   int placed = 0;
   int applyFailed = 0;
-  std::vector<std::uint8_t> used(tileset.variants.size(), 0);
+  std::vector<std::uint8_t> used(tileset.variants.size(), std::uint8_t{0});
 
   for (int cy = 0; cy < cellsY; ++cy) {
     for (int cx = 0; cx < cellsX; ++cx) {
@@ -12489,7 +12489,7 @@ void Game::floodFillDistrict(Point start, bool includeRoads)
     }
   };
 
-  std::vector<std::uint8_t> visited(static_cast<std::size_t>(n), 0);
+  std::vector<std::uint8_t> visited(static_cast<std::size_t>(n), std::uint8_t{0});
   std::vector<Point> stack;
   stack.reserve(std::min(n, 4096));
 
@@ -16567,7 +16567,7 @@ void Game::draw()
 
     if (m_pondingDirty || m_pondingHeatmap.size() != n) {
       std::vector<float> heights(n, 0.0f);
-      std::vector<std::uint8_t> drainMask(n, 0);
+      std::vector<std::uint8_t> drainMask(n, std::uint8_t{0});
 
       if (w > 0 && h > 0) {
         for (int y = 0; y < h; ++y) {

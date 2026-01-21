@@ -475,7 +475,7 @@ static void AddProceduralLakes(World& world,
   const int maxExtraWater = static_cast<int>(static_cast<float>(totalArea) * 0.10f);
   int addedWater = 0;
 
-  std::vector<std::uint8_t> visited(n, 0);
+  std::vector<std::uint8_t> visited(n, std::uint8_t{0});
   std::vector<int> stack;
   stack.reserve(1024);
   std::vector<int> lakeCells;
@@ -1007,7 +1007,7 @@ static std::vector<Edge> BuildHubMST(const std::vector<P>& hubs)
 
   std::vector<int> bestDist(n, std::numeric_limits<int>::max());
   std::vector<int> parent(n, -1);
-  std::vector<std::uint8_t> inTree(n, 0);
+  std::vector<std::uint8_t> inTree(n, std::uint8_t{0});
 
   bestDist[0] = 0;
 

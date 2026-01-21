@@ -40,7 +40,7 @@ ZoneAccessMap BuildZoneAccessMap(const World& world, const std::vector<std::uint
 
   const bool maskOk = MaskUsable(roadToEdgeMask, w, h);
 
-  std::vector<std::uint8_t> visited(n, 0);
+  std::vector<std::uint8_t> visited(n, std::uint8_t{0});
   std::deque<int> q;
   std::vector<int> comp;
   comp.reserve(n / 8);

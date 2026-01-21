@@ -344,7 +344,7 @@ bool BuildFixedHuffmanTables(HuffmanTable& outLitLen, HuffmanTable& outDist, std
 {
   outError.clear();
 
-  std::vector<std::uint8_t> litLenLens(288, 0u);
+  std::vector<std::uint8_t> litLenLens(288, std::uint8_t{0});
   for (int i = 0; i <= 143; ++i) litLenLens[static_cast<std::size_t>(i)] = 8u;
   for (int i = 144; i <= 255; ++i) litLenLens[static_cast<std::size_t>(i)] = 9u;
   for (int i = 256; i <= 279; ++i) litLenLens[static_cast<std::size_t>(i)] = 7u;
@@ -371,7 +371,7 @@ bool BuildDynamicHuffmanTables(BitReader& br, HuffmanTable& outLitLen, HuffmanTa
 
   static constexpr int kCLOrder[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
 
-  std::vector<std::uint8_t> clLens(19, 0u);
+  std::vector<std::uint8_t> clLens(19, std::uint8_t{0});
   for (int i = 0; i < HCLEN; ++i) {
     if (!br.readBits(3, v, outError)) return false;
     const int sym = kCLOrder[i];
@@ -439,7 +439,7 @@ bool BuildDynamicHuffmanTables(BitReader& br, HuffmanTable& outLitLen, HuffmanTa
   }
 
   // Literal/length alphabet has 286 codes (0..285).
-  std::vector<std::uint8_t> litLenLens(286, 0u);
+  std::vector<std::uint8_t> litLenLens(286, std::uint8_t{0});
   for (int i = 0; i < HLIT; ++i) {
     litLenLens[static_cast<std::size_t>(i)] = lengths[static_cast<std::size_t>(i)];
   }
@@ -449,7 +449,7 @@ bool BuildDynamicHuffmanTables(BitReader& br, HuffmanTable& outLitLen, HuffmanTa
   }
 
   // Distance alphabet has up to 32 codes (0..31), but only 0..29 are used.
-  std::vector<std::uint8_t> distLens(32, 0u);
+  std::vector<std::uint8_t> distLens(32, std::uint8_t{0});
   for (int i = 0; i < HDIST; ++i) {
     distLens[static_cast<std::size_t>(i)] = lengths[static_cast<std::size_t>(HLIT + i)];
   }
@@ -876,7 +876,7 @@ bool GetFixedDeflateEncodeTables(HuffmanEncodeTable& outLitLen,
   static HuffmanEncodeTable s_dist;
 
   if (!s_ready) {
-    std::vector<std::uint8_t> litLenLens(288, 0u);
+    std::vector<std::uint8_t> litLenLens(288, std::uint8_t{0});
     for (int i = 0; i <= 143; ++i) litLenLens[static_cast<std::size_t>(i)] = 8u;
     for (int i = 144; i <= 255; ++i) litLenLens[static_cast<std::size_t>(i)] = 9u;
     for (int i = 256; i <= 279; ++i) litLenLens[static_cast<std::size_t>(i)] = 7u;
@@ -1599,8 +1599,8 @@ bool ReadPngRGBA(const std::string& path, RgbaImage& outImg, std::string& outErr
   img.height = h;
   img.rgba.resize(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u);
 
-  std::vector<std::uint8_t> prev(static_cast<std::size_t>(w) * bpp, 0u);
-  std::vector<std::uint8_t> recon(static_cast<std::size_t>(w) * bpp, 0u);
+  std::vector<std::uint8_t> prev(static_cast<std::size_t>(w) * bpp, std::uint8_t{0});
+  std::vector<std::uint8_t> recon(static_cast<std::size_t>(w) * bpp, std::uint8_t{0});
 
   const std::size_t palEntries = plteRgb.size() / 3u;
 
@@ -1963,8 +1963,8 @@ bool ReadPng(const std::string& path, PpmImage& outImg, std::string& outError)
   img.height = h;
   img.rgb.resize(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 3u);
 
-  std::vector<std::uint8_t> prev(static_cast<std::size_t>(w) * bpp, 0u);
-  std::vector<std::uint8_t> recon(static_cast<std::size_t>(w) * bpp, 0u);
+  std::vector<std::uint8_t> prev(static_cast<std::size_t>(w) * bpp, std::uint8_t{0});
+  std::vector<std::uint8_t> recon(static_cast<std::size_t>(w) * bpp, std::uint8_t{0});
 
   for (int y = 0; y < h; ++y) {
     const std::size_t srcRow = static_cast<std::size_t>(y) * rowBytes;

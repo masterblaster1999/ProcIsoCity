@@ -210,7 +210,7 @@ bool BuildWorldMeshQuads(const World& world, const MeshExportConfig& cfg, IMeshS
     const int bw = x1 - x0;
     const int bh = y1 - y0;
     if (bw > 0 && bh > 0 && cfg.mergeTopSurfaces) {
-      std::vector<std::uint8_t> visited(static_cast<std::size_t>(bw) * static_cast<std::size_t>(bh), 0);
+      std::vector<std::uint8_t> visited(static_cast<std::size_t>(bw) * static_cast<std::size_t>(bh), std::uint8_t{0});
       auto vidx = [&](int x, int y) -> std::size_t {
         return static_cast<std::size_t>(y - y0) * static_cast<std::size_t>(bw) +
                static_cast<std::size_t>(x - x0);

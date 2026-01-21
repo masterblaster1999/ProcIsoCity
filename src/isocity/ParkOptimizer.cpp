@@ -155,7 +155,7 @@ ParkOptimizerResult SuggestParkPlacements(const World& world,
   }
 
   // Track park tiles already used by our suggestions.
-  std::vector<std::uint8_t> usedParkTile(N, 0);
+  std::vector<std::uint8_t> usedParkTile(N, std::uint8_t{0});
 
   // Greedy iterations.
   std::vector<int> curSources = sources;

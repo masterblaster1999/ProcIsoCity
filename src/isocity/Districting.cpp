@@ -113,7 +113,7 @@ static void FarthestPointSeedsOnRoads(const World& world, const std::vector<int>
   const int h = world.height();
   const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
 
-  std::vector<std::uint8_t> isSeed(n, 0u);
+  std::vector<std::uint8_t> isSeed(n, std::uint8_t{0});
 
   const int first = PickRoadClosestToCenter(world, roads);
   if (first < 0) return;

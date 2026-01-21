@@ -527,7 +527,7 @@ TradeMarketSummary PlanTradeMarket(const World& world, int day, const TradeModel
   ComputeDeficitSurplus(sd.supply, sd.demand, deficit, surplus);
 
   // Disruption status per partner.
-  std::vector<std::uint8_t> disrupted(partners.size(), 0u);
+  std::vector<std::uint8_t> disrupted(partners.size(), std::uint8_t{0});
   for (std::size_t i = 0; i < partners.size(); ++i) {
     disrupted[i] = PartnerDisrupted(seed32, day, static_cast<int>(i), partners[i].reliability) ? 1u : 0u;
   }

@@ -110,6 +110,9 @@ add_library(isocity_core
   src/isocity/GfxBuildings.cpp
   src/isocity/GfxFacilities.cpp
   src/isocity/GfxProps.cpp
+  src/isocity/GfxSigils.cpp
+  src/isocity/GfxPatterns.cpp
+  src/isocity/GfxFrames.cpp
   src/isocity/GfxTileset.cpp
   src/isocity/Heightmap.cpp
   src/isocity/Hash.cpp
@@ -767,6 +770,16 @@ if (PROCISOCITY_BUILD_CLI)
   target_link_libraries(proc_isocity_tileset PRIVATE isocity_core)
 
   procisocity_set_strict_warnings(proc_isocity_tileset)
+
+  # Custom graphics generator tool (headless): export procedural "sigil" badge icons as a PNG sheet.
+  add_executable(proc_isocity_customgfx
+    src/cli/customgfx.cpp
+  )
+
+  target_include_directories(proc_isocity_customgfx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_customgfx PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_customgfx)
 
 endif()
 

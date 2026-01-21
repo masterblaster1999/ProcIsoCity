@@ -1,6 +1,7 @@
 #include "isocity/Ui.hpp"
 
 #include "isocity/GfxText.hpp"
+#include "isocity/Random.hpp"
 
 #include <algorithm>
 #include <array>
@@ -71,14 +72,6 @@ struct State {
 };
 
 State g;
-
-static std::uint64_t SplitMix64Next(std::uint64_t& state)
-{
-  std::uint64_t z = (state += 0x9E3779B97F4A7C15ULL);
-  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-  return z ^ (z >> 31);
-}
 
 static inline unsigned char ClampU8(int v)
 {
@@ -459,7 +452,8 @@ static FontAtlas MakeFontAtlasSdf(bool bold, int atlasScale)
   const int maxDist2 = maxDist * maxDist;
 
   // Hi-res mask for a single glyph (glyphWpx x glyphHpx).
-  std::vector<unsigned char> hiMask(static_cast<std::size_t>(fa.glyphWpx * fa.glyphHpx), 0);
+  std::vector<unsigned char> hiMask(static_cast<std::size_t>(fa.glyphWpx * fa.glyphHpx),
+                                    static_cast<unsigned char>(0));
 
   for (int c = fa.firstChar; c <= fa.lastChar; ++c) {
     // Reset mask.
@@ -507,7 +501,8 @@ static FontAtlas MakeFontAtlasSdf(bool bold, int atlasScale)
     }
 
     // Rasterize hi-res mask.
-    std::fill(hiMask.begin(), hiMask.end(), 0);
+    // Explicit unsigned-char literal avoids MSVC warning C4244 (narrowing conversion).
+    std::fill(hiMask.begin(), hiMask.end(), static_cast<unsigned char>(0));
     for (int gy = 0; gy < fa.glyphH; ++gy) {
       for (int gx = 0; gx < fa.glyphW; ++gx) {
         if (!mask[gx][gy]) continue;
@@ -518,7 +513,7 @@ static FontAtlas MakeFontAtlasSdf(bool bold, int atlasScale)
             const int x = px0 + sx;
             const int y = py0 + sy;
             if (x < 0 || y < 0 || x >= fa.glyphWpx || y >= fa.glyphHpx) continue;
-            hiMask[static_cast<std::size_t>(y * fa.glyphWpx + x)] = 1;
+            hiMask[static_cast<std::size_t>(y * fa.glyphWpx + x)] = static_cast<unsigned char>(1);
           }
         }
       }

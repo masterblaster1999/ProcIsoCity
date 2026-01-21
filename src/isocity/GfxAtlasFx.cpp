@@ -116,7 +116,7 @@ void BoxBlurAlpha(RgbaImage& img, int radiusPx)
   const int h = img.height;
   if (w <= 0 || h <= 0) return;
 
-  std::vector<std::uint8_t> tmp(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), 0u);
+  std::vector<std::uint8_t> tmp(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), std::uint8_t{0});
 
   // Horizontal pass.
   std::vector<int> prefix(static_cast<std::size_t>(w) + 1u, 0);
@@ -523,8 +523,8 @@ bool GenerateSignedDistanceField(const RgbaImage& src, const GfxSdfConfig& cfg, 
   const std::size_t npx = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
 
   const int thr = static_cast<int>(std::lround(cfg.alphaThreshold * 255.0f));
-  std::vector<std::uint8_t> inside(npx, 0u);
-  std::vector<std::uint8_t> outside(npx, 0u);
+  std::vector<std::uint8_t> inside(npx, std::uint8_t{0});
+  std::vector<std::uint8_t> outside(npx, std::uint8_t{0});
 
   for (std::size_t i = 0; i < npx; ++i) {
     const std::uint8_t a = src.rgba[i * 4u + 3u];

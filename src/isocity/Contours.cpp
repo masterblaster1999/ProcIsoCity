@@ -94,7 +94,7 @@ std::vector<FPoint> SimplifyDouglasPeuckerOpen(const std::vector<FPoint>& in, do
   const double tolSq = tol * tol;
   const int n = static_cast<int>(in.size());
 
-  std::vector<std::uint8_t> keep(static_cast<std::size_t>(n), 0);
+  std::vector<std::uint8_t> keep(static_cast<std::size_t>(n), std::uint8_t{0});
   keep[0] = 1;
   keep[n - 1] = 1;
 
@@ -365,7 +365,7 @@ std::vector<ContourLevel> ExtractContours(const std::vector<double>& cornerValue
     }
 
     // Trace polylines.
-    std::vector<std::uint8_t> used(segments.size(), 0);
+    std::vector<std::uint8_t> used(segments.size(), std::uint8_t{0});
 
     // Gather keys for deterministic traversal.
     std::vector<Key> keys;

@@ -250,7 +250,7 @@ RoadUpgradePlan PlanRoadUpgrades(const World& world, const RoadGraph& g,
   });
 
   const int budget = cfg.budget;
-  std::vector<std::uint8_t> edgeChosen(g.edges.size(), 0);
+  std::vector<std::uint8_t> edgeChosen(g.edges.size(), std::uint8_t{0});
 
   // --- Greedy selection ---
   for (const Candidate& c : candidates) {

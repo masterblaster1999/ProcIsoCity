@@ -180,7 +180,7 @@ float ParkCoverageRatio(const World& world, int radius, const std::vector<std::u
   const bool edgeOk = (roadToEdge && roadToEdge->size() == n);
 
   // Sources are the road tiles adjacent to parks (optionally requiring outside connection).
-  std::vector<std::uint8_t> srcMask(n, 0);
+  std::vector<std::uint8_t> srcMask(n, std::uint8_t{0});
   constexpr int kDirs[4][2] = {{0, -1}, {1, 0}, {0, 1}, {-1, 0}};
 
   for (int y = 0; y < h; ++y) {
@@ -557,7 +557,7 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
       plan.cfg = pcfg;
 
       // Track which edges are served by at least one line.
-      std::vector<std::uint8_t> served(g.edges.size(), 0u);
+      std::vector<std::uint8_t> served(g.edges.size(), std::uint8_t{0});
       for (const TransitLine& line : plan.lines) {
         for (int ei : line.edges) {
           if (ei >= 0 && static_cast<std::size_t>(ei) < served.size()) {
@@ -581,7 +581,7 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
               : 0.0f;
 
       // Unique served road tiles (for cost accounting).
-      std::vector<std::uint8_t> servedTileMask(nTiles, 0u);
+      std::vector<std::uint8_t> servedTileMask(nTiles, std::uint8_t{0});
       for (std::size_t ei = 0; ei < served.size() && ei < g.edges.size(); ++ei) {
         if (!served[ei]) continue;
         for (const Point& p : g.edges[ei].tiles) {
@@ -598,7 +598,7 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
       const int stopSpacing = std::max(2, m_transitModel.stopSpacingTiles);
       std::vector<int> stopRoadIdx;
       stopRoadIdx.reserve(256);
-      std::vector<std::uint8_t> stopSeen(nTiles, 0u);
+      std::vector<std::uint8_t> stopSeen(nTiles, std::uint8_t{0});
       std::vector<Point> tmpStops;
       tmpStops.reserve(256);
 

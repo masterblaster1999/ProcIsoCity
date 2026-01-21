@@ -491,7 +491,7 @@ bool FindRoadBuildPathBetweenSets(const World& world,
   goalIdxs.erase(std::unique(goalIdxs.begin(), goalIdxs.end()), goalIdxs.end());
 
   // Prepare goal mask for O(1) membership checks.
-  std::vector<std::uint8_t> isGoal(n, 0);
+  std::vector<std::uint8_t> isGoal(n, std::uint8_t{0});
   for (const int gi : goalIdxs) {
     if (gi >= 0 && static_cast<std::size_t>(gi) < n) isGoal[static_cast<std::size_t>(gi)] = 1;
   }
@@ -765,7 +765,7 @@ bool FindRoadPathToEdge(const World& world, Point start, std::vector<Point>& out
   const int startIdx = Idx(start.x, start.y, w);
 
   std::vector<int> cameFrom(n, -1);
-  std::vector<std::uint8_t> visited(n, 0);
+  std::vector<std::uint8_t> visited(n, std::uint8_t{0});
 
   std::queue<int> q;
   q.push(startIdx);

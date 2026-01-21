@@ -19,9 +19,9 @@ inline std::uint64_t TimeSeed()
 {
   const auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
   std::uint64_t s = static_cast<std::uint64_t>(now);
-  // One extra mix so the very low bits also get "random-looking".
-  (void)SplitMix64Next(s);
-  return s;
+  // Use the SplitMix64 output as the seed; the internal state increment alone
+  // does not provide the mixing we want here.
+  return SplitMix64Next(s);
 }
 
 struct RNG {
@@ -41,8 +41,15 @@ struct RNG {
   {
     if (maxExclusive <= 1u) return 0u;
 
-    // threshold == 2^32 % maxExclusive (computed with unsigned wraparound).
-    const std::uint32_t threshold = static_cast<std::uint32_t>(-maxExclusive) % maxExclusive;
+    // Power-of-two fast path: modulo == bitmask. Keeps results identical while
+    // avoiding a division.
+    if ((maxExclusive & (maxExclusive - 1u)) == 0u) {
+      return nextU32() & (maxExclusive - 1u);
+    }
+
+    // threshold == 2^32 % maxExclusive.
+    // Compute in 64-bit to avoid MSVC warning C4146 (unary minus on unsigned).
+    const std::uint32_t threshold = static_cast<std::uint32_t>((std::uint64_t{1} << 32) % maxExclusive);
     while (true) {
       const std::uint32_t r = nextU32();
       if (r >= threshold) return r % maxExclusive;
@@ -63,8 +70,31 @@ struct RNG {
   int rangeInt(int minInclusive, int maxInclusive)
   {
     if (maxInclusive <= minInclusive) return minInclusive;
-    const std::uint32_t span = static_cast<std::uint32_t>(maxInclusive - minInclusive + 1);
-    return minInclusive + static_cast<int>(nextU32() % span);
+
+    const std::int64_t lo = static_cast<std::int64_t>(minInclusive);
+    const std::int64_t hi = static_cast<std::int64_t>(maxInclusive);
+    const std::int64_t span = hi - lo + 1;
+
+    // Overflow guard (shouldn't happen for normal int ranges, but keep it robust).
+    if (span <= 0) return minInclusive;
+
+    // Fast path for the full 32-bit range (span == 2^32).
+    // Avoids unsigned->signed implementation-defined casts.
+    if (span == (std::int64_t{1} << 32)) {
+      const std::int64_t r = static_cast<std::int64_t>(nextU32());
+      return static_cast<int>(lo + r);
+    }
+
+    // Most uses have small spans; use rejection sampling to avoid modulo bias.
+    if (span <= static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
+      const std::uint32_t uSpan = static_cast<std::uint32_t>(span);
+      const std::uint32_t r = rangeU32(uSpan);
+      return static_cast<int>(lo + static_cast<std::int64_t>(r));
+    }
+
+    // Fallback (span > 2^32): use 64-bit modulo. This is extremely unlikely for int,
+    // but keeps the function well-defined if it ever happens.
+    return static_cast<int>(lo + static_cast<std::int64_t>(nextU64() % static_cast<std::uint64_t>(span)));
   }
 
   float rangeFloat(float minInclusive, float maxInclusive)
