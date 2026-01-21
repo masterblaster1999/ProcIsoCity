@@ -4515,6 +4515,7 @@ void Renderer::unloadPropSprites()
   unloadVec(m_propTreeConifer);
   unloadVec(m_propStreetLight);
   unloadVec(m_propPedestrian);
+  unloadVec(m_propPedestrianUmbrella);
 }
 
 
@@ -4724,6 +4725,11 @@ void Renderer::rebuildPropSprites()
   buildKind(GfxPropKind::TreeConifer, cfgTrees, 10, m_propTreeConifer);
   buildKind(GfxPropKind::StreetLight, cfgLights, 8, m_propStreetLight);
   buildKind(GfxPropKind::Pedestrian, cfgPeople, 16, m_propPedestrian);
+
+  // Umbrella variants (used opportunistically during rain).
+  GfxPropsConfig cfgPeopleUmbrella = cfgPeople;
+  cfgPeopleUmbrella.pedestrianUmbrella = true;
+  buildKind(GfxPropKind::Pedestrian, cfgPeopleUmbrella, 16, m_propPedestrianUmbrella);
 }
 
 void Renderer::setCloudShadowSettings(const CloudShadowSettings& s)
@@ -7571,10 +7577,24 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
   };
 
   // Pick a pedestrian sprite variant with a cheap walk-cycle (two pose variants per “style”).
-  auto pickPedestrianSprite = [&](std::uint32_t h, float tSec) -> const PropSprite* {
-    if (m_propPedestrian.empty()) return nullptr;
-    const int n = static_cast<int>(m_propPedestrian.size());
-    if (n <= 1) return &m_propPedestrian.front();
+  //
+  // If umbrella=true and umbrella variants exist, this will prefer that set.
+  auto pickPedestrianSprite = [&](std::uint32_t h, float tSec, bool umbrella) -> const PropSprite* {
+    const std::vector<PropSprite>* vptr = nullptr;
+    if (umbrella && !m_propPedestrianUmbrella.empty()) {
+      vptr = &m_propPedestrianUmbrella;
+    } else if (!m_propPedestrian.empty()) {
+      vptr = &m_propPedestrian;
+    } else if (!m_propPedestrianUmbrella.empty()) {
+      // Fallback (should be rare): base set missing but umbrella set exists.
+      vptr = &m_propPedestrianUmbrella;
+    } else {
+      return nullptr;
+    }
+
+    const auto& v = *vptr;
+    const int n = static_cast<int>(v.size());
+    if (n <= 1) return &v.front();
 
     const int styles = std::max(1, n / 2);
     const int style = static_cast<int>((h >> 8u) % static_cast<std::uint32_t>(styles));
@@ -7586,7 +7606,7 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
     int idx = style * 2 + frame;
     if (idx < 0) idx = 0;
     if (idx >= n) idx = idx % n;
-    return &m_propPedestrian[static_cast<std::size_t>(idx)];
+    return &v[static_cast<std::size_t>(idx)];
   };
 
   // High-zoom procedural building sprites (adds detail on top of the existing prism-based
@@ -7884,7 +7904,7 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
         // We spawn them deterministically on:
         //  - park tiles (leisure), and
         //  - road tiles that border an active zone (sidewalk activity).
-        if (!m_propPedestrian.empty() && tileScreenW >= 56.0f) {
+        if ((!m_propPedestrian.empty() || !m_propPedestrianUmbrella.empty()) && tileScreenW >= 56.0f) {
           const float invZoom = 1.0f / std::max(0.001f, camera.zoom);
 
           auto crowdFactor = [&]() -> float {
@@ -7900,6 +7920,15 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
           const float crowd = crowdFactor();
           const std::uint32_t hPed = HashCoords32(x, y, m_gfxSeed32 ^ 0x0BADC0DEu);
 
+          auto wantsUmbrella = [&](std::uint32_t h) -> bool {
+            if (weather.mode != WeatherSettings::Mode::Rain) return false;
+            if (weather.intensity <= 0.05f) return false;
+            if (m_propPedestrianUmbrella.empty()) return false;
+            const float inten = std::clamp(weather.intensity, 0.0f, 1.0f);
+            const float p = std::clamp(0.25f + 0.70f * inten, 0.0f, 0.92f);
+            return (Frac01(h ^ 0x51A5EEDu) < p);
+          };
+
           // --- Park pedestrians (front-edge "path") ---
           if (t.overlay == Overlay::Park && tileScreenW >= 60.0f && crowd > 0.05f) {
             int count = 0;
@@ -7913,7 +7942,8 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
               for (int i = 0; i < count; ++i) {
                 const std::uint32_t hi = HashCoords32(i, static_cast<int>(hPed), m_gfxSeed32 ^ 0xC0FFEEu);
 
-                const PropSprite* ps = pickPedestrianSprite(hi, timeSec);
+                const bool umbrella = wantsUmbrella(hi);
+                const PropSprite* ps = pickPedestrianSprite(hi, timeSec, umbrella);
                 if (!ps) break;
 
                 // Place along the front edge (between BL and BR) and nudge inward.
@@ -7992,7 +8022,8 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
               const float pSpawn = std::clamp(0.06f + 0.22f * activity, 0.0f, 0.30f) * crowd;
               if (Frac01(hPed ^ 0xD00Du) < pSpawn) {
                 const std::uint32_t hi = HashCoords32(selNx, selNy, hPed ^ 0xFACEFEEDu);
-                const PropSprite* ps = pickPedestrianSprite(hi, timeSec);
+                const bool umbrella = wantsUmbrella(hi);
+                const PropSprite* ps = pickPedestrianSprite(hi, timeSec, umbrella);
                 if (ps) {
                   Vector2 corners[4];
                   TileDiamondCorners(center, tileWf, tileHf, corners);

@@ -656,6 +656,8 @@ private:
   std::vector<PropSprite> m_propTreeConifer;
   std::vector<PropSprite> m_propStreetLight;
   std::vector<PropSprite> m_propPedestrian;
+  // Rain variants (umbrella) for pedestrians; the renderer blends these in during rainy weather.
+  std::vector<PropSprite> m_propPedestrianUmbrella;
 
   // Procedural building sprite variants (zone buildings). These are generated at runtime so the
   // project stays asset-free, but provide much richer visuals than simple geometric prisms when

@@ -18,9 +18,11 @@ using gfx::BlendPixel;
 using gfx::ClampU8;
 using gfx::FillCircleSoft;
 using gfx::FillRect;
+using gfx::FillTriangle;
 using gfx::Lerp;
 using gfx::Mul;
 using gfx::SdfRoundRect;
+using gfx::StrokeLine;
 using gfx::SmoothStep01;
 using gfx::SpriteLight;
 
@@ -743,10 +745,12 @@ void MakePedestrian(int variant, std::uint32_t seedv, const GfxPropsConfig& cfg,
   const int yBelt = static_cast<int>(std::lround(hipY - 1.0f));
   FillRect(out.color, xTorso0, yBelt, xTorso1, yBelt, Rgba8{pants.r, pants.g, pants.b, 130});
 
+  // Arm anchor (also used for umbrella handle placement).
+  const int yArm = static_cast<int>(std::lround(torsoTopY + torsoH * 0.45f));
+
   // Arms: two short strokes. Occasionally add a bag.
   {
     const bool bag = (h01(style, 14, 0xA1Eu) > 0.72f);
-    const int yArm = static_cast<int>(std::lround(torsoTopY + torsoH * 0.45f));
     const int axL = xTorso0 - 1;
     const int axR = xTorso1 + 1;
 
@@ -778,6 +782,72 @@ void MakePedestrian(int variant, std::uint32_t seedv, const GfxPropsConfig& cfg,
                static_cast<int>(std::lround(headCy + headR * 0.35f)),
                Rgba8{brim.r, brim.g, brim.b, 210});
     }
+  }
+
+  // Optional umbrella (used by the in-game renderer during rain).
+  //
+  // This is intentionally simple (flat canopy + handle) but it reads well at high zoom
+  // and gives rainy scenes extra life without external assets.
+  if (cfg.pedestrianUmbrella) {
+    // Canopy size derived from the person size so it stays readable across tile sizes.
+    const float umbW = (headR * 2.8f + torsoW * 0.55f) * (0.92f + 0.18f * h01(style, 18, 0xA22u));
+    const float umbH = umbW * (0.52f + 0.08f * h01(style, 19, 0xA23u));
+
+    // Pose-dependent lean so alternating walk frames don't look identical.
+    const float lean = (pose == 0 ? -1.0f : 1.0f) * (0.35f + 0.35f * h01(style, 20, 0xA24u));
+
+    const float uCx = cx + lean * 1.25f;
+    const float uCy = headCy - headR * (1.55f + 0.25f * h01(style, 21, 0xA25u)) - umbH * 0.10f;
+
+    // Pick a bright-ish fabric color from the palette.
+    const float pick = h01(style, 22, 0xA26u);
+    Rgba8 uCol = pal.overlayCommercial;
+    if (pick < 0.33f) uCol = pal.overlayResidential;
+    else if (pick < 0.66f) uCol = pal.overlayIndustrial;
+    else uCol = pal.roadMarkYellow;
+    uCol = Mul(uCol, 1.08f);
+
+    const Rgba8 uShade = Mul(uCol, 0.80f);
+    const Rgba8 uHi = Mul(uCol, 1.22f);
+    const Rgba8 handle = Mul(pal.roadAsphalt2, 0.68f);
+
+    const int ax = static_cast<int>(std::lround(uCx));
+    const int ay = static_cast<int>(std::lround(uCy - umbH * 0.55f));
+    const int bx = static_cast<int>(std::lround(uCx - umbW * 0.5f));
+    const int by = static_cast<int>(std::lround(uCy + umbH * 0.35f));
+    const int cx2 = static_cast<int>(std::lround(uCx + umbW * 0.5f));
+    const int cy2 = by;
+
+    // Main canopy.
+    FillTriangle(out.color, ax, ay, bx, by, cx2, cy2, Rgba8{uCol.r, uCol.g, uCol.b, 240});
+
+    // Scalloped edge (subtle, but helps read as an umbrella rather than a random triangle).
+    const int scallops = (umbW >= 12.0f) ? 4 : 3;
+    for (int si = 0; si < scallops; ++si) {
+      const float t = (static_cast<float>(si) + 0.5f) / static_cast<float>(scallops);
+      const float sx = static_cast<float>(bx) * (1.0f - t) + static_cast<float>(cx2) * t;
+      FillCircleSoft(out.color, sx, static_cast<float>(by), umbW * 0.11f, umbW * 0.06f,
+                     Rgba8{uShade.r, uShade.g, uShade.b, 220});
+    }
+
+    // Highlight wedge.
+    FillTriangle(out.color,
+                 ax, ay,
+                 static_cast<int>(std::lround(uCx - umbW * 0.20f)),
+                 static_cast<int>(std::lround(uCy + umbH * 0.10f)),
+                 static_cast<int>(std::lround(uCx + umbW * 0.20f)),
+                 static_cast<int>(std::lround(uCy + umbH * 0.10f)),
+                 Rgba8{uHi.r, uHi.g, uHi.b, 200});
+
+    // Handle shaft down to the arm anchor.
+    const int hx0 = static_cast<int>(std::lround(uCx));
+    const int hy0 = static_cast<int>(std::lround(uCy + umbH * 0.20f));
+    const int hx1 = static_cast<int>(std::lround(cx + lean * 0.65f));
+    const int hy1 = yArm + 3;
+    StrokeLine(out.color, hx0, hy0, hx1, hy1, Rgba8{handle.r, handle.g, handle.b, 225});
+
+    // Tiny hook at the bottom.
+    StrokeLine(out.color, hx1, hy1, hx1 + (pose ? -2 : 2), hy1 + 1, Rgba8{handle.r, handle.g, handle.b, 205});
   }
 
   // Lighting + tiny per-pixel variation to avoid flat silhouettes.

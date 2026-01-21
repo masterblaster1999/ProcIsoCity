@@ -48,6 +48,12 @@ struct GfxPropsConfig {
 
   // Generate emissive map (streetlights, vehicle headlights).
   bool includeEmissive = false;
+
+  // --- Pedestrian-specific options ---
+  // If true, GenerateGfxPropSprite(Pedestrian, ...) will draw the pedestrian holding
+  // a simple umbrella. This is used by the in-game renderer to make rainy scenes
+  // feel more alive without introducing external art assets.
+  bool pedestrianUmbrella = false;
 };
 
 // Generate a single prop sprite for a given kind and deterministic variant.
