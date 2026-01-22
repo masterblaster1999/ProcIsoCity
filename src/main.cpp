@@ -1,5 +1,6 @@
 #include "isocity/Game.hpp"
 #include "isocity/Random.hpp"
+#include "isocity/Version.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -76,7 +77,8 @@ int main(int argc, char** argv)
     const std::string arg = argv[i];
 
     if (arg == "--help" || arg == "-h") {
-      std::cout << "ProcIsoCity\n"
+      std::cout << "ProcIsoCity v" << isocity::ProcIsoCityFullVersionString() << "\n"
+                << "  --version\n"
                 << "  --seed <u64|0xHEX>\n"
                 << "  --size <W>x<H>      (map size)\n"
                 << "  --window <W>x<H>    (window size)\n"
@@ -84,6 +86,11 @@ int main(int argc, char** argv)
                 << "  --elevsteps <N>     (0=smooth, otherwise quantize to N steps; default 16)\n"
                 << "  --flat              (shortcut for --elev 0)\n"
                 << "  --novsync\n";
+      return 0;
+    }
+
+    if (arg == "--version" || arg == "-V") {
+      std::cout << "ProcIsoCity " << isocity::ProcIsoCityFullVersionString() << "\n";
       return 0;
     }
 

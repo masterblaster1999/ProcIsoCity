@@ -6,6 +6,28 @@ project(ProcIsoCity
   LANGUAGES C CXX
 )
 
+# ---- Version / build metadata ----
+# Expose the project version (and optionally the git commit SHA) as compile-time macros.
+#
+# - The version comes from the CMake project() VERSION field.
+# - The git SHA is best-effort: it is "unknown" when building from a source archive
+#   without a .git directory, or when git is not available.
+set(PROCISOCITY_GIT_SHA "unknown")
+find_package(Git QUIET)
+if (GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+  execute_process(
+    COMMAND ${GIT_EXECUTABLE} rev-parse --short=12 HEAD
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE _procisocity_git_sha
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _procisocity_git_sha_rv
+    ERROR_QUIET
+  )
+  if (_procisocity_git_sha_rv EQUAL 0 AND NOT "${_procisocity_git_sha}" STREQUAL "")
+    set(PROCISOCITY_GIT_SHA "${_procisocity_git_sha}")
+  endif()
+endif()
+
 # ---- Options ----
 option(PROCISOCITY_BUILD_APP "Build the interactive raylib application" ON)
 option(PROCISOCITY_BUILD_TESTS "Build headless tests (no raylib required)" OFF)
@@ -116,6 +138,7 @@ add_library(isocity_core
   src/isocity/GfxTileset.cpp
   src/isocity/Heightmap.cpp
   src/isocity/Hash.cpp
+  src/isocity/FileHash.cpp
   src/isocity/EditHistory.cpp
   src/isocity/Pathfinding.cpp
   src/isocity/RoadGraph.cpp
@@ -141,6 +164,15 @@ add_library(isocity_core
 )
 
 target_include_directories(isocity_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# Provide version/build metadata to all targets that link against isocity_core.
+target_compile_definitions(isocity_core PUBLIC
+  PROCISOCITY_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+  PROCISOCITY_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+  PROCISOCITY_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+  PROCISOCITY_VERSION_STRING=\"${PROJECT_VERSION}\"
+  PROCISOCITY_GIT_SHA=\"${PROCISOCITY_GIT_SHA}\"
+)
 
 procisocity_set_strict_warnings(isocity_core)
 

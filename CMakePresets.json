@@ -44,11 +44,26 @@
     }
   ],
   "buildPresets": [
-    { "name": "default", "configurePreset": "default" },
-    { "name": "cli", "configurePreset": "cli" },
-    { "name": "tests", "configurePreset": "tests" }
+    {
+      "name": "default",
+      "configurePreset": "default"
+    },
+    {
+      "name": "cli",
+      "configurePreset": "cli"
+    },
+    {
+      "name": "tests",
+      "configurePreset": "tests"
+    }
   ],
   "testPresets": [
-    { "name": "tests", "configurePreset": "tests", "outputOnFailure": true }
+    {
+      "name": "tests",
+      "configurePreset": "tests",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
   ]
 }

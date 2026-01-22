@@ -20,6 +20,7 @@
 #include "isocity/LandValue.hpp"
 #include "isocity/Replay.hpp"
 #include "isocity/Hash.hpp"
+#include "isocity/FileHash.hpp"
 #include "isocity/DeterministicMath.hpp"
 #include "isocity/Json.hpp"
 #include "isocity/Compression.hpp"
@@ -7986,6 +7987,51 @@ void TestGfxCanvasAffineAndSampling()
 }
 
 
+void TestFileHashFNV1a64()
+{
+  using namespace isocity;
+
+  // In-memory hashing sanity check ("hello").
+  {
+    const char* s = "hello";
+    const std::uint64_t h = Fnv1a64(s, 5);
+    EXPECT_EQ(h, 0xa430d84680aabd0bull);
+  }
+
+  // File hashing check.
+  const fs::path dir = fs::temp_directory_path() / "procisocity_filehash_test";
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+
+  const fs::path p = dir / "hello.txt";
+  {
+    std::ofstream f(p, std::ios::binary);
+    f << "hello";
+  }
+
+  FileHashInfo info;
+  std::string err;
+  EXPECT_TRUE(ComputeFileHashFNV1a64(p.string(), info, err));
+  EXPECT_TRUE(err.empty());
+  EXPECT_EQ(info.sizeBytes, 5u);
+  EXPECT_EQ(info.fnv1a64, 0xa430d84680aabd0bull);
+
+  // Empty file should hash to the offset basis.
+  const fs::path p2 = dir / "empty.bin";
+  {
+    std::ofstream f(p2, std::ios::binary);
+  }
+  FileHashInfo info2;
+  EXPECT_TRUE(ComputeFileHashFNV1a64(p2.string(), info2, err));
+  EXPECT_EQ(info2.sizeBytes, 0u);
+  EXPECT_EQ(info2.fnv1a64, 0xcbf29ce484222325ull);
+
+  fs::remove(p, ec);
+  fs::remove(p2, ec);
+  fs::remove(dir, ec);
+}
+
+
 
 
 int main()
@@ -8007,6 +8053,7 @@ int main()
   TestJsonUnicodeEscapesAndStringify();
   TestJsonWriterStreaming();
   TestGfxCanvasAffineAndSampling();
+  TestFileHashFNV1a64();
   TestPngReadersSupportDeflateAndFilters();
   TestSaveV8UsesCompressionForLargeDeltaPayload();
   TestSaveLoadDetectsCorruption();

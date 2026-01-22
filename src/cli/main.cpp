@@ -6,7 +6,9 @@
 #include "isocity/Sim.hpp"
 #include "isocity/Export.hpp"
 #include "isocity/GfxTilesetAtlas.hpp"
+#include "isocity/FileHash.hpp"
 #include "isocity/Pathfinding.hpp"
+#include "isocity/Version.hpp"
 
 #include <algorithm>
 
@@ -16,6 +18,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -141,17 +144,239 @@ bool ParseJsonObjectText(const std::string& text, isocity::JsonValue& outObj, st
   return true;
 }
 
+
+bool LoadJsonFileText(const std::string& path, std::string& outText, std::string& outErr)
+{
+  std::ifstream f(path, std::ios::binary);
+  if (!f) {
+    outErr = "failed to open file";
+    return false;
+  }
+  std::ostringstream oss;
+  oss << f.rdbuf();
+  if (!f && !f.eof()) {
+    outErr = "failed to read file";
+    return false;
+  }
+  outText = oss.str();
+  outErr.clear();
+  return true;
+}
+
+bool LoadJsonObjectFile(const std::string& path, isocity::JsonValue& outObj, std::string& outErr)
+{
+  std::string text;
+  if (!LoadJsonFileText(path, text, outErr)) return false;
+
+  isocity::JsonValue v;
+  std::string err;
+  if (!isocity::ParseJson(text, v, err)) {
+    outErr = err;
+    return false;
+  }
+  if (!v.isObject()) {
+    outErr = "expected JSON object";
+    return false;
+  }
+  outObj = std::move(v);
+  outErr.clear();
+  return true;
+}
+
+bool ApplyCombinedConfigPatch(const isocity::JsonValue& root,
+                             isocity::ProcGenConfig& ioProc,
+                             isocity::SimConfig& ioSim,
+                             std::optional<isocity::JsonValue>* outProcPatch,
+                             std::optional<isocity::JsonValue>* outSimPatch,
+                             std::string& outErr)
+{
+  if (!root.isObject()) {
+    outErr = "combined config JSON must be an object";
+    return false;
+  }
+
+  if (outProcPatch) outProcPatch->reset();
+  if (outSimPatch) outSimPatch->reset();
+
+  bool any = false;
+  std::string err;
+
+  const isocity::JsonValue* proc = isocity::FindJsonMember(root, "proc");
+  if (proc) {
+    if (!proc->isObject()) {
+      outErr = "proc must be an object";
+      return false;
+    }
+    any = true;
+    if (!isocity::ApplyProcGenConfigJson(*proc, ioProc, err)) {
+      outErr = std::string("proc: ") + err;
+      return false;
+    }
+    if (outProcPatch) *outProcPatch = *proc;
+  }
+
+  const isocity::JsonValue* sim = isocity::FindJsonMember(root, "sim");
+  if (sim) {
+    if (!sim->isObject()) {
+      outErr = "sim must be an object";
+      return false;
+    }
+    any = true;
+    if (!isocity::ApplySimConfigJson(*sim, ioSim, err)) {
+      outErr = std::string("sim: ") + err;
+      return false;
+    }
+    if (outSimPatch) *outSimPatch = *sim;
+  }
+
+  if (!any) {
+    outErr = "combined config must contain a 'proc' and/or 'sim' object";
+    return false;
+  }
+
+  outErr.clear();
+  return true;
+}
+
+struct ArtifactEntry {
+  std::string kind;
+  std::string path;
+  std::string layer; // optional (primarily for export images)
+};
+
+bool WriteRunManifestJson(const std::string& outPath,
+                          int runIdx,
+                          std::uint64_t requestedSeed,
+                          std::uint64_t actualSeed,
+                          int w,
+                          int h,
+                          int days,
+                          std::uint64_t worldHash,
+                          const std::string& loadPath,
+                          const std::vector<std::string>& argvList,
+                          const isocity::ProcGenConfig& procCfg,
+                          const isocity::SimConfig& simCfg,
+                          const std::vector<ArtifactEntry>& artifacts,
+                          std::string& outErr)
+{
+  using isocity::JsonValue;
+
+  JsonValue root = JsonValue::MakeObject();
+  auto add = [](JsonValue& obj, const char* key, JsonValue v) {
+    obj.objectValue.emplace_back(key, std::move(v));
+  };
+
+  // High-level provenance.
+  add(root, "tool", JsonValue::MakeString("proc_isocity_cli"));
+  add(root, "tool_version", JsonValue::MakeString(isocity::ProcIsoCityVersionString()));
+  add(root, "tool_git_sha", JsonValue::MakeString(isocity::ProcIsoCityGitSha()));
+  add(root, "build_stamp", JsonValue::MakeString(isocity::ProcIsoCityBuildStamp()));
+
+  // Run parameters.
+  add(root, "run_index", JsonValue::MakeNumber(static_cast<double>(runIdx)));
+  add(root, "requested_seed", JsonValue::MakeNumber(static_cast<double>(requestedSeed)));
+  add(root, "actual_seed", JsonValue::MakeNumber(static_cast<double>(actualSeed)));
+  add(root, "seed_hex", JsonValue::MakeString(HexU64(actualSeed)));
+  add(root, "width", JsonValue::MakeNumber(static_cast<double>(w)));
+  add(root, "height", JsonValue::MakeNumber(static_cast<double>(h)));
+  add(root, "days", JsonValue::MakeNumber(static_cast<double>(days)));
+  add(root, "world_hash", JsonValue::MakeString(HexU64(worldHash)));
+
+  if (!loadPath.empty()) {
+    add(root, "load", JsonValue::MakeString(loadPath));
+  }
+
+  // Capture the full command line for reproducibility.
+  {
+    JsonValue arr = JsonValue::MakeArray();
+    arr.arrayValue.reserve(argvList.size());
+    for (const auto& a : argvList) {
+      arr.arrayValue.emplace_back(JsonValue::MakeString(a));
+    }
+    add(root, "argv", std::move(arr));
+  }
+
+  // Embed configs (same schema as other tools) so the manifest is standalone.
+  {
+    std::string err;
+    JsonValue procObj;
+    if (!ParseJsonObjectText(isocity::ProcGenConfigToJson(procCfg, 2), procObj, err)) {
+      outErr = std::string("failed to serialize ProcGenConfig: ") + err;
+      return false;
+    }
+    add(root, "proc", std::move(procObj));
+  }
+
+  {
+    std::string err;
+    JsonValue simObj;
+    if (!ParseJsonObjectText(isocity::SimConfigToJson(simCfg, 2), simObj, err)) {
+      outErr = std::string("failed to serialize SimConfig: ") + err;
+      return false;
+    }
+    add(root, "sim", std::move(simObj));
+  }
+
+  // Output artifacts with file hashes (FNV-1a 64-bit) for quick integrity checks.
+  {
+    JsonValue arr = JsonValue::MakeArray();
+    arr.arrayValue.reserve(artifacts.size());
+
+    for (const auto& a : artifacts) {
+      JsonValue obj = JsonValue::MakeObject();
+      add(obj, "kind", JsonValue::MakeString(a.kind));
+      add(obj, "path", JsonValue::MakeString(a.path));
+      if (!a.layer.empty()) add(obj, "layer", JsonValue::MakeString(a.layer));
+
+      isocity::FileHashInfo info;
+      std::string herr;
+      if (!isocity::ComputeFileHashFNV1a64(a.path, info, herr)) {
+        add(obj, "hash_error", JsonValue::MakeString(herr));
+      } else {
+        add(obj, "size_bytes", JsonValue::MakeNumber(static_cast<double>(info.sizeBytes)));
+        add(obj, "hash_fnv1a64", JsonValue::MakeString(HexU64(info.fnv1a64)));
+      }
+
+      arr.arrayValue.emplace_back(std::move(obj));
+    }
+
+    add(root, "artifacts", std::move(arr));
+  }
+
+  const isocity::JsonWriteOptions wopt{.pretty = true, .indent = 2, .sortKeys = false};
+
+  // Match the CLI's convention: "-" means stdout.
+  if (outPath.empty() || outPath == "-") {
+    std::cout << isocity::JsonStringify(root, wopt);
+    outErr.clear();
+    return true;
+  }
+
+  std::string err;
+  if (!isocity::WriteJsonFile(outPath, root, err, wopt)) {
+    outErr = err;
+    return false;
+  }
+
+  outErr.clear();
+  return true;
+}
+
+
 void PrintHelp()
 {
   std::cout
-      << "proc_isocity_cli (headless simulation runner)\n\n"
+      << "proc_isocity_cli v" << isocity::ProcIsoCityFullVersionString() << " (headless simulation runner)\n\n"
       << "Usage:\n"
+      << "  proc_isocity_cli --version\n"
+      << "  proc_isocity_cli --build-info\n"
       << "  proc_isocity_cli [--load <save.bin>] [--seed <u64>] [--size <WxH>]\n"
+      << "                 [--config <combined.json>] [--proc <proc.json>] [--sim <sim.json>]\n"
       << "                 [--gen-preset <name>] [--gen-preset-strength <N>]\n"
       << "                 [--gen-road-layout <organic|grid|radial|space_colonization>]\n"
       << "                 [--gen-road-hierarchy <0|1>] [--gen-road-hierarchy-strength <N>]\n"
       << "                 [--gen-districting-mode <voronoi|road_flow|block_graph>] [--days <N>]\n"
-      << "                 [--out <summary.json>] [--csv <ticks.csv>] [--save <save.bin>]\n"
+      << "                 [--out <summary.json>] [--csv <ticks.csv>] [--save <save.bin>] [--manifest <manifest.json>]\n"
       << "                 [--require-outside <0|1>] [--tax-res <N>] [--tax-com <N>] [--tax-ind <N>]\n"
       << "                 [--maint-road <N>] [--maint-park <N>]\n"
       << "                 [--export-ppm <layer> <out.ppm|out.png>]... [--export-scale <N>]\n"
@@ -184,11 +409,13 @@ void PrintHelp()
       << "  - To write per-run files, include {seed} or {run} in any output path.\n"
       << "    Example: --out out_{seed}.json  --export-ppm overlay map_{seed}.png\n\n"
       << "Notes:\n"
-      << "  - If --load is provided, the world + ProcGenConfig + SimConfig are loaded from the save.\n"
-      << "  - Otherwise, a new world is generated from (--seed, --size).\n"
-      << "  - --gen-preset/--gen-preset-strength/--gen-road-layout/--gen-road-hierarchy*/--gen-districting-mode only apply when generating a new world.\n"
+      << "  - If --load is provided, the world + embedded ProcGenConfig + SimConfig are loaded from the save.\n"
+      << "  - Then any CLI config overrides (JSON patches, --gen-*, --require-outside, --tax-*, --maint-*) are applied on top.\n"
+      << "  - Otherwise, a new world is generated from (--seed, --size) using the effective ProcGenConfig.\n"
+      << "  - When --load is used, --gen-* options do NOT regenerate the world; they only affect the config recorded in outputs / re-saves.\n"
       << "  - --days advances the simulator by N ticks via Simulator::stepOnce().\n"
-      << "  - A stable 64-bit hash of the final world is included in the JSON output.\n";
+      << "  - A stable 64-bit hash of the final world is included in the JSON output.\n"
+      << "  - --manifest writes a JSON file listing all output artifacts (csv/images/saves/etc.) with their byte sizes and FNV-1a hashes.\n";
 }
 
 bool WriteJsonSummary(const isocity::World& world, std::uint64_t hash, const std::string& outPath,
@@ -202,11 +429,21 @@ bool WriteJsonSummary(const isocity::World& world, std::uint64_t hash, const std
     obj.objectValue.emplace_back(key, std::move(v));
   };
 
+  add(root, "tool", JsonValue::MakeString("proc_isocity_cli"));
+  add(root, "tool_version", JsonValue::MakeString(isocity::ProcIsoCityVersionString()));
+  add(root, "tool_git_sha", JsonValue::MakeString(isocity::ProcIsoCityGitSha()));
+  add(root, "build_stamp", JsonValue::MakeString(isocity::ProcIsoCityBuildStamp()));
+
   add(root, "width", JsonValue::MakeNumber(static_cast<double>(world.width())));
   add(root, "height", JsonValue::MakeNumber(static_cast<double>(world.height())));
   add(root, "seed", JsonValue::MakeNumber(static_cast<double>(world.seed())));
   add(root, "seed_hex", JsonValue::MakeString(HexU64(world.seed())));
   add(root, "hash", JsonValue::MakeString(HexU64(hash)));
+
+  // Embed the generator/tool version so outputs can be compared across releases.
+  add(root, "procisocity_version", JsonValue::MakeString(isocity::ProcIsoCityVersionString()));
+  add(root, "procisocity_git_sha", JsonValue::MakeString(isocity::ProcIsoCityGitSha()));
+  add(root, "procisocity_build_stamp", JsonValue::MakeString(isocity::ProcIsoCityBuildStamp()));
 
   // Embed the exact configs used for this run so the JSON output is fully reproducible.
   // We reuse ConfigIO's serialization to keep field names consistent across tools.
@@ -289,10 +526,17 @@ int main(int argc, char** argv)
 {
   using namespace isocity;
 
+  std::vector<std::string> argvList;
+  argvList.reserve(static_cast<std::size_t>(argc));
+  for (int i = 0; i < argc; ++i) {
+    argvList.emplace_back(argv[i] ? argv[i] : "");
+  }
+
   std::string loadPath;
   std::string savePath;
   std::string outJson;
   std::string outCsv;
+  std::string manifestPath;
 
   // --- New headless export options ---
   struct PpmExport {
@@ -340,6 +584,8 @@ int main(int argc, char** argv)
   ProcGenConfig procCfg{};
   SimConfig simCfg{};
 
+  std::vector<std::function<void(ProcGenConfig&, SimConfig&)>> configOps;
+
   auto requireValue = [&](int& i, std::string& out) -> bool {
     if (i + 1 >= argc) return false;
     out = argv[++i];
@@ -350,7 +596,14 @@ int main(int argc, char** argv)
     const std::string arg = argv[i];
     std::string val;
 
-    if (arg == "--help" || arg == "-h") {
+    if (arg == "--version" || arg == "-V") {
+      std::cout << "proc_isocity_cli " << isocity::ProcIsoCityFullVersionString() << "\n";
+      return 0;
+    } else if (arg == "--build-info") {
+      std::cout << "proc_isocity_cli " << isocity::ProcIsoCityFullVersionString() << "\n"
+                << "built " << isocity::ProcIsoCityBuildStamp() << "\n";
+      return 0;
+    } else if (arg == "--help" || arg == "-h") {
       PrintHelp();
       return 0;
     } else if (arg == "--load") {
@@ -377,6 +630,12 @@ int main(int argc, char** argv)
         return 2;
       }
       outCsv = val;
+    } else if (arg == "--manifest") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--manifest requires a path (use '-' for stdout)\n";
+        return 2;
+      }
+      manifestPath = val;
     } else if (arg == "--seed") {
       if (!requireValue(i, val) || !ParseU64(val, &seed)) {
         std::cerr << "--seed requires a valid integer (decimal or 0x...)\n";
@@ -400,6 +659,7 @@ int main(int argc, char** argv)
         return 2;
       }
       procCfg.terrainPreset = p;
+      configOps.emplace_back([p](ProcGenConfig& pc, SimConfig&) { pc.terrainPreset = p; });
     } else if (arg == "--gen-preset-strength") {
       float s = 1.0f;
       if (!requireValue(i, val) || !ParseF32(val, &s)) {
@@ -407,6 +667,7 @@ int main(int argc, char** argv)
         return 2;
       }
       procCfg.terrainPresetStrength = std::clamp(s, 0.0f, 5.0f);
+      configOps.emplace_back([s](ProcGenConfig& pc, SimConfig&) { pc.terrainPresetStrength = std::clamp(s, 0.0f, 5.0f); });
     } else if (arg == "--gen-road-layout" || arg == "--gen-roadlayout") {
       if (!requireValue(i, val)) {
         std::cerr << "--gen-road-layout requires a layout name\n";
@@ -418,6 +679,7 @@ int main(int argc, char** argv)
         return 2;
       }
       procCfg.roadLayout = layout;
+      configOps.emplace_back([layout](ProcGenConfig& pc, SimConfig&) { pc.roadLayout = layout; });
     } else if (arg == "--gen-road-hierarchy") {
       if (!requireValue(i, val)) {
         std::cerr << "--gen-road-hierarchy requires 0 or 1\n";
@@ -429,6 +691,7 @@ int main(int argc, char** argv)
         return 2;
       }
       procCfg.roadHierarchyEnabled = (b != 0);
+      configOps.emplace_back([b](ProcGenConfig& pc, SimConfig&) { pc.roadHierarchyEnabled = (b != 0); });
     } else if (arg == "--gen-road-hierarchy-strength") {
       float s = 1.0f;
       if (!requireValue(i, val) || !ParseF32(val, &s)) {
@@ -436,6 +699,7 @@ int main(int argc, char** argv)
         return 2;
       }
       procCfg.roadHierarchyStrength = std::clamp(s, 0.0f, 3.0f);
+      configOps.emplace_back([s](ProcGenConfig& pc, SimConfig&) { pc.roadHierarchyStrength = std::clamp(s, 0.0f, 3.0f); });
     } else if (arg == "--gen-districting-mode") {
       if (!requireValue(i, val)) {
         std::cerr << "--gen-districting-mode requires a mode name\n";
@@ -447,6 +711,7 @@ int main(int argc, char** argv)
         return 2;
       }
       procCfg.districtingMode = mode;
+      configOps.emplace_back([mode](ProcGenConfig& pc, SimConfig&) { pc.districtingMode = mode; });
     } else if (arg == "--days" || arg == "--ticks") {
       if (!requireValue(i, val) || !ParseI32(val, &days) || days < 0) {
         std::cerr << arg << " requires a non-negative integer\n";
@@ -463,31 +728,104 @@ int main(int argc, char** argv)
         return 2;
       }
       simCfg.requireOutsideConnection = (b != 0);
+      configOps.emplace_back([b](ProcGenConfig&, SimConfig& sc) { sc.requireOutsideConnection = (b != 0); });
     } else if (arg == "--tax-res") {
       if (!requireValue(i, val) || !ParseI32(val, &simCfg.taxResidential)) {
         std::cerr << "--tax-res requires an integer\n";
         return 2;
       }
+      configOps.emplace_back([v = simCfg.taxResidential](ProcGenConfig&, SimConfig& sc) { sc.taxResidential = v; });
     } else if (arg == "--tax-com") {
       if (!requireValue(i, val) || !ParseI32(val, &simCfg.taxCommercial)) {
         std::cerr << "--tax-com requires an integer\n";
         return 2;
       }
+      configOps.emplace_back([v = simCfg.taxCommercial](ProcGenConfig&, SimConfig& sc) { sc.taxCommercial = v; });
     } else if (arg == "--tax-ind") {
       if (!requireValue(i, val) || !ParseI32(val, &simCfg.taxIndustrial)) {
         std::cerr << "--tax-ind requires an integer\n";
         return 2;
       }
+      configOps.emplace_back([v = simCfg.taxIndustrial](ProcGenConfig&, SimConfig& sc) { sc.taxIndustrial = v; });
     } else if (arg == "--maint-road") {
       if (!requireValue(i, val) || !ParseI32(val, &simCfg.maintenanceRoad)) {
         std::cerr << "--maint-road requires an integer\n";
         return 2;
       }
+      configOps.emplace_back([v = simCfg.maintenanceRoad](ProcGenConfig&, SimConfig& sc) { sc.maintenanceRoad = v; });
     } else if (arg == "--maint-park") {
       if (!requireValue(i, val) || !ParseI32(val, &simCfg.maintenancePark)) {
         std::cerr << "--maint-park requires an integer\n";
         return 2;
       }
+      configOps.emplace_back([v = simCfg.maintenancePark](ProcGenConfig&, SimConfig& sc) { sc.maintenancePark = v; });
+    } else if (arg == "--proc") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--proc requires a path\n";
+        return 2;
+      }
+
+      isocity::JsonValue patch;
+      std::string err;
+      if (!LoadJsonObjectFile(val, patch, err)) {
+        std::cerr << "Failed to load proc config JSON: " << err << "\n";
+        return 1;
+      }
+      if (!isocity::ApplyProcGenConfigJson(patch, procCfg, err)) {
+        std::cerr << "Invalid proc config JSON: " << err << "\n";
+        return 1;
+      }
+
+      configOps.emplace_back([patch](ProcGenConfig& pc, SimConfig&) {
+        std::string e;
+        (void)isocity::ApplyProcGenConfigJson(patch, pc, e);
+      });
+    } else if (arg == "--sim") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--sim requires a path\n";
+        return 2;
+      }
+
+      isocity::JsonValue patch;
+      std::string err;
+      if (!LoadJsonObjectFile(val, patch, err)) {
+        std::cerr << "Failed to load sim config JSON: " << err << "\n";
+        return 1;
+      }
+      if (!isocity::ApplySimConfigJson(patch, simCfg, err)) {
+        std::cerr << "Invalid sim config JSON: " << err << "\n";
+        return 1;
+      }
+
+      configOps.emplace_back([patch](ProcGenConfig&, SimConfig& sc) {
+        std::string e;
+        (void)isocity::ApplySimConfigJson(patch, sc, e);
+      });
+    } else if (arg == "--config") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--config requires a path\n";
+        return 2;
+      }
+
+      isocity::JsonValue root;
+      std::string err;
+      if (!LoadJsonObjectFile(val, root, err)) {
+        std::cerr << "Failed to load combined config JSON: " << err << "\n";
+        return 1;
+      }
+
+      std::optional<isocity::JsonValue> procPatch;
+      std::optional<isocity::JsonValue> simPatch;
+      if (!ApplyCombinedConfigPatch(root, procCfg, simCfg, &procPatch, &simPatch, err)) {
+        std::cerr << "Invalid combined config JSON: " << err << "\n";
+        return 1;
+      }
+
+      configOps.emplace_back([procPatch, simPatch](ProcGenConfig& pc, SimConfig& sc) {
+        std::string e;
+        if (procPatch) (void)isocity::ApplyProcGenConfigJson(*procPatch, pc, e);
+        if (simPatch) (void)isocity::ApplySimConfigJson(*simPatch, sc, e);
+      });
     } else if (arg == "--export-ppm") {
       std::string layerName;
       std::string outPath;
@@ -1506,6 +1844,7 @@ int main(int argc, char** argv)
     if (!checkTemplate(outJson, "--out")) return 2;
     if (!checkTemplate(outCsv, "--csv")) return 2;
     if (!checkTemplate(savePath, "--save")) return 2;
+    if (!checkTemplate(manifestPath, "--manifest")) return 2;
     if (!checkTemplate(tilesCsvPath, "--export-tiles-csv")) return 2;
     for (const auto& e : ppmExports) {
       if (!checkTemplate(e.path, "--export-ppm")) return 2;
@@ -1588,11 +1927,19 @@ int main(int argc, char** argv)
     ProcGenConfig runProcCfg = procCfg;
     SimConfig runSimCfg = simCfg;
 
+    std::vector<ArtifactEntry> artifacts;
+    artifacts.reserve(8);
+
     if (!loadPath.empty()) {
       std::string err;
       if (!LoadWorldBinary(world, runProcCfg, runSimCfg, loadPath, err)) {
         std::cerr << "Failed to load save: " << err << "\n";
         return 1;
+      }
+
+      // Re-apply CLI config overrides on top of the save's embedded configs.
+      for (const auto& op : configOps) {
+        op(runProcCfg, runSimCfg);
       }
     } else {
       world = GenerateWorld(w, h, requestedSeed, runProcCfg);
@@ -1614,6 +1961,7 @@ int main(int argc, char** argv)
       }
       csv << "day,population,money,housingCapacity,jobsCapacity,jobsCapacityAccessible,employed,happiness,roads,parks,avgCommuteTime,trafficCongestion,goodsDemand,goodsDelivered,goodsSatisfaction,avgLandValue,demandResidential\n";
       WriteCsvRow(csv, world.stats());
+      artifacts.push_back(ArtifactEntry{"csv", csvPath, ""});
     }
 
     for (int i = 0; i < days; ++i) {
@@ -1631,6 +1979,7 @@ int main(int argc, char** argv)
         std::cerr << "Failed to save world: " << err << "\n";
         return 1;
       }
+      artifacts.push_back(ArtifactEntry{"save", saveP, ""});
     }
 
     const std::string tilesP = expandPath(tilesCsvPath, runIdx, actualSeed);
@@ -1643,6 +1992,7 @@ int main(int argc, char** argv)
         std::cerr << "\n";
         return 1;
       }
+      artifacts.push_back(ArtifactEntry{"tiles_csv", tilesP, ""});
     }
 
     // Optional derived-map exports (images)
@@ -1720,6 +2070,7 @@ int main(int argc, char** argv)
           std::cerr << "Failed to write image (" << ExportLayerName(e.layer) << "): " << outP << " (" << err << ")\n";
           return 1;
         }
+        artifacts.push_back(ArtifactEntry{"export_ppm", outP, ExportLayerName(e.layer)});
       }
 
       for (const auto& e : isoExports) {
@@ -1741,6 +2092,7 @@ int main(int argc, char** argv)
           std::cerr << "Failed to write ISO image (" << ExportLayerName(e.layer) << "): " << outP << " (" << err << ")\n";
           return 1;
         }
+        artifacts.push_back(ArtifactEntry{"export_iso", outP, ExportLayerName(e.layer)});
       }
 
       for (const auto& e : render3dExports) {
@@ -1761,6 +2113,7 @@ int main(int argc, char** argv)
           std::cerr << "Failed to write 3D image (" << ExportLayerName(e.layer) << "): " << outP << " (" << err << ")\n";
           return 1;
         }
+        artifacts.push_back(ArtifactEntry{"export_3d", outP, ExportLayerName(e.layer)});
       }
     }
 
@@ -1769,6 +2122,37 @@ int main(int argc, char** argv)
     if (!WriteJsonSummary(world, hash, jsonP, runProcCfg, sim.config())) {
       std::cerr << "Failed to write JSON summary" << (jsonP.empty() ? "" : (": " + jsonP)) << "\n";
       return 1;
+    }
+
+    if (!jsonP.empty() && jsonP != "-") {
+      artifacts.push_back(ArtifactEntry{"summary_json", jsonP, ""});
+    }
+
+    // Close any open streams before computing manifest hashes.
+    if (csv) csv.close();
+
+    const std::string manifestP = expandPath(manifestPath, runIdx, actualSeed);
+    if (!manifestP.empty()) {
+      if (manifestP != "-") ensureParentDir(manifestP);
+      std::string err;
+      if (!WriteRunManifestJson(manifestP,
+                                runIdx,
+                                requestedSeed,
+                                actualSeed,
+                                world.width(),
+                                world.height(),
+                                days,
+                                hash,
+                                loadPath,
+                                argvList,
+                                runProcCfg,
+                                sim.config(),
+                                artifacts,
+                                err)) {
+        std::cerr << "Failed to write manifest" << (manifestP.empty() ? "" : (": " + manifestP))
+                  << (err.empty() ? "" : (" (" + err + ")")) << "\n";
+        return 1;
+      }
     }
 
     return 0;
