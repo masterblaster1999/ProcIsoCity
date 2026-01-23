@@ -442,6 +442,8 @@ bool WriteStats(JsonWriter& w, const Stats& s, std::string& outError)
 
   // Demand / valuation
   if (!w.key("demand_residential") || !w.numberValue(s.demandResidential)) { outError = w.error(); return false; }
+  if (!w.key("demand_commercial") || !w.numberValue(s.demandCommercial)) { outError = w.error(); return false; }
+  if (!w.key("demand_industrial") || !w.numberValue(s.demandIndustrial)) { outError = w.error(); return false; }
   if (!w.key("avg_land_value") || !w.numberValue(s.avgLandValue)) { outError = w.error(); return false; }
 
   if (!w.endObject()) {
@@ -641,6 +643,21 @@ bool ReadStats(const JsonValue& obj, Stats& outStats, std::string& outError)
     double n = 0.0;
     if (!GetRequiredNumber(obj, "demand_residential", n, err)) { outError = err; return false; }
     s.demandResidential = static_cast<float>(n);
+
+    // Optional newer fields (back-compat for old JSON patches).
+    const JsonValue* dc = FindJsonMember(obj, "demand_commercial");
+    if (dc && dc->isNumber()) {
+      s.demandCommercial = static_cast<float>(dc->numberValue);
+    } else {
+      s.demandCommercial = 0.0f;
+    }
+    const JsonValue* di = FindJsonMember(obj, "demand_industrial");
+    if (di && di->isNumber()) {
+      s.demandIndustrial = static_cast<float>(di->numberValue);
+    } else {
+      s.demandIndustrial = 0.0f;
+    }
+
     if (!GetRequiredNumber(obj, "avg_land_value", n, err)) { outError = err; return false; }
     s.avgLandValue = static_cast<float>(n);
   }

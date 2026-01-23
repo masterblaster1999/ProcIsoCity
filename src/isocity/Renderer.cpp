@@ -4488,6 +4488,7 @@ void Renderer::unloadBuildingSprites()
       for (auto& s : v) {
         if (s.color.id != 0) UnloadTexture(s.color);
         if (s.emissive.id != 0) UnloadTexture(s.emissive);
+        if (s.shadow.id != 0) UnloadTexture(s.shadow);
         s = BuildingSprite{};
       }
       v.clear();
@@ -4635,6 +4636,98 @@ void Renderer::rebuildBuildingSprites()
     return t;
   };
 
+  const int halfH = std::max(1, cfg.tileH / 2);
+
+  // Generate a soft ground shadow mask from the building sprite alpha by projecting pixels downwards
+  // along a fixed sun direction. This is a cheap "contact + cast shadow" that helps buildings sit
+  // on the ground without requiring any additional art assets.
+  auto makeShadow = [&](const RgbaImage& src, int pivotY) -> RgbaImage {
+    RgbaImage sh{};
+    sh.width = src.width;
+    sh.height = src.height;
+    if (src.width <= 0 || src.height <= 0) return sh;
+    if (src.rgba.empty()) return sh;
+
+    const int w = src.width;
+    const int h = src.height;
+    const int groundTopY = pivotY - halfH;
+
+    std::vector<unsigned char> a0(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), 0u);
+
+    // Shadow projection tuning. Direction is "down-right" in screen space (sun from top-left).
+    const float dirX = 0.92f;
+    const float dirY = 0.46f;
+    const float cast = 0.24f; // pixels per unit height
+
+    auto alphaAt = [&](int x, int y) -> unsigned char {
+      const std::size_t idx = (static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x)) * 4u;
+      return src.rgba[idx + 3u];
+    };
+
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) {
+        const unsigned char a = alphaAt(x, y);
+        if (a < 120) continue; // ignore faint/translucent pixels (windows)
+        const int dh = pivotY - y;
+        if (dh <= 0) continue;
+
+        const int sx = static_cast<int>(std::lround(static_cast<float>(x) + dirX * cast * static_cast<float>(dh)));
+        const int sy = static_cast<int>(std::lround(static_cast<float>(y) + dirY * cast * static_cast<float>(dh)));
+
+        if (sx < 0 || sy < 0 || sx >= w || sy >= h) continue;
+        if (sy < groundTopY) continue; // keep shadows on/under the ground plane
+
+        const unsigned char aa = ClampU8(static_cast<int>(std::lround(static_cast<float>(a) * 0.55f)));
+        const std::size_t si = static_cast<std::size_t>(sy) * static_cast<std::size_t>(w) + static_cast<std::size_t>(sx);
+        if (aa > a0[si]) a0[si] = aa;
+      }
+    }
+
+    // Separable box blur (radius 2) to avoid harsh jaggies.
+    std::vector<unsigned char> a1(a0.size(), 0u);
+    constexpr int r = 2;
+
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) {
+        int sum = 0;
+        int cnt = 0;
+        const int x0 = std::max(0, x - r);
+        const int x1 = std::min(w - 1, x + r);
+        for (int xx = x0; xx <= x1; ++xx) {
+          sum += static_cast<int>(a0[static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(xx)]);
+          ++cnt;
+        }
+        a1[static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x)] =
+          static_cast<unsigned char>(sum / std::max(1, cnt));
+      }
+    }
+
+    for (int x = 0; x < w; ++x) {
+      for (int y = 0; y < h; ++y) {
+        int sum = 0;
+        int cnt = 0;
+        const int y0 = std::max(0, y - r);
+        const int y1 = std::min(h - 1, y + r);
+        for (int yy = y0; yy <= y1; ++yy) {
+          sum += static_cast<int>(a1[static_cast<std::size_t>(yy) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x)]);
+          ++cnt;
+        }
+        a0[static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x)] =
+          static_cast<unsigned char>(sum / std::max(1, cnt));
+      }
+    }
+
+    sh.rgba.assign(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4u, 0u);
+    for (std::size_t p = 0; p < a0.size(); ++p) {
+      sh.rgba[p * 4u + 0u] = 0u;
+      sh.rgba[p * 4u + 1u] = 0u;
+      sh.rgba[p * 4u + 2u] = 0u;
+      sh.rgba[p * 4u + 3u] = a0[p];
+    }
+
+    return sh;
+  };
+
   auto buildLevel = [&](GfxBuildingKind kind, int lvl, int want, std::vector<BuildingSprite>& out) {
     std::string err;
     for (int variant = 0; variant < want; ++variant) {
@@ -4651,11 +4744,18 @@ void Renderer::rebuildBuildingSprites()
         if (bs.emissive.id != 0) UnloadTexture(bs.emissive);
         continue;
       }
+
+      const RgbaImage sh = makeShadow(spr.color, spr.pivotY);
+      bs.shadow = loadTex(sh);
+
       out.push_back(bs);
     }
   };
 
-  constexpr int kWantPerLevel = 10;
+  // Keep a small bank of variants per building level, but group them into a few
+  // "style families" so districts / neighborhoods can look more coherent.
+  constexpr int kVariantsPerFamily = 3;
+  constexpr int kWantPerLevel = (kGfxBuildingVariantFamilies * kVariantsPerFamily);
 
   for (int lvl = 1; lvl <= 3; ++lvl) {
     buildLevel(GfxBuildingKind::Residential, lvl, kWantPerLevel, m_buildingResidential[static_cast<std::size_t>(lvl - 1)]);
@@ -7618,7 +7718,7 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
   const bool wantBuildingEmissive =
     drawZoneBuildingSprites && m_dayNight.enabled && m_dayNight.drawLights && dayNight.nightLights > 0.01f;
 
-  auto pickBuildingSprite = [&](Overlay ov, int lvl, std::uint32_t style) -> const BuildingSprite* {
+  auto pickBuildingSprite = [&](Overlay ov, int lvl, int x, int y, std::uint8_t district, std::uint32_t style) -> const BuildingSprite* {
     const int li = std::clamp(lvl, 1, 3) - 1;
     const std::array<std::vector<BuildingSprite>, 3>* levels = nullptr;
     switch (ov) {
@@ -7634,10 +7734,40 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
     default:
       return nullptr;
     }
+
     const auto& v = (*levels)[static_cast<std::size_t>(li)];
     if (v.empty()) return nullptr;
-    const std::size_t idx = static_cast<std::size_t>(style % static_cast<std::uint32_t>(v.size()));
-    return &v[idx];
+
+    // Variants are grouped into a few "style families"; bias family selection to stay coherent
+    // within explicit districts, otherwise fall back to coarse neighborhoods.
+    const std::uint32_t famCountU = static_cast<std::uint32_t>(std::max(1, kGfxBuildingVariantFamilies));
+    std::uint32_t family = 0u;
+    if (famCountU > 1u && static_cast<std::uint32_t>(v.size()) >= famCountU) {
+      if (district != 0u) {
+        family = HashCoords32(static_cast<int>(district), static_cast<int>(ov), m_gfxSeed32 ^ 0xD15TR1C7u) % famCountU;
+      } else {
+        const int nx = x >> 4;
+        const int ny = y >> 4;
+        family = HashCoords32(nx, ny, m_gfxSeed32 ^ 0xD15TR1C7u ^ (static_cast<std::uint32_t>(ov) * 0x9E3779B9u)) % famCountU;
+      }
+    }
+
+    const std::uint32_t n = static_cast<std::uint32_t>(v.size());
+    // Partition indices into famCount buckets with ~equal sizes.
+    const std::uint32_t base = n / famCountU;
+    const std::uint32_t rem = n % famCountU;
+    const std::uint32_t start = family * base + std::min(family, rem);
+    const std::uint32_t size = base + (family < rem ? 1u : 0u);
+
+    std::uint32_t idxU = 0u;
+    if (size == 0u) {
+      idxU = (n > 0u) ? (style % n) : 0u;
+    } else {
+      idxU = start + (style % size);
+      if (idxU >= n) idxU = idxU % n;
+    }
+
+    return &v[static_cast<std::size_t>(idxU)];
   };
 
   auto drawZoneBuildingSprite = [&](const Tile& t, int x, int y, int sum, Vector2 center, float brightness) -> bool {
@@ -7648,10 +7778,19 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
     const std::uint32_t style =
       HashCoords32(x, y, m_gfxSeed32 ^ 0xB1D1B00Du ^ (static_cast<std::uint32_t>(t.variation) * 0x9E3779B9u));
 
-    const BuildingSprite* bs = pickBuildingSprite(t.overlay, lvl, style);
+    const BuildingSprite* bs = pickBuildingSprite(t.overlay, lvl, x, y, t.district, style);
     if (!bs || bs->color.id == 0) return false;
 
     const Vector2 topLeft{center.x - static_cast<float>(bs->pivotX), center.y - static_cast<float>(bs->pivotY)};
+
+    if (bs->shadow.id != 0) {
+      const float sun = std::clamp(dayNight.day, 0.0f, 1.0f);
+      const float over = std::clamp(weather.overcast, 0.0f, 1.0f);
+      const float strength = sun * (1.0f - 0.85f * over) * std::clamp(0.35f + 0.65f * brightness, 0.0f, 1.0f);
+      const unsigned char a = ClampU8(static_cast<int>(170.0f * strength));
+      if (a != 0) DrawTextureV(bs->shadow, topLeft, Color{255, 255, 255, a});
+    }
+
     DrawTextureV(bs->color, topLeft, BrightnessTint(brightness));
 
     if (wantBuildingEmissive && bs->emissive.id != 0) {
@@ -8726,7 +8865,10 @@ void Renderer::drawHUD(const World& world, const Camera2D& camera, Tool tool, in
   }
 
   {
-    std::snprintf(buf, sizeof(buf), "Demand: %.0f%%  Land: %.0f%%  Tax/cap: %.2f", static_cast<double>(s.demandResidential * 100.0f),
+    std::snprintf(buf, sizeof(buf), "Demand R/C/I: %.0f%%/%.0f%%/%.0f%%  Land: %.0f%%  Tax/cap: %.2f",
+                  static_cast<double>(s.demandResidential * 100.0f),
+                  static_cast<double>(s.demandCommercial * 100.0f),
+                  static_cast<double>(s.demandIndustrial * 100.0f),
                   static_cast<double>(s.avgLandValue * 100.0f), static_cast<double>(s.avgTaxPerCapita));
     line(buf);
   }
@@ -8891,7 +9033,7 @@ void Renderer::drawHUD(const World& world, const Camera2D& camera, Tool tool, in
         if (tipR.height > 12.0f) {
           ui::TextBox(
             tipR, 14,
-            "More: F4 console | F5 save/menu | M minimap | L heatmap | F1 report | F2 cache | Ctrl+F2 lab | F3 model | Shift+F3 weather | F11 fullscreen. "
+            "More: F4 console | F5 save/menu | M minimap | L heatmap | F1 report | Ctrl+N news | Ctrl+X services | F2 cache | Ctrl+F2 lab | F3 model | Shift+F3 weather | F11 fullscreen. "
             "Tip: re-place a zone to upgrade. Road: U selects class (paint to upgrade), Shift+drag builds path. Terraform: Shift=strong, Ctrl=fine. "
             "District: Alt+click pick, Shift+click fill.",
             uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1, /*wrap=*/true, /*clip=*/true);

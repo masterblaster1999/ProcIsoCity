@@ -4,6 +4,7 @@
 #include "isocity/World.hpp"
 
 #include <cstdint>
+#include <atomic>
 #include <limits>
 #include <string>
 #include <vector>
@@ -174,6 +175,21 @@ struct PolicyOptimizationResult {
   std::vector<PolicyDistribution> distByIteration;
 };
 
+
+// Optional progress reporting for long-running optimization calls.
+//
+// When non-null, OptimizePolicies() will update these atomics as it evaluates candidates.
+// The intent is for interactive UIs to display approximate progress without needing
+// a heavy callback or logging system.
+struct PolicyOptProgress {
+  std::atomic<int> iterationsTotal{0};      // total planned iterations (1 for exhaustive)
+  std::atomic<int> iterationsCompleted{0};  // completed iterations
+  std::atomic<int> candidatesEvaluated{0};  // total candidates evaluated so far
+  std::atomic<bool> exhaustive{false};      // true when methodUsed==Exhaustive
+  std::atomic<bool> done{false};            // set to true when the call returns
+};
+
+
 // Extract the editable policy subset from a SimConfig.
 PolicyCandidate ExtractPolicyFromSimConfig(const SimConfig& cfg);
 
@@ -186,6 +202,6 @@ PolicyEvalResult EvaluatePolicyCandidate(const World& baseWorld, const SimConfig
 
 // Optimize policy parameters over the given search space.
 PolicyOptimizationResult OptimizePolicies(const World& baseWorld, const SimConfig& baseSimCfg, const PolicySearchSpace& space,
-                                         const PolicyOptimizerConfig& cfg);
+                                         const PolicyOptimizerConfig& cfg, PolicyOptProgress* progress = nullptr);
 
 } // namespace isocity

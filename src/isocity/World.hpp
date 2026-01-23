@@ -187,6 +187,8 @@ struct Stats {
 
   // --- Derived demand / valuation metrics (not persisted in saves) ---
   float demandResidential = 0.0f; // 0..1 (global)
+  float demandCommercial = 0.0f;  // 0..1 (global)
+  float demandIndustrial = 0.0f;  // 0..1 (global)
   float avgLandValue = 0.0f;      // mean land value across non-water tiles
 };
 

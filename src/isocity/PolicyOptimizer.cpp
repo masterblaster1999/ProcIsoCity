@@ -361,15 +361,30 @@ PolicyEvalResult EvaluatePolicyCandidate(const World& baseWorld, const SimConfig
 }
 
 PolicyOptimizationResult OptimizePolicies(const World& baseWorld, const SimConfig& baseSimCfg, const PolicySearchSpace& space,
-                                         const PolicyOptimizerConfig& cfg)
+                                         const PolicyOptimizerConfig& cfg, PolicyOptProgress* progress)
 {
   PolicyOptimizationResult out;
+
+
+if (progress) {
+  progress->iterationsTotal.store(0);
+  progress->iterationsCompleted.store(0);
+  progress->candidatesEvaluated.store(0);
+  progress->exhaustive.store(false);
+  progress->done.store(false);
+}
 
   const std::uint64_t total = CountCandidates(space);
 
   const bool canExhaustive = (total > 0 && total <= cfg.maxExhaustiveCandidates);
   const PolicyOptMethod method = (cfg.method == PolicyOptMethod::Exhaustive || canExhaustive) ? PolicyOptMethod::Exhaustive : cfg.method;
   out.methodUsed = method;
+
+
+if (progress) {
+  progress->exhaustive.store(method == PolicyOptMethod::Exhaustive);
+  progress->iterationsTotal.store((method == PolicyOptMethod::Exhaustive) ? 1 : std::max(1, cfg.iterations));
+}
 
   std::unordered_map<std::uint64_t, PolicyEvalResult> cache;
   cache.reserve(2048);
@@ -397,6 +412,7 @@ PolicyOptimizationResult OptimizePolicies(const World& baseWorld, const SimConfi
 
               PolicyEvalResult r = EvaluateWithCache(baseWorld, baseSimCfg, cand, cfg, cache, cacheMutex);
               out.candidatesEvaluated++;
+              if (progress) progress->candidatesEvaluated.store(out.candidatesEvaluated);
 
               if (Better(r, best)) best = r;
               InsertTopK(top, r, cfg.topK);
@@ -410,6 +426,10 @@ PolicyOptimizationResult OptimizePolicies(const World& baseWorld, const SimConfi
     out.top = std::move(top);
     out.iterationsCompleted = 1;
     out.bestByIteration.push_back(best);
+    if (progress) {
+      progress->iterationsCompleted.store(1);
+      progress->done.store(true);
+    }
     return out;
   }
 
@@ -457,10 +477,15 @@ PolicyOptimizationResult OptimizePolicies(const World& baseWorld, const SimConfi
     out.bestByIteration.push_back(best);
     out.distByIteration.push_back(dist);
     out.iterationsCompleted = it + 1;
+    if (progress) {
+      progress->iterationsCompleted.store(out.iterationsCompleted);
+      progress->candidatesEvaluated.store(out.candidatesEvaluated);
+    }
   }
 
   out.best = best;
   out.top = std::move(top);
+  if (progress) progress->done.store(true);
   return out;
 }
 

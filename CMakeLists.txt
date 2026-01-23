@@ -111,10 +111,14 @@ add_library(isocity_core
   src/isocity/ServiceOptimizer.cpp
   src/isocity/FlowField.cpp
   src/isocity/Traffic.cpp
+  src/isocity/NoisePollution.cpp
+  src/isocity/HeatIsland.cpp
+  src/isocity/FireRisk.cpp
   src/isocity/Goods.cpp
   src/isocity/TradeMarket.cpp
   src/isocity/ParkOptimizer.cpp
   src/isocity/LandValue.cpp
+  src/isocity/LandUseMix.cpp
   src/isocity/DistrictStats.cpp
   src/isocity/ZoneAccess.cpp
   src/isocity/SaveLoad.cpp

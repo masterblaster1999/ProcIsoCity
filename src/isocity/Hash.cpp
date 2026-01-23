@@ -149,6 +149,8 @@ std::uint64_t HashStats(const Stats& s)
 
   // Demand/valuation.
   HashF32(h, s.demandResidential);
+  HashF32(h, s.demandCommercial);
+  HashF32(h, s.demandIndustrial);
   HashF32(h, s.avgLandValue);
 
   return h;

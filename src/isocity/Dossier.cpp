@@ -7,6 +7,10 @@
 #include "isocity/Hash.hpp"
 #include "isocity/Json.hpp"
 #include "isocity/LandValue.hpp"
+#include "isocity/LandUseMix.hpp"
+#include "isocity/NoisePollution.hpp"
+#include "isocity/HeatIsland.hpp"
+#include "isocity/FireRisk.hpp"
 #include "isocity/Pathfinding.hpp"
 #include "isocity/SaveLoad.hpp"
 #include "isocity/Traffic.hpp"
@@ -167,7 +171,7 @@ void BuildHeightFieldAndDrainMask(const World& world, std::vector<float>& height
 
 bool WriteCsvHeader(std::ostream& os)
 {
-  os << "day,population,money,housingCapacity,jobsCapacity,jobsCapacityAccessible,employed,happiness,roads,parks,avgCommuteTime,trafficCongestion,goodsDemand,goodsDelivered,goodsSatisfaction,avgLandValue,demandResidential\n";
+  os << "day,population,money,housingCapacity,jobsCapacity,jobsCapacityAccessible,employed,happiness,roads,parks,avgCommuteTime,trafficCongestion,goodsDemand,goodsDelivered,goodsSatisfaction,avgLandValue,demandResidential,demandCommercial,demandIndustrial\n";
   return static_cast<bool>(os);
 }
 
@@ -189,7 +193,9 @@ bool WriteCsvRow(std::ostream& os, const Stats& s)
      << s.goodsDelivered << ','
      << s.goodsSatisfaction << ','
      << s.avgLandValue << ','
-     << s.demandResidential
+     << s.demandResidential << ','
+     << s.demandCommercial << ','
+     << s.demandIndustrial
      << '\n';
   return static_cast<bool>(os);
 }
@@ -257,6 +263,8 @@ bool WriteSummaryJson(const std::filesystem::path& outPath, const World& world,
       add(st, "goodsSatisfaction", JsonValue::MakeNumber(static_cast<double>(s.goodsSatisfaction)));
       add(st, "avgLandValue", JsonValue::MakeNumber(static_cast<double>(s.avgLandValue)));
       add(st, "demandResidential", JsonValue::MakeNumber(static_cast<double>(s.demandResidential)));
+      add(st, "demandCommercial", JsonValue::MakeNumber(static_cast<double>(s.demandCommercial)));
+      add(st, "demandIndustrial", JsonValue::MakeNumber(static_cast<double>(s.demandIndustrial)));
       arr.arrayValue.push_back(std::move(st));
     }
     add(root, "ticks", std::move(arr));
@@ -454,7 +462,7 @@ layerSel.addEventListener('change', () => {
 });
 
 // --- Tile metrics ---
-let metrics = null; // {terrain,overlay,level,district,height,occupants,land_value,commute_traffic,goods_fill,flood_depth,ponding_depth}
+let metrics = null; // {terrain,overlay,level,district,height,occupants,land_value,commute_traffic,goods_fill,flood_depth,ponding_depth,heat_island,heat_island_raw,fire_risk,fire_coverage,fire_response_cost}
 
 function parseCsv(text) {
   const lines = text.split(/\r?\n/).filter(l => l.length > 0);
@@ -477,6 +485,11 @@ function parseCsv(text) {
     goods_fill: idx('goods_fill'),
     flood_depth: idx('flood_depth'),
     ponding_depth: idx('ponding_depth'),
+    heat_island: idx('heat_island'),
+    heat_island_raw: idx('heat_island_raw'),
+    fire_risk: idx('fire_risk'),
+    fire_coverage: idx('fire_coverage'),
+    fire_response_cost: idx('fire_response_cost'),
   };
 
   const n = MAP_W * MAP_H;
@@ -492,12 +505,22 @@ function parseCsv(text) {
     goods_fill: new Int32Array(n),
     flood_depth: new Float32Array(n),
     ponding_depth: new Float32Array(n),
+    heat_island: new Float32Array(n),
+    heat_island_raw: new Float32Array(n),
+    fire_risk: new Float32Array(n),
+    fire_coverage: new Float32Array(n),
+    fire_response_cost: new Int32Array(n),
   };
 
   // Initialize optional numeric channels to NaN so we can detect missing.
   out.land_value.fill(NaN);
   out.flood_depth.fill(NaN);
   out.ponding_depth.fill(NaN);
+  out.heat_island.fill(NaN);
+  out.heat_island_raw.fill(NaN);
+  out.fire_risk.fill(NaN);
+  out.fire_coverage.fill(NaN);
+  out.fire_response_cost.fill(-1);
 
   for (let li = 1; li < lines.length; ++li) {
     const parts = lines[li].split(',');
@@ -520,6 +543,11 @@ function parseCsv(text) {
     if (take.goods_fill >= 0) out.goods_fill[i] = parseInt(parts[take.goods_fill], 10) || 0;
     if (take.flood_depth >= 0) out.flood_depth[i] = parseFloat(parts[take.flood_depth]);
     if (take.ponding_depth >= 0) out.ponding_depth[i] = parseFloat(parts[take.ponding_depth]);
+    if (take.heat_island >= 0) out.heat_island[i] = parseFloat(parts[take.heat_island]);
+    if (take.heat_island_raw >= 0) out.heat_island_raw[i] = parseFloat(parts[take.heat_island_raw]);
+    if (take.fire_risk >= 0) out.fire_risk[i] = parseFloat(parts[take.fire_risk]);
+    if (take.fire_coverage >= 0) out.fire_coverage[i] = parseFloat(parts[take.fire_coverage]);
+    if (take.fire_response_cost >= 0) out.fire_response_cost[i] = parseInt(parts[take.fire_response_cost], 10) || -1;
   }
 
   return out;
@@ -577,6 +605,11 @@ function updateHover(ev) {
     const lv = metrics.land_value[i];
     const fd = metrics.flood_depth[i];
     const pd = metrics.ponding_depth[i];
+    const hi = metrics.heat_island[i];
+    const hir = metrics.heat_island_raw[i];
+    const fr = metrics.fire_risk[i];
+    const fc = metrics.fire_coverage[i];
+    const frc = metrics.fire_response_cost[i];
 
     const parts = [];
     parts.push(' terrain=' + metrics.terrain[i]);
@@ -591,6 +624,11 @@ function updateHover(ev) {
     parts.push(' goodsFill=' + metrics.goods_fill[i]);
     if (!Number.isNaN(fd)) parts.push(' flood=' + fd.toFixed(3));
     if (!Number.isNaN(pd)) parts.push(' pond=' + pd.toFixed(3));
+    if (!Number.isNaN(hi)) parts.push(' heat=' + hi.toFixed(3));
+    if (!Number.isNaN(hir)) parts.push(' heatRaw=' + hir.toFixed(3));
+    if (!Number.isNaN(fr)) parts.push(' fireRisk=' + fr.toFixed(3));
+    if (!Number.isNaN(fc)) parts.push(' fireCov=' + fc.toFixed(3));
+    if (frc >= 0) parts.push(' fireResp=' + (frc / 1000.0).toFixed(1));
 
     tileInfo.textContent = parts.join('');
   } else {
@@ -762,10 +800,34 @@ bool WriteCityDossier(World& world,
   // tile_metrics.csv
   if (cfg.writeTileMetricsCsv) {
     if (!beginStage("write_tile_metrics_csv")) return cancel();
+
+    // Derived soundscape/noise field.
+    NoiseConfig nc{};
+    const NoiseResult noiseRes = ComputeNoisePollution(world, nc, &trafficRes, &goodsRes);
+
+    // Local land-use mix / diversity.
+    LandUseMixConfig lmc{};
+    const LandUseMixResult landUseMixRes = ComputeLandUseMix(world, lmc);
+
+    // Heuristic urban heat island.
+    HeatIslandConfig hic{};
+    const HeatIslandResult heatIslandRes = ComputeHeatIsland(world, hic, &trafficRes, &goodsRes);
+
+    // SimCity-style fire risk (density + fire station response coverage).
+    FireRiskConfig frc{};
+    frc.requireOutsideConnection = true;
+    frc.weightMode = IsochroneWeightMode::TravelTime;
+    frc.responseRadiusSteps = 18;
+    const FireRiskResult fireRiskRes = ComputeFireRisk(world, frc);
+
     TileMetricsCsvInputs inputs;
     inputs.landValue = &landValueRes;
     inputs.traffic = &trafficRes;
     inputs.goods = &goodsRes;
+    inputs.noise = &noiseRes;
+    inputs.landUseMix = &landUseMixRes;
+    inputs.heatIsland = &heatIslandRes;
+    inputs.fireRisk = &fireRiskRes;
     inputs.seaFlood = &seaFlood;
     inputs.ponding = &ponding;
 
@@ -774,6 +836,9 @@ bool WriteCityDossier(World& world,
     opt.includeLandValueComponents = true;
     opt.includeTraffic = true;
     opt.includeGoods = true;
+    opt.includeNoise = true;
+    opt.includeLandUseMix = true;
+    opt.includeHeatIsland = true;
     opt.includeFlood = true;
     opt.includePonding = true;
     opt.floatPrecision = 6;

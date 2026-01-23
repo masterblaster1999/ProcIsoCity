@@ -49,6 +49,62 @@ float ResidentialDemand(float jobPressure, float happiness, float avgLandValue)
   return Clamp01(d);
 }
 
+float CommercialDemand(int population, int jobsCommercialAccessible, float goodsSatisfaction,
+                       float happiness, float avgLandValue, int taxCommercial)
+{
+  if (population <= 0) return 0.0f;
+
+  // A lightweight SimCity-ish meter: commercial demand rises when population outgrows
+  // accessible commercial job capacity, and falls when oversupplied.
+  const float pop = static_cast<float>(population);
+
+  // Rough target: ~0.28 service jobs per resident.
+  const float desired = std::max(6.0f, pop * 0.28f);
+  const float gap = (desired - static_cast<float>(std::max(0, jobsCommercialAccessible))) / desired; // [-inf..1]
+  const float shortage = Clamp01(gap);
+  const float oversupply = Clamp01(-gap);
+
+  const float sizeFactor = Clamp01(pop / 140.0f);
+  const float goodsFactor = Clamp01(0.35f + 0.65f * goodsSatisfaction);
+  const float happyFactor = Clamp01(0.55f + 0.45f * happiness);
+  const float lvFactor = Clamp01(0.60f + 0.40f * avgLandValue);
+  const float taxFactor = Clamp01(1.05f - 0.06f * static_cast<float>(std::max(0, taxCommercial)));
+
+  float d = 0.08f + 0.72f * shortage - 0.55f * oversupply + 0.20f * sizeFactor;
+  d *= goodsFactor * happyFactor * lvFactor * taxFactor;
+  return Clamp01(d);
+}
+
+float IndustrialDemand(float jobPressure, int population, int jobsIndustrialAccessible,
+                       float goodsSatisfaction, float tradeMarketIndex,
+                       float happiness, float avgLandValue, int taxIndustrial)
+{
+  // Industrial demand is a blend of:
+  //  - job shortfall (need more employment capacity)
+  //  - goods shortfall (need more production/logistics)
+  //  - trade/market strength (export demand)
+  // and is tempered by land value (industry prefers cheaper land) and tax.
+
+  const float jobsNeed = Clamp01(1.0f - std::min(1.0f, jobPressure));
+  const float goodsNeed = Clamp01(1.0f - goodsSatisfaction);
+
+  // If we already have lots of industrial capacity relative to population, dampen.
+  const float pop = static_cast<float>(std::max(0, population));
+  const float desired = std::max(6.0f, pop * 0.22f);
+  const float gap = (desired - static_cast<float>(std::max(0, jobsIndustrialAccessible))) / desired;
+  const float shortage = Clamp01(gap);
+  const float oversupply = Clamp01(-gap);
+
+  const float happyFactor = Clamp01(0.55f + 0.45f * happiness);
+  const float lvFactor = Clamp01(0.75f + 0.35f * (0.55f - avgLandValue));
+  const float taxFactor = Clamp01(1.05f - 0.06f * static_cast<float>(std::max(0, taxIndustrial)));
+  const float tradeFactor = Clamp01(0.70f + 0.30f * std::clamp(tradeMarketIndex, 0.0f, 2.0f));
+
+  float d = 0.06f + 0.55f * jobsNeed + 0.35f * goodsNeed + 0.20f * shortage - 0.45f * oversupply;
+  d *= happyFactor * lvFactor * taxFactor * tradeFactor;
+  return Clamp01(d);
+}
+
 float AvgLandValueNonWater(const World& world, const LandValueResult& lv)
 {
   const int w = world.width();
@@ -336,12 +392,17 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
   // Otherwise the sim can incorrectly show "employment" (and income) even when all jobs
   // are on disconnected road components.
   int jobsCapAccessible = 0;
+  int jobsCapCommercialAccessible = 0;
+  int jobsCapIndustrialAccessible = 0;
   for (int y = 0; y < world.height(); ++y) {
     for (int x = 0; x < world.width(); ++x) {
       const Tile& t = world.at(x, y);
       if (t.overlay != Overlay::Commercial && t.overlay != Overlay::Industrial) continue;
       if (!HasZoneAccess(*zoneAccess, x, y)) continue;
-      jobsCapAccessible += JobsForTile(t);
+      const int cap = JobsForTile(t);
+      jobsCapAccessible += cap;
+      if (t.overlay == Overlay::Commercial) jobsCapCommercialAccessible += cap;
+      else if (t.overlay == Overlay::Industrial) jobsCapIndustrialAccessible += cap;
     }
   }
 
@@ -996,6 +1057,11 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
                                 : 0.0f;
   s.demandResidential = ResidentialDemand(jobPressure, s.happiness, s.avgLandValue);
 
+  s.demandCommercial = CommercialDemand(scan.population, jobsCapCommercialAccessible, goods.satisfaction,
+                                        s.happiness, s.avgLandValue, m_cfg.taxCommercial);
+  s.demandIndustrial = IndustrialDemand(jobPressure, scan.population, jobsCapIndustrialAccessible, goods.satisfaction,
+                                        s.tradeMarketIndex, s.happiness, s.avgLandValue, m_cfg.taxIndustrial);
+
   s.population = scan.population;
   s.housingCapacity = scan.housingCap;
   s.jobsCapacity = scan.jobsCap;
@@ -1050,9 +1116,15 @@ void Simulator::step(World& world)
       const int cap = (t.overlay == Overlay::Residential) ? HousingForLevel(t.level) : JobsForTile(t);
       const float occFrac = (cap > 0) ? (static_cast<float>(t.occupants) / static_cast<float>(cap)) : 0.0f;
 
+      float zoneDemand = 0.0f;
+      if (t.overlay == Overlay::Residential) zoneDemand = s.demandResidential;
+      else if (t.overlay == Overlay::Commercial) zoneDemand = s.demandCommercial;
+      else if (t.overlay == Overlay::Industrial) zoneDemand = s.demandIndustrial;
+
       // Upgrade: happy + high land value + mostly full.
-      if (t.level < 3 && s.happiness > 0.58f && lvVal > 0.45f && occFrac > 0.70f && s.money > 80) {
-        const float p = 0.0010f + 0.0040f * s.happiness * (0.6f + 0.4f * lvVal) * occFrac;
+      if (t.level < 3 && s.happiness > 0.58f && lvVal > 0.45f && occFrac > 0.70f && s.money > 80 && zoneDemand > 0.45f) {
+        const float demandBoost = 0.55f + 0.90f * zoneDemand;
+        const float p = (0.0010f + 0.0040f * s.happiness * (0.6f + 0.4f * lvVal) * occFrac) * demandBoost;
         if (rng.chance(p)) {
           t.level++;
           // Some disruption during construction.
@@ -1062,8 +1134,10 @@ void Simulator::step(World& world)
       }
 
       // Downgrade: unhappy + low land value + mostly empty.
-      if (t.level > 1 && s.happiness < 0.42f && lvVal < 0.25f && occFrac < 0.35f) {
-        const float p = 0.0008f + 0.0030f * (0.42f - s.happiness) * (0.25f - lvVal) * (1.0f - occFrac);
+      if (t.level > 1 && (s.happiness < 0.42f || zoneDemand < 0.22f) && lvVal < 0.25f && occFrac < 0.35f) {
+        const float demandPress = Clamp01(0.30f - zoneDemand);
+        const float p = 0.0008f + 0.0030f * (0.42f - s.happiness) * (0.25f - lvVal) * (1.0f - occFrac) +
+                        0.0022f * demandPress * (0.8f + 0.2f * (0.35f - occFrac));
         if (rng.chance(p)) {
           t.level--;
           const int newCap = (t.overlay == Overlay::Residential) ? HousingForLevel(t.level) : JobsForTile(t);

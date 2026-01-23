@@ -403,7 +403,8 @@ void PrintHelp()
       << "                 [--export-tiles-csv <tiles.csv>]\n"
       << "                 [--batch <N>]\n\n"
       << "Export layers (for --export-ppm / --export-iso / --export-3d):\n"
-      << "  terrain overlay height landvalue traffic goods_traffic goods_fill district\n\n"
+      << "  terrain overlay height landvalue traffic goods_traffic goods_fill district"
+         " flood_depth ponding_depth services services_education services_health services_safety noise landuse_mix\n\n"
       << "Batch mode:\n"
       << "  - --batch N>1 runs N simulations with seeds (seed, seed+1, ...).\n"
       << "  - To write per-run files, include {seed} or {run} in any output path.\n"
@@ -2002,18 +2003,18 @@ int main(int argc, char** argv)
       bool needLandValue = false;
 
       for (const auto& e : ppmExports) {
-        if (e.layer == ExportLayer::Traffic) needTraffic = true;
-        if (e.layer == ExportLayer::GoodsTraffic || e.layer == ExportLayer::GoodsFill) needGoods = true;
+        if (e.layer == ExportLayer::Traffic || e.layer == ExportLayer::Noise) needTraffic = true;
+        if (e.layer == ExportLayer::GoodsTraffic || e.layer == ExportLayer::GoodsFill || e.layer == ExportLayer::Noise) needGoods = true;
         if (e.layer == ExportLayer::LandValue) needLandValue = true;
       }
       for (const auto& e : isoExports) {
-        if (e.layer == ExportLayer::Traffic) needTraffic = true;
-        if (e.layer == ExportLayer::GoodsTraffic || e.layer == ExportLayer::GoodsFill) needGoods = true;
+        if (e.layer == ExportLayer::Traffic || e.layer == ExportLayer::Noise) needTraffic = true;
+        if (e.layer == ExportLayer::GoodsTraffic || e.layer == ExportLayer::GoodsFill || e.layer == ExportLayer::Noise) needGoods = true;
         if (e.layer == ExportLayer::LandValue) needLandValue = true;
       }
       for (const auto& e : render3dExports) {
-        if (e.layer == ExportLayer::Traffic) needTraffic = true;
-        if (e.layer == ExportLayer::GoodsTraffic || e.layer == ExportLayer::GoodsFill) needGoods = true;
+        if (e.layer == ExportLayer::Traffic || e.layer == ExportLayer::Noise) needTraffic = true;
+        if (e.layer == ExportLayer::GoodsTraffic || e.layer == ExportLayer::GoodsFill || e.layer == ExportLayer::Noise) needGoods = true;
         if (e.layer == ExportLayer::LandValue) needLandValue = true;
       }
 

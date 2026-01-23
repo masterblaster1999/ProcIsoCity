@@ -4,11 +4,16 @@
 #include "isocity/GfxTilesetAtlas.hpp"
 #include "isocity/Random.hpp"
 #include "isocity/ZoneMetrics.hpp"
+#include "isocity/ZoneAccess.hpp"
 
 #include "isocity/Services.hpp"
 
 #include "isocity/FloodRisk.hpp"
 #include "isocity/DepressionFill.hpp"
+#include "isocity/NoisePollution.hpp"
+#include "isocity/HeatIsland.hpp"
+#include "isocity/FireRisk.hpp"
+#include "isocity/LandUseMix.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -30,6 +35,12 @@ inline float Clamp01(float v) { return std::clamp(v, 0.0f, 1.0f); }
 inline float Lerp(float a, float b, float t)
 {
   return a + (b - a) * std::clamp(t, 0.0f, 1.0f);
+}
+
+inline std::uint8_t LerpU8(std::uint8_t a, std::uint8_t b, float t)
+{
+  const float v = Lerp(static_cast<float>(a), static_cast<float>(b), t);
+  return static_cast<std::uint8_t>(std::lround(std::clamp(v, 0.0f, 255.0f)));
 }
 
 inline float SmoothStep(float edge0, float edge1, float x)
@@ -703,6 +714,10 @@ struct TileColorContext {
   const TrafficResult* traffic = nullptr;
   const GoodsResult* goods = nullptr;
   const ServicesResult* services = nullptr;
+  const NoiseResult* noise = nullptr;
+  const LandUseMixResult* landUseMix = nullptr;
+  const HeatIslandResult* heatIsland = nullptr;
+  const FireRiskResult* fireRisk = nullptr;
 
   std::uint16_t maxTraffic = 0;
   std::uint16_t maxGoodsTraffic = 0;
@@ -714,6 +729,9 @@ struct TileColorContext {
 
   const std::vector<float>* pondingDepth = nullptr;
   float pondingMaxDepth = 0.0f;
+
+  // Optional per-zone road access mapping (used by zone pressure layers).
+  const ZoneAccessMap* zoneAccess = nullptr;
 };
 
 inline TileColorContext MakeTileColorContext(const World& world, const LandValueResult* landValue, const TrafficResult* traffic,
@@ -909,6 +927,202 @@ inline void ComputeTileColor(const World& world, int x, int y, ExportLayer layer
     }
   } break;
 
+  case ExportLayer::Noise: {
+    // Heuristic noise pollution / soundscape.
+    // Background: terrain with height shading.
+    MulPixel(r, g, b, shade);
+
+    if (ctx.noise && ctx.noise->noise01.size() == static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h)) {
+      const float n01 = ctx.noise->noise01[FlatIdx(x, y, ctx.w)];
+      std::uint8_t hr, hg, hb;
+      // Invert so *loud* is red, *quiet* is green.
+      HeatRampRedYellowGreen(1.0f - n01, hr, hg, hb);
+      r = static_cast<std::uint8_t>((static_cast<int>(r) + static_cast<int>(hr) * 2) / 3);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) + static_cast<int>(hg) * 2) / 3);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) + static_cast<int>(hb) * 2) / 3);
+    }
+
+    // Keep overlay context visible for parks/zones (helps interpret "why" a
+    // tile is loud/quiet without switching layers).
+    if (t.overlay == Overlay::Park || t.overlay == Overlay::Residential ||
+        t.overlay == Overlay::Commercial || t.overlay == Overlay::Industrial) {
+      std::uint8_t orr = r, org = g, orb = b;
+      OverlayColor(t, orr, org, orb);
+      r = static_cast<std::uint8_t>((static_cast<int>(r) * 2 + static_cast<int>(orr)) / 3);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) * 2 + static_cast<int>(org)) / 3);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) * 2 + static_cast<int>(orb)) / 3);
+    }
+  } break;
+
+  case ExportLayer::LandUseMix: {
+    // Land-use mix / diversity index.
+    // Background: terrain with height shading.
+    MulPixel(r, g, b, shade);
+
+    if (ctx.landUseMix && ctx.landUseMix->mix01.size() == static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h)) {
+      const std::size_t i = FlatIdx(x, y, ctx.w);
+      const float m01 = ctx.landUseMix->mix01[i];
+
+      float dens = 1.0f;
+      if (ctx.landUseMix->density01.size() == static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h)) {
+        dens = ctx.landUseMix->density01[i];
+      }
+
+      std::uint8_t hr, hg, hb;
+      // 0 -> red (single-use), 1 -> green (well-mixed).
+      HeatRampRedYellowGreen(m01, hr, hg, hb);
+
+      // Fade the heatmap in only where there is meaningful land use in the window.
+      const float a = 0.85f * SmoothStep(0.05f, 0.25f, dens);
+      r = LerpU8(r, hr, a);
+      g = LerpU8(g, hg, a);
+      b = LerpU8(b, hb, a);
+    }
+
+    // Keep overlay context visible for zones/parks (helps interpret the mix).
+    if (t.overlay == Overlay::Park || t.overlay == Overlay::Residential ||
+        t.overlay == Overlay::Commercial || t.overlay == Overlay::Industrial) {
+      std::uint8_t orr = r, org = g, orb = b;
+      OverlayColor(t, orr, org, orb);
+      r = static_cast<std::uint8_t>((static_cast<int>(r) * 2 + static_cast<int>(orr)) / 3);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) * 2 + static_cast<int>(org)) / 3);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) * 2 + static_cast<int>(orb)) / 3);
+    }
+  } break;
+
+  case ExportLayer::HeatIsland: {
+    // Heuristic urban heat island (diffused heat sources/sinks).
+    // Background: terrain with height shading.
+    MulPixel(r, g, b, shade);
+
+    if (ctx.heatIsland && ctx.heatIsland->heat01.size() == static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h)) {
+      const float h01 = ctx.heatIsland->heat01[FlatIdx(x, y, ctx.w)];
+
+      std::uint8_t hr, hg, hb;
+      // Invert so *hot* is red, *cool* is green.
+      HeatRampRedYellowGreen(1.0f - h01, hr, hg, hb);
+
+      const float a = 0.85f;
+      r = LerpU8(r, hr, a);
+      g = LerpU8(g, hg, a);
+      b = LerpU8(b, hb, a);
+    }
+
+    // Keep overlay context visible (roads/parks/zones/civic) so the causes of
+    // hot/cool patches are readable in a single layer.
+    if (t.overlay != Overlay::None) {
+      std::uint8_t orr = r, org = g, orb = b;
+      OverlayColor(t, orr, org, orb);
+      r = static_cast<std::uint8_t>((static_cast<int>(r) * 2 + static_cast<int>(orr)) / 3);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) * 2 + static_cast<int>(org)) / 3);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) * 2 + static_cast<int>(orb)) / 3);
+    }
+  } break;
+
+  case ExportLayer::FireRisk: {
+    // Heuristic fire risk (dense development + weak fire station coverage).
+    // Background: terrain with height shading.
+    MulPixel(r, g, b, shade);
+
+    // Always highlight fire stations so the supply is obvious.
+    if (t.overlay == Overlay::FireStation) {
+      OverlayColor(t, r, g, b);
+      break;
+    }
+
+    if (ctx.fireRisk && ctx.fireRisk->risk01.size() == static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h)) {
+      const float fr01 = ctx.fireRisk->risk01[FlatIdx(x, y, ctx.w)];
+
+      std::uint8_t hr, hg, hb;
+      // Invert so *high risk* is red and *low risk* is green.
+      HeatRampRedYellowGreen(1.0f - fr01, hr, hg, hb);
+
+      // Make water remain readable.
+      const float a = (t.terrain == Terrain::Water) ? 0.35f : 0.85f;
+      r = LerpU8(r, hr, a);
+      g = LerpU8(g, hg, a);
+      b = LerpU8(b, hb, a);
+    }
+
+    // Keep overlay context visible (roads/parks/zones/civic) so the causes of
+    // risk hot-spots are readable.
+    if (t.overlay != Overlay::None) {
+      std::uint8_t orr = r, org = g, orb = b;
+      OverlayColor(t, orr, org, orb);
+      r = static_cast<std::uint8_t>((static_cast<int>(r) * 2 + static_cast<int>(orr)) / 3);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) * 2 + static_cast<int>(org)) / 3);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) * 2 + static_cast<int>(orb)) / 3);
+    }
+  } break;
+
+  case ExportLayer::ZonePressureResidential:
+  case ExportLayer::ZonePressureCommercial:
+  case ExportLayer::ZonePressureIndustrial: {
+    MulPixel(r, g, b, shade);
+
+    if (t.terrain == Terrain::Water) {
+      // Leave water as shaded terrain.
+      break;
+    }
+
+    Overlay target = Overlay::Residential;
+    float demand = world.stats().demandResidential;
+    float lvWeight = 0.70f;
+
+    if (layer == ExportLayer::ZonePressureCommercial) {
+      target = Overlay::Commercial;
+      demand = world.stats().demandCommercial;
+      lvWeight = 0.80f;
+    } else if (layer == ExportLayer::ZonePressureIndustrial) {
+      target = Overlay::Industrial;
+      demand = world.stats().demandIndustrial;
+      lvWeight = 0.80f;
+    }
+
+    // Only show pressure on empty land or on matching zone tiles.
+    if (!(t.overlay == Overlay::None || t.overlay == target)) {
+      MulPixel(r, g, b, 0.55f);
+      break;
+    }
+
+    bool access = false;
+    if (t.overlay == target) {
+      if (ctx.zoneAccess) {
+        access = HasZoneAccess(*ctx.zoneAccess, x, y);
+      } else {
+        access = world.hasAdjacentRoad(x, y);
+      }
+    } else {
+      // For zoning guidance, show pressure only where a new zone could connect to a road.
+      access = world.hasAdjacentRoad(x, y);
+    }
+
+    const float accessFactor = access ? 1.0f : 0.0f;
+
+    float lvVal = 0.5f;
+    if (ctx.landValue && ctx.landValue->w == ctx.w && ctx.landValue->h == ctx.h &&
+        ctx.landValue->value.size() == static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h)) {
+      lvVal = ctx.landValue->value[FlatIdx(x, y, ctx.w)];
+    }
+
+    float desir = 1.0f;
+    if (target == Overlay::Industrial) {
+      // Industry prefers cheaper land.
+      desir = 1.0f + lvWeight * (0.50f - lvVal);
+    } else {
+      desir = 1.0f + lvWeight * (lvVal - 0.50f);
+    }
+    desir = std::clamp(desir, 0.40f, 1.60f);
+
+    const float pressure = Clamp01(demand * desir) * accessFactor;
+
+    std::uint8_t hr, hg, hb;
+    HeatRampRedYellowGreen(pressure, hr, hg, hb);
+    r = static_cast<std::uint8_t>((static_cast<int>(r) + static_cast<int>(hr) * 2) / 3);
+    g = static_cast<std::uint8_t>((static_cast<int>(g) + static_cast<int>(hg) * 2) / 3);
+    b = static_cast<std::uint8_t>((static_cast<int>(b) + static_cast<int>(hb) * 2) / 3);
+  } break;
+
 
   default:
     break;
@@ -1001,9 +1215,9 @@ bool ParseExportLayer(const std::string& s, ExportLayer& outLayer)
 {
   const std::string k = ToLower(s);
   if (k == "terrain") { outLayer = ExportLayer::Terrain; return true; }
-  if (k == "overlay") { outLayer = ExportLayer::Overlay; return true; }
-  if (k == "height" || k == "elevation") { outLayer = ExportLayer::Height; return true; }
-  if (k == "landvalue" || k == "land_value" || k == "lv") { outLayer = ExportLayer::LandValue; return true; }
+  if (k == "overlay" || k == "overlays") { outLayer = ExportLayer::Overlay; return true; }
+  if (k == "height" || k == "elevation" || k == "heightmap") { outLayer = ExportLayer::Height; return true; }
+  if (k == "landvalue" || k == "land_value" || k == "lv" || k == "land" || k == "value") { outLayer = ExportLayer::LandValue; return true; }
   if (k == "traffic" || k == "commute") { outLayer = ExportLayer::Traffic; return true; }
   if (k == "goods" || k == "goods_traffic" || k == "goodstraffic") { outLayer = ExportLayer::GoodsTraffic; return true; }
   if (k == "goods_fill" || k == "goodsfill" || k == "fill") { outLayer = ExportLayer::GoodsFill; return true; }
@@ -1029,6 +1243,37 @@ bool ParseExportLayer(const std::string& s, ExportLayer& outLayer)
     outLayer = ExportLayer::ServicesSafety;
     return true;
   }
+  if (k == "noise" || k == "sound" || k == "noise_pollution" || k == "noisepollution") {
+    outLayer = ExportLayer::Noise;
+    return true;
+  }
+  if (k == "landuse_mix" || k == "land_use_mix" || k == "landusemix" || k == "mix" || k == "diversity") {
+    outLayer = ExportLayer::LandUseMix;
+    return true;
+  }
+  if (k == "heat_island" || k == "heat" || k == "uhi" || k == "heatisland" || k == "urban_heat" || k == "temperature") {
+    outLayer = ExportLayer::HeatIsland;
+    return true;
+  }
+  if (k == "fire_risk" || k == "firerisk" || k == "fire" || k == "firehazard" || k == "hazard_fire") {
+    outLayer = ExportLayer::FireRisk;
+    return true;
+  }
+  if (k == "zone_pressure_residential" || k == "zonepressure_residential" || k == "res_pressure" || k == "pressure_res" ||
+      k == "rci_res" || k == "rci_r" || k == "demand_res" || k == "zoning_res") {
+    outLayer = ExportLayer::ZonePressureResidential;
+    return true;
+  }
+  if (k == "zone_pressure_commercial" || k == "zonepressure_commercial" || k == "com_pressure" || k == "pressure_com" ||
+      k == "rci_com" || k == "rci_c" || k == "demand_com" || k == "zoning_com") {
+    outLayer = ExportLayer::ZonePressureCommercial;
+    return true;
+  }
+  if (k == "zone_pressure_industrial" || k == "zonepressure_industrial" || k == "ind_pressure" || k == "pressure_ind" ||
+      k == "rci_ind" || k == "rci_i" || k == "demand_ind" || k == "zoning_ind") {
+    outLayer = ExportLayer::ZonePressureIndustrial;
+    return true;
+  }
   return false;
 }
 
@@ -1049,6 +1294,13 @@ const char* ExportLayerName(ExportLayer layer)
   case ExportLayer::ServicesEducation: return "services_education";
   case ExportLayer::ServicesHealth: return "services_health";
   case ExportLayer::ServicesSafety: return "services_safety";
+  case ExportLayer::Noise: return "noise";
+  case ExportLayer::LandUseMix: return "landuse_mix";
+  case ExportLayer::HeatIsland: return "heat_island";
+  case ExportLayer::FireRisk: return "fire_risk";
+  case ExportLayer::ZonePressureResidential: return "zone_pressure_residential";
+  case ExportLayer::ZonePressureCommercial: return "zone_pressure_commercial";
+  case ExportLayer::ZonePressureIndustrial: return "zone_pressure_industrial";
   default: return "unknown";
   }
 }
@@ -1112,9 +1364,69 @@ PpmImage RenderPpmLayer(const World& world, ExportLayer layer, const LandValueRe
     haveServices = true;
   }
 
+  NoiseResult noise{};
+  bool haveNoise = false;
+  if (layer == ExportLayer::Noise) {
+    NoiseConfig nc{};
+    noise = ComputeNoisePollution(world, nc, traffic, goods);
+    haveNoise = true;
+  }
+
+  LandUseMixResult landUseMix{};
+  bool haveLandUseMix = false;
+  if (layer == ExportLayer::LandUseMix) {
+    LandUseMixConfig mc{};
+    landUseMix = ComputeLandUseMix(world, mc);
+    haveLandUseMix = true;
+  }
+
+  HeatIslandResult heatIsland{};
+  bool haveHeatIsland = false;
+  if (layer == ExportLayer::HeatIsland) {
+    HeatIslandConfig hc{};
+    heatIsland = ComputeHeatIsland(world, hc, traffic, goods);
+    haveHeatIsland = true;
+  }
+
+  FireRiskResult fireRisk{};
+  bool haveFireRisk = false;
+  if (layer == ExportLayer::FireRisk) {
+    FireRiskConfig fc{};
+    fc.requireOutsideConnection = true;
+    fc.weightMode = IsochroneWeightMode::TravelTime;
+    fc.responseRadiusSteps = 18;
+    fireRisk = ComputeFireRisk(world, fc);
+    haveFireRisk = true;
+  }
+
+  ZoneAccessMap zoneAccess{};
+  bool haveZoneAccess = false;
+  if (layer == ExportLayer::ZonePressureResidential || layer == ExportLayer::ZonePressureCommercial ||
+      layer == ExportLayer::ZonePressureIndustrial) {
+    // No outside connection mask here; exports should remain usable for worlds
+    // that haven't run the sim or don't enforce border connectivity.
+    zoneAccess = BuildZoneAccessMap(world, nullptr);
+    haveZoneAccess = true;
+  }
+
   TileColorContext ctx = MakeTileColorContext(world, landValue, traffic, goods);
   if (haveServices) {
     ctx.services = &services;
+  }
+  if (haveNoise) {
+    ctx.noise = &noise;
+  }
+  if (haveLandUseMix) {
+    ctx.landUseMix = &landUseMix;
+  }
+  if (haveHeatIsland) {
+    ctx.heatIsland = &heatIsland;
+  }
+  if (haveFireRisk) {
+    ctx.fireRisk = &fireRisk;
+  }
+  if (haveZoneAccess) {
+    ctx.zoneAccess = &zoneAccess;
   }
   if (haveSeaFlood) {
     ctx.seaFloodDepth = &seaFlood.depth;
@@ -1250,9 +1562,67 @@ IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const
     haveServices = true;
   }
 
+  NoiseResult noise{};
+  bool haveNoise = false;
+  if (layer == ExportLayer::Noise) {
+    NoiseConfig nc{};
+    noise = ComputeNoisePollution(world, nc, traffic, goods);
+    haveNoise = true;
+  }
+
+  LandUseMixResult landUseMix{};
+  bool haveLandUseMix = false;
+  if (layer == ExportLayer::LandUseMix) {
+    LandUseMixConfig mc{};
+    landUseMix = ComputeLandUseMix(world, mc);
+    haveLandUseMix = true;
+  }
+
+  HeatIslandResult heatIsland{};
+  bool haveHeatIsland = false;
+  if (layer == ExportLayer::HeatIsland) {
+    HeatIslandConfig hc{};
+    heatIsland = ComputeHeatIsland(world, hc, traffic, goods);
+    haveHeatIsland = true;
+  }
+
+  FireRiskResult fireRisk{};
+  bool haveFireRisk = false;
+  if (layer == ExportLayer::FireRisk) {
+    FireRiskConfig fc{};
+    fc.requireOutsideConnection = true;
+    fc.weightMode = IsochroneWeightMode::TravelTime;
+    fc.responseRadiusSteps = 18;
+    fireRisk = ComputeFireRisk(world, fc);
+    haveFireRisk = true;
+  }
+
+  ZoneAccessMap zoneAccess{};
+  bool haveZoneAccess = false;
+  if (layer == ExportLayer::ZonePressureResidential || layer == ExportLayer::ZonePressureCommercial ||
+      layer == ExportLayer::ZonePressureIndustrial) {
+    zoneAccess = BuildZoneAccessMap(world, nullptr);
+    haveZoneAccess = true;
+  }
+
   TileColorContext ctx = MakeTileColorContext(world, landValue, traffic, goods);
   if (haveServices) {
     ctx.services = &services;
+  }
+  if (haveNoise) {
+    ctx.noise = &noise;
+  }
+  if (haveLandUseMix) {
+    ctx.landUseMix = &landUseMix;
+  }
+  if (haveHeatIsland) {
+    ctx.heatIsland = &heatIsland;
+  }
+  if (haveFireRisk) {
+    ctx.fireRisk = &fireRisk;
+  }
+  if (haveZoneAccess) {
+    ctx.zoneAccess = &zoneAccess;
   }
   if (haveSeaFlood) {
     ctx.seaFloodDepth = &seaFlood.depth;
@@ -3003,6 +3373,42 @@ bool WriteTileMetricsCsv(const World& world, const std::string& path, std::strin
     }
   }
 
+  if (inputs.noise && opt.includeNoise) {
+    if (!validateGridSize("NoiseResult", inputs.noise->w, inputs.noise->h, inputs.noise->noise01.size())) {
+      return false;
+    }
+  }
+
+  if (inputs.landUseMix && opt.includeLandUseMix) {
+    if (!validateGridSize("LandUseMixResult", inputs.landUseMix->w, inputs.landUseMix->h, inputs.landUseMix->mix01.size())) {
+      return false;
+    }
+    if (!inputs.landUseMix->density01.empty() && inputs.landUseMix->density01.size() != n) {
+      outError = "LandUseMixResult density array does not match world";
+      return false;
+    }
+  }
+
+  if (inputs.heatIsland && opt.includeHeatIsland) {
+    if (!validateGridSize("HeatIslandResult", inputs.heatIsland->w, inputs.heatIsland->h, inputs.heatIsland->heat01.size())) {
+      return false;
+    }
+    if (inputs.heatIsland->heat.size() != n) {
+      outError = "HeatIslandResult heat array does not match world";
+      return false;
+    }
+  }
+
+  if (inputs.fireRisk && opt.includeFireRisk) {
+    if (!validateGridSize("FireRiskResult", inputs.fireRisk->w, inputs.fireRisk->h, inputs.fireRisk->risk01.size())) {
+      return false;
+    }
+    if (inputs.fireRisk->coverage01.size() != n || inputs.fireRisk->responseCostMilli.size() != n) {
+      outError = "FireRiskResult arrays do not match world";
+      return false;
+    }
+  }
+
   if (inputs.seaFlood && opt.includeFlood) {
     if (!validateGridSize("SeaFloodResult", inputs.seaFlood->w, inputs.seaFlood->h, inputs.seaFlood->depth.size())) {
       return false;
@@ -3017,6 +3423,13 @@ bool WriteTileMetricsCsv(const World& world, const std::string& path, std::strin
     if (!validateGridSize("DepressionFillResult", inputs.ponding->w, inputs.ponding->h, inputs.ponding->depth.size())) {
       return false;
     }
+  }
+
+  ZoneAccessMap zoneAccess{};
+  bool haveZoneAccess = false;
+  if (opt.includeRciPressure) {
+    zoneAccess = BuildZoneAccessMap(world, nullptr);
+    haveZoneAccess = true;
   }
 
   std::ofstream f(path, std::ios::binary);
@@ -3037,6 +3450,21 @@ bool WriteTileMetricsCsv(const World& world, const std::string& path, std::strin
   }
   if (opt.includeGoods && inputs.goods) {
     f << ",goods_traffic,goods_fill";
+  }
+  if (opt.includeNoise && inputs.noise) {
+    f << ",noise";
+  }
+  if (opt.includeLandUseMix && inputs.landUseMix) {
+    f << ",landuse_mix,landuse_density";
+  }
+  if (opt.includeHeatIsland && inputs.heatIsland) {
+    f << ",heat_island,heat_island_raw";
+  }
+  if (opt.includeFireRisk && inputs.fireRisk) {
+    f << ",fire_risk,fire_coverage,fire_response_cost";
+  }
+  if (opt.includeRciPressure) {
+    f << ",zone_pressure_residential,zone_pressure_commercial,zone_pressure_industrial";
   }
   if (opt.includeFlood && inputs.seaFlood) {
     f << ",flooded,flood_depth";
@@ -3074,6 +3502,56 @@ bool WriteTileMetricsCsv(const World& world, const std::string& path, std::strin
       if (opt.includeGoods && inputs.goods) {
         f << ',' << static_cast<int>(inputs.goods->roadGoodsTraffic[i]);
         f << ',' << static_cast<int>(inputs.goods->commercialFill[i]);
+      }
+      if (opt.includeNoise && inputs.noise) {
+        f << ',' << static_cast<double>(inputs.noise->noise01[i]);
+      }
+      if (opt.includeLandUseMix && inputs.landUseMix) {
+        const float dens = (!inputs.landUseMix->density01.empty()) ? inputs.landUseMix->density01[i] : 0.0f;
+        f << ',' << static_cast<double>(inputs.landUseMix->mix01[i]);
+        f << ',' << static_cast<double>(dens);
+      }
+      if (opt.includeHeatIsland && inputs.heatIsland) {
+        f << ',' << static_cast<double>(inputs.heatIsland->heat01[i]);
+        f << ',' << static_cast<double>(inputs.heatIsland->heat[i]);
+      }
+      if (opt.includeFireRisk && inputs.fireRisk) {
+        f << ',' << static_cast<double>(inputs.fireRisk->risk01[i]);
+        f << ',' << static_cast<double>(inputs.fireRisk->coverage01[i]);
+        f << ',' << static_cast<int>(inputs.fireRisk->responseCostMilli[i]);
+      }
+      if (opt.includeRciPressure) {
+        float lvVal = 0.5f;
+        if (inputs.landValue && inputs.landValue->value.size() == n) {
+          lvVal = inputs.landValue->value[i];
+        }
+
+        auto pressureFor = [&](Overlay target, float demand, float lvWeight) -> float {
+          if (t.terrain == Terrain::Water) return 0.0f;
+          if (!(t.overlay == Overlay::None || t.overlay == target)) return 0.0f;
+
+          bool access = false;
+          if (t.overlay == Overlay::None) {
+            access = world.hasAdjacentRoad(x, y);
+          } else {
+            access = haveZoneAccess ? HasZoneAccess(zoneAccess, x, y) : world.hasAdjacentRoad(x, y);
+          }
+          if (!access) return 0.0f;
+
+          float desir = 1.0f;
+          if (target == Overlay::Industrial) {
+            desir = 1.0f + lvWeight * (0.50f - lvVal);
+          } else {
+            desir = 1.0f + lvWeight * (lvVal - 0.50f);
+          }
+          desir = std::clamp(desir, 0.40f, 1.60f);
+          return Clamp01(std::clamp(demand, 0.0f, 1.0f) * desir);
+        };
+
+        const float pR = pressureFor(Overlay::Residential, world.stats().demandResidential, 0.70f);
+        const float pC = pressureFor(Overlay::Commercial, world.stats().demandCommercial, 0.80f);
+        const float pI = pressureFor(Overlay::Industrial, world.stats().demandIndustrial, 0.80f);
+        f << ',' << static_cast<double>(pR) << ',' << static_cast<double>(pC) << ',' << static_cast<double>(pI);
       }
       if (opt.includeFlood && inputs.seaFlood) {
         f << ',' << static_cast<int>(inputs.seaFlood->flooded[i]);

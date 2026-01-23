@@ -665,6 +665,7 @@ private:
   struct BuildingSprite {
     Texture2D color{};
     Texture2D emissive{}; // optional (lit windows / signage)
+    Texture2D shadow{};   // optional (ground shadow / contact occlusion)
     int pivotX = 0;
     int pivotY = 0;
   };

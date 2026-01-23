@@ -446,10 +446,12 @@ bool WriteStats(ByteWriter& w, const Stats& s)
          w.writeF32(s.avgTaxPerCapita) &&
          // Demand/valuation
          w.writeF32(s.demandResidential) &&
+         w.writeF32(s.demandCommercial) &&
+         w.writeF32(s.demandIndustrial) &&
          w.writeF32(s.avgLandValue);
 }
 
-bool ReadStats(ByteReader& r, Stats& s)
+bool ReadStats(ByteReader& r, Stats& s, std::uint32_t patchVersion)
 {
   // Keep in sync with WriteStats.
   std::int32_t i32 = 0;
@@ -520,6 +522,13 @@ bool ReadStats(ByteReader& r, Stats& s)
   if (!r.readF32(s.avgTaxPerCapita)) return false;
 
   if (!r.readF32(s.demandResidential)) return false;
+  if (patchVersion >= 6) {
+    if (!r.readF32(s.demandCommercial)) return false;
+    if (!r.readF32(s.demandIndustrial)) return false;
+  } else {
+    s.demandCommercial = 0.0f;
+    s.demandIndustrial = 0.0f;
+  }
   if (!r.readF32(s.avgLandValue)) return false;
   return true;
 }
@@ -537,7 +546,7 @@ bool ReadStats(ByteReader& r, Stats& s)
 //   u8  compressionMethod (WorldPatchCompression)
 //   u32 payloadSize (uncompressed)
 //   u32 payloadSizeCompressed
-inline constexpr std::uint32_t kPatchVersion = 5;
+inline constexpr std::uint32_t kPatchVersion = 6;
 inline constexpr std::uint8_t kMagic[8] = { 'I','S','O','P','A','T','C','H' };
 
 enum PatchFlags : std::uint32_t {
@@ -1017,7 +1026,7 @@ bool LoadWorldPatchBinary(WorldPatch& outPatch, const std::string& path, std::st
     }
   }
   if (outPatch.includeStats) {
-    if (!ReadStats(r, outPatch.stats)) {
+    if (!ReadStats(r, outPatch.stats, outPatch.version)) {
       outError = "Failed to parse Stats";
       return false;
     }
@@ -1245,7 +1254,7 @@ bool DeserializeWorldPatchBinary(WorldPatch& outPatch, const std::uint8_t* data,
     }
   }
   if (outPatch.includeStats) {
-    if (!ReadStats(pr, outPatch.stats)) {
+    if (!ReadStats(pr, outPatch.stats, outPatch.version)) {
       outError = "Failed to parse Stats";
       return false;
     }

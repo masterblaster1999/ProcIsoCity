@@ -59,6 +59,10 @@ struct CityDossierConfig {
       ExportLayer::District,
       ExportLayer::FloodDepth,
       ExportLayer::PondingDepth,
+      ExportLayer::Noise,
+      ExportLayer::LandUseMix,
+      ExportLayer::HeatIsland,
+      ExportLayer::FireRisk,
   };
 
   // Optional isometric overview exports.
@@ -66,6 +70,8 @@ struct CityDossierConfig {
   std::vector<ExportLayer> layersIso = {
       ExportLayer::Overlay,
       ExportLayer::LandValue,
+      ExportLayer::HeatIsland,
+      ExportLayer::FireRisk,
   };
 
   // Optional CPU software 3D render.

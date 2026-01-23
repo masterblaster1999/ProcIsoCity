@@ -7,6 +7,9 @@
 #include "isocity/Hash.hpp"
 #include "isocity/Json.hpp"
 #include "isocity/LandValue.hpp"
+#include "isocity/LandUseMix.hpp"
+#include "isocity/NoisePollution.hpp"
+#include "isocity/HeatIsland.hpp"
 #include "isocity/Pathfinding.hpp"
 #include "isocity/ProcGen.hpp"
 #include "isocity/SaveLoad.hpp"
@@ -577,7 +580,7 @@ layerSel.addEventListener('change', () => {
 });
 
 // --- Tile metrics ---
-let metrics = null; // {terrain,overlay,level,district,height,occupants,land_value,commute_traffic,goods_fill,flood_depth,ponding_depth}
+let metrics = null; // {terrain,overlay,level,district,height,occupants,land_value,commute_traffic,goods_fill,flood_depth,ponding_depth,heat_island,heat_island_raw}
 
 function parseCsv(text) {
   const lines = text.split(/\r?\n/).filter(l => l.length > 0);
@@ -600,6 +603,8 @@ function parseCsv(text) {
     goods_fill: idx('goods_fill'),
     flood_depth: idx('flood_depth'),
     ponding_depth: idx('ponding_depth'),
+    heat_island: idx('heat_island'),
+    heat_island_raw: idx('heat_island_raw'),
   };
 
   const n = MAP_W * MAP_H;
@@ -615,12 +620,16 @@ function parseCsv(text) {
     goods_fill: new Int32Array(n),
     flood_depth: new Float32Array(n),
     ponding_depth: new Float32Array(n),
+    heat_island: new Float32Array(n),
+    heat_island_raw: new Float32Array(n),
   };
 
   // Initialize optional numeric channels to NaN so we can detect missing.
   out.land_value.fill(NaN);
   out.flood_depth.fill(NaN);
   out.ponding_depth.fill(NaN);
+  out.heat_island.fill(NaN);
+  out.heat_island_raw.fill(NaN);
 
   for (let li = 1; li < lines.length; ++li) {
     const parts = lines[li].split(',');
@@ -643,6 +652,8 @@ function parseCsv(text) {
     if (take.goods_fill >= 0) out.goods_fill[i] = parseInt(parts[take.goods_fill], 10) || 0;
     if (take.flood_depth >= 0) out.flood_depth[i] = parseFloat(parts[take.flood_depth]);
     if (take.ponding_depth >= 0) out.ponding_depth[i] = parseFloat(parts[take.ponding_depth]);
+    if (take.heat_island >= 0) out.heat_island[i] = parseFloat(parts[take.heat_island]);
+    if (take.heat_island_raw >= 0) out.heat_island_raw[i] = parseFloat(parts[take.heat_island_raw]);
   }
 
   return out;
@@ -700,6 +711,8 @@ function updateHover(ev) {
     const lv = metrics.land_value[i];
     const fd = metrics.flood_depth[i];
     const pd = metrics.ponding_depth[i];
+    const hi = metrics.heat_island[i];
+    const hir = metrics.heat_island_raw[i];
 
     const parts = [];
     parts.push(' terrain=' + metrics.terrain[i]);
@@ -714,6 +727,8 @@ function updateHover(ev) {
     parts.push(' goodsFill=' + metrics.goods_fill[i]);
     if (!Number.isNaN(fd)) parts.push(' flood=' + fd.toFixed(3));
     if (!Number.isNaN(pd)) parts.push(' pond=' + pd.toFixed(3));
+    if (!Number.isNaN(hi)) parts.push(' heat=' + hi.toFixed(3));
+    if (!Number.isNaN(hir)) parts.push(' heatRaw=' + hir.toFixed(3));
 
     tileInfo.textContent = parts.join('');
   } else {
@@ -762,9 +777,9 @@ void PrintHelp()
       << "Export:\n"
       << "  --format <png|ppm>             Image format (default png).\n"
       << "  --scale <N>                    Nearest-neighbor scale for top-down layers (default 2).\n"
-      << "  --layers <a,b,c>               Top-down layers to export (default: terrain,overlay,height,landvalue,traffic,goods_traffic,goods_fill,district,flood_depth,ponding_depth).\n"
+      << "  --layers <a,b,c>               Top-down layers to export (default: terrain,overlay,height,landvalue,traffic,goods_traffic,goods_fill,district,flood_depth,ponding_depth,noise,landuse_mix,heat_island).\n"
       << "  --iso <0|1>                    Enable isometric exports (default 1).\n"
-      << "  --iso-layers <a,b,c>           Iso layers (default: overlay,landvalue).\n"
+      << "  --iso-layers <a,b,c>           Iso layers (default: overlay,landvalue,heat_island).\n"
       << "  --3d <0|1>                     Enable a 3D overlay render (default 0).\n\n";
 }
 
@@ -800,12 +815,16 @@ int main(int argc, char** argv)
       ExportLayer::District,
       ExportLayer::FloodDepth,
       ExportLayer::PondingDepth,
+      ExportLayer::Noise,
+      ExportLayer::LandUseMix,
+      ExportLayer::HeatIsland,
   };
 
   bool exportIso = true;
   std::vector<ExportLayer> layersIso = {
       ExportLayer::Overlay,
       ExportLayer::LandValue,
+      ExportLayer::HeatIsland,
   };
 
   bool export3d = false;
@@ -1111,6 +1130,18 @@ int main(int argc, char** argv)
   lc.requireOutsideConnection = sim.config().requireOutsideConnection;
   const LandValueResult landValueRes = ComputeLandValue(world, lc, &trafficRes, roadToEdgePtr);
 
+  // Derived soundscape/noise field (for exports + tile_metrics.csv).
+  NoiseConfig nc{};
+  const NoiseResult noiseRes = ComputeNoisePollution(world, nc, &trafficRes, &goodsRes);
+
+  // Local land-use mix / diversity (for exports + tile_metrics.csv).
+  LandUseMixConfig lmc{};
+  const LandUseMixResult landUseMixRes = ComputeLandUseMix(world, lmc);
+
+  // Heuristic urban heat island (for exports + tile_metrics.csv).
+  HeatIslandConfig hic{};
+  const HeatIslandResult heatIslandRes = ComputeHeatIsland(world, hic, &trafficRes, &goodsRes);
+
   std::vector<float> heights;
   std::vector<std::uint8_t> drainMask;
   BuildHeightFieldAndDrainMask(world, heights, drainMask);
@@ -1145,6 +1176,9 @@ int main(int argc, char** argv)
     inputs.landValue = &landValueRes;
     inputs.traffic = &trafficRes;
     inputs.goods = &goodsRes;
+    inputs.noise = &noiseRes;
+    inputs.landUseMix = &landUseMixRes;
+    inputs.heatIsland = &heatIslandRes;
     inputs.seaFlood = &seaFlood;
     inputs.ponding = &ponding;
     TileMetricsCsvOptions opt;
@@ -1152,6 +1186,9 @@ int main(int argc, char** argv)
     opt.includeLandValueComponents = true;
     opt.includeTraffic = true;
     opt.includeGoods = true;
+    opt.includeNoise = true;
+    opt.includeLandUseMix = true;
+    opt.includeHeatIsland = true;
     opt.includeFlood = true;
     opt.includePonding = true;
     opt.floatPrecision = 6;

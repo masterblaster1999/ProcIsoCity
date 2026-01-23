@@ -8,6 +8,7 @@
 #include "isocity/Dossier.hpp"
 #include "isocity/SeedMiner.hpp"
 #include "isocity/ServiceOptimizer.hpp"
+#include "isocity/PolicyOptimizer.hpp"
 #include "isocity/FloodRisk.hpp"
 #include "isocity/DepressionFill.hpp"
 #include "isocity/EvacuationScenario.hpp"
@@ -32,6 +33,7 @@
 #include "isocity/Traffic.hpp"
 #include "isocity/Goods.hpp"
 #include "isocity/LandValue.hpp"
+#include "isocity/FireRisk.hpp"
 #include "isocity/TransitPlanner.hpp"
 #include "isocity/Sim.hpp"
 #include "isocity/World.hpp"
@@ -67,6 +69,8 @@ struct CityHistorySample {
 
   float happiness = 0.0f;          // 0..1
   float demandResidential = 0.0f;  // 0..1
+  float demandCommercial = 0.0f;   // 0..1
+  float demandIndustrial = 0.0f;   // 0..1
 
   float avgLandValue = 0.0f;       // 0..1
   float avgTaxPerCapita = 0.0f;
@@ -83,6 +87,22 @@ struct CityHistorySample {
 
   float goodsSatisfaction = 1.0f;  // 0..1
 };
+
+// SimCity-style city news / advisor feed entry.
+// Stored in the game layer (not saved yet), derived from World::Stats after each sim day.
+enum class CityNewsTone : std::uint8_t { Good = 0, Neutral = 1, Bad = 2, Alert = 3 };
+
+struct CityNewsEntry {
+  int day = 0;
+  CityNewsTone tone = CityNewsTone::Neutral;
+
+  // Mayor rating (0..100), exponentially smoothed so it doesn't jitter day-to-day.
+  float mayorRating = 50.0f;
+
+  std::string headline;
+  std::string body;
+};
+
 
 
 class Game {
@@ -104,6 +124,12 @@ private:
   void clearHistory();
   void recordHistorySample(const Stats& s);
   void drawReportPanel(int screenW, int screenH);
+
+  // City news / advisor feed (SimCity-style newspaper headlines).
+  void clearCityNews();
+  void recordCityNews(const Stats& s);
+  void drawNewsPanel(const Rectangle& rect);
+  void exportCityNews();
 
   // Visual micro-sim: moving vehicles along roads (commute + goods).
   void rebuildVehiclesRoutingCache();
@@ -149,6 +175,11 @@ private:
 
   // Mesh export (OBJ/glTF) - runs asynchronously so exports do not stall the render thread.
   void updateMeshExportJob();
+
+  // Policy advisor / auto-tuner (async policy optimization).
+  void updatePolicyOptimizationJob();
+  void startPolicyOptimization();
+  void applyPolicyCandidate(const PolicyCandidate& p, const char* toastLabel = nullptr);
 
   // Seed mining integration (headless).
   void updateSeedMining(float dt);
@@ -208,6 +239,21 @@ private:
   void ensureTransitPlanUpToDate();
   void ensureTransitVizUpToDate();
   void ensureTradeMarketUpToDate();
+
+  // Public services satisfaction (heatmap overlays).
+  void ensureServicesHeatmapsUpToDate();
+
+  // Fire risk/coverage (heatmap overlay + city news).
+  void ensureFireRiskUpToDate();
+
+  // Public services planner (facility placement suggestions) + overlay.
+  void ensureServicesPlanUpToDate();
+  void drawServicesOverlay();
+  void drawServicesPanel(int x0, int y0);
+  void adjustServicesPanel(int dir, bool bigStep);
+  bool applyServicePlacement(std::size_t idx);
+  void exportServicesArtifacts();
+
   void drawTransitOverlay();
   void drawTransitPanel(int x0, int y0);
   void adjustTransitPanel(int dir, bool bigStep);
@@ -323,6 +369,28 @@ private:
   bool m_showPolicy = false;
   int m_policySelection = 0;
 
+  // Policy advisor: async optimizer that suggests taxes/maintenance for a chosen objective.
+  struct PolicyOptJob;
+  std::unique_ptr<PolicyOptJob> m_policyOptJob;
+  PolicyOptProgress m_policyOptProgress;
+
+  // Advisor UI settings.
+  int m_policyOptPreset = 0;        // objective preset selector
+  int m_policyOptTaxRadius = 3;     // +/- range around current taxes
+  int m_policyOptMaintRadius = 1;   // +/- range around current maintenance
+
+  PolicyOptimizerConfig m_policyOptCfg{};
+
+  // Last completed result (cached for display / application).
+  bool m_policyOptHaveResult = false;
+  bool m_policyOptResultOk = false;
+  int m_policyOptResultDay = -1;
+  PolicyOptimizationResult m_policyOptResult{};
+  std::string m_policyOptResultErr;
+
+  int m_policyOptTopSelection = 0;
+  int m_policyOptTopFirst = 0;
+
   bool m_showTrafficModel = false;
   int m_trafficModelSelection = 0;
 
@@ -339,12 +407,19 @@ private:
   float m_servicesHeatmapsTimer = 0.0f;
   ServicesResult m_servicesHeatmaps;
 
+  // Cached fire risk/coverage field (computed on-demand; used for heatmap + news).
+  bool m_fireRiskDirty = true;
+  float m_fireRiskTimer = 0.0f;
+  FireRiskConfig m_fireRiskCfg{};
+  FireRiskResult m_fireRisk;
+
   // Cached optimizer plan (where to place the next facilities).
   bool m_servicesPlanDirty = true;
   bool m_servicesPlanValid = false;
   ServiceOptimizerConfig m_servicesPlanCfg{};
   ServiceOptimizerResult m_servicesPlan{};
   int m_servicesPlanSelection = 0;
+  int m_servicesPlanFirst = 0; // scroll offset (rows) for placement list
   Tool m_servicesPlanTool = Tool::School;
 
   // District UI (toggle with F7). Districts are a lightweight per-tile label (0..kDistrictCount-1)
@@ -363,6 +438,15 @@ private:
   // This mirrors m_cityHistory but stores the complete Stats struct for each sampled day.
   std::vector<Stats> m_tickStatsHistory;
   int m_cityHistoryMax = 240; // max stored days
+
+  // City news (SimCity-style newspaper/advisor feed). Not saved yet; derived from daily Stats.
+  bool m_showNewsPanel = false;
+  std::deque<CityNewsEntry> m_cityNews;
+  int m_cityNewsMax = 120;
+  int m_newsSelection = 0;
+  int m_newsFirst = 0;
+  float m_mayorRatingEma = 50.0f;
+  float m_mayorRatingPrev = 50.0f;
 
   // UI minimap overlay (toggle with M). Clicking the minimap recenters the camera.
   bool m_showMinimap = false;
@@ -647,6 +731,9 @@ private:
     ServicesEducation,
     ServicesHealth,
     ServicesSafety,
+
+  // Heuristic fire hazard (dense development + weak fire station response).
+  FireRisk,
 
     // Sea-level coastal flooding depth (derived from the heightfield).
     FloodDepth,

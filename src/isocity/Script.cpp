@@ -890,7 +890,7 @@ static bool WriteStatsCsv(const std::string& path, const std::vector<Stats>& row
     return false;
   }
 
-  f << "day,population,money,housingCapacity,jobsCapacity,jobsCapacityAccessible,employed,happiness,roads,parks,avgCommuteTime,trafficCongestion,goodsDemand,goodsDelivered,goodsSatisfaction,avgLandValue,demandResidential\n";
+  f << "day,population,money,housingCapacity,jobsCapacity,jobsCapacityAccessible,employed,happiness,roads,parks,avgCommuteTime,trafficCongestion,goodsDemand,goodsDelivered,goodsSatisfaction,avgLandValue,demandResidential,demandCommercial,demandIndustrial\n";
   for (const auto& s : rows) {
     f << s.day << ','
       << s.population << ','
@@ -908,7 +908,9 @@ static bool WriteStatsCsv(const std::string& path, const std::vector<Stats>& row
       << s.goodsDelivered << ','
       << s.goodsSatisfaction << ','
       << s.avgLandValue << ','
-      << s.demandResidential << '\n';
+      << s.demandResidential << ','
+      << s.demandCommercial << ','
+      << s.demandIndustrial << '\n';
   }
 
   if (!f) {

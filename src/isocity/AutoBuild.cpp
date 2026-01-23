@@ -1377,10 +1377,10 @@ AutoBuildReport RunAutoBuild(World& world, Simulator& sim, const AutoBuildConfig
       }
     }
 
-    // Decide a zoning target based on job/housing balance.
+    // Decide a zoning target using SimCity-like RCI demand signals.
     //
-    // NOTE: When housing==0, the simulator's demand model needs *some* jobs to
-    // exist first; otherwise residential target occupancy stays at 0.
+    // NOTE: When housing==0, the simulator needs *some* jobs to exist first;
+    // otherwise residential target occupancy stays at 0.
     float jobPressure = 0.0f;
     if (s.housingCapacity <= 0) {
       jobPressure = (s.jobsCapacityAccessible > 0) ? 2.0f : 0.0f;
@@ -1389,19 +1389,43 @@ AutoBuildReport RunAutoBuild(World& world, Simulator& sim, const AutoBuildConfig
     }
 
     Tool zoneTool = Tool::Residential;
-    if (jobPressure > 1.10f || s.demandResidential > 0.55f) {
-      zoneTool = Tool::Residential;
-    } else if (jobPressure < 0.80f) {
-      // Need jobs.
-      zoneTool = (s.goodsSatisfaction < 0.80f) ? Tool::Industrial : Tool::Commercial;
-    } else {
-      // Balanced: add a mix.
-      const std::uint32_t mix = HashCoords32(day, s.population, DaySeed(world, day, 0x004D4958u)); // "MIX"
 
-      const int r = static_cast<int>(mix % 10u);
-      if (r < 5) zoneTool = Tool::Residential;
-      else if (r < 8) zoneTool = Tool::Commercial;
-      else zoneTool = Tool::Industrial;
+    if (s.housingCapacity <= 0) {
+      // Bootstrap the city: build jobs first, then let residential fill in.
+      zoneTool = (s.jobsCapacityAccessible > 0) ? Tool::Residential
+                                                : ((s.goodsSatisfaction < 0.80f) ? Tool::Industrial : Tool::Commercial);
+    } else {
+      const float dR = std::clamp(s.demandResidential, 0.0f, 1.0f);
+      const float dC = std::clamp(s.demandCommercial, 0.0f, 1.0f);
+      const float dI = std::clamp(s.demandIndustrial, 0.0f, 1.0f);
+
+      // Pick the highest-demand zone type; break ties deterministically.
+      const float m = std::max(dR, std::max(dC, dI));
+      const bool tieRC = (std::abs(dR - dC) < 1e-4f) && (dR >= m - 1e-6f);
+      const bool tieRI = (std::abs(dR - dI) < 1e-4f) && (dR >= m - 1e-6f);
+      const bool tieCI = (std::abs(dC - dI) < 1e-4f) && (dC >= m - 1e-6f);
+
+      if ((dR > dC && dR > dI) || ((tieRC || tieRI) && (dR >= m - 1e-6f))) {
+        zoneTool = Tool::Residential;
+      } else if ((dC > dR && dC > dI) || (tieCI && (dC >= m - 1e-6f))) {
+        zoneTool = Tool::Commercial;
+      } else {
+        zoneTool = Tool::Industrial;
+      }
+
+      if (tieRC || tieRI || tieCI) {
+        // Deterministic tie-break: add a little variety so "flat" demand doesn't
+        // get stuck on one category.
+        const std::uint32_t mix = HashCoords32(day, s.population, DaySeed(world, day, 0x00524349u)); // "RCI"
+        const int r = static_cast<int>(mix % 3u);
+        zoneTool = (r == 0) ? Tool::Residential : (r == 1) ? Tool::Commercial : Tool::Industrial;
+      }
+
+      // Guardrail: if we are clearly job-starved, prefer job zones even if
+      // residential demand is moderately high.
+      if (jobPressure < 0.72f && zoneTool == Tool::Residential && (dC > 0.25f || dI > 0.25f)) {
+        zoneTool = (dI > dC) ? Tool::Industrial : Tool::Commercial;
+      }
     }
 
     // Place zones.

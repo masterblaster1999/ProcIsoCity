@@ -14,6 +14,7 @@ namespace isocity {
 
 struct SeaFloodResult;
 struct DepressionFillResult;
+struct FireRiskResult;
 
 // Small headless export utilities.
 // Intended for:
@@ -45,6 +46,24 @@ enum class ExportLayer : std::uint8_t {
   ServicesEducation = 11,
   ServicesHealth = 12,
   ServicesSafety = 13,
+
+  // Heuristic noise pollution / soundscape (derived from traffic + land use).
+  Noise = 14,
+
+  // Land-use mix / diversity index (normalized entropy, 0..1).
+  LandUseMix = 15,
+
+  // Heuristic urban heat island (diffused heatmap, 0..1).
+  HeatIsland = 16,
+
+  // SimCity-style zoning guidance: global R/C/I demand modulated by local land value.
+  // These layers visualize *where* growth pressure is highest for each zone type.
+  ZonePressureResidential = 17,
+  ZonePressureCommercial = 18,
+  ZonePressureIndustrial = 19,
+
+  // Heuristic fire-risk / response coverage (derived from fire stations + density).
+  FireRisk = 20,
 };
 
 // Back-compat alias: older UI code refers to the 2D export layer enum as ExportLayer2D.
@@ -625,6 +644,10 @@ struct TileMetricsCsvInputs {
   const LandValueResult* landValue = nullptr;
   const TrafficResult* traffic = nullptr;
   const GoodsResult* goods = nullptr;
+  const struct NoiseResult* noise = nullptr;
+  const struct LandUseMixResult* landUseMix = nullptr;
+  const struct HeatIslandResult* heatIsland = nullptr;
+  const FireRiskResult* fireRisk = nullptr;
   const SeaFloodResult* seaFlood = nullptr;
   const DepressionFillResult* ponding = nullptr;
 };
@@ -634,8 +657,15 @@ struct TileMetricsCsvOptions {
   bool includeLandValueComponents = true;
   bool includeTraffic = true;
   bool includeGoods = true;
+  bool includeNoise = true;
+  bool includeLandUseMix = true;
+  bool includeHeatIsland = true;
+  bool includeFireRisk = true;
   bool includeFlood = true;
   bool includePonding = true;
+
+  // Include SimCity-style R/C/I zoning pressure metrics (global demand modulated by local land value).
+  bool includeRciPressure = true;
 
   // Float precision for heights/metrics.
   int floatPrecision = 6;
@@ -651,8 +681,14 @@ struct TileMetricsCsvOptions {
 //   - land value: land_value,park_amenity,water_amenity,pollution,traffic_penalty
 //   - traffic: commute_traffic
 //   - goods: goods_traffic,goods_fill
+//   - noise: noise
+//   - land use mix: landuse_mix,landuse_density
+//   - heat island: heat_island,heat_island_raw
+//   - fire risk: fire_risk,fire_coverage,fire_response_cost
+//   - zoning pressure: zone_pressure_residential,zone_pressure_commercial,zone_pressure_industrial
 //   - flood: flooded,flood_depth
 //   - ponding: ponding_depth
+//   - RCI pressure: rci_pressure_residential,rci_pressure_commercial,rci_pressure_industrial
 //
 // Returns true on success; on failure, outError contains a human-friendly error.
 bool WriteTileMetricsCsv(const World& world, const std::string& path, std::string& outError,
