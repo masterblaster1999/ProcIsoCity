@@ -80,7 +80,86 @@ struct MineRecord {
 
   // Objective score.
   double score = 0.0;
+
+  // Pareto analysis (optional): populated by ComputePareto()/SelectTopParetoIndices().
+  // Rank 0 is the non-dominated front. Crowding distance follows the NSGA-II
+  // convention (front boundaries get +inf).
+  int paretoRank = -1;
+  double paretoCrowding = 0.0;
 };
+
+// ----------------------------------------------------------------------------
+// Multi-objective mining (Pareto / NSGA-II style selection)
+//
+// The existing seed miner produces a single scalar score (MineObjective) for
+// simple ranking. For exploratory workflows it is often more useful to treat
+// the KPIs as a multi-objective problem and keep a diverse set of
+// non-dominated candidates.
+// ----------------------------------------------------------------------------
+
+enum class MineMetric : std::uint8_t {
+  Population = 0,
+  Happiness = 1,
+  Money = 2,
+  AvgLandValue = 3,
+  TrafficCongestion = 4,
+  GoodsSatisfaction = 5,
+  ServicesOverallSatisfaction = 6,
+
+  WaterFrac = 7,
+  RoadFrac = 8,
+  ZoneFrac = 9,
+  ParkFrac = 10,
+
+  SeaFloodFrac = 11,
+  SeaMaxDepth = 12,
+  PondFrac = 13,
+  PondMaxDepth = 14,
+  PondVolume = 15,
+
+  // Derived: combines sea + ponding signals into a single severity proxy.
+  FloodRisk = 16,
+
+  // The scalar score computed for the MineObjective.
+  Score = 17,
+};
+
+const char* MineMetricName(MineMetric m);
+
+// Parse metric from a string (case-insensitive). Accepts common aliases.
+bool ParseMineMetric(const std::string& s, MineMetric& out);
+
+// Compute a metric value from a MineRecord.
+double MineMetricValue(const MineRecord& r, MineMetric m);
+
+struct ParetoObjective {
+  MineMetric metric = MineMetric::Population;
+  bool maximize = true;
+};
+
+struct ParetoResult {
+  // Pareto rank per record (0 = nondominated front). Size == recs.size().
+  std::vector<int> rank;
+
+  // NSGA-II crowding distance per record (inf for front boundaries). Size == recs.size().
+  std::vector<double> crowding;
+
+  // Fronts[k] contains indices of records in the k-th Pareto front.
+  std::vector<std::vector<int>> fronts;
+};
+
+// Compute Pareto fronts + crowding distance for the given objectives.
+//
+// Notes:
+// - Complexity is O(N^2 * M) which is fine for typical mining sample counts.
+// - If objectives is empty, all records are assigned rank 0.
+ParetoResult ComputePareto(const std::vector<MineRecord>& recs,
+                           const std::vector<ParetoObjective>& objectives);
+
+// Select top-K indices using Pareto rank then crowding distance (NSGA-II style).
+// If useCrowding is false, the final partially-selected front is tie-broken by
+// score (desc) then seed (asc).
+std::vector<int> SelectTopParetoIndices(const ParetoResult& pr, int topK, bool useCrowding = true);
 
 struct MineConfig {
   std::uint64_t seedStart = 1;

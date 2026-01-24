@@ -28,6 +28,7 @@ enum class ProcGenTerrainPreset : std::uint8_t {
   Canyon = 7,  // High plateau cut by a deep winding canyon river.
   Volcano = 8, // Central volcanic cone with a caldera (optionally lake-filled).
   Delta = 9,   // Low coastal river delta with branching distributaries.
+  Tectonic = 10, // Plate-driven mountain ranges and rift valleys.
 };
 
 // Human-readable name (stable for saves/CLI).

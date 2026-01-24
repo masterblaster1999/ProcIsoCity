@@ -38,6 +38,7 @@ const char* ToString(ProcGenTerrainPreset p)
   case ProcGenTerrainPreset::Canyon: return "canyon";
   case ProcGenTerrainPreset::Volcano: return "volcano";
   case ProcGenTerrainPreset::Delta: return "delta";
+  case ProcGenTerrainPreset::Tectonic: return "tectonic";
   default: return "classic";
   }
 }
@@ -101,6 +102,12 @@ bool ParseProcGenTerrainPreset(const std::string& s, ProcGenTerrainPreset& out)
   if (eq("delta") || eq("riverdelta") || eq("river_delta") || eq("river-delta") || eq("floodplain") ||
       eq("wetlands") || eq("marsh") || eq("marshes")) {
     out = ProcGenTerrainPreset::Delta;
+    return true;
+  }
+
+  if (eq("tectonic") || eq("plates") || eq("plate") || eq("plate_tectonics") || eq("plate-tectonics") ||
+      eq("tectonic_plate") || eq("tectonic_plates") || eq("ranges") || eq("mountain_ranges")) {
+    out = ProcGenTerrainPreset::Tectonic;
     return true;
   }
 
@@ -4045,6 +4052,99 @@ static void ApplyTerrainPreset(std::vector<float>& heights, int width, int heigh
   }
 
   // Apply per-tile modification.
+
+  // Precompute tectonic plates for the Tectonic preset.
+  struct TectPlate {
+    float cx = 0.0f;
+    float cy = 0.0f;
+    float vx = 0.0f;
+    float vy = 0.0f;
+    float bias = 0.0f; // base elevation bias (continental vs oceanic)
+  };
+
+  std::vector<TectPlate> tectPlates;
+  float tectSigma = 4.0f;         // boundary thickness (tiles)
+  float tectWarpScale = 0.05f;    // domain warp scale (in tile units)
+  float tectWarpAmp = 0.0f;       // domain warp amplitude (tiles)
+  std::uint32_t tectSeed = 0u;
+
+  if (preset == ProcGenTerrainPreset::Tectonic) {
+    tectSeed = seed32 ^ 0x7EC70C01u;
+
+    const int minD = std::min(width, height);
+
+    // Rough heuristic: larger maps get more plates. Strength can add a little more.
+    int plateCount = std::clamp(static_cast<int>(std::round(static_cast<float>(minD) / 38.0f)) + 5, 6, 22);
+    if (strength > 1.15f) {
+      plateCount = std::min(plateCount + 2, 24);
+    }
+    plateCount = std::clamp(plateCount, 6, 24);
+
+    // Jittered grid sampling so plates are reasonably well spaced.
+    const int g = std::max(2, static_cast<int>(std::ceil(std::sqrt(static_cast<float>(plateCount)))));
+    const int totalCells = g * g;
+
+    std::vector<int> cells;
+    cells.reserve(static_cast<std::size_t>(totalCells));
+    for (int i = 0; i < totalCells; ++i) cells.push_back(i);
+
+    // Deterministic shuffle (Fisher–Yates).
+    for (int i = totalCells - 1; i > 0; --i) {
+      const int j = prng.rangeInt(0, i);
+      std::swap(cells[static_cast<std::size_t>(i)], cells[static_cast<std::size_t>(j)]);
+    }
+
+    const float cellW = static_cast<float>(width) / static_cast<float>(g);
+    const float cellH = static_cast<float>(height) / static_cast<float>(g);
+
+    tectPlates.reserve(static_cast<std::size_t>(plateCount));
+
+    for (int pi = 0; pi < plateCount; ++pi) {
+      const int cell = cells[static_cast<std::size_t>(pi)];
+      const int cxCell = cell % g;
+      const int cyCell = cell / g;
+
+      const float jx = (prng.nextF01() - 0.5f) * 0.70f;
+      const float jy = (prng.nextF01() - 0.5f) * 0.70f;
+
+      float cxp = (static_cast<float>(cxCell) + 0.5f + jx) * cellW;
+      float cyp = (static_cast<float>(cyCell) + 0.5f + jy) * cellH;
+
+      cxp = std::clamp(cxp, 0.0f, static_cast<float>(width - 1));
+      cyp = std::clamp(cyp, 0.0f, static_cast<float>(height - 1));
+
+      // Drift direction (unit-ish vector).
+      const float ang = prng.nextF01() * kTwoPiF;
+      float sa = 0.0f;
+      float ca = 1.0f;
+      FastSinCosRad(ang, sa, ca);
+
+      // Plate base elevation bias: some plates are "oceanic".
+      float bias = 0.0f;
+      if (prng.chance(0.40f)) {
+        bias = -(0.18f + 0.08f * prng.nextF01());
+      } else {
+        bias = (0.08f + 0.12f * prng.nextF01());
+      }
+      bias *= (0.85f + 0.15f * std::min(strength, 1.0f));
+
+      TectPlate tp;
+      tp.cx = cxp;
+      tp.cy = cyp;
+      tp.vx = ca;
+      tp.vy = sa;
+      tp.bias = bias;
+      tectPlates.push_back(tp);
+    }
+
+    // Boundary thickness scales with map size.
+    tectSigma = std::clamp(2.8f + 0.022f * static_cast<float>(minD), 2.8f, 7.0f);
+
+    // Domain-warp the plate distance field a bit so boundaries are not perfectly straight.
+    tectWarpScale = std::max(0.0001f, coastScale * 0.55f);
+    tectWarpAmp = static_cast<float>(minD) * (0.07f + 0.04f * std::min(strength, 2.5f));
+  }
+
   for (int y = 0; y < height; ++y) {
     for (int x = 0; x < width; ++x) {
       const std::size_t i = Idx(x, y, width);
@@ -4281,6 +4381,97 @@ static void ApplyTerrainPreset(std::vector<float>& heights, int width, int heigh
                                               static_cast<float>(y) * coastScale * 1.20f,
                                               seed32 ^ 0xD311A5E5u, 3) * 2.0f - 1.0f);
           h -= marshN * coastal * (0.05f * strength);
+        }
+      }
+
+
+      else if (preset == ProcGenTerrainPreset::Tectonic) {
+        // Plate-tectonics inspired macro relief: long mountain ranges (convergent boundaries)
+        // and rift valleys (divergent boundaries), with domain-warped Voronoi plates.
+        if (!tectPlates.empty()) {
+          float px = static_cast<float>(x);
+          float py = static_cast<float>(y);
+
+          // Domain warp to curve boundaries.
+          if (tectWarpAmp > 0.01f) {
+            const float wx = (fbmNormalized(px * tectWarpScale, py * tectWarpScale,
+                                            tectSeed ^ 0xA0B1C2D3u, 3) * 2.0f - 1.0f);
+            const float wy = (fbmNormalized(px * tectWarpScale, py * tectWarpScale,
+                                            tectSeed ^ 0x31415926u, 3) * 2.0f - 1.0f);
+            px += wx * tectWarpAmp;
+            py += wy * tectWarpAmp;
+          }
+
+          int best = 0;
+          int second = 0;
+          float bestD2 = std::numeric_limits<float>::max();
+          float secondD2 = std::numeric_limits<float>::max();
+
+          for (int pi = 0; pi < static_cast<int>(tectPlates.size()); ++pi) {
+            const TectPlate& p = tectPlates[static_cast<std::size_t>(pi)];
+            const float dx = px - p.cx;
+            const float dy = py - p.cy;
+            const float d2 = dx * dx + dy * dy;
+
+            if (d2 < bestD2) {
+              secondD2 = bestD2;
+              second = best;
+              bestD2 = d2;
+              best = pi;
+            } else if (d2 < secondD2) {
+              secondD2 = d2;
+              second = pi;
+            }
+          }
+
+          const TectPlate& a = tectPlates[static_cast<std::size_t>(best)];
+          const TectPlate& b = tectPlates[static_cast<std::size_t>(second)];
+
+          // Interior bias: continental plates tend to sit higher than oceanic plates.
+          h += a.bias * (0.45f * strength);
+
+          const float d1 = std::sqrt(bestD2);
+          const float d2 = std::sqrt(secondD2);
+          const float delta = std::max(0.0f, d2 - d1);
+
+          // Boundary proximity: 1 on the boundary, ~0 in plate interiors.
+          const float sigma = std::max(0.001f, tectSigma);
+          const float boundary = std::exp(-(delta * delta) / (2.0f * sigma * sigma));
+          const float b2 = boundary * boundary;
+
+          // Convergence / divergence measured along the axis between plate centers.
+          float ux = b.cx - a.cx;
+          float uy = b.cy - a.cy;
+          const float len = std::sqrt(ux * ux + uy * uy) + 1e-6f;
+          ux /= len;
+          uy /= len;
+
+          const float compA = a.vx * ux + a.vy * uy;
+          const float compB = b.vx * ux + b.vy * uy;
+          float closing = compA - compB; // >0 => closing (convergent), <0 => opening (divergent)
+          closing = std::clamp(closing, -1.0f, 1.0f);
+
+          const float conv = std::max(0.0f, closing);
+          const float div = std::max(0.0f, -closing);
+
+          // Mountains at convergent boundaries; rift valleys at divergent boundaries.
+          h += b2 * conv * (0.56f * strength);
+          h -= b2 * div * (0.40f * strength);
+
+          // Transform boundaries (near-zero closing) get a rough shear ridge texture.
+          const float trans = 1.0f - std::min(1.0f, std::fabs(closing));
+          if (trans > 0.05f) {
+            const float shearN = (ridgedFbmNormalized(static_cast<float>(x) * coastScale * 1.25f,
+                                                      static_cast<float>(y) * coastScale * 1.25f,
+                                                      tectSeed ^ 0xC001D00Du, 3) * 2.0f - 1.0f);
+            h += shearN * boundary * trans * (0.08f * strength);
+          }
+
+          // Add a faint, broad "fold" pattern to help ranges read at a distance.
+          const float fold = (fbmNormalized(static_cast<float>(x) * coastScale * 0.55f,
+                                            static_cast<float>(y) * coastScale * 0.55f,
+                                            tectSeed ^ 0x51A71D00u, 2) * 2.0f - 1.0f);
+          h += fold * (0.06f * strength);
         }
       }
 
@@ -5036,6 +5227,92 @@ World GenerateWorld(int width, int height, std::uint64_t seed, const ProcGenConf
 
   if (hubPts.empty()) {
     hubPts.push_back({width / 2, height / 2});
+  }
+
+  // If the map contains water, try to ensure at least one hub has shoreline access.
+  //
+  // This produces more varied early cities (waterfront downtowns / ports) and tends to
+  // improve outside-connection plausibility without forcing *all* hubs to hug the coast.
+  if (hasAnyWater && !hubPts.empty()) {
+    auto waterFracAround = [&](const P& p, int rad) {
+      int total = 0;
+      int land = 0;
+      int water = 0;
+      CountLandAndWaterInRadius(world, p.x, p.y, rad, total, land, water);
+      return (total > 0) ? (static_cast<float>(water) / static_cast<float>(total)) : 0.0f;
+    };
+
+    bool anyNearWater = false;
+    for (const P& p : hubPts) {
+      if (waterFracAround(p, 6) > 0.0f) {
+        anyNearWater = true;
+        break;
+      }
+    }
+
+    if (!anyNearWater) {
+      // Pick a hub to replace (worst score), then search for a shoreline candidate
+      // that stays well-separated from the remaining hubs.
+      int replaceIdx = 0;
+      float worst = std::numeric_limits<float>::max();
+
+      for (int i = 0; i < static_cast<int>(hubPts.size()); ++i) {
+        const P& p = hubPts[static_cast<std::size_t>(i)];
+        const float s = ScoreHubCandidate(world, p.x, p.y, hasAnyWater, seed32 ^ 0xDADADA11u ^ static_cast<std::uint32_t>(i));
+        if (s < worst) {
+          worst = s;
+          replaceIdx = i;
+        }
+      }
+
+      P best = hubPts[static_cast<std::size_t>(replaceIdx)];
+      float bestScore = -1.0e9f;
+
+      const std::uint32_t waterHubSeed = seed32 ^ 0x51EA7E11u;
+      const int rad = 7;
+
+      for (int tries = 0; tries < 2500; ++tries) {
+        const int x = rng.rangeInt(1, width - 2);
+        const int y = rng.rangeInt(1, height - 2);
+        if (!world.isBuildable(x, y)) continue;
+        if (!HasAdjacentWater4(world, x, y)) continue;
+
+        bool farEnough = true;
+        for (int i = 0; i < static_cast<int>(hubPts.size()); ++i) {
+          if (i == replaceIdx) continue;
+          const P& h = hubPts[static_cast<std::size_t>(i)];
+          if (std::abs(h.x - x) + std::abs(h.y - y) < minDist) {
+            farEnough = false;
+            break;
+          }
+        }
+        if (!farEnough) continue;
+
+        float s = ScoreHubCandidate(world, x, y, hasAnyWater, waterHubSeed);
+
+        // Bonus for being "near" water but not completely surrounded by it.
+        int total = 0;
+        int land = 0;
+        int water = 0;
+        CountLandAndWaterInRadius(world, x, y, rad, total, land, water);
+        const float wf = (total > 0) ? (static_cast<float>(water) / static_cast<float>(total)) : 0.0f;
+
+        const float wTarget = 0.18f;
+        const float wSigma = 0.10f;
+        const float d = (wf - wTarget) / std::max(0.001f, wSigma);
+        const float wScore = std::exp(-(d * d));
+        s += wScore * 0.12f;
+
+        if (s > bestScore) {
+          bestScore = s;
+          best = {x, y};
+        }
+      }
+
+      if (bestScore > -1.0e8f) {
+        hubPts[static_cast<std::size_t>(replaceIdx)] = best;
+      }
+    }
   }
 
   // Districts: create meaningful administrative regions from the start.

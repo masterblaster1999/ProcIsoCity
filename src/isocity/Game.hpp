@@ -915,6 +915,8 @@ private:
   MineObjective m_mineObjective = MineObjective::Balanced;
   int m_mineTopK = 20;
   bool m_mineTopDiverse = true;
+  bool m_mineTopPareto = false;
+  bool m_mineTopParetoCrowding = true;
 
   // City Lab UI state for mining.
   MineConfig m_labMineCfg{};
@@ -927,6 +929,8 @@ private:
   int m_labMineTopCacheIndex = -1;
   int m_labMineTopCacheTopK = 0;
   bool m_labMineTopCacheDiverse = true;
+  bool m_labMineTopCachePareto = false;
+  bool m_labMineTopCacheParetoCrowding = true;
   std::vector<int> m_labMineTopIndices;
 
   // Manual stepping requests (used by dev console and future UI) so expensive

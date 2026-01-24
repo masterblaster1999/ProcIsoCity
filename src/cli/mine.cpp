@@ -13,11 +13,13 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -50,6 +52,15 @@ static void PrintHelp()
       << "  --diverse <0|1>          Diversify the top-K selection (default: 1).\n"
       << "  --candidate-pool <N>     Candidate pool size used for diversity (default: max(50,10*K)).\n"
       << "  --mmr-score-weight <F>   Diversity tradeoff in [0,1] (default: 0.70).\n"
+      << "\nMulti-objective (Pareto/NSGA-II) selection (optional):\n"
+      << "  --pareto <0|1>           Enable Pareto selection instead of scalar score ranking (default: 0).\n"
+      << "  --pareto-max <list>      Comma-separated metrics to maximize (default: population,happiness,avg_land_value).\n"
+      << "  --pareto-min <list>      Comma-separated metrics to minimize (default: traffic_congestion[,flood_risk]).\n"
+      << "  --pareto-crowding <0|1>  Use crowding distance within fronts (default: 1).\n"
+      << "\n  Metric names:\n"
+      << "    population,happiness,money,avg_land_value,traffic_congestion,goods_satisfaction,services_overall_satisfaction,\n"
+      << "    water_frac,road_frac,zone_frac,park_frac,sea_flood_frac,sea_max_depth,pond_frac,pond_max_depth,pond_volume,\n"
+      << "    flood_risk,score\n"
       << "\nConfig loading (optional):\n"
       << "  --config <combined.json> Load {proc:{...},sim:{...}} (overrides defaults).\n"
       << "  --proc <proc.json>       Load ProcGenConfig JSON overrides.\n"
@@ -183,6 +194,36 @@ static bool ParseJsonObjectText(const std::string& text, JsonValue& outObj, std:
   return true;
 }
 
+static std::string Trim(const std::string& s)
+{
+  std::size_t a = 0;
+  while (a < s.size() && std::isspace(static_cast<unsigned char>(s[a]))) ++a;
+  std::size_t b = s.size();
+  while (b > a && std::isspace(static_cast<unsigned char>(s[b - 1]))) --b;
+  return s.substr(a, b - a);
+}
+
+static std::vector<std::string> SplitCsvList(const std::string& s)
+{
+  std::vector<std::string> out;
+  std::string cur;
+  cur.reserve(s.size());
+
+  for (char c : s) {
+    if (c == ',') {
+      const std::string t = Trim(cur);
+      if (!t.empty()) out.push_back(t);
+      cur.clear();
+      continue;
+    }
+    cur.push_back(c);
+  }
+
+  const std::string t = Trim(cur);
+  if (!t.empty()) out.push_back(t);
+  return out;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -208,6 +249,12 @@ int main(int argc, char** argv)
   bool sea8 = false;
   float seaLevelOverride = std::numeric_limits<float>::quiet_NaN();
   float depEps = 0.0f;
+
+  // Pareto selection (multi-objective).
+  bool pareto = false;
+  std::string paretoMax;
+  std::string paretoMin;
+  bool paretoCrowding = true;
 
   bool quiet = false;
 
@@ -387,6 +434,34 @@ int main(int argc, char** argv)
       continue;
     }
 
+    if (arg == "--pareto") {
+      const std::string v = requireArg(i, "--pareto");
+      if (!ParseBool01(v, &pareto)) {
+        std::cerr << "invalid --pareto (expected 0|1): " << v << "\n";
+        return 2;
+      }
+      continue;
+    }
+
+    if (arg == "--pareto-max") {
+      paretoMax = requireArg(i, "--pareto-max");
+      continue;
+    }
+
+    if (arg == "--pareto-min") {
+      paretoMin = requireArg(i, "--pareto-min");
+      continue;
+    }
+
+    if (arg == "--pareto-crowding") {
+      const std::string v = requireArg(i, "--pareto-crowding");
+      if (!ParseBool01(v, &paretoCrowding)) {
+        std::cerr << "invalid --pareto-crowding (expected 0|1): " << v << "\n";
+        return 2;
+      }
+      continue;
+    }
+
     if (arg == "--config") {
       const std::string path = requireArg(i, "--config");
       CombinedConfig cc;
@@ -443,6 +518,9 @@ int main(int argc, char** argv)
     } else {
       std::cout << "  hydrology: off\n";
     }
+    if (pareto) {
+      std::cout << "  selection: pareto (NSGA-II)\n";
+    }
   }
 
   MineConfig mineCfg;
@@ -474,6 +552,49 @@ int main(int argc, char** argv)
 
   std::vector<MineRecord> recs = MineSeeds(mineCfg, procCfg, simCfg, progress);
 
+  // Optional Pareto analysis/selection.
+  ParetoResult paretoRes;
+  std::vector<ParetoObjective> paretoObjectives;
+  if (pareto) {
+    auto addMetricList = [&](const std::string& list, bool maximize) -> bool {
+      for (const std::string& name : SplitCsvList(list)) {
+        MineMetric m;
+        if (!ParseMineMetric(name, m)) {
+          std::cerr << "unknown Pareto metric: " << name << "\n";
+          return false;
+        }
+        ParetoObjective o;
+        o.metric = m;
+        o.maximize = maximize;
+        paretoObjectives.push_back(o);
+      }
+      return true;
+    };
+
+    if (!paretoMax.empty() || !paretoMin.empty()) {
+      if (!addMetricList(paretoMax, true)) return 2;
+      if (!addMetricList(paretoMin, false)) return 2;
+    } else {
+      // Default set: a compact, interpretable 4-5D tradeoff surface.
+      paretoObjectives.push_back({MineMetric::Population, true});
+      paretoObjectives.push_back({MineMetric::Happiness, true});
+      paretoObjectives.push_back({MineMetric::AvgLandValue, true});
+      paretoObjectives.push_back({MineMetric::TrafficCongestion, false});
+      if (hydro) paretoObjectives.push_back({MineMetric::FloodRisk, false});
+    }
+
+    if (paretoObjectives.empty()) {
+      std::cerr << "--pareto requires at least one objective (use --pareto-max/--pareto-min)\n";
+      return 2;
+    }
+
+    paretoRes = ComputePareto(recs, paretoObjectives);
+    for (std::size_t i = 0; i < recs.size(); ++i) {
+      recs[i].paretoRank = paretoRes.rank[i];
+      recs[i].paretoCrowding = paretoRes.crowding[i];
+    }
+  }
+
   // Write CSV.
   {
     if (!EnsureParentDir(fs::path(outCsv))) {
@@ -490,10 +611,18 @@ int main(int argc, char** argv)
   }
 
   // Select and print top seeds.
-  const std::vector<int> top = SelectTopIndices(recs, topK, diverse, candidatePool, mmrScoreWeight);
+  const std::vector<int> top = pareto
+                                  ? SelectTopParetoIndices(paretoRes, topK, paretoCrowding)
+                                  : SelectTopIndices(recs, topK, diverse, candidatePool, mmrScoreWeight);
 
   if (!quiet) {
-    std::cout << "\nTop " << top.size() << " seeds (" << (diverse ? "diverse" : "ranked") << "):\n";
+    std::cout << "\nTop " << top.size() << " seeds (";
+    if (pareto) {
+      std::cout << "pareto";
+    } else {
+      std::cout << (diverse ? "diverse" : "ranked");
+    }
+    std::cout << "):\n";
     for (std::size_t rank = 0; rank < top.size(); ++rank) {
       const MineRecord& r = recs[static_cast<std::size_t>(top[rank])];
       std::cout << "  " << (rank + 1) << ") seed=" << r.seed << " (" << HexU64(r.seed) << ")"
@@ -501,6 +630,10 @@ int main(int argc, char** argv)
                 << " pop=" << r.stats.population
                 << " happy=" << std::setprecision(3) << r.stats.happiness
                 << " cong=" << std::setprecision(3) << r.stats.trafficCongestion;
+      if (pareto) {
+        std::cout << " pr=" << r.paretoRank
+                  << " cd=" << std::setprecision(3) << r.paretoCrowding;
+      }
       if (hydro) {
         std::cout << " seaFrac=" << std::setprecision(3) << r.seaFloodFrac
                   << " pondMax=" << std::setprecision(3) << r.pondMaxDepth;
@@ -554,6 +687,19 @@ int main(int argc, char** argv)
     add(root, "diverse", JsonValue::MakeBool(diverse));
     add(root, "candidatePool", JsonValue::MakeNumber(static_cast<double>(candidatePool)));
     add(root, "mmrScoreWeight", JsonValue::MakeNumber(mmrScoreWeight));
+
+    add(root, "paretoEnabled", JsonValue::MakeBool(pareto));
+    add(root, "paretoCrowding", JsonValue::MakeBool(paretoCrowding));
+    if (pareto) {
+      JsonValue arrObj = JsonValue::MakeArray();
+      for (const auto& o : paretoObjectives) {
+        JsonValue po = JsonValue::MakeObject();
+        add(po, "metric", JsonValue::MakeString(MineMetricName(o.metric)));
+        add(po, "maximize", JsonValue::MakeBool(o.maximize));
+        arrObj.arrayValue.push_back(std::move(po));
+      }
+      add(root, "paretoObjectives", std::move(arrObj));
+    }
 
     add(root, "hydroEnabled", JsonValue::MakeBool(hydro));
     add(root, "seaLevel", JsonValue::MakeNumber(static_cast<double>(seaLevel)));

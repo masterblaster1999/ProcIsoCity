@@ -2313,6 +2313,7 @@ void Game::setupDevConsole()
           c.print("  canyon");
           c.print("  volcano");
           c.print("  delta");
+          c.print("  tectonic");
         };
 
         auto listRoadLayouts = [&]() {
@@ -4558,11 +4559,11 @@ void Game::setupDevConsole()
           c.print("Seed mining (headless) - uses the same core as proc_isocity_mine");
           c.print("Usage:");
           c.print("  mine begin <samples> [objective] [key=value...]  - start a new mining session (auto-runs)");
-          c.print("       keys: days=N seed_start=U64 seed_step=U64 hydro=0|1 sea=0..1 topK=N diverse=0|1");
+          c.print("       keys: days=N seed_start=U64 seed_step=U64 hydro=0|1 sea=0..1 topK=N diverse=0|1 pareto=0|1 crowding=0|1");
           c.print("  mine status                                 - show status / best seed so far");
           c.print("  mine auto on|off|toggle [steps=N] [budget=MS] - enable/disable auto-stepping each frame");
           c.print("  mine step [N]                               - synchronously mine N samples now");
-          c.print("  mine top [K] [diverse=0|1]                  - list top seeds by score");
+          c.print("  mine top [K] [diverse=0|1] [pareto=0|1] [crowding=0|1] - list top seeds (score/mmr or pareto)");
           c.print("  mine load <rank>                            - reset the game world to the Nth best seed (rank starts at 1)");
           c.print("  mine export <path.csv|path.json>            - export mined records");
           c.print("  mine stop                                  - stop and discard the current session");
@@ -4717,6 +4718,8 @@ void Game::setupDevConsole()
           }
           int k = m_mineTopK;
           bool diverse = m_mineTopDiverse;
+          bool pareto = m_mineTopPareto;
+          bool crowding = m_mineTopParetoCrowding;
 
           for (std::size_t i = 1; i < args.size(); ++i) {
             if (i == 1) {
@@ -4728,7 +4731,7 @@ void Game::setupDevConsole()
             }
             const std::size_t eq = args[i].find('=');
             if (eq == std::string::npos) {
-              c.print("Usage: mine top [K] [diverse=0|1]");
+              c.print("Usage: mine top [K] [diverse=0|1] [pareto=0|1] [crowding=0|1]");
               return;
             }
             const std::string key = toLower(args[i].substr(0, eq));
@@ -4742,6 +4745,24 @@ void Game::setupDevConsole()
               diverse = b;
               continue;
             }
+            if (key == "pareto") {
+              bool b = pareto;
+              if (!parseBool(val, b)) {
+                c.print("Bad pareto. Use pareto=0|1");
+                return;
+              }
+              pareto = b;
+              continue;
+            }
+            if (key == "crowding" || key == "pareto_crowding") {
+              bool b = crowding;
+              if (!parseBool(val, b)) {
+                c.print("Bad crowding. Use crowding=0|1");
+                return;
+              }
+              crowding = b;
+              continue;
+            }
             c.print("Unknown key: " + key);
             return;
           }
@@ -4749,17 +4770,47 @@ void Game::setupDevConsole()
           k = std::clamp(k, 1, 1000);
           m_mineTopK = k;
           m_mineTopDiverse = diverse;
+          m_mineTopPareto = pareto;
+          m_mineTopParetoCrowding = crowding;
 
-          const auto& recs = m_mineSession->records();
-          const auto idxs = SelectTopIndices(recs, k, diverse);
-          c.print(TextFormat("Top %d seeds (%s):", static_cast<int>(idxs.size()), diverse ? "diverse" : "best"));
+          auto& recs = m_mineSession->records();
+
+          std::vector<int> idxs;
+          if (pareto) {
+            std::vector<ParetoObjective> obj;
+            obj.push_back({MineMetric::Population, true});
+            obj.push_back({MineMetric::Happiness, true});
+            obj.push_back({MineMetric::AvgLandValue, true});
+            obj.push_back({MineMetric::TrafficCongestion, false});
+            if (m_mineSession->config().hydrologyEnabled) obj.push_back({MineMetric::FloodRisk, false});
+
+            const ParetoResult pr = ComputePareto(recs, obj);
+            for (std::size_t ii = 0; ii < recs.size(); ++ii) {
+              recs[ii].paretoRank = pr.rank[ii];
+              recs[ii].paretoCrowding = pr.crowding[ii];
+            }
+
+            idxs = SelectTopParetoIndices(pr, k, crowding);
+          } else {
+            idxs = SelectTopIndices(recs, k, diverse);
+          }
+
+          c.print(TextFormat("Top %d seeds (%s):", static_cast<int>(idxs.size()), pareto ? "pareto" : (diverse ? "diverse" : "best")));
           for (std::size_t i = 0; i < idxs.size(); ++i) {
             const MineRecord& r = recs[static_cast<std::size_t>(idxs[i])];
-            c.print(TextFormat(
-                "  %2d) score=%.4f seed=%llu pop=%d hap=%.1f land=%.1f commute=%.2fmin flood=%.2f%% pond=%.2f%%",
-                static_cast<int>(i + 1), r.score, static_cast<unsigned long long>(r.seed), r.stats.population,
-                r.stats.happiness, r.stats.avgLandValue, r.stats.avgCommuteTime, r.seaFloodFrac * 100.0,
-                r.pondFrac * 100.0));
+            if (pareto) {
+              c.print(TextFormat(
+                  "  %2d) pr=%d cd=%.3f score=%.4f seed=%llu pop=%d hap=%.1f land=%.1f commute=%.2fmin flood=%.2f%% pond=%.2f%%",
+                  static_cast<int>(i + 1), r.paretoRank, r.paretoCrowding, r.score,
+                  static_cast<unsigned long long>(r.seed), r.stats.population, r.stats.happiness, r.stats.avgLandValue,
+                  r.stats.avgCommuteTime, r.seaFloodFrac * 100.0, r.pondFrac * 100.0));
+            } else {
+              c.print(TextFormat(
+                  "  %2d) score=%.4f seed=%llu pop=%d hap=%.1f land=%.1f commute=%.2fmin flood=%.2f%% pond=%.2f%%",
+                  static_cast<int>(i + 1), r.score, static_cast<unsigned long long>(r.seed), r.stats.population,
+                  r.stats.happiness, r.stats.avgLandValue, r.stats.avgCommuteTime, r.seaFloodFrac * 100.0,
+                  r.pondFrac * 100.0));
+            }
           }
           return;
         }
@@ -4779,14 +4830,32 @@ void Game::setupDevConsole()
             return;
           }
 
-          const auto& recs = m_mineSession->records();
+          auto& recs = m_mineSession->records();
           if (recs.empty()) {
             c.print("mine: no records yet.");
             return;
           }
 
           const int k = std::max(1, m_mineTopK);
-          const auto idxs = SelectTopIndices(recs, k, m_mineTopDiverse);
+          std::vector<int> idxs;
+          if (m_mineTopPareto) {
+            std::vector<ParetoObjective> obj;
+            obj.push_back({MineMetric::Population, true});
+            obj.push_back({MineMetric::Happiness, true});
+            obj.push_back({MineMetric::AvgLandValue, true});
+            obj.push_back({MineMetric::TrafficCongestion, false});
+            if (m_mineSession->config().hydrologyEnabled) obj.push_back({MineMetric::FloodRisk, false});
+
+            const ParetoResult pr = ComputePareto(recs, obj);
+            for (std::size_t ii = 0; ii < recs.size(); ++ii) {
+              recs[ii].paretoRank = pr.rank[ii];
+              recs[ii].paretoCrowding = pr.crowding[ii];
+            }
+
+            idxs = SelectTopParetoIndices(pr, k, m_mineTopParetoCrowding);
+          } else {
+            idxs = SelectTopIndices(recs, k, m_mineTopDiverse);
+          }
           if (rank > static_cast<int>(idxs.size())) {
             c.print(TextFormat("Rank out of range. Have %d records in top list.", static_cast<int>(idxs.size())));
             return;
@@ -4814,10 +4883,27 @@ void Game::setupDevConsole()
             c.print("mine: no active session.");
             return;
           }
-          const auto& recs = m_mineSession->records();
+          auto& recs = m_mineSession->records();
           if (recs.empty()) {
             c.print("mine: no records yet.");
             return;
+          }
+
+          // If Pareto mode is enabled for the top list, annotate records so exports
+          // carry paretoRank/paretoCrowding alongside the usual scalar score.
+          if (m_mineTopPareto) {
+            std::vector<ParetoObjective> obj;
+            obj.push_back({MineMetric::Population, true});
+            obj.push_back({MineMetric::Happiness, true});
+            obj.push_back({MineMetric::AvgLandValue, true});
+            obj.push_back({MineMetric::TrafficCongestion, false});
+            if (m_mineSession->config().hydrologyEnabled) obj.push_back({MineMetric::FloodRisk, false});
+
+            const ParetoResult pr = ComputePareto(recs, obj);
+            for (std::size_t ii = 0; ii < recs.size(); ++ii) {
+              recs[ii].paretoRank = pr.rank[ii];
+              recs[ii].paretoCrowding = pr.crowding[ii];
+            }
           }
 
           std::string pathOut;
@@ -4983,6 +5069,24 @@ void Game::setupDevConsole()
                 return;
               }
               m_mineTopDiverse = b;
+              continue;
+            }
+            if (k == "pareto") {
+              bool b = m_mineTopPareto;
+              if (!parseBool(v, b)) {
+                c.print("Bad pareto. Use pareto=0|1");
+                return;
+              }
+              m_mineTopPareto = b;
+              continue;
+            }
+            if (k == "crowding" || k == "pareto_crowding") {
+              bool b = m_mineTopParetoCrowding;
+              if (!parseBool(v, b)) {
+                c.print("Bad crowding. Use crowding=0|1");
+                return;
+              }
+              m_mineTopParetoCrowding = b;
               continue;
             }
             c.print("Unknown key: " + k);
@@ -21353,10 +21457,25 @@ void Game::drawHeadlessLabPanel(int x0, int y0)
                     m_mineTopK, 1, 200, mouseUi, uiTime);
       cy += 22;
 
-      ui::Text(labelX, cy + 2, 14, "Diverse", uiTh.textDim);
-      ui::Toggle(9221, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), 120.0f, 18.0f}, m_mineTopDiverse,
+      ui::Text(labelX, cy + 2, 14, "Pareto", uiTh.textDim);
+      ui::Toggle(9229, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), 120.0f, 18.0f}, m_mineTopPareto,
                  mouseUi, uiTime);
+      ui::Text(ctrlX + 128, cy + 2, 14, "(multi-objective)", uiTh.textDim);
       cy += 22;
+
+      if (m_mineTopPareto) {
+        ui::Text(labelX, cy + 2, 14, "Crowding", uiTh.textDim);
+        ui::Toggle(9239, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), 120.0f, 18.0f}, m_mineTopParetoCrowding,
+                   mouseUi, uiTime);
+        ui::Text(ctrlX + 128, cy + 2, 14, "(diversify fronts)", uiTh.textDim);
+        cy += 22;
+      } else {
+        ui::Text(labelX, cy + 2, 14, "Diverse", uiTh.textDim);
+        ui::Toggle(9221, Rectangle{static_cast<float>(ctrlX), static_cast<float>(cy), 120.0f, 18.0f}, m_mineTopDiverse,
+                   mouseUi, uiTime);
+        ui::Text(ctrlX + 128, cy + 2, 14, "(MMR)", uiTh.textDim);
+        cy += 22;
+      }
     }
 
     // Auto-run controls.
@@ -21460,11 +21579,32 @@ void Game::drawHeadlessLabPanel(int x0, int y0)
       } else {
         const int curIdx = m_mineSession->index();
         if (curIdx != m_labMineTopCacheIndex || m_mineTopK != m_labMineTopCacheTopK ||
-            m_mineTopDiverse != m_labMineTopCacheDiverse) {
-          m_labMineTopIndices = SelectTopIndices(m_mineSession->records(), m_mineTopK, m_mineTopDiverse);
+            m_mineTopDiverse != m_labMineTopCacheDiverse || m_mineTopPareto != m_labMineTopCachePareto ||
+            m_mineTopParetoCrowding != m_labMineTopCacheParetoCrowding) {
+          auto& recs = m_mineSession->records();
+          if (m_mineTopPareto) {
+            std::vector<ParetoObjective> obj;
+            obj.push_back({MineMetric::Population, true});
+            obj.push_back({MineMetric::Happiness, true});
+            obj.push_back({MineMetric::AvgLandValue, true});
+            obj.push_back({MineMetric::TrafficCongestion, false});
+            if (m_mineSession->config().hydrologyEnabled) obj.push_back({MineMetric::FloodRisk, false});
+
+            const ParetoResult pr = ComputePareto(recs, obj);
+            for (std::size_t ii = 0; ii < recs.size(); ++ii) {
+              recs[ii].paretoRank = pr.rank[ii];
+              recs[ii].paretoCrowding = pr.crowding[ii];
+            }
+            m_labMineTopIndices = SelectTopParetoIndices(pr, m_mineTopK, m_mineTopParetoCrowding);
+          } else {
+            m_labMineTopIndices = SelectTopIndices(recs, m_mineTopK, m_mineTopDiverse);
+          }
+
           m_labMineTopCacheIndex = curIdx;
           m_labMineTopCacheTopK = m_mineTopK;
           m_labMineTopCacheDiverse = m_mineTopDiverse;
+          m_labMineTopCachePareto = m_mineTopPareto;
+          m_labMineTopCacheParetoCrowding = m_mineTopParetoCrowding;
           m_labMineTopSelection = std::clamp(m_labMineTopSelection, 0, std::max(0, (int)m_labMineTopIndices.size() - 1));
           m_labMineTopScroll = std::clamp(m_labMineTopScroll, 0, std::max(0, (int)m_labMineTopIndices.size() - 1));
         }
@@ -21503,10 +21643,18 @@ void Game::drawHeadlessLabPanel(int x0, int y0)
           const float floodPct = static_cast<float>(r.seaFloodFrac * 100.0);
           const float pondPct = static_cast<float>(r.pondFrac * 100.0);
 
-          ui::Text(baseX, ry, 14,
-                   TextFormat("#%d  %s  score %.2f  pop %.0f  hap %.0f  flood %.1f%% pond %.1f%%", i + 1,
-                              HexU64(r.seed).c_str(), r.score, r.stats.population, r.stats.happiness, floodPct, pondPct),
-                   selected ? uiTh.text : uiTh.textDim, false, true, 1);
+          if (m_mineTopPareto) {
+            ui::Text(baseX, ry, 14,
+                     TextFormat("#%d  %s  pr %d  score %.2f  pop %.0f  hap %.0f  flood %.1f%% pond %.1f%%", i + 1,
+                                HexU64(r.seed).c_str(), r.paretoRank, r.score, r.stats.population, r.stats.happiness,
+                                floodPct, pondPct),
+                     selected ? uiTh.text : uiTh.textDim, false, true, 1);
+          } else {
+            ui::Text(baseX, ry, 14,
+                     TextFormat("#%d  %s  score %.2f  pop %.0f  hap %.0f  flood %.1f%% pond %.1f%%", i + 1,
+                                HexU64(r.seed).c_str(), r.score, r.stats.population, r.stats.happiness, floodPct, pondPct),
+                     selected ? uiTh.text : uiTh.textDim, false, true, 1);
+          }
 
           ry += rowH;
         }

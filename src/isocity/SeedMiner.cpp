@@ -14,6 +14,26 @@ namespace isocity {
 
 namespace {
 
+// We avoid IEEE inf in exported artifacts (CSV/JSON) to keep them portable.
+constexpr double kParetoCrowdingInf = 1.0e30;
+
+static std::string NormalizeKey(const std::string& s)
+{
+  std::string t;
+  t.reserve(s.size());
+  for (char c : s) {
+    unsigned char uc = static_cast<unsigned char>(c);
+    char out = static_cast<char>(std::tolower(uc));
+    if (out == '-' || out == ' ' || out == '.') out = '_';
+    t.push_back(out);
+  }
+  return t;
+}
+
+} // namespace
+
+namespace {
+
 static std::vector<float> ExtractHeights(const World& world)
 {
   std::vector<float> heights;
@@ -257,6 +277,322 @@ static MineRecord MineOneSeed(std::uint64_t seed,
 }
 
 } // namespace
+
+
+const char* MineMetricName(MineMetric m)
+{
+  switch (m) {
+  case MineMetric::Population: return "population";
+  case MineMetric::Happiness: return "happiness";
+  case MineMetric::Money: return "money";
+  case MineMetric::AvgLandValue: return "avg_land_value";
+  case MineMetric::TrafficCongestion: return "traffic_congestion";
+  case MineMetric::GoodsSatisfaction: return "goods_satisfaction";
+  case MineMetric::ServicesOverallSatisfaction: return "services_overall_satisfaction";
+  case MineMetric::WaterFrac: return "water_frac";
+  case MineMetric::RoadFrac: return "road_frac";
+  case MineMetric::ZoneFrac: return "zone_frac";
+  case MineMetric::ParkFrac: return "park_frac";
+  case MineMetric::SeaFloodFrac: return "sea_flood_frac";
+  case MineMetric::SeaMaxDepth: return "sea_max_depth";
+  case MineMetric::PondFrac: return "pond_frac";
+  case MineMetric::PondMaxDepth: return "pond_max_depth";
+  case MineMetric::PondVolume: return "pond_volume";
+  case MineMetric::FloodRisk: return "flood_risk";
+  case MineMetric::Score: return "score";
+  }
+  return "population";
+}
+
+bool ParseMineMetric(const std::string& s, MineMetric& out)
+{
+  const std::string t = NormalizeKey(s);
+  if (t == "population" || t == "pop") {
+    out = MineMetric::Population;
+    return true;
+  }
+  if (t == "happiness" || t == "happy") {
+    out = MineMetric::Happiness;
+    return true;
+  }
+  if (t == "money" || t == "cash" || t == "funds") {
+    out = MineMetric::Money;
+    return true;
+  }
+  if (t == "avg_land_value" || t == "land_value" || t == "landvalue" || t == "avglandvalue") {
+    out = MineMetric::AvgLandValue;
+    return true;
+  }
+  if (t == "traffic_congestion" || t == "congestion" || t == "traffic" || t == "cong") {
+    out = MineMetric::TrafficCongestion;
+    return true;
+  }
+  if (t == "goods_satisfaction" || t == "goods" || t == "goods_sat" || t == "goodssatisfaction") {
+    out = MineMetric::GoodsSatisfaction;
+    return true;
+  }
+  if (t == "services_overall_satisfaction" || t == "services" || t == "services_sat" ||
+      t == "services_satisfaction" || t == "servicesoverall") {
+    out = MineMetric::ServicesOverallSatisfaction;
+    return true;
+  }
+  if (t == "water_frac" || t == "water") {
+    out = MineMetric::WaterFrac;
+    return true;
+  }
+  if (t == "road_frac" || t == "roads" || t == "road") {
+    out = MineMetric::RoadFrac;
+    return true;
+  }
+  if (t == "zone_frac" || t == "zones" || t == "zone") {
+    out = MineMetric::ZoneFrac;
+    return true;
+  }
+  if (t == "park_frac" || t == "parks" || t == "park") {
+    out = MineMetric::ParkFrac;
+    return true;
+  }
+  if (t == "sea_flood_frac" || t == "sea_flood" || t == "seafloodfrac") {
+    out = MineMetric::SeaFloodFrac;
+    return true;
+  }
+  if (t == "sea_max_depth" || t == "sea_depth" || t == "seamaxdepth") {
+    out = MineMetric::SeaMaxDepth;
+    return true;
+  }
+  if (t == "pond_frac" || t == "ponding_frac" || t == "pond") {
+    out = MineMetric::PondFrac;
+    return true;
+  }
+  if (t == "pond_max_depth" || t == "pond_depth" || t == "pondmaxdepth") {
+    out = MineMetric::PondMaxDepth;
+    return true;
+  }
+  if (t == "pond_volume" || t == "pondvolume") {
+    out = MineMetric::PondVolume;
+    return true;
+  }
+  if (t == "flood_risk" || t == "floodrisk" || t == "hydro_risk" || t == "hydrorisk") {
+    out = MineMetric::FloodRisk;
+    return true;
+  }
+  if (t == "score") {
+    out = MineMetric::Score;
+    return true;
+  }
+  return false;
+}
+
+double MineMetricValue(const MineRecord& r, MineMetric m)
+{
+  switch (m) {
+  case MineMetric::Population: return static_cast<double>(r.stats.population);
+  case MineMetric::Happiness: return static_cast<double>(r.stats.happiness);
+  case MineMetric::Money: return static_cast<double>(r.stats.money);
+  case MineMetric::AvgLandValue: return static_cast<double>(r.stats.avgLandValue);
+  case MineMetric::TrafficCongestion: return static_cast<double>(r.stats.trafficCongestion);
+  case MineMetric::GoodsSatisfaction: return static_cast<double>(r.stats.goodsSatisfaction);
+  case MineMetric::ServicesOverallSatisfaction: return static_cast<double>(r.stats.servicesOverallSatisfaction);
+  case MineMetric::WaterFrac: return r.waterFrac;
+  case MineMetric::RoadFrac: return r.roadFrac;
+  case MineMetric::ZoneFrac: return r.zoneFrac;
+  case MineMetric::ParkFrac: return r.parkFrac;
+  case MineMetric::SeaFloodFrac: return r.seaFloodFrac;
+  case MineMetric::SeaMaxDepth: return r.seaMaxDepth;
+  case MineMetric::PondFrac: return r.pondFrac;
+  case MineMetric::PondMaxDepth: return r.pondMaxDepth;
+  case MineMetric::PondVolume: return r.pondVolume;
+  case MineMetric::FloodRisk: {
+    // A simple, unitless proxy that combines fraction flooded + max depth signals.
+    // Depth terms are lightly down-weighted (they tend to have a narrower range).
+    constexpr double kDepthScale = 0.25;
+    return r.seaFloodFrac + r.pondFrac + kDepthScale * r.seaMaxDepth + kDepthScale * r.pondMaxDepth;
+  }
+  case MineMetric::Score: return r.score;
+  }
+  return 0.0;
+}
+
+namespace {
+
+static bool Dominates(const std::vector<double>& values, int a, int b, int m)
+{
+  bool anyStrict = false;
+  const std::size_t baseA = static_cast<std::size_t>(a) * static_cast<std::size_t>(m);
+  const std::size_t baseB = static_cast<std::size_t>(b) * static_cast<std::size_t>(m);
+  for (int k = 0; k < m; ++k) {
+    const double va = values[baseA + static_cast<std::size_t>(k)];
+    const double vb = values[baseB + static_cast<std::size_t>(k)];
+    if (va < vb) return false;
+    if (va > vb) anyStrict = true;
+  }
+  return anyStrict;
+}
+
+static void ComputeCrowding(const std::vector<double>& values,
+                            int m,
+                            const std::vector<int>& front,
+                            std::vector<double>& crowdingOut)
+{
+  if (front.empty()) return;
+  if (front.size() <= 2) {
+    for (int idx : front) crowdingOut[static_cast<std::size_t>(idx)] = kParetoCrowdingInf;
+    return;
+  }
+
+  // For each objective, sort the front and accumulate normalized neighbor distances.
+  std::vector<int> order = front;
+  for (int obj = 0; obj < m; ++obj) {
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+      const double va = values[static_cast<std::size_t>(a) * static_cast<std::size_t>(m) + static_cast<std::size_t>(obj)];
+      const double vb = values[static_cast<std::size_t>(b) * static_cast<std::size_t>(m) + static_cast<std::size_t>(obj)];
+      if (va == vb) return a < b;
+      return va < vb;
+    });
+
+    const double vmin = values[static_cast<std::size_t>(order.front()) * static_cast<std::size_t>(m) + static_cast<std::size_t>(obj)];
+    const double vmax = values[static_cast<std::size_t>(order.back()) * static_cast<std::size_t>(m) + static_cast<std::size_t>(obj)];
+    const double denom = (vmax > vmin) ? (vmax - vmin) : 0.0;
+
+    // Boundary points get an effectively-infinite crowding distance.
+    crowdingOut[static_cast<std::size_t>(order.front())] = kParetoCrowdingInf;
+    crowdingOut[static_cast<std::size_t>(order.back())] = kParetoCrowdingInf;
+
+    if (denom <= 0.0) continue;
+
+    for (std::size_t i = 1; i + 1 < order.size(); ++i) {
+      const int id = order[i];
+      // Once a point is marked as a boundary, keep it there.
+      if (crowdingOut[static_cast<std::size_t>(id)] >= kParetoCrowdingInf * 0.5) continue;
+      const double vprev = values[static_cast<std::size_t>(order[i - 1]) * static_cast<std::size_t>(m) + static_cast<std::size_t>(obj)];
+      const double vnext = values[static_cast<std::size_t>(order[i + 1]) * static_cast<std::size_t>(m) + static_cast<std::size_t>(obj)];
+      crowdingOut[static_cast<std::size_t>(id)] += (vnext - vprev) / denom;
+    }
+  }
+}
+
+} // namespace
+
+ParetoResult ComputePareto(const std::vector<MineRecord>& recs, const std::vector<ParetoObjective>& objectives)
+{
+  ParetoResult pr;
+  const int n = static_cast<int>(recs.size());
+  if (n <= 0) return pr;
+
+  pr.rank.assign(static_cast<std::size_t>(n), 0);
+  pr.crowding.assign(static_cast<std::size_t>(n), 0.0);
+
+  const int m = static_cast<int>(objectives.size());
+  if (m <= 0) {
+    // Degenerate: everything is in the same front.
+    pr.fronts.resize(1);
+    pr.fronts[0].reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) pr.fronts[0].push_back(i);
+    return pr;
+  }
+
+  // Build a transformed objective matrix where larger is always better
+  // (minimization objectives are negated).
+  std::vector<double> values;
+  values.resize(static_cast<std::size_t>(n) * static_cast<std::size_t>(m));
+  for (int i = 0; i < n; ++i) {
+    for (int k = 0; k < m; ++k) {
+      double v = MineMetricValue(recs[static_cast<std::size_t>(i)], objectives[static_cast<std::size_t>(k)].metric);
+      if (!objectives[static_cast<std::size_t>(k)].maximize) v = -v;
+      values[static_cast<std::size_t>(i) * static_cast<std::size_t>(m) + static_cast<std::size_t>(k)] = v;
+    }
+  }
+
+  // NSGA-II nondominated sorting.
+  std::vector<std::vector<int>> S;
+  S.resize(static_cast<std::size_t>(n));
+  std::vector<int> domCount(static_cast<std::size_t>(n), 0);
+
+  for (int i = 0; i < n; ++i) {
+    for (int j = i + 1; j < n; ++j) {
+      const bool iDomJ = Dominates(values, i, j, m);
+      const bool jDomI = !iDomJ && Dominates(values, j, i, m);
+      if (iDomJ) {
+        S[static_cast<std::size_t>(i)].push_back(j);
+        domCount[static_cast<std::size_t>(j)]++;
+      } else if (jDomI) {
+        S[static_cast<std::size_t>(j)].push_back(i);
+        domCount[static_cast<std::size_t>(i)]++;
+      }
+    }
+  }
+
+  std::vector<int> front;
+  front.reserve(static_cast<std::size_t>(n));
+  for (int i = 0; i < n; ++i) {
+    if (domCount[static_cast<std::size_t>(i)] == 0) {
+      pr.rank[static_cast<std::size_t>(i)] = 0;
+      front.push_back(i);
+    }
+  }
+
+  int rank = 0;
+  while (!front.empty()) {
+    pr.fronts.push_back(front);
+    std::vector<int> next;
+    for (int p : front) {
+      for (int q : S[static_cast<std::size_t>(p)]) {
+        int& c = domCount[static_cast<std::size_t>(q)];
+        c -= 1;
+        if (c == 0) {
+          pr.rank[static_cast<std::size_t>(q)] = rank + 1;
+          next.push_back(q);
+        }
+      }
+    }
+    ++rank;
+    front = std::move(next);
+  }
+
+  // Crowding distance per front.
+  for (const auto& f : pr.fronts) {
+    ComputeCrowding(values, m, f, pr.crowding);
+  }
+
+  return pr;
+}
+
+std::vector<int> SelectTopParetoIndices(const ParetoResult& pr, int topK, bool useCrowding)
+{
+  std::vector<int> out;
+  if (topK <= 0) return out;
+  if (pr.rank.empty()) return out;
+
+  const int n = static_cast<int>(pr.rank.size());
+  topK = std::min(topK, n);
+  out.reserve(static_cast<std::size_t>(topK));
+
+  for (const auto& front : pr.fronts) {
+    if (out.size() >= static_cast<std::size_t>(topK)) break;
+
+    std::vector<int> order = front;
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+      const double ca = pr.crowding[static_cast<std::size_t>(a)];
+      const double cb = pr.crowding[static_cast<std::size_t>(b)];
+      if (useCrowding) {
+        if (ca != cb) return ca > cb;
+      }
+      // Deterministic fallback: prefer lower rank (should be equal within front), then higher crowding, then index.
+      const int ra = pr.rank[static_cast<std::size_t>(a)];
+      const int rb = pr.rank[static_cast<std::size_t>(b)];
+      if (ra != rb) return ra < rb;
+      if (ca != cb) return ca > cb;
+      return a < b;
+    });
+
+    for (int id : order) {
+      if (out.size() >= static_cast<std::size_t>(topK)) break;
+      out.push_back(id);
+    }
+  }
+
+  return out;
+}
 
 const char* MineObjectiveName(MineObjective o)
 {
@@ -505,7 +841,7 @@ void WriteMineCsvHeader(std::ostream& os)
 {
   os << "seed,seed_hex,score,day,population,happiness,money,avg_land_value,traffic_congestion,goods_satisfaction,services_overall_satisfaction,"
         "roads,parks,road_tiles,water_tiles,res_tiles,com_tiles,ind_tiles,park_tiles,"
-        "sea_flood_frac,sea_max_depth,pond_frac,pond_max_depth,pond_volume\n";
+        "sea_flood_frac,sea_max_depth,pond_frac,pond_max_depth,pond_volume,pareto_rank,pareto_crowding\n";
 }
 
 void WriteMineCsvRow(std::ostream& os, const MineRecord& r)
@@ -535,7 +871,9 @@ void WriteMineCsvRow(std::ostream& os, const MineRecord& r)
   os << r.seaMaxDepth << ',';
   os << r.pondFrac << ',';
   os << r.pondMaxDepth << ',';
-  os << r.pondVolume;
+  os << r.pondVolume << ',';
+  os << r.paretoRank << ',';
+  os << r.paretoCrowding;
   os << "\n";
 }
 
@@ -547,6 +885,8 @@ JsonValue MineRecordToJson(const MineRecord& r)
   add(obj, "seed", JsonValue::MakeNumber(static_cast<double>(r.seed)));
   add(obj, "seed_hex", JsonValue::MakeString(HexU64(r.seed)));
   add(obj, "score", JsonValue::MakeNumber(r.score));
+  add(obj, "paretoRank", JsonValue::MakeNumber(static_cast<double>(r.paretoRank)));
+  add(obj, "paretoCrowding", JsonValue::MakeNumber(r.paretoCrowding));
 
   JsonValue st = JsonValue::MakeObject();
   add(st, "day", JsonValue::MakeNumber(static_cast<double>(r.stats.day)));

@@ -14,6 +14,7 @@
 #include "isocity/SaveLoad.hpp"
 #include "isocity/ConfigIO.hpp"
 #include "isocity/Sim.hpp"
+#include "isocity/SeedMiner.hpp"
 #include "isocity/Traffic.hpp"
 #include "isocity/Goods.hpp"
 #include "isocity/ParkOptimizer.hpp"
@@ -123,6 +124,52 @@ static int g_failures = 0;
                 << ")\n";                                                                                            \
     }                                                                                                                \
   } while (0)
+
+
+#define ASSERT_TRUE(cond)                                                                                            \
+  do {                                                                                                               \
+    if (!(cond)) {                                                                                                   \
+      ++g_failures;                                                                                                  \
+      std::cerr << __FILE__ << ":" << __LINE__ << " ASSERT_TRUE failed: " << #cond << "\n";                         \
+      return;                                                                                                        \
+    }                                                                                                                \
+  } while (0)
+
+#define ASSERT_EQ(a, b)                                                                                              \
+  do {                                                                                                               \
+    const auto _a = (a);                                                                                             \
+    const auto _b = (b);                                                                                             \
+    if (!(_a == _b)) {                                                                                               \
+      ++g_failures;                                                                                                  \
+      std::cerr << __FILE__ << ":" << __LINE__ << " ASSERT_EQ failed: " << #a << " == " << #b << "\n";              \
+      return;                                                                                                        \
+    }                                                                                                                \
+  } while (0)
+
+#define ASSERT_NE(a, b)                                                                                              \
+  do {                                                                                                               \
+    const auto _a = (a);                                                                                             \
+    const auto _b = (b);                                                                                             \
+    if ((_a == _b)) {                                                                                                \
+      ++g_failures;                                                                                                  \
+      std::cerr << __FILE__ << ":" << __LINE__ << " ASSERT_NE failed: " << #a << " != " << #b << "\n";              \
+      return;                                                                                                        \
+    }                                                                                                                \
+  } while (0)
+
+#define ASSERT_NEAR(a, b, eps)                                                                                       \
+  do {                                                                                                               \
+    const auto _a = (a);                                                                                             \
+    const auto _b = (b);                                                                                             \
+    const auto _e = (eps);                                                                                           \
+    if (std::fabs((_a) - (_b)) > (_e)) {                                                                             \
+      ++g_failures;                                                                                                  \
+      std::cerr << __FILE__ << ":" << __LINE__ << " ASSERT_NEAR failed: " << #a << " ~= " << #b << " (eps=" << _e   \
+                << ")\n";                                                                                           \
+      return;                                                                                                        \
+    }                                                                                                                \
+  } while (0)
+
 
 
 
@@ -2886,6 +2933,58 @@ void TestProcGenTerrainPresetIslandMakesCoastalWater()
   }
   EXPECT_TRUE(foundLand);
 }
+
+void TestProcGenTerrainPresetTectonicParsesAndGenerates()
+{
+  using namespace isocity;
+
+  ProcGenTerrainPreset p{};
+  EXPECT_TRUE(ParseProcGenTerrainPreset("tectonic", p));
+  EXPECT_EQ(p, ProcGenTerrainPreset::Tectonic);
+  EXPECT_EQ(std::string(ToString(p)), std::string("tectonic"));
+
+  ProcGenConfig pc{};
+  pc.zoneChance = 0.0f;
+  pc.parkChance = 0.0f;
+  pc.hubs = 1;
+  pc.extraConnections = 0;
+  pc.erosion.enabled = false;
+  pc.erosion.riversEnabled = false;
+  pc.terrainPreset = ProcGenTerrainPreset::Tectonic;
+  pc.terrainPresetStrength = 1.0f;
+
+  const std::uint64_t seed = 0xBADC0FFEu;
+
+  World w1 = GenerateWorld(64, 64, seed, pc);
+  World w2 = GenerateWorld(64, 64, seed, pc);
+
+  EXPECT_EQ(HashWorld(w1), HashWorld(w2));
+
+  float minH = 1e9f;
+  float maxH = -1e9f;
+  int water = 0;
+  const int total = w1.width() * w1.height();
+
+  for (int y = 0; y < w1.height(); ++y) {
+    for (int x = 0; x < w1.width(); ++x) {
+      const Tile& t = w1.at(x, y);
+      minH = std::min(minH, t.height);
+      maxH = std::max(maxH, t.height);
+      if (t.terrain == Terrain::Water) ++water;
+    }
+  }
+
+  const float range = maxH - minH;
+  const float waterFrac = (total > 0) ? (static_cast<float>(water) / static_cast<float>(total)) : 0.0f;
+
+  // The tectonic preset should create strong macro relief (ridges + basins) and
+  // usually produces both land and water with the default sea level.
+  EXPECT_TRUE(range > 0.50f);
+  EXPECT_TRUE(waterFrac > 0.02f);
+  EXPECT_TRUE(waterFrac < 0.80f);
+}
+
+
 
 
 void TestSimulationDeterministicHashAfterTicks()
@@ -8032,6 +8131,210 @@ void TestFileHashFNV1a64()
 }
 
 
+void TestSeedMinerParetoRankingAndSelection()
+{
+  using namespace isocity;
+
+  std::vector<MineRecord> recs;
+  recs.resize(4);
+
+  // A small synthetic set with an obvious dominance relation:
+  // record 0 dominates record 3 (higher pop, lower congestion).
+  recs[0].seed = 1;
+  recs[0].stats.population = 100;
+  recs[0].stats.trafficCongestion = 0.20;
+
+  recs[1].seed = 2;
+  recs[1].stats.population = 80;
+  recs[1].stats.trafficCongestion = 0.10;
+
+  recs[2].seed = 3;
+  recs[2].stats.population = 120;
+  recs[2].stats.trafficCongestion = 0.30;
+
+  recs[3].seed = 4;
+  recs[3].stats.population = 90;
+  recs[3].stats.trafficCongestion = 0.25;
+
+  std::vector<ParetoObjective> obj;
+  obj.push_back({MineMetric::Population, true});
+  obj.push_back({MineMetric::TrafficCongestion, false});
+
+  const ParetoResult pr = ComputePareto(recs, obj);
+  ASSERT_EQ(pr.rank.size(), recs.size());
+  ASSERT_EQ(pr.crowding.size(), recs.size());
+  ASSERT_TRUE(!pr.fronts.empty());
+
+  // First three points trade off pop vs congestion, so all should be nondominated.
+  EXPECT_EQ(pr.rank[0], 0);
+  EXPECT_EQ(pr.rank[1], 0);
+  EXPECT_EQ(pr.rank[2], 0);
+
+  // Fourth is dominated by record 0.
+  EXPECT_EQ(pr.rank[3], 1);
+
+  // Selecting 2 points from the first front should pick both extremes
+  // (best congestion + best population) via crowding distance.
+  const std::vector<int> top = SelectTopParetoIndices(pr, 2, true);
+  ASSERT_EQ(top.size(), 2u);
+  auto contains = [&](int id) {
+    for (int x : top) {
+      if (x == id) return true;
+    }
+    return false;
+  };
+  EXPECT_TRUE(contains(1));
+  EXPECT_TRUE(contains(2));
+}
+
+
+void TestSeedMinerMapElitesBasic()
+{
+  using namespace isocity;
+
+  std::vector<MineRecord> recs;
+  recs.resize(4);
+
+  // Two behavior dimensions (water fraction, traffic congestion), two bins each.
+  // Records 0 and 1 land in the same cell; record 1 has higher quality (score) and should win.
+  recs[0].seed = 1;
+  recs[0].w = 10;
+  recs[0].h = 10;
+  recs[0].waterFrac = 0.10f;
+  recs[0].stats.trafficCongestion = 0.20;
+  recs[0].score = 10.0;
+
+  recs[1].seed = 2;
+  recs[1].w = 10;
+  recs[1].h = 10;
+  recs[1].waterFrac = 0.10f;
+  recs[1].stats.trafficCongestion = 0.20;
+  recs[1].score = 12.0;
+
+  recs[2].seed = 3;
+  recs[2].w = 10;
+  recs[2].h = 10;
+  recs[2].waterFrac = 0.90f;
+  recs[2].stats.trafficCongestion = 0.20;
+  recs[2].score = 9.0;
+
+  recs[3].seed = 4;
+  recs[3].w = 10;
+  recs[3].h = 10;
+  recs[3].waterFrac = 0.90f;
+  recs[3].stats.trafficCongestion = 0.80;
+  recs[3].score = 11.0;
+
+  MapElitesConfig cfg;
+  cfg.x.metric = MineMetric::WaterFrac;
+  cfg.x.bins = 2;
+  cfg.x.autoRange = false;
+  cfg.x.min = 0.0;
+  cfg.x.max = 1.0;
+
+  cfg.y.metric = MineMetric::TrafficCongestion;
+  cfg.y.bins = 2;
+  cfg.y.autoRange = false;
+  cfg.y.min = 0.0;
+  cfg.y.max = 1.0;
+
+  cfg.qualityMetric = MineMetric::Score;
+  cfg.qualityMaximize = true;
+  cfg.clampToBounds = true;
+
+  const MapElitesResult me = ComputeMapElites(recs, cfg);
+  EXPECT_EQ(me.cfg.x.bins, 2);
+  EXPECT_EQ(me.cfg.y.bins, 2);
+  EXPECT_EQ(me.filledCells, 3);
+  EXPECT_NEAR(me.coverage, 0.75, 1.0e-12);
+  EXPECT_NEAR(me.qdScore, 32.0, 1.0e-12);
+  ASSERT_EQ(me.grid.size(), 4u);
+
+  // Cell indexing: (x,y) => y*xBins + x
+  // (0,0) should contain record 1 (wins over record 0).
+  EXPECT_EQ(me.grid[0], 1);
+  // (1,0) => record 2
+  EXPECT_EQ(me.grid[1], 2);
+  // (0,1) empty
+  EXPECT_EQ(me.grid[2], -1);
+  // (1,1) => record 3
+  EXPECT_EQ(me.grid[3], 3);
+
+  const std::vector<int> top = SelectTopMapElitesIndices(me, recs, 10);
+  ASSERT_EQ(top.size(), 3u);
+  EXPECT_EQ(top[0], 1); // score 12
+  EXPECT_EQ(top[1], 3); // score 11
+  EXPECT_EQ(top[2], 2); // score 9
+}
+
+
+void TestSeedMinerThreadedDeterminism()
+{
+  using namespace isocity;
+
+  ProcGenConfig procCfg;
+  SimConfig simCfg;
+
+  MineConfig cfg;
+  cfg.seedStart = 1;
+  cfg.seedStep = 1;
+  cfg.samples = 12;
+  cfg.w = 64;
+  cfg.h = 64;
+  cfg.days = 40;
+  cfg.threads = 1;
+  cfg.objective = MineObjective::Balanced;
+
+  // Keep this test light: hydrology metrics are deterministic but can be slower.
+  cfg.hydrologyEnabled = false;
+
+  const std::vector<MineRecord> single = MineSeeds(cfg, procCfg, simCfg);
+
+  cfg.threads = 4;
+  const std::vector<MineRecord> multi = MineSeeds(cfg, procCfg, simCfg);
+
+  ASSERT_EQ(single.size(), multi.size());
+  for (std::size_t i = 0; i < single.size(); ++i) {
+    const MineRecord& a = single[i];
+    const MineRecord& b = multi[i];
+
+    EXPECT_EQ(a.seed, b.seed);
+    EXPECT_EQ(a.w, b.w);
+    EXPECT_EQ(a.h, b.h);
+
+    EXPECT_EQ(a.stats.day, b.stats.day);
+    EXPECT_EQ(a.stats.population, b.stats.population);
+    EXPECT_EQ(a.stats.money, b.stats.money);
+
+    EXPECT_NEAR(a.stats.happiness, b.stats.happiness, 1.0e-6f);
+    EXPECT_NEAR(a.stats.trafficCongestion, b.stats.trafficCongestion, 1.0e-6f);
+    EXPECT_NEAR(a.stats.avgLandValue, b.stats.avgLandValue, 1.0e-4f);
+
+    EXPECT_EQ(a.roadTiles, b.roadTiles);
+    EXPECT_EQ(a.waterTiles, b.waterTiles);
+    EXPECT_EQ(a.resTiles, b.resTiles);
+    EXPECT_EQ(a.comTiles, b.comTiles);
+    EXPECT_EQ(a.indTiles, b.indTiles);
+    EXPECT_EQ(a.parkTiles, b.parkTiles);
+
+    EXPECT_NEAR(a.score, b.score, 1.0e-9);
+  }
+
+  // Also validate progress callback order is deterministic even in multi-thread mode.
+  std::vector<int> progressIdx;
+  progressIdx.reserve(static_cast<std::size_t>(cfg.samples));
+  MineProgressFn progress = [&](const MineProgress& p) { progressIdx.push_back(p.index); };
+
+  (void)MineSeeds(cfg, procCfg, simCfg, progress);
+
+  ASSERT_EQ(progressIdx.size(), static_cast<std::size_t>(cfg.samples));
+  for (int i = 0; i < cfg.samples; ++i) {
+    EXPECT_EQ(progressIdx[static_cast<std::size_t>(i)], i);
+  }
+}
+
+
+
 
 
 int main()
@@ -8054,6 +8357,9 @@ int main()
   TestJsonWriterStreaming();
   TestGfxCanvasAffineAndSampling();
   TestFileHashFNV1a64();
+  TestSeedMinerParetoRankingAndSelection();
+  TestSeedMinerMapElitesBasic();
+  TestSeedMinerThreadedDeterminism();
   TestPngReadersSupportDeflateAndFilters();
   TestSaveV8UsesCompressionForLargeDeltaPayload();
   TestSaveLoadDetectsCorruption();
@@ -8097,6 +8403,7 @@ int main()
   TestProcGenRiversAsWaterAddsWaterTiles();
   TestProcGenErosionToggleAffectsHash();
   TestProcGenTerrainPresetIslandMakesCoastalWater();
+  TestProcGenTerrainPresetTectonicParsesAndGenerates();
   TestSimulationDeterministicHashAfterTicks();
   TestWorldDiffCounts();
   TestWorldPatchRoundTrip();
