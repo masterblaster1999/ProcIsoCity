@@ -24,11 +24,49 @@ vec2 clampUv(vec2 uv)
     return clamp(uv, vec2(0.0), vec2(1.0));
 }
 
+vec3 srgbToLinear(vec3 c)
+{
+    // Cheap gamma decode. Good enough for a stylized pipeline.
+    return pow(max(c, vec3(0.0)), vec3(2.2));
+}
+
+vec3 linearToSrgb(vec3 c)
+{
+    return pow(max(c, vec3(0.0)), vec3(1.0/2.2));
+}
+
+// YCoCg conversion is useful for TAA clamping: it reduces chroma shifts compared to RGB
+// variance clipping. Operates in linear space.
+vec3 rgbToYCoCg(vec3 rgb)
+{
+    float Co = rgb.r - rgb.b;
+    float t  = rgb.b + 0.5 * Co;   // (r + b) * 0.5
+    float Cg = rgb.g - t;
+    float Y  = t + 0.5 * Cg;       // (r + 2g + b) * 0.25
+    return vec3(Y, Co, Cg);
+}
+
+vec3 yCoCgToRgb(vec3 ycg)
+{
+    float Y  = ycg.x;
+    float Co = ycg.y;
+    float Cg = ycg.z;
+
+    float t = Y - 0.5 * Cg;
+    float g = Cg + t;
+    float b = t - 0.5 * Co;
+    float r = b + Co;
+    return vec3(r, g, b);
+}
+
 // Manual bilinear sample of texture0.
 // This keeps TAA effective even if the underlying texture filter is set to point.
 vec4 sample0Bilinear(vec2 uv)
 {
-    vec2 texSize = 1.0 / max(u_texelSize, vec2(1e-6));
+    if (u_texelSize.x <= 0.0 || u_texelSize.y <= 0.0)
+        return texture(texture0, clampUv(uv));
+
+    vec2 texSize = 1.0 / u_texelSize;
 
     // Convert to texel space.
     vec2 pos = uv * texSize - vec2(0.5);
@@ -61,8 +99,10 @@ void main()
     vec2 cuv = clampUv(uv + u_jitterUV);
 
     // Preserve raylib tinting semantics.
-    vec4 curS = sample0Bilinear(cuv) * colDiffuse * fragColor;
-    vec3 cur = curS.rgb;
+    vec4 modulate = colDiffuse * fragColor;
+
+    vec4 curS = sample0Bilinear(cuv) * modulate;
+    vec3 curSrgb = curS.rgb;
 
     // First frame after reset: just seed the history.
     if (u_reset != 0) {
@@ -70,29 +110,68 @@ void main()
         return;
     }
 
-    vec3 hist = texture(u_history, uv).rgb;
+    vec3 histSrgb = texture(u_history, uv).rgb;
 
-    // --- Neighborhood clamp (TAA-lite)
-    // Use a 5-tap min/max to avoid severe ghosting without motion vectors.
-    vec3 cN = sample0Bilinear(clampUv(cuv + vec2(0.0, -u_texelSize.y))).rgb;
-    vec3 cS = sample0Bilinear(clampUv(cuv + vec2(0.0,  u_texelSize.y))).rgb;
-    vec3 cE = sample0Bilinear(clampUv(cuv + vec2( u_texelSize.x, 0.0))).rgb;
-    vec3 cW = sample0Bilinear(clampUv(cuv + vec2(-u_texelSize.x, 0.0))).rgb;
+    // --- Neighborhood clamp + variance clip (YCoCg, linear) ---
+    // Convert to linear and YCoCg so variance clipping is less likely to skew chroma.
+    vec3 curLin  = srgbToLinear(curSrgb);
+    vec3 histLin = srgbToLinear(histSrgb);
 
-    vec3 mn = min(cur, min(min(cN, cS), min(cE, cW)));
-    vec3 mx = max(cur, max(max(cN, cS), max(cE, cW)));
+    // 9-tap neighborhood improves diagonal edges and reduces flicker.
+    vec3 cN  = sample0Bilinear(clampUv(cuv + vec2(0.0, -u_texelSize.y))).rgb * modulate.rgb;
+    vec3 cS  = sample0Bilinear(clampUv(cuv + vec2(0.0,  u_texelSize.y))).rgb * modulate.rgb;
+    vec3 cE  = sample0Bilinear(clampUv(cuv + vec2( u_texelSize.x, 0.0))).rgb * modulate.rgb;
+    vec3 cW  = sample0Bilinear(clampUv(cuv + vec2(-u_texelSize.x, 0.0))).rgb * modulate.rgb;
 
-    vec3 histClamped = clamp(hist, mn, mx);
+    vec3 cNW = sample0Bilinear(clampUv(cuv + vec2(-u_texelSize.x, -u_texelSize.y))).rgb * modulate.rgb;
+    vec3 cNE = sample0Bilinear(clampUv(cuv + vec2( u_texelSize.x, -u_texelSize.y))).rgb * modulate.rgb;
+    vec3 cSW = sample0Bilinear(clampUv(cuv + vec2(-u_texelSize.x,  u_texelSize.y))).rgb * modulate.rgb;
+    vec3 cSE = sample0Bilinear(clampUv(cuv + vec2( u_texelSize.x,  u_texelSize.y))).rgb * modulate.rgb;
+
+    vec3 curYC  = rgbToYCoCg(curLin);
+    vec3 histYC = rgbToYCoCg(histLin);
+
+    vec3 yN  = rgbToYCoCg(srgbToLinear(cN));
+    vec3 yS  = rgbToYCoCg(srgbToLinear(cS));
+    vec3 yE  = rgbToYCoCg(srgbToLinear(cE));
+    vec3 yW  = rgbToYCoCg(srgbToLinear(cW));
+    vec3 yNW = rgbToYCoCg(srgbToLinear(cNW));
+    vec3 yNE = rgbToYCoCg(srgbToLinear(cNE));
+    vec3 ySW = rgbToYCoCg(srgbToLinear(cSW));
+    vec3 ySE = rgbToYCoCg(srgbToLinear(cSE));
+
+    vec3 mn = min(curYC, min(min(min(yN, yS), min(yE, yW)), min(min(yNW, yNE), min(ySW, ySE))));
+    vec3 mx = max(curYC, max(max(max(yN, yS), max(yE, yW)), max(max(yNW, yNE), max(ySW, ySE))));
+
+    // Variance clip: clamp history to mean +/- k*sigma (per-channel) to reduce ghosting.
+    vec3 sum  = curYC + yN + yS + yE + yW + yNW + yNE + ySW + ySE;
+    vec3 mean = sum * (1.0/9.0);
+
+    vec3 sum2 = curYC*curYC + yN*yN + yS*yS + yE*yE + yW*yW + yNW*yNW + yNE*yNE + ySW*ySW + ySE*ySE;
+    vec3 var  = max(sum2 * (1.0/9.0) - mean*mean, vec3(0.0));
+    vec3 sigma = sqrt(var);
+
+    const float k = 1.25;
+    vec3 clipMin = mean - sigma * k;
+    vec3 clipMax = mean + sigma * k;
+
+    vec3 histClamped = clamp(histYC, mn, mx);
+    histClamped = clamp(histClamped, clipMin, clipMax);
 
     // Responsiveness term: if the current frame disagrees with history, reduce
     // the history weight to avoid trails.
-    float diff = abs(luma(cur) - luma(histClamped));
+    float diff = abs(curYC.x - histClamped.x); // Y channel is a good luminance proxy in YCoCg
     float resp = mix(0.0, 8.0, clamp(u_response, 0.0, 1.0));
 
     float w = clamp(u_historyWeight, 0.0, 1.0);
     w *= clamp(1.0 - diff * resp, 0.0, 1.0);
     w = min(w, 0.98);
 
-    vec3 outRgb = mix(cur, histClamped, w);
-    finalColor = vec4(outRgb, curS.a);
+    vec3 outYC = mix(curYC, histClamped, w);
+
+    vec3 outLin = yCoCgToRgb(outYC);
+    vec3 outSrgb = linearToSrgb(outLin);
+    outSrgb = clamp(outSrgb, 0.0, 1.0);
+
+    finalColor = vec4(outSrgb, curS.a);
 }

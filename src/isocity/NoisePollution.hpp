@@ -46,6 +46,10 @@ struct NoiseConfig {
 
   // Clamp for the intermediate emission map.
   float emissionClamp = 1.0f;
+
+  // Clamp the final convolved noise field into [0,1] before the output curve.
+  // If false, negative values can propagate (useful for debugging sinks).
+  bool clamp01 = true;
 };
 
 struct NoiseResult {

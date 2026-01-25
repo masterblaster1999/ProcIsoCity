@@ -75,4 +75,44 @@ float bayer4(vec2 pixel, float seed)
     return (float(m[idx]) + 0.5) / 16.0;
 }
 
+
+float bayer8(vec2 pixel, float seed)
+{
+    // 8x8 Bayer matrix (normalized to [0,1)).
+    //
+    // Compared to bayer4(), this reduces visible repeating patterns in subtle
+    // dithering/quantization passes while remaining deterministic and cheap.
+    ivec2 p = ivec2(int(floor(pixel.x)) & 7, int(floor(pixel.y)) & 7);
+
+    // Seeded permutation: shift and optionally transpose the 8x8 matrix.
+    // This avoids a single universal dither pattern across all worlds.
+    int si = int(seed * 65535.0);
+    int s = si & 63;
+    int ox = s & 7;
+    int oy = (s >> 3) & 7;
+    p = ivec2((p.x + ox) & 7, (p.y + oy) & 7);
+    if ((s & 32) != 0) {
+        int tmp = p.x;
+        p.x = p.y;
+        p.y = tmp;
+    }
+
+    int idx = p.x + p.y * 8;
+
+    // Canonical 8x8 Bayer matrix values [0..63].
+    // (Recursive expansion of the 4x4 Bayer matrix.)
+    int m[64] = int[64](
+         0, 32,  8, 40,  2, 34, 10, 42,
+        48, 16, 56, 24, 50, 18, 58, 26,
+        12, 44,  4, 36, 14, 46,  6, 38,
+        60, 28, 52, 20, 62, 30, 54, 22,
+         3, 35, 11, 43,  1, 33,  9, 41,
+        51, 19, 59, 27, 49, 17, 57, 25,
+        15, 47,  7, 39, 13, 45,  5, 37,
+        63, 31, 55, 23, 61, 29, 53, 21
+    );
+
+    return (float(m[idx]) + 0.5) / 64.0;
+}
+
 #endif // PROCISOCITY_COMMON_GLSL

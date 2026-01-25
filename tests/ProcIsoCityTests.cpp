@@ -15,6 +15,12 @@
 #include "isocity/ConfigIO.hpp"
 #include "isocity/Sim.hpp"
 #include "isocity/SeedMiner.hpp"
+#include "isocity/MineCheckpoint.hpp"
+#include "isocity/MineCheckpointSh.hpp"
+#include "isocity/MineGallery.hpp"
+#include "isocity/MineClustering.hpp"
+#include "isocity/MineNeighbors.hpp"
+#include "isocity/PerceptualHash.hpp"
 #include "isocity/Traffic.hpp"
 #include "isocity/Goods.hpp"
 #include "isocity/ParkOptimizer.hpp"
@@ -64,6 +70,7 @@
 #include "isocity/Blueprint.hpp"
 #include "isocity/Road.hpp"
 #include "isocity/WorldDiff.hpp"
+#include "isocity/WorldDiffViz.hpp"
 #include "isocity/WorldPatch.hpp"
 #include "isocity/WorldPatchJson.hpp"
 #include "isocity/WorldTransform.hpp"
@@ -4081,6 +4088,47 @@ void TestWorldDiffCounts()
   EXPECT_EQ(d.districtDifferent, 1);
 
   EXPECT_EQ(d.tilesDifferent, 4);
+}
+
+
+void TestWorldDiffVizBasic()
+{
+  using namespace isocity;
+
+  World a(4, 4, 123u);
+  World b = a;
+
+  b.setRoad(1, 1);
+  b.setRoad(2, 1); // adjacent roads => road masks update => variation differs too.
+
+  const WorldDiffBounds bounds = ComputeWorldDiffBounds(a, b, 1e-6f);
+  EXPECT_TRUE(bounds.anyDifferent);
+  EXPECT_EQ(bounds.tilesDifferent, 2);
+  EXPECT_EQ(bounds.minX, 1);
+  EXPECT_EQ(bounds.minY, 1);
+  EXPECT_EQ(bounds.maxX, 3);
+  EXPECT_EQ(bounds.maxY, 2);
+
+  const PpmImage color = RenderWorldDiffColor(a, b, 1e-6f);
+  EXPECT_EQ(color.width, 4);
+  EXPECT_EQ(color.height, 4);
+  EXPECT_EQ(static_cast<int>(color.rgb.size()), 4 * 4 * 3);
+
+  // (1,1) should show overlay diff as strong green; variation diff should also lift red.
+  const std::size_t i = (1u + 1u * 4u) * 3u;
+  EXPECT_EQ(color.rgb[i + 1], 255);      // strong green for overlay
+  EXPECT_TRUE(color.rgb[i + 0] >= 160);  // variation adds red (yellowish)
+  EXPECT_EQ(color.rgb[i + 2], 0);        // no height diff in this test
+
+  const PpmImage count = RenderWorldDiffCount(a, b, 1e-6f);
+  EXPECT_EQ(count.width, 4);
+  EXPECT_EQ(count.height, 4);
+  EXPECT_EQ(static_cast<int>(count.rgb.size()), 4 * 4 * 3);
+
+  // The count image should be non-zero at differing tiles.
+  EXPECT_TRUE(count.rgb[i + 0] > 0);
+  EXPECT_EQ(count.rgb[i + 0], count.rgb[i + 1]);
+  EXPECT_EQ(count.rgb[i + 0], count.rgb[i + 2]);
 }
 
 void TestWorldPatchRoundTrip()
@@ -8267,6 +8315,172 @@ void TestSeedMinerMapElitesBasic()
   EXPECT_EQ(top[2], 2); // score 9
 }
 
+void TestSeedMinerLocalOutlierFactorBasic()
+{
+  using namespace isocity;
+
+  std::vector<MineRecord> recs;
+  recs.resize(6);
+
+  // Five points in a tight cluster.
+  for (int i = 0; i < 5; ++i) {
+    recs[static_cast<std::size_t>(i)].seed = static_cast<std::uint64_t>(i + 1);
+    recs[static_cast<std::size_t>(i)].stats.population = 100 + i;
+  }
+
+  // One obvious outlier far away in population space.
+  recs[5].seed = 999;
+  recs[5].stats.population = 1000;
+
+  OutlierConfig cfg;
+  cfg.k = 2;
+  cfg.space = MineDiversityMode::Scalar;
+  cfg.robustScaling = true;
+  cfg.layoutWeight = 0.50;
+  cfg.metrics = {MineMetric::Population};
+
+  const OutlierResult r1 = ComputeLocalOutlierFactor(recs, cfg);
+  ASSERT_EQ(r1.lof.size(), recs.size());
+  ASSERT_EQ(r1.novelty.size(), recs.size());
+
+  const double lofOut = r1.lof[5];
+  EXPECT_TRUE(lofOut > 2.0);
+
+  for (int i = 0; i < 5; ++i) {
+    EXPECT_TRUE(r1.lof[static_cast<std::size_t>(i)] < lofOut);
+  }
+
+  // Novelty should also be highest for the outlier.
+  double maxNov = -1.0;
+  int maxIdx = -1;
+  for (int i = 0; i < static_cast<int>(recs.size()); ++i) {
+    const double nov = r1.novelty[static_cast<std::size_t>(i)];
+    if (nov > maxNov) {
+      maxNov = nov;
+      maxIdx = i;
+    }
+  }
+  EXPECT_EQ(maxIdx, 5);
+
+  // Selection helper should pick the outlier first.
+  for (std::size_t i = 0; i < recs.size(); ++i) {
+    recs[i].outlierLof = r1.lof[i];
+    recs[i].novelty = r1.novelty[i];
+  }
+  const std::vector<int> top = SelectTopOutlierIndices(recs, 2);
+  ASSERT_TRUE(top.size() >= 1u);
+  EXPECT_EQ(top[0], 5);
+
+  // Deterministic: recomputing should produce identical results.
+  const OutlierResult r2 = ComputeLocalOutlierFactor(recs, cfg);
+  ASSERT_EQ(r2.lof.size(), recs.size());
+  for (std::size_t i = 0; i < recs.size(); ++i) {
+    EXPECT_NEAR(r1.lof[i], r2.lof[i], 1.0e-12);
+    EXPECT_NEAR(r1.novelty[i], r2.novelty[i], 1.0e-12);
+  }
+}
+
+
+void TestMineClusteringKMedoidsLayoutBasic()
+{
+  using namespace isocity;
+
+  std::vector<MineRecord> recs;
+  recs.resize(6);
+
+  // Two very separated layout clusters in pHash space.
+  // Cluster 0: near all-zeros.
+  recs[0].seed = 1; recs[0].score = 100.0; recs[0].overlayPHash = 0x0000000000000000ull;
+  recs[1].seed = 2; recs[1].score =  90.0; recs[1].overlayPHash = 0x0000000000000000ull;
+  recs[2].seed = 3; recs[2].score =  80.0; recs[2].overlayPHash = 0x0000000000000001ull;
+
+  // Cluster 1: near all-ones.
+  recs[3].seed = 4; recs[3].score = 70.0; recs[3].overlayPHash = 0xFFFFFFFFFFFFFFFFull;
+  recs[4].seed = 5; recs[4].score = 60.0; recs[4].overlayPHash = 0xFFFFFFFFFFFFFFFFull;
+  recs[5].seed = 6; recs[5].score = 50.0; recs[5].overlayPHash = 0xFFFFFFFFFFFFFFFEull;
+
+  std::vector<int> sel = {0, 1, 2, 3, 4, 5};
+
+  MineClusteringConfig cfg;
+  cfg.k = 2;
+  cfg.space = MineDiversityMode::Layout;
+  cfg.maxIters = 25;
+
+  const MineClusteringResult res = ComputeMineClusteringKMedoids(recs, sel, cfg);
+  ASSERT_TRUE(res.ok);
+  ASSERT_EQ(res.assignment.size(), sel.size());
+  ASSERT_EQ(res.clusterSizes.size(), 2u);
+  EXPECT_EQ(res.clusterSizes[0], 3);
+  EXPECT_EQ(res.clusterSizes[1], 3);
+
+  // Deterministic initialization picks the best-score point (seed=1) as the first medoid,
+  // which lies in the all-zeros cluster.
+  for (int i = 0; i < 3; ++i) EXPECT_EQ(res.assignment[static_cast<std::size_t>(i)], 0);
+  for (int i = 3; i < 6; ++i) EXPECT_EQ(res.assignment[static_cast<std::size_t>(i)], 1);
+
+  // Medoids should come from their respective groups.
+  ASSERT_EQ(res.medoidRecIndex.size(), 2u);
+  EXPECT_TRUE(res.medoidRecIndex[0] >= 0 && res.medoidRecIndex[0] <= 2);
+  EXPECT_TRUE(res.medoidRecIndex[1] >= 3 && res.medoidRecIndex[1] <= 5);
+
+  // These clusters are extremely separated, silhouette should be high.
+  EXPECT_TRUE(res.avgSilhouette > 0.8);
+}
+
+
+void TestMineNeighborsKnnLayoutBasic()
+{
+  using namespace isocity;
+
+  std::vector<MineRecord> recs;
+  recs.resize(5);
+
+  // Two layout groups in pHash space.
+  recs[0].seed = 1; recs[0].overlayPHash = 0x0000000000000000ull;
+  recs[1].seed = 2; recs[1].overlayPHash = 0x0000000000000000ull;
+  recs[2].seed = 3; recs[2].overlayPHash = 0x0000000000000001ull;
+  recs[3].seed = 4; recs[3].overlayPHash = 0xFFFFFFFFFFFFFFFFull;
+  recs[4].seed = 5; recs[4].overlayPHash = 0xFFFFFFFFFFFFFFFEull;
+
+  std::vector<int> sel = {0, 1, 2, 3, 4};
+
+  MineNeighborsConfig cfg;
+  cfg.k = 2;
+  cfg.space = MineDiversityMode::Layout;
+
+  const MineNeighborsResult r1 = ComputeMineNeighborsKNN(recs, sel, cfg);
+  ASSERT_TRUE(r1.ok);
+  ASSERT_EQ(r1.neighbors.size(), sel.size());
+  ASSERT_EQ(r1.distances.size(), sel.size());
+
+  // For entry 0 (all-zeros pHash), nearest should be entry 1 (identical) then entry 2 (Hamming 1).
+  ASSERT_EQ(r1.neighbors[0].size(), 2u);
+  EXPECT_EQ(r1.neighbors[0][0], 1);
+  EXPECT_NEAR(r1.distances[0][0], 0.0, 1.0e-12);
+  EXPECT_EQ(r1.neighbors[0][1], 2);
+  EXPECT_NEAR(r1.distances[0][1], 1.0 / 64.0, 1.0e-12);
+
+  // For entry 3 (all-ones pHash), nearest should be entry 4 (Hamming 1).
+  ASSERT_TRUE(!r1.neighbors[3].empty());
+  EXPECT_EQ(r1.neighbors[3][0], 4);
+  EXPECT_NEAR(r1.distances[3][0], 1.0 / 64.0, 1.0e-12);
+
+  // Deterministic: recomputing yields identical neighbor ordering/distances.
+  const MineNeighborsResult r2 = ComputeMineNeighborsKNN(recs, sel, cfg);
+  ASSERT_TRUE(r2.ok);
+  ASSERT_EQ(r2.neighbors.size(), r1.neighbors.size());
+  for (std::size_t i = 0; i < r1.neighbors.size(); ++i) {
+    ASSERT_EQ(r2.neighbors[i].size(), r1.neighbors[i].size());
+    ASSERT_EQ(r2.distances[i].size(), r1.distances[i].size());
+    for (std::size_t j = 0; j < r1.neighbors[i].size(); ++j) {
+      EXPECT_EQ(r2.neighbors[i][j], r1.neighbors[i][j]);
+      EXPECT_NEAR(r2.distances[i][j], r1.distances[i][j], 1.0e-12);
+    }
+  }
+}
+
+
+
 
 void TestSeedMinerThreadedDeterminism()
 {
@@ -8317,6 +8531,8 @@ void TestSeedMinerThreadedDeterminism()
     EXPECT_EQ(a.indTiles, b.indTiles);
     EXPECT_EQ(a.parkTiles, b.parkTiles);
 
+    EXPECT_EQ(a.overlayPHash, b.overlayPHash);
+
     EXPECT_NEAR(a.score, b.score, 1.0e-9);
   }
 
@@ -8332,6 +8548,592 @@ void TestSeedMinerThreadedDeterminism()
     EXPECT_EQ(progressIdx[static_cast<std::size_t>(i)], i);
   }
 }
+
+
+
+
+static std::uint64_t ReverseBits64_Test(std::uint64_t x)
+{
+  x = ((x & 0x5555555555555555ULL) << 1) | ((x >> 1) & 0x5555555555555555ULL);
+  x = ((x & 0x3333333333333333ULL) << 2) | ((x >> 2) & 0x3333333333333333ULL);
+  x = ((x & 0x0F0F0F0F0F0F0F0FULL) << 4) | ((x >> 4) & 0x0F0F0F0F0F0F0F0FULL);
+  x = ((x & 0x00FF00FF00FF00FFULL) << 8) | ((x >> 8) & 0x00FF00FF00FF00FFULL);
+  x = ((x & 0x0000FFFF0000FFFFULL) << 16) | ((x >> 16) & 0x0000FFFF0000FFFFULL);
+  x = (x << 32) | (x >> 32);
+  return x;
+}
+
+static std::uint64_t SplitMix64Hash_Test(std::uint64_t x)
+{
+  // Match isocity::SplitMix64Next behavior for a local state initialized to x.
+  std::uint64_t s = x + 0x9e3779b97f4a7c15ULL;
+  std::uint64_t z = s;
+  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+  return z ^ (z >> 31);
+}
+
+static std::uint64_t RadicalInverseU64_Test(std::uint64_t n, std::uint32_t base)
+{
+  if (base < 2u) return 0u;
+  if (n == 0u) return 0u;
+
+  __uint128_t numer = 0;
+  __uint128_t denom = 1;
+  while (n > 0u) {
+    const std::uint64_t digit = (base == 2u) ? (n & 1u) : (n % static_cast<std::uint64_t>(base));
+    n = (base == 2u) ? (n >> 1u) : (n / static_cast<std::uint64_t>(base));
+    numer = numer * static_cast<std::uint64_t>(base) + digit;
+    denom *= static_cast<std::uint64_t>(base);
+  }
+
+  std::uint64_t out = 0;
+  __uint128_t rem = numer;
+  for (int i = 0; i < 64; ++i) {
+    rem *= 2;
+    out <<= 1;
+    if (rem >= denom) {
+      rem -= denom;
+      out |= 1ULL;
+    }
+  }
+  return out;
+}
+
+static std::uint64_t Part1By1_Test(std::uint32_t x)
+{
+  std::uint64_t v = static_cast<std::uint64_t>(x);
+  v = (v | (v << 16)) & 0x0000FFFF0000FFFFULL;
+  v = (v | (v << 8)) & 0x00FF00FF00FF00FFULL;
+  v = (v | (v << 4)) & 0x0F0F0F0F0F0F0F0FULL;
+  v = (v | (v << 2)) & 0x3333333333333333ULL;
+  v = (v | (v << 1)) & 0x5555555555555555ULL;
+  return v;
+}
+
+static std::uint64_t Morton2D32_Test(std::uint32_t x, std::uint32_t y)
+{
+  return Part1By1_Test(x) | (Part1By1_Test(y) << 1);
+}
+
+void TestSeedSamplerModes()
+{
+  using namespace isocity;
+
+  MineConfig cfg;
+  cfg.seedStart = 0;
+  cfg.seedStep = 1;
+  cfg.seedXor = 0;
+  cfg.samples = 0;
+
+  cfg.seedSampler = MineSeedSampler::Linear;
+  EXPECT_EQ(MineSeedForSample(cfg, 0), 0ull);
+  EXPECT_EQ(MineSeedForSample(cfg, 5), 5ull);
+
+  cfg.seedSampler = MineSeedSampler::SplitMix64;
+  EXPECT_EQ(MineSeedForSample(cfg, 0), SplitMix64Hash_Test(0));
+  EXPECT_EQ(MineSeedForSample(cfg, 1), SplitMix64Hash_Test(1));
+
+  cfg.seedSampler = MineSeedSampler::VanDerCorput2;
+  EXPECT_EQ(MineSeedForSample(cfg, 0), 0ull);
+  EXPECT_EQ(MineSeedForSample(cfg, 1), 0x8000000000000000ULL);
+  EXPECT_EQ(MineSeedForSample(cfg, 2), 0x4000000000000000ULL);
+
+  cfg.seedSampler = MineSeedSampler::Halton23;
+  auto expectedHalton23 = [&](std::uint64_t base) -> std::uint64_t {
+    const std::uint64_t u = ReverseBits64_Test(base);
+    const std::uint64_t v = RadicalInverseU64_Test(base, 3);
+    const std::uint32_t ux = static_cast<std::uint32_t>(u >> 32);
+    const std::uint32_t vx = static_cast<std::uint32_t>(v >> 32);
+    return Morton2D32_Test(ux, vx);
+  };
+  EXPECT_EQ(MineSeedForSample(cfg, 0), expectedHalton23(0));
+  EXPECT_EQ(MineSeedForSample(cfg, 1), expectedHalton23(1));
+  EXPECT_EQ(MineSeedForSample(cfg, 3), expectedHalton23(3));
+
+  cfg.seedXor = 0xDEADBEEFCAFEBABEULL;
+  EXPECT_EQ(MineSeedForSample(cfg, 1), expectedHalton23(1) ^ cfg.seedXor);
+}
+
+
+void TestSeedMinerExplicitSeedList()
+{
+  using namespace isocity;
+
+  ProcGenConfig procCfg;
+  SimConfig simCfg;
+
+  MineConfig base;
+  base.seedStart = 0;
+  base.seedStep = 1;
+  base.samples = 0; // ignored by MineSeedsExplicit
+  base.w = 48;
+  base.h = 48;
+  base.days = 12;
+  base.threads = 3;
+  base.objective = MineObjective::Balanced;
+
+  // Keep this test light.
+  base.hydrologyEnabled = false;
+
+  const std::vector<std::uint64_t> seeds = {1ull, 2ull, 42ull, 1337ull};
+
+  std::vector<MineRecord> batch;
+  std::string err;
+  ASSERT_TRUE(MineSeedsExplicit(base, procCfg, simCfg, seeds, batch, &err));
+  ASSERT_TRUE(err.empty());
+  ASSERT_EQ(batch.size(), seeds.size());
+
+  // MineSeedsExplicit must preserve the input ordering (even with multiple threads).
+  for (std::size_t i = 0; i < seeds.size(); ++i) {
+    EXPECT_EQ(batch[i].seed, seeds[i]);
+    EXPECT_EQ(batch[i].w, base.w);
+    EXPECT_EQ(batch[i].h, base.h);
+  }
+
+  // Cross-check: mining each seed individually via the original MineSeeds path
+  // should match the corresponding explicit-list record.
+  for (std::size_t i = 0; i < seeds.size(); ++i) {
+    MineConfig one = base;
+    one.seedStart = seeds[i];
+    one.seedStep = 1;
+    one.samples = 1;
+    one.threads = 1;
+
+    std::vector<MineRecord> per;
+    std::string err2;
+    ASSERT_TRUE(MineSeeds(one, procCfg, simCfg, per, &err2));
+    ASSERT_TRUE(err2.empty());
+    ASSERT_EQ(per.size(), 1u);
+
+    const MineRecord& a = batch[i];
+    const MineRecord& b = per[0];
+
+    EXPECT_EQ(a.seed, b.seed);
+    EXPECT_EQ(a.w, b.w);
+    EXPECT_EQ(a.h, b.h);
+
+    EXPECT_EQ(a.stats.day, b.stats.day);
+    EXPECT_EQ(a.stats.population, b.stats.population);
+    EXPECT_EQ(a.stats.money, b.stats.money);
+    EXPECT_NEAR(a.stats.happiness, b.stats.happiness, 1.0e-6f);
+    EXPECT_NEAR(a.stats.trafficCongestion, b.stats.trafficCongestion, 1.0e-6f);
+    EXPECT_NEAR(a.stats.avgLandValue, b.stats.avgLandValue, 1.0e-4f);
+
+    EXPECT_EQ(a.overlayPHash, b.overlayPHash);
+
+    EXPECT_NEAR(a.objectiveScore, b.objectiveScore, 1.0e-9);
+    EXPECT_NEAR(a.score, b.score, 1.0e-9);
+  }
+}
+
+
+static void TestPerceptualHashBasics()
+{
+  using namespace isocity;
+
+  // Simple synthetic patterns should yield deterministic hashes and non-zero distances.
+  PHashOptions opt;
+  opt.downW = 32;
+  opt.downH = 32;
+  opt.dctSize = 8;
+
+  const std::uint64_t hVert = ComputePHashSample(64, 64, [&](int x, int /*y*/) -> float {
+    return (x < 32) ? 0.0f : 255.0f;
+  }, opt);
+
+  const std::uint64_t hVert2 = ComputePHashSample(64, 64, [&](int x, int /*y*/) -> float {
+    return (x < 32) ? 0.0f : 255.0f;
+  }, opt);
+
+  const std::uint64_t hHoriz = ComputePHashSample(64, 64, [&](int /*x*/, int y) -> float {
+    return (y < 32) ? 0.0f : 255.0f;
+  }, opt);
+
+  EXPECT_EQ(hVert, hVert2);
+  EXPECT_EQ(HammingDistance64(hVert, hVert2), 0);
+
+  const int dh = HammingDistance64(hVert, hHoriz);
+  EXPECT_TRUE(dh > 0);
+  EXPECT_TRUE(dh <= 64);
+}
+
+static void TestMineCheckpointRoundTrip()
+{
+  using namespace isocity;
+
+  ProcGenConfig procCfg;
+  SimConfig simCfg;
+
+  MineConfig cfg;
+  cfg.seedStart = 0x123456789ABCDEF0ULL;
+  cfg.seedStep = 0x1111111111111111ULL;
+  cfg.seedSampler = MineSeedSampler::SplitMix64;
+  cfg.seedXor = 0x0F0E0D0C0B0A0908ULL;
+  cfg.samples = 6;
+  cfg.w = 48;
+  cfg.h = 48;
+  cfg.days = 25;
+  cfg.threads = 1;
+  cfg.objective = MineObjective::Balanced;
+  cfg.hydrologyEnabled = false;
+
+  const std::vector<MineRecord> recs = MineSeeds(cfg, procCfg, simCfg);
+  ASSERT_EQ(recs.size(), static_cast<std::size_t>(cfg.samples));
+
+  MineCheckpointHeader h;
+  h.version = 1;
+  h.mineCfg = cfg;
+  h.procCfg = procCfg;
+  h.simCfg = simCfg;
+
+  const fs::path tmp = fs::temp_directory_path() / "procisocity_mine_checkpoint_test.jsonl";
+  {
+    std::ofstream os(tmp, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(static_cast<bool>(os));
+    std::string err;
+    if (!WriteMineCheckpointHeader(os, h, &err)) {
+      std::cerr << "checkpoint header write failed: " << err << "\n";
+      ASSERT_TRUE(false);
+    }
+    for (std::size_t i = 0; i < recs.size(); ++i) {
+      if (!AppendMineCheckpointRecord(os, static_cast<int>(i), recs[i], &err)) {
+        std::cerr << "checkpoint record write failed: " << err << "\n";
+        ASSERT_TRUE(false);
+      }
+    }
+  }
+
+  MineCheckpointHeader loaded;
+  std::vector<MineRecord> loadedRecs;
+  std::vector<bool> have;
+  std::string err;
+  if (!LoadMineCheckpointFile(tmp.string(), &loaded, loadedRecs, &have, &err)) {
+    std::cerr << "checkpoint load failed: " << err << "\n";
+    ASSERT_TRUE(false);
+  }
+
+  std::string why;
+  if (!MineCheckpointConfigsMatch(h, loaded, &why)) {
+    std::cerr << "checkpoint config mismatch: " << why << "\n";
+    ASSERT_TRUE(false);
+  }
+
+  ASSERT_EQ(loadedRecs.size(), recs.size());
+  ASSERT_EQ(have.size(), recs.size());
+  for (std::size_t i = 0; i < recs.size(); ++i) {
+    EXPECT_TRUE(have[i]);
+    EXPECT_EQ(loadedRecs[i].seed, recs[i].seed);
+    EXPECT_EQ(loadedRecs[i].overlayPHash, recs[i].overlayPHash);
+    EXPECT_EQ(loadedRecs[i].stats.population, recs[i].stats.population);
+    EXPECT_NEAR(loadedRecs[i].score, recs[i].score, 1.0e-9);
+    EXPECT_NEAR(loadedRecs[i].objectiveScore, recs[i].objectiveScore, 1.0e-9);
+  }
+
+  // Also verify MineRecordFromJsonText works on the nested record JSON.
+  JsonWriteOptions opt;
+  opt.pretty = false;
+  opt.sortKeys = true;
+  const std::string recText = JsonStringify(MineRecordToJson(recs.front()), opt);
+  MineRecord parsed;
+  if (!MineRecordFromJsonText(recText, parsed, &err)) {
+    std::cerr << "MineRecordFromJsonText failed: " << err << "\n";
+    ASSERT_TRUE(false);
+  }
+  EXPECT_EQ(parsed.seed, recs.front().seed);
+  EXPECT_EQ(parsed.overlayPHash, recs.front().overlayPHash);
+  EXPECT_NEAR(parsed.score, recs.front().score, 1.0e-9);
+  EXPECT_NEAR(parsed.objectiveScore, recs.front().objectiveScore, 1.0e-9);
+
+  (void)fs::remove(tmp);
+}
+
+
+static void TestMineCheckpointShRoundTrip()
+{
+  using namespace isocity;
+
+  ProcGenConfig procCfg;
+  SimConfig simCfg;
+
+  // Create a tiny two-stage successive-halving run.
+  MineConfig cfg;
+  cfg.seedStart = 123;
+  cfg.seedStep = 1;
+  cfg.seedSampler = MineSeedSampler::Linear;
+  cfg.seedXor = 0;
+  cfg.samples = 4;
+  cfg.w = 32;
+  cfg.h = 32;
+  cfg.days = 3; // effective (final) days
+  cfg.threads = 1;
+  cfg.objective = MineObjective::Balanced;
+  cfg.hydrologyEnabled = false;
+
+  std::vector<SuccessiveHalvingStage> stages;
+  stages.push_back({2, 3}); // stage 0: evaluate 4 seeds at 2 days, keep 3
+  stages.push_back({3, 2}); // stage 1: evaluate 3 seeds at 3 days, keep 2
+
+  MineCheckpointShHeader h;
+  h.version = 1;
+  h.mineCfg = cfg;
+  h.procCfg = procCfg;
+  h.simCfg = simCfg;
+  h.sh.spec = "2:3,3:2";
+  h.sh.stages = stages;
+  h.sh.diverse = false;
+  h.sh.candidatePool = 0;
+  h.sh.mmrScoreWeight = 0.6;
+  h.sh.diversityMode = MineDiversityMode::Hybrid;
+  h.sh.layoutWeight = 0.5;
+
+  // Stage 0 seeds.
+  std::vector<std::uint64_t> seeds0;
+  for (int i = 0; i < cfg.samples; ++i) seeds0.push_back(MineSeedForSample(cfg, static_cast<std::uint64_t>(i)));
+  MineConfig stage0Cfg = cfg;
+  stage0Cfg.days = stages[0].days;
+  std::vector<MineRecord> stage0Recs;
+  {
+    std::string err;
+    if (!MineSeedsExplicit(stage0Cfg, procCfg, simCfg, seeds0, stage0Recs, &err)) {
+      std::cerr << "stage0 MineSeedsExplicit failed: " << err << "\n";
+      ASSERT_TRUE(false);
+    }
+  }
+
+  // Stage 1 seeds: take the first 3 (deterministic) for this test.
+  std::vector<std::uint64_t> seeds1;
+  seeds1.push_back(stage0Recs[0].seed);
+  seeds1.push_back(stage0Recs[1].seed);
+  seeds1.push_back(stage0Recs[2].seed);
+  MineConfig stage1Cfg = cfg;
+  stage1Cfg.days = stages[1].days;
+  std::vector<MineRecord> stage1Recs;
+  {
+    std::string err;
+    if (!MineSeedsExplicit(stage1Cfg, procCfg, simCfg, seeds1, stage1Recs, &err)) {
+      std::cerr << "stage1 MineSeedsExplicit failed: " << err << "\n";
+      ASSERT_TRUE(false);
+    }
+  }
+
+  const fs::path tmp = fs::temp_directory_path() / "procisocity_chk_sh_test.jsonl";
+  {
+    std::ofstream os(tmp, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(os.good());
+    std::string err;
+    if (!WriteMineCheckpointShHeader(os, h, &err)) {
+      std::cerr << "WriteMineCheckpointShHeader failed: " << err << "\n";
+      ASSERT_TRUE(false);
+    }
+    for (int i = 0; i < static_cast<int>(stage0Recs.size()); ++i) {
+      if (!AppendMineCheckpointShRecord(os, 0, i, stage0Recs[static_cast<std::size_t>(i)], &err)) {
+        std::cerr << "AppendMineCheckpointShRecord(stage0) failed: " << err << "\n";
+        ASSERT_TRUE(false);
+      }
+    }
+    for (int i = 0; i < static_cast<int>(stage1Recs.size()); ++i) {
+      if (!AppendMineCheckpointShRecord(os, 1, i, stage1Recs[static_cast<std::size_t>(i)], &err)) {
+        std::cerr << "AppendMineCheckpointShRecord(stage1) failed: " << err << "\n";
+        ASSERT_TRUE(false);
+      }
+    }
+  }
+
+  MineCheckpointShHeader loaded;
+  std::vector<std::vector<MineRecord>> loadedStages;
+  std::vector<std::vector<bool>> have;
+  std::string err;
+  if (!LoadMineCheckpointShFile(tmp.string(), &loaded, loadedStages, &have, &err)) {
+    std::cerr << "LoadMineCheckpointShFile failed: " << err << "\n";
+    ASSERT_TRUE(false);
+  }
+
+  std::string why;
+  if (!MineCheckpointShConfigsMatch(h, loaded, &why)) {
+    std::cerr << "MineCheckpointShConfigsMatch failed: " << why << "\n";
+    ASSERT_TRUE(false);
+  }
+
+  ASSERT_EQ(loadedStages.size(), std::size_t(2));
+  ASSERT_EQ(have.size(), std::size_t(2));
+  ASSERT_EQ(loadedStages[0].size(), stage0Recs.size());
+  ASSERT_EQ(loadedStages[1].size(), stage1Recs.size());
+
+  for (std::size_t i = 0; i < stage0Recs.size(); ++i) {
+    EXPECT_TRUE(have[0][i]);
+    EXPECT_EQ(loadedStages[0][i].seed, stage0Recs[i].seed);
+  }
+  for (std::size_t i = 0; i < stage1Recs.size(); ++i) {
+    EXPECT_TRUE(have[1][i]);
+    EXPECT_EQ(loadedStages[1][i].seed, stage1Recs[i].seed);
+  }
+
+  (void)fs::remove(tmp);
+}
+
+
+static void TestMineScoreExprCustomScore()
+{
+  using namespace isocity;
+
+  ProcGenConfig procCfg;
+  SimConfig simCfg;
+
+  MineConfig cfg;
+  cfg.seedStart = 100;
+  cfg.seedStep = 1;
+  cfg.samples = 5;
+  cfg.w = 32;
+  cfg.h = 32;
+  cfg.days = 0;
+  cfg.threads = 1;
+  cfg.objective = MineObjective::Balanced;
+  cfg.hydrologyEnabled = false;
+
+  // Custom score expression should override MineRecord::score while preserving
+  // the raw MineObjective score in MineRecord::objectiveScore.
+  cfg.scoreExpr = "seed + 0.5";
+
+  const std::vector<MineRecord> recs = MineSeeds(cfg, procCfg, simCfg);
+  ASSERT_EQ(recs.size(), static_cast<std::size_t>(cfg.samples));
+
+  for (int i = 0; i < cfg.samples; ++i) {
+    const double expected = static_cast<double>(MineSeedForSample(cfg, static_cast<std::uint64_t>(i))) + 0.5;
+    EXPECT_NEAR(recs[static_cast<std::size_t>(i)].score, expected, 1.0e-12);
+    EXPECT_TRUE(std::isfinite(recs[static_cast<std::size_t>(i)].objectiveScore));
+  }
+}
+
+static void TestMineGalleryExport()
+{
+  using namespace isocity;
+
+  ProcGenConfig procCfg;
+  SimConfig simCfg;
+
+  MineConfig cfg;
+  cfg.seedStart = 42;
+  cfg.seedStep = 1;
+  cfg.samples = 8;
+  cfg.w = 32;
+  cfg.h = 32;
+  cfg.days = 8;
+  cfg.threads = 1;
+  cfg.objective = MineObjective::Balanced;
+  cfg.hydrologyEnabled = false;
+
+  const std::vector<MineRecord> recs = MineSeeds(cfg, procCfg, simCfg);
+  ASSERT_EQ(recs.size(), static_cast<std::size_t>(cfg.samples));
+
+  const std::vector<int> top = SelectTopIndices(recs, 4, false, 0, 0.70, MineDiversityMode::Scalar, 0.50);
+  ASSERT_EQ(top.size(), 4u);
+
+  const fs::path tmpDir = fs::temp_directory_path() / "procisocity_mine_gallery_test";
+  {
+    std::error_code ec;
+    fs::remove_all(tmpDir, ec);
+  }
+
+  MineGalleryConfig gcfg;
+  gcfg.outDir = tmpDir;
+  gcfg.format = "png";
+  gcfg.exportScale = 2;
+  gcfg.layers = {ExportLayer::Overlay};
+  gcfg.writeContactSheet = true;
+  gcfg.contactSheetCols = 2;
+  gcfg.contactSheetPaddingPx = 1;
+  gcfg.writeHtml = true;
+  gcfg.writeJson = true;
+  gcfg.writeEmbeddingPlot = true;
+  gcfg.embeddingCfg.space = MineDiversityMode::Hybrid;
+  gcfg.embeddingCfg.layoutWeight = 0.50;
+  gcfg.embeddingCfg.robustScaling = true;
+  gcfg.embeddingCfg.powerIters = 32;
+
+  gcfg.writeTraces = true;
+  gcfg.traceMetrics = {MineTraceMetric::Population, MineTraceMetric::Happiness};
+
+  MineGalleryResult gres;
+  std::string err;
+  if (!WriteMineGallery(gcfg, recs, top, procCfg, simCfg, cfg.days, &gres, err)) {
+    std::cerr << "WriteMineGallery failed: " << err << "\n";
+    ASSERT_TRUE(false);
+  }
+
+  EXPECT_TRUE(fs::exists(gres.indexHtml));
+  EXPECT_TRUE(fs::exists(gres.jsonManifest));
+  EXPECT_TRUE(fs::exists(gres.contactSheet));
+  EXPECT_TRUE(fs::exists(gres.embeddingJson));
+  EXPECT_TRUE(fs::exists(gres.tracesJson));
+
+  // Ensure HTML contains the embedding canvas.
+  {
+    std::ifstream is(gres.indexHtml);
+    ASSERT_TRUE(static_cast<bool>(is));
+    std::string text((std::istreambuf_iterator<char>(is)), std::istreambuf_iterator<char>());
+    EXPECT_TRUE(text.find("embed_canvas") != std::string::npos);
+    EXPECT_TRUE(text.find("Embedding map") != std::string::npos);
+    EXPECT_TRUE(text.find("trace_metric") != std::string::npos);
+  }
+
+  // Validate traces.json structure.
+  {
+    std::ifstream is(gres.tracesJson);
+    ASSERT_TRUE(static_cast<bool>(is));
+    std::string text((std::istreambuf_iterator<char>(is)), std::istreambuf_iterator<char>());
+    JsonValue j;
+    std::string jerr;
+    ASSERT_TRUE(ParseJson(text, j, jerr));
+    ASSERT_TRUE(j.isObject());
+
+    const JsonValue* metrics = FindJsonMember(j, "metrics");
+    ASSERT_TRUE(metrics && metrics->isArray());
+    EXPECT_TRUE(metrics->arrayValue.size() >= 2u);
+
+    const JsonValue* series = FindJsonMember(j, "series");
+    ASSERT_TRUE(series && series->isArray());
+    ASSERT_EQ(series->arrayValue.size(), top.size());
+
+    // Each entry should have values[metric][t] with length days+1.
+    for (const JsonValue& e : series->arrayValue) {
+      const JsonValue* values = FindJsonMember(e, "values");
+      ASSERT_TRUE(values && values->isArray());
+      ASSERT_EQ(values->arrayValue.size(), 2u);
+      for (const JsonValue& v : values->arrayValue) {
+        ASSERT_TRUE(v.isArray());
+        EXPECT_EQ(v.arrayValue.size(), static_cast<std::size_t>(cfg.days + 1));
+      }
+    }
+  }
+
+  // Validate contact sheet dimensions.
+  PpmImage sheet;
+  std::string imgErr;
+  ASSERT_TRUE(ReadPng(gres.contactSheet.string(), sheet, imgErr));
+  const int thumbW = cfg.w * gcfg.exportScale;
+  const int thumbH = cfg.h * gcfg.exportScale;
+  const int cols = gcfg.contactSheetCols;
+  const int rows = (static_cast<int>(top.size()) + cols - 1) / cols;
+  const int expectedW = cols * thumbW + (cols - 1) * gcfg.contactSheetPaddingPx;
+  const int expectedH = rows * thumbH + (rows - 1) * gcfg.contactSheetPaddingPx;
+  EXPECT_EQ(sheet.width, expectedW);
+  EXPECT_EQ(sheet.height, expectedH);
+
+  // Ensure at least one thumbnail exists.
+  const fs::path thumbsDir = tmpDir / "thumbs";
+  int thumbCount = 0;
+  for (const auto& it : fs::directory_iterator(thumbsDir)) {
+    if (it.is_regular_file()) ++thumbCount;
+  }
+  EXPECT_TRUE(thumbCount > 0);
+
+  {
+    std::error_code ec;
+    fs::remove_all(tmpDir, ec);
+  }
+}
+
 
 
 
@@ -8357,9 +9159,19 @@ int main()
   TestJsonWriterStreaming();
   TestGfxCanvasAffineAndSampling();
   TestFileHashFNV1a64();
+  TestPerceptualHashBasics();
   TestSeedMinerParetoRankingAndSelection();
   TestSeedMinerMapElitesBasic();
+  TestSeedMinerLocalOutlierFactorBasic();
+  TestMineClusteringKMedoidsLayoutBasic();
+  TestMineNeighborsKnnLayoutBasic();
   TestSeedMinerThreadedDeterminism();
+  TestSeedSamplerModes();
+  TestSeedMinerExplicitSeedList();
+  TestMineCheckpointRoundTrip();
+  TestMineCheckpointShRoundTrip();
+  TestMineScoreExprCustomScore();
+  TestMineGalleryExport();
   TestPngReadersSupportDeflateAndFilters();
   TestSaveV8UsesCompressionForLargeDeltaPayload();
   TestSaveLoadDetectsCorruption();
@@ -8406,6 +9218,7 @@ int main()
   TestProcGenTerrainPresetTectonicParsesAndGenerates();
   TestSimulationDeterministicHashAfterTicks();
   TestWorldDiffCounts();
+  TestWorldDiffVizBasic();
   TestWorldPatchRoundTrip();
   TestWorldPatchJsonRoundTrip();
   TestWorldPatchRejectsMismatchedBaseHash();

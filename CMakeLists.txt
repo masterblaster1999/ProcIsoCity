@@ -29,7 +29,9 @@ if (GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
 endif()
 
 # ---- Options ----
-option(PROCISOCITY_BUILD_APP "Build the interactive raylib application" ON)
+# NOTE: Default OFF to keep the default build fully offline-capable.
+# The interactive app requires raylib; enable explicitly when you have raylib available.
+option(PROCISOCITY_BUILD_APP "Build the interactive raylib application (requires raylib)" OFF)
 option(PROCISOCITY_BUILD_TESTS "Build headless tests (no raylib required)" OFF)
 option(PROCISOCITY_BUILD_CLI "Build headless command-line tools" ON)
 
@@ -93,6 +95,7 @@ add_library(isocity_core
   src/isocity/WorldPatchJson.cpp
   src/isocity/World.cpp
   src/isocity/WorldDiff.cpp
+  src/isocity/WorldDiffViz.cpp
   src/isocity/WorldTransform.cpp
   src/isocity/ProcGen.cpp
   src/isocity/Erosion.cpp
@@ -164,6 +167,14 @@ add_library(isocity_core
   src/isocity/Json.cpp
   src/isocity/ConfigIO.cpp
   src/isocity/SeedMiner.cpp
+  src/isocity/MineExpr.cpp
+  src/isocity/MineCheckpoint.cpp
+  src/isocity/MineCheckpointSh.cpp
+  src/isocity/MineGallery.cpp
+  src/isocity/MineClustering.cpp
+  src/isocity/MineEmbedding.cpp
+  src/isocity/MineNeighbors.cpp
+  src/isocity/MineTraces.cpp
   src/isocity/Dossier.cpp
 )
 
@@ -744,6 +755,17 @@ if (PROCISOCITY_BUILD_CLI)
   target_link_libraries(proc_isocity_imagediff PRIVATE isocity_core)
 
   procisocity_set_strict_warnings(proc_isocity_imagediff)
+
+  # World diff tool (headless): compare two worlds (saves or generated seeds) and optionally write diff images.
+  add_executable(proc_isocity_worlddiff
+    src/cli/worlddiff.cpp
+  )
+
+  target_include_directories(proc_isocity_worlddiff PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_worlddiff PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_worlddiff)
+
 
   # District report tool (headless): per-district stats + GeoJSON/SVG vector exports.
   add_executable(proc_isocity_districtreport

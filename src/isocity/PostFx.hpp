@@ -123,6 +123,11 @@ private:
   int m_locFxaa = -1;
   int m_locSharpen = -1;
 
+  // Optional inline bloom uniforms (if present, bloom can be composited
+  // inside the main PostFX shader before tonemapping/grading).
+  int m_locPostBloomTex = -1;
+  int m_locPostBloomStrength = -1;
+
   // Filmic tonemap / grade uniforms (optional).
   int m_locTonemapEnabled = -1;
   int m_locExposure = -1;

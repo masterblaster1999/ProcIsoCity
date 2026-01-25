@@ -20,6 +20,14 @@ enum class GfxBuildingKind : std::uint8_t {
   Industrial = 2,
 };
 
+// Number of high-level "style families" for building variants.
+//
+// Callers can generate many variants per level, then group them into a small
+// number of families (e.g., per neighborhood) to keep architecture coherent.
+//
+// This constant is shared between sprite generation and renderers.
+constexpr int kGfxBuildingVariantFamilies = 4;
+
 struct GfxBuildingSprite {
   // Main color sprite (RGBA).
   RgbaImage color;

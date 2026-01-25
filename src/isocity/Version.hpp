@@ -73,4 +73,15 @@ inline constexpr const char* ProcIsoCityBuildTime()
   return __TIME__;
 }
 
+// A friendly build "stamp" used by CLI tools for manifests and --version.
+//
+// Note: This is intentionally not constexpr because we build a std::string.
+inline std::string ProcIsoCityBuildStamp()
+{
+  std::string s = std::string(ProcIsoCityBuildDate());
+  s += " ";
+  s += ProcIsoCityBuildTime();
+  return s;
+}
+
 } // namespace isocity

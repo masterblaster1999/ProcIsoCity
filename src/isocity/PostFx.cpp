@@ -728,6 +728,10 @@ void PostFxPipeline::init()
       m_locFxaa = GetShaderLocation(m_shader, "u_fxaa");
       m_locSharpen = GetShaderLocation(m_shader, "u_sharpen");
 
+      // Optional inline bloom uniforms (supported by the on-disk PostFX override).
+      m_locPostBloomTex = GetShaderLocation(m_shader, "u_bloomTex");
+      m_locPostBloomStrength = GetShaderLocation(m_shader, "u_bloomStrength");
+
       m_locTonemapEnabled = GetShaderLocation(m_shader, "u_tonemapEnabled");
       m_locExposure = GetShaderLocation(m_shader, "u_exposure");
       m_locContrast = GetShaderLocation(m_shader, "u_contrast");
@@ -858,6 +862,9 @@ void PostFxPipeline::shutdown()
 
   m_locFxaa = -1;
   m_locSharpen = -1;
+
+  m_locPostBloomTex = -1;
+  m_locPostBloomStrength = -1;
 
   m_locTonemapEnabled = -1;
   m_locExposure = -1;
@@ -1244,6 +1251,15 @@ void PostFxPipeline::drawTexturePro(const Texture2D& tex, const Rectangle& src, 
     if (m_locFxaa >= 0) SetShaderValue(m_shader, m_locFxaa, &fxaa, SHADER_UNIFORM_FLOAT);
     if (m_locSharpen >= 0) SetShaderValue(m_shader, m_locSharpen, &sharpen, SHADER_UNIFORM_FLOAT);
 
+    // Inline bloom composite (if the PostFX shader supports it).
+    // We bind a valid texture even when bloom is disabled so the sampler is never undefined.
+    const float bloomInline = (drewBloom && m_bloomRTValid) ? bloomStrength : 0.0f;
+    if (m_locPostBloomStrength >= 0) SetShaderValue(m_shader, m_locPostBloomStrength, &bloomInline, SHADER_UNIFORM_FLOAT);
+    if (m_locPostBloomTex >= 0) {
+      const Texture2D& btex = (drewBloom && m_bloomRTValid) ? m_bloomRT0.texture : *baseTex;
+      SetShaderValueTexture(m_shader, m_locPostBloomTex, btex);
+    }
+
     if (m_locTonemapEnabled >= 0) SetShaderValue(m_shader, m_locTonemapEnabled, &tonemapEnabled, SHADER_UNIFORM_FLOAT);
     if (m_locExposure >= 0) SetShaderValue(m_shader, m_locExposure, &exposure, SHADER_UNIFORM_FLOAT);
     if (m_locContrast >= 0) SetShaderValue(m_shader, m_locContrast, &contrast, SHADER_UNIFORM_FLOAT);
@@ -1285,7 +1301,8 @@ void PostFxPipeline::drawTexturePro(const Texture2D& tex, const Rectangle& src, 
   // ---------------------------------------------------------------------------
   // Bloom composite pass (additive)
   // ---------------------------------------------------------------------------
-  if (drewBloom && m_bloomRTValid) {
+  const bool inlineBloom = (m_ready && (m_locPostBloomTex >= 0) && (m_locPostBloomStrength >= 0));
+  if (drewBloom && m_bloomRTValid && !inlineBloom) {
     BeginBlendMode(BLEND_ADDITIVE);
     Color bcol = WHITE;
     bcol.a = static_cast<unsigned char>(std::clamp(bloomStrength, 0.0f, 1.0f) * 255.0f);
