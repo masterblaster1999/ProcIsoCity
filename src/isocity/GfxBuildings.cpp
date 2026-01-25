@@ -323,7 +323,12 @@ BillboardDecal MakeBillboardDecal(const std::string& name, int w, int h, Rgba8 b
 
   const int textW = gfx::MeasureTextWidth5x7(token, scale, spacing);
   const int textH = gfx::MeasureTextHeight5x7(scale);
-  const int tx = (logoCx + logoR + 3);
+
+  // Center the token within the remaining horizontal space to avoid a
+  // consistently left-anchored look (and to silence MSVC's unused variable
+  // warning for textW).
+  const int txBase = (logoCx + logoR + 3);
+  const int tx = txBase + std::max(0, (maxTextW - textW) / 2);
   const int ty = (h - textH) / 2;
 
   gfx::DrawText5x7Outlined(d.albedo, tx, ty, token, ink, Mul(border, 0.85f), scale, spacing, BlendMode::Alpha);

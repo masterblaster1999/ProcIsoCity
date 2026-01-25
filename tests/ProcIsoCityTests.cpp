@@ -20,6 +20,7 @@
 #include "isocity/MineGallery.hpp"
 #include "isocity/MineClustering.hpp"
 #include "isocity/MineNeighbors.hpp"
+#include "isocity/UInt128.hpp"
 #include "isocity/PerceptualHash.hpp"
 #include "isocity/Traffic.hpp"
 #include "isocity/Goods.hpp"
@@ -8578,22 +8579,28 @@ static std::uint64_t RadicalInverseU64_Test(std::uint64_t n, std::uint32_t base)
   if (base < 2u) return 0u;
   if (n == 0u) return 0u;
 
-  __uint128_t numer = 0;
-  __uint128_t denom = 1;
+  // Base-2 van der Corput is exactly bit-reversal in a 64-bit binary fixed-point
+  // representation.
+  if (base == 2u) return ReverseBits64_Test(n);
+
+  // Use the project's portable 128-bit helper so tests build on MSVC as well.
+  isocity::UInt128 numer = isocity::UInt128::FromU64(0);
+  isocity::UInt128 denom = isocity::UInt128::FromU64(1);
   while (n > 0u) {
-    const std::uint64_t digit = (base == 2u) ? (n & 1u) : (n % static_cast<std::uint64_t>(base));
-    n = (base == 2u) ? (n >> 1u) : (n / static_cast<std::uint64_t>(base));
-    numer = numer * static_cast<std::uint64_t>(base) + digit;
-    denom *= static_cast<std::uint64_t>(base);
+    const std::uint64_t digit = n % static_cast<std::uint64_t>(base);
+    n /= static_cast<std::uint64_t>(base);
+    numer.MulU32(base);
+    numer.AddU64(digit);
+    denom.MulU32(base);
   }
 
   std::uint64_t out = 0;
-  __uint128_t rem = numer;
+  isocity::UInt128 rem = numer;
   for (int i = 0; i < 64; ++i) {
-    rem *= 2;
+    rem.Mul2();
     out <<= 1;
     if (rem >= denom) {
-      rem -= denom;
+      rem.Sub(denom);
       out |= 1ULL;
     }
   }

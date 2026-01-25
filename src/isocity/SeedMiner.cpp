@@ -2,6 +2,7 @@
 #include "isocity/PerceptualHash.hpp"
 #include "isocity/VPTree.hpp"
 #include "isocity/Random.hpp"
+#include "isocity/UInt128.hpp"
 
 #include <algorithm>
 #include <array>
@@ -66,22 +67,31 @@ static std::uint64_t RadicalInverseU64(std::uint64_t n, std::uint32_t base)
   if (base < 2u) return 0u;
   if (n == 0u) return 0u;
 
-  __uint128_t numer = 0;
-  __uint128_t denom = 1;
+  // Fast path: van der Corput base-2 is exactly bit-reversal when expressed
+  // as a 64-bit binary fixed-point fraction.
+  if (base == 2u) return ReverseBits64(n);
+
+  // Build a fraction numer/denom in base-b with digits reversed (van der Corput).
+  //
+  // We use UInt128 instead of compiler-specific __uint128_t so this stays
+  // portable to MSVC.
+  UInt128 numer = UInt128::FromU64(0);
+  UInt128 denom = UInt128::FromU64(1);
   while (n > 0u) {
     const std::uint64_t digit = (base == 2u) ? (n & 1u) : (n % static_cast<std::uint64_t>(base));
     n = (base == 2u) ? (n >> 1u) : (n / static_cast<std::uint64_t>(base));
-    numer = numer * static_cast<std::uint64_t>(base) + digit;
-    denom *= static_cast<std::uint64_t>(base);
+    numer.MulU32(base);
+    numer.AddU64(digit);
+    denom.MulU32(base);
   }
 
   std::uint64_t out = 0;
-  __uint128_t rem = numer;
+  UInt128 rem = numer;
   for (int i = 0; i < 64; ++i) {
-    rem *= 2;
+    rem.Mul2();
     out <<= 1;
     if (rem >= denom) {
-      rem -= denom;
+      rem.Sub(denom);
       out |= 1ULL;
     }
   }
@@ -1899,6 +1909,20 @@ static bool ReadNumberF64(const JsonValue* v, double& out)
   return true;
 }
 
+static bool ReadNumberF32(const JsonValue* v, float& out)
+{
+  if (!v) return false;
+  if (!v->isNumber()) return false;
+  const double d = v->numberValue;
+  if (!std::isfinite(d)) return false;
+  if (d < -static_cast<double>(std::numeric_limits<float>::max()) ||
+      d > static_cast<double>(std::numeric_limits<float>::max())) {
+    return false;
+  }
+  out = static_cast<float>(d);
+  return true;
+}
+
 static bool ReadString(const JsonValue* v, std::string& out)
 {
   if (!v) return false;
@@ -1998,15 +2022,15 @@ bool MineRecordFromJson(const JsonValue& obj, MineRecord& out, std::string* outE
     const JsonValue* st = FindJsonMember(obj, "stats");
     if (st && st->isObject()) {
       int iv = 0;
-      double dv = 0.0;
+      float fv = 0.0f;
       if (ReadNumberI32(FindJsonMember(*st, "day"), iv)) r.stats.day = iv;
       if (ReadNumberI32(FindJsonMember(*st, "population"), iv)) r.stats.population = iv;
-      if (ReadNumberF64(FindJsonMember(*st, "happiness"), dv)) r.stats.happiness = dv;
-      if (ReadNumberF64(FindJsonMember(*st, "money"), dv)) r.stats.money = dv;
-      if (ReadNumberF64(FindJsonMember(*st, "avgLandValue"), dv)) r.stats.avgLandValue = dv;
-      if (ReadNumberF64(FindJsonMember(*st, "trafficCongestion"), dv)) r.stats.trafficCongestion = dv;
-      if (ReadNumberF64(FindJsonMember(*st, "goodsSatisfaction"), dv)) r.stats.goodsSatisfaction = dv;
-      if (ReadNumberF64(FindJsonMember(*st, "servicesOverallSatisfaction"), dv)) r.stats.servicesOverallSatisfaction = dv;
+      if (ReadNumberF32(FindJsonMember(*st, "happiness"), fv)) r.stats.happiness = fv;
+      if (ReadNumberI32(FindJsonMember(*st, "money"), iv)) r.stats.money = iv;
+      if (ReadNumberF32(FindJsonMember(*st, "avgLandValue"), fv)) r.stats.avgLandValue = fv;
+      if (ReadNumberF32(FindJsonMember(*st, "trafficCongestion"), fv)) r.stats.trafficCongestion = fv;
+      if (ReadNumberF32(FindJsonMember(*st, "goodsSatisfaction"), fv)) r.stats.goodsSatisfaction = fv;
+      if (ReadNumberF32(FindJsonMember(*st, "servicesOverallSatisfaction"), fv)) r.stats.servicesOverallSatisfaction = fv;
       if (ReadNumberI32(FindJsonMember(*st, "roads"), iv)) r.stats.roads = iv;
       if (ReadNumberI32(FindJsonMember(*st, "parks"), iv)) r.stats.parks = iv;
     }
