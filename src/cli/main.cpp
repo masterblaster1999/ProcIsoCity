@@ -11,6 +11,8 @@
 #include "isocity/Version.hpp"
 
 #include <algorithm>
+#include <array>
+#include <string_view>
 
 #include <cerrno>
 #include <cmath>
@@ -130,6 +132,81 @@ std::string HexU64(std::uint64_t v)
   oss << "0x" << std::hex << std::setw(16) << std::setfill('0') << v;
   return oss.str();
 }
+
+// For unknown CLI args, offer a small "did you mean" hint.
+constexpr std::array<std::string_view, 126> kKnownCliArgs = {
+  "--3d-ambient", "--3d-ao", "--3d-ao-bias", "--3d-ao-blur", "--3d-ao-power",
+  "--3d-ao-radius", "--3d-ao-range", "--3d-ao-samples", "--3d-ao-strength", "--3d-bg",
+  "--3d-buildings", "--3d-cliffs", "--3d-contrast", "--3d-diffuse", "--3d-dist",
+  "--3d-dither", "--3d-dither-bits", "--3d-dither-strength", "--3d-edge", "--3d-edge-alpha",
+  "--3d-edge-color", "--3d-edge-radius", "--3d-edge-softness", "--3d-edge-threshold", "--3d-exposure",
+  "--3d-fit", "--3d-fog", "--3d-fog-end", "--3d-fog-start", "--3d-fog-strength",
+  "--3d-fov", "--3d-gamma", "--3d-heightfield", "--3d-heightscale", "--3d-light",
+  "--3d-ortho", "--3d-outline", "--3d-pitch", "--3d-post-seed", "--3d-proj",
+  "--3d-quant", "--3d-roll", "--3d-saturation", "--3d-size", "--3d-skirt",
+  "--3d-skirt-drop", "--3d-ssaa", "--3d-target", "--3d-tonemap", "--3d-top",
+  "--3d-vignette", "--3d-yaw", "--batch", "--build-info", "--config",
+  "--csv", "--days", "--export-3d", "--export-iso", "--export-ppm",
+  "--export-scale", "--export-tiles-csv", "--gen-districting-mode", "--gen-preset", "--gen-preset-strength",
+  "--gen-road-hierarchy", "--gen-road-hierarchy-strength", "--gen-road-layout", "--gen-roadlayout", "--help",
+  "--iso-cliffs", "--iso-cloud-cover", "--iso-cloud-scale", "--iso-cloud-strength", "--iso-clouds",
+  "--iso-daynight", "--iso-dusk", "--iso-fancy", "--iso-grid", "--iso-height",
+  "--iso-lights", "--iso-margin", "--iso-night", "--iso-roadmarks", "--iso-shore",
+  "--iso-texture", "--iso-tile", "--iso-tileset", "--iso-tileset-conifer", "--iso-tileset-emit",
+  "--iso-tileset-light", "--iso-tileset-normal", "--iso-tileset-normal-strength", "--iso-tileset-props", "--iso-tileset-shadow",
+  "--iso-tileset-shadow-strength", "--iso-tileset-streetlight-chance", "--iso-tileset-streetlights", "--iso-tileset-tree-density", "--iso-time",
+  "--iso-weather", "--iso-wx-fog", "--iso-wx-intensity", "--iso-wx-overcast", "--iso-wx-precip",
+  "--iso-wx-reflect", "--iso-zonepatterns", "--json", "--load", "--maint-park",
+  "--maint-road", "--manifest", "--out", "--proc", "--require-outside",
+  "--save", "--seed", "--sim", "--size", "--tax-com",
+  "--tax-ind", "--tax-res", "--ticks", "--version", "-V",
+  "-h"
+};
+
+std::size_t EditDistance(std::string_view a, std::string_view b)
+{
+  // Classic Levenshtein distance, O(|a|*|b|), fine for short CLI flags.
+  std::vector<std::size_t> prev(b.size() + 1);
+  std::vector<std::size_t> cur(b.size() + 1);
+  for (std::size_t j = 0; j <= b.size(); ++j) {
+    prev[j] = j;
+  }
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    cur[0] = i + 1;
+    for (std::size_t j = 0; j < b.size(); ++j) {
+      const std::size_t cost = (a[i] == b[j]) ? 0u : 1u;
+      cur[j + 1] = std::min({prev[j + 1] + 1u, cur[j] + 1u, prev[j] + cost});
+    }
+    prev.swap(cur);
+  }
+  return prev[b.size()];
+}
+
+std::string SuggestClosestCliArg(std::string_view unknown)
+{
+  if (unknown.empty()) return {};
+
+  std::string_view best;
+  std::size_t bestDist = std::numeric_limits<std::size_t>::max();
+  for (const std::string_view opt : kKnownCliArgs) {
+    const std::size_t d = EditDistance(unknown, opt);
+    if (d < bestDist) {
+      bestDist = d;
+      best = opt;
+    }
+  }
+
+  if (best.empty()) return {};
+
+  const std::size_t len = std::max(unknown.size(), best.size());
+  std::size_t maxDist = 3;
+  if (len <= 4) maxDist = 1;
+  else if (len <= 8) maxDist = 2;
+
+  if (bestDist > maxDist) return {};
+  return std::string(best);
+}
+
 
 bool ParseJsonObjectText(const std::string& text, isocity::JsonValue& outObj, std::string& outErr)
 {
@@ -600,55 +677,72 @@ int main(int argc, char** argv)
     if (arg == "--version" || arg == "-V") {
       std::cout << "proc_isocity_cli " << isocity::ProcIsoCityFullVersionString() << "\n";
       return 0;
-    } else if (arg == "--build-info") {
+    }
+    if (arg == "--build-info") {
       std::cout << "proc_isocity_cli " << isocity::ProcIsoCityFullVersionString() << "\n"
                 << "built " << isocity::ProcIsoCityBuildStamp() << "\n";
       return 0;
-    } else if (arg == "--help" || arg == "-h") {
+    }
+    if (arg == "--help" || arg == "-h") {
       PrintHelp();
       return 0;
-    } else if (arg == "--load") {
+    }
+    if (arg == "--load") {
       if (!requireValue(i, val)) {
         std::cerr << "--load requires a path\n";
         return 2;
       }
       loadPath = val;
-    } else if (arg == "--save") {
+      continue;
+    }
+    if (arg == "--save") {
       if (!requireValue(i, val)) {
         std::cerr << "--save requires a path\n";
         return 2;
       }
       savePath = val;
-    } else if (arg == "--out" || arg == "--json") {
+      continue;
+    }
+    if (arg == "--out" || arg == "--json") {
       if (!requireValue(i, val)) {
         std::cerr << arg << " requires a path\n";
         return 2;
       }
       outJson = val;
-    } else if (arg == "--csv") {
+      continue;
+    }
+    if (arg == "--csv") {
       if (!requireValue(i, val)) {
         std::cerr << "--csv requires a path\n";
         return 2;
       }
       outCsv = val;
-    } else if (arg == "--manifest") {
+      continue;
+    }
+    if (arg == "--manifest") {
       if (!requireValue(i, val)) {
         std::cerr << "--manifest requires a path (use '-' for stdout)\n";
         return 2;
       }
       manifestPath = val;
-    } else if (arg == "--seed") {
+      continue;
+    }
+    if (arg == "--seed") {
       if (!requireValue(i, val) || !ParseU64(val, &seed)) {
         std::cerr << "--seed requires a valid integer (decimal or 0x...)\n";
         return 2;
       }
       seedProvided = true;
-    } else if (arg == "--size") {
+      continue;
+    }
+    if (arg == "--size") {
       if (!requireValue(i, val) || !ParseWxH(val, &w, &h)) {
         std::cerr << "--size requires format WxH (e.g. 128x128)\n";
         return 2;
       }
-    } else if (arg == "--gen-preset") {
+      continue;
+    }
+    if (arg == "--gen-preset") {
       if (!requireValue(i, val)) {
         std::cerr << "--gen-preset requires a name (classic|island|archipelago|inland_sea|river_valley|mountain_ring|fjords|canyon|volcano|delta)\n";
         return 2;
@@ -661,7 +755,9 @@ int main(int argc, char** argv)
       }
       procCfg.terrainPreset = p;
       configOps.emplace_back([p](ProcGenConfig& pc, SimConfig&) { pc.terrainPreset = p; });
-    } else if (arg == "--gen-preset-strength") {
+      continue;
+    }
+    if (arg == "--gen-preset-strength") {
       float s = 1.0f;
       if (!requireValue(i, val) || !ParseF32(val, &s)) {
         std::cerr << "--gen-preset-strength requires a float\n";
@@ -669,7 +765,9 @@ int main(int argc, char** argv)
       }
       procCfg.terrainPresetStrength = std::clamp(s, 0.0f, 5.0f);
       configOps.emplace_back([s](ProcGenConfig& pc, SimConfig&) { pc.terrainPresetStrength = std::clamp(s, 0.0f, 5.0f); });
-    } else if (arg == "--gen-road-layout" || arg == "--gen-roadlayout") {
+      continue;
+    }
+    if (arg == "--gen-road-layout" || arg == "--gen-roadlayout") {
       if (!requireValue(i, val)) {
         std::cerr << "--gen-road-layout requires a layout name\n";
         return 2;
@@ -681,7 +779,9 @@ int main(int argc, char** argv)
       }
       procCfg.roadLayout = layout;
       configOps.emplace_back([layout](ProcGenConfig& pc, SimConfig&) { pc.roadLayout = layout; });
-    } else if (arg == "--gen-road-hierarchy") {
+      continue;
+    }
+    if (arg == "--gen-road-hierarchy") {
       if (!requireValue(i, val)) {
         std::cerr << "--gen-road-hierarchy requires 0 or 1\n";
         return 2;
@@ -693,7 +793,9 @@ int main(int argc, char** argv)
       }
       procCfg.roadHierarchyEnabled = (b != 0);
       configOps.emplace_back([b](ProcGenConfig& pc, SimConfig&) { pc.roadHierarchyEnabled = (b != 0); });
-    } else if (arg == "--gen-road-hierarchy-strength") {
+      continue;
+    }
+    if (arg == "--gen-road-hierarchy-strength") {
       float s = 1.0f;
       if (!requireValue(i, val) || !ParseF32(val, &s)) {
         std::cerr << "--gen-road-hierarchy-strength requires a float\n";
@@ -701,7 +803,9 @@ int main(int argc, char** argv)
       }
       procCfg.roadHierarchyStrength = std::clamp(s, 0.0f, 3.0f);
       configOps.emplace_back([s](ProcGenConfig& pc, SimConfig&) { pc.roadHierarchyStrength = std::clamp(s, 0.0f, 3.0f); });
-    } else if (arg == "--gen-districting-mode") {
+      continue;
+    }
+    if (arg == "--gen-districting-mode") {
       if (!requireValue(i, val)) {
         std::cerr << "--gen-districting-mode requires a mode name\n";
         return 2;
@@ -713,12 +817,16 @@ int main(int argc, char** argv)
       }
       procCfg.districtingMode = mode;
       configOps.emplace_back([mode](ProcGenConfig& pc, SimConfig&) { pc.districtingMode = mode; });
-    } else if (arg == "--days" || arg == "--ticks") {
+      continue;
+    }
+    if (arg == "--days" || arg == "--ticks") {
       if (!requireValue(i, val) || !ParseI32(val, &days) || days < 0) {
         std::cerr << arg << " requires a non-negative integer\n";
         return 2;
       }
-    } else if (arg == "--require-outside") {
+      continue;
+    }
+    if (arg == "--require-outside") {
       if (!requireValue(i, val)) {
         std::cerr << "--require-outside requires 0 or 1\n";
         return 2;
@@ -730,37 +838,49 @@ int main(int argc, char** argv)
       }
       simCfg.requireOutsideConnection = (b != 0);
       configOps.emplace_back([b](ProcGenConfig&, SimConfig& sc) { sc.requireOutsideConnection = (b != 0); });
-    } else if (arg == "--tax-res") {
+      continue;
+    }
+    if (arg == "--tax-res") {
       if (!requireValue(i, val) || !ParseI32(val, &simCfg.taxResidential)) {
         std::cerr << "--tax-res requires an integer\n";
         return 2;
       }
       configOps.emplace_back([v = simCfg.taxResidential](ProcGenConfig&, SimConfig& sc) { sc.taxResidential = v; });
-    } else if (arg == "--tax-com") {
+      continue;
+    }
+    if (arg == "--tax-com") {
       if (!requireValue(i, val) || !ParseI32(val, &simCfg.taxCommercial)) {
         std::cerr << "--tax-com requires an integer\n";
         return 2;
       }
       configOps.emplace_back([v = simCfg.taxCommercial](ProcGenConfig&, SimConfig& sc) { sc.taxCommercial = v; });
-    } else if (arg == "--tax-ind") {
+      continue;
+    }
+    if (arg == "--tax-ind") {
       if (!requireValue(i, val) || !ParseI32(val, &simCfg.taxIndustrial)) {
         std::cerr << "--tax-ind requires an integer\n";
         return 2;
       }
       configOps.emplace_back([v = simCfg.taxIndustrial](ProcGenConfig&, SimConfig& sc) { sc.taxIndustrial = v; });
-    } else if (arg == "--maint-road") {
+      continue;
+    }
+    if (arg == "--maint-road") {
       if (!requireValue(i, val) || !ParseI32(val, &simCfg.maintenanceRoad)) {
         std::cerr << "--maint-road requires an integer\n";
         return 2;
       }
       configOps.emplace_back([v = simCfg.maintenanceRoad](ProcGenConfig&, SimConfig& sc) { sc.maintenanceRoad = v; });
-    } else if (arg == "--maint-park") {
+      continue;
+    }
+    if (arg == "--maint-park") {
       if (!requireValue(i, val) || !ParseI32(val, &simCfg.maintenancePark)) {
         std::cerr << "--maint-park requires an integer\n";
         return 2;
       }
       configOps.emplace_back([v = simCfg.maintenancePark](ProcGenConfig&, SimConfig& sc) { sc.maintenancePark = v; });
-    } else if (arg == "--proc") {
+      continue;
+    }
+    if (arg == "--proc") {
       if (!requireValue(i, val)) {
         std::cerr << "--proc requires a path\n";
         return 2;
@@ -781,7 +901,9 @@ int main(int argc, char** argv)
         std::string e;
         (void)isocity::ApplyProcGenConfigJson(patch, pc, e);
       });
-    } else if (arg == "--sim") {
+      continue;
+    }
+    if (arg == "--sim") {
       if (!requireValue(i, val)) {
         std::cerr << "--sim requires a path\n";
         return 2;
@@ -802,7 +924,9 @@ int main(int argc, char** argv)
         std::string e;
         (void)isocity::ApplySimConfigJson(patch, sc, e);
       });
-    } else if (arg == "--config") {
+      continue;
+    }
+    if (arg == "--config") {
       if (!requireValue(i, val)) {
         std::cerr << "--config requires a path\n";
         return 2;
@@ -827,7 +951,9 @@ int main(int argc, char** argv)
         if (procPatch) (void)isocity::ApplyProcGenConfigJson(*procPatch, pc, e);
         if (simPatch) (void)isocity::ApplySimConfigJson(*simPatch, sc, e);
       });
-    } else if (arg == "--export-ppm") {
+      continue;
+    }
+    if (arg == "--export-ppm") {
       std::string layerName;
       std::string outPath;
       if (!requireValue(i, layerName) || !requireValue(i, outPath)) {
@@ -841,7 +967,9 @@ int main(int argc, char** argv)
         return 2;
       }
       ppmExports.push_back(PpmExport{layer, outPath});
-    } else if (arg == "--export-iso") {
+      continue;
+    }
+    if (arg == "--export-iso") {
       std::string layerName;
       std::string outPath;
       if (!requireValue(i, layerName) || !requireValue(i, outPath)) {
@@ -855,7 +983,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoExports.push_back(IsoExport{layer, outPath});
-    } else if (arg == "--export-3d") {
+      continue;
+    }
+    if (arg == "--export-3d") {
       std::string layerName;
       std::string outPath;
       if (!requireValue(i, layerName) || !requireValue(i, outPath)) {
@@ -869,7 +999,9 @@ int main(int argc, char** argv)
         return 2;
       }
       render3dExports.push_back(Render3DExport{layer, outPath});
-    } else if (arg == "--3d-size") {
+      continue;
+    }
+    if (arg == "--3d-size") {
       int ow = 0;
       int oh = 0;
       if (!requireValue(i, val) || !ParseWxH(val, &ow, &oh)) {
@@ -878,7 +1010,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.width = ow;
       render3dCfg.height = oh;
-    } else if (arg == "--3d-proj") {
+      continue;
+    }
+    if (arg == "--3d-proj") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-proj requires: iso|persp\n";
         return 2;
@@ -891,28 +1025,36 @@ int main(int argc, char** argv)
         std::cerr << "--3d-proj requires: iso|persp\n";
         return 2;
       }
-    } else if (arg == "--3d-yaw") {
+      continue;
+    }
+    if (arg == "--3d-yaw") {
       float deg = 0.0f;
       if (!requireValue(i, val) || !ParseF32(val, &deg)) {
         std::cerr << "--3d-yaw requires a float (degrees)\n";
         return 2;
       }
       render3dCfg.yawDeg = deg;
-    } else if (arg == "--3d-pitch") {
+      continue;
+    }
+    if (arg == "--3d-pitch") {
       float deg = 0.0f;
       if (!requireValue(i, val) || !ParseF32(val, &deg)) {
         std::cerr << "--3d-pitch requires a float (degrees)\n";
         return 2;
       }
       render3dCfg.pitchDeg = deg;
-    } else if (arg == "--3d-roll") {
+      continue;
+    }
+    if (arg == "--3d-roll") {
       float deg = 0.0f;
       if (!requireValue(i, val) || !ParseF32(val, &deg)) {
         std::cerr << "--3d-roll requires a float (degrees)\n";
         return 2;
       }
       render3dCfg.rollDeg = deg;
-    } else if (arg == "--3d-target") {
+      continue;
+    }
+    if (arg == "--3d-target") {
       float tx = 0.0f, ty = 0.0f, tz = 0.0f;
       if (!requireValue(i, val) || !ParseF32Triple(val, &tx, &ty, &tz)) {
         std::cerr << "--3d-target requires: x,y,z\n";
@@ -921,28 +1063,36 @@ int main(int argc, char** argv)
       render3dCfg.targetX = tx;
       render3dCfg.targetY = ty;
       render3dCfg.targetZ = tz;
-    } else if (arg == "--3d-dist") {
+      continue;
+    }
+    if (arg == "--3d-dist") {
       float d = 0.0f;
       if (!requireValue(i, val) || !ParseF32(val, &d) || !(d > 0.0f)) {
         std::cerr << "--3d-dist requires a float > 0\n";
         return 2;
       }
       render3dCfg.distance = d;
-    } else if (arg == "--3d-fov") {
+      continue;
+    }
+    if (arg == "--3d-fov") {
       float deg = 0.0f;
       if (!requireValue(i, val) || !ParseF32(val, &deg)) {
         std::cerr << "--3d-fov requires a float (degrees)\n";
         return 2;
       }
       render3dCfg.fovYDeg = deg;
-    } else if (arg == "--3d-ortho") {
+      continue;
+    }
+    if (arg == "--3d-ortho") {
       float hh = 0.0f;
       if (!requireValue(i, val) || !ParseF32(val, &hh) || !(hh > 0.0f)) {
         std::cerr << "--3d-ortho requires a float > 0 (half-height in world units)\n";
         return 2;
       }
       render3dCfg.orthoHalfHeight = hh;
-    } else if (arg == "--3d-fit") {
+      continue;
+    }
+    if (arg == "--3d-fit") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-fit requires 0 or 1\n";
         return 2;
@@ -953,7 +1103,9 @@ int main(int argc, char** argv)
         return 2;
       }
       render3dCfg.autoFit = (b != 0);
-    } else if (arg == "--3d-ssaa") {
+      continue;
+    }
+    if (arg == "--3d-ssaa") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-ssaa requires an integer >= 1\n";
         return 2;
@@ -964,7 +1116,9 @@ int main(int argc, char** argv)
         return 2;
       }
       render3dCfg.supersample = ss;
-    } else if (arg == "--3d-outline") {
+      continue;
+    }
+    if (arg == "--3d-outline") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-outline requires 0 or 1\n";
         return 2;
@@ -975,7 +1129,9 @@ int main(int argc, char** argv)
         return 2;
       }
       render3dCfg.drawOutlines = (b != 0);
-    } else if (arg == "--3d-light") {
+      continue;
+    }
+    if (arg == "--3d-light") {
       float lx = 0.0f, ly = 0.0f, lz = 0.0f;
       if (!requireValue(i, val) || !ParseF32Triple(val, &lx, &ly, &lz)) {
         std::cerr << "--3d-light requires: x,y,z\n";
@@ -984,7 +1140,9 @@ int main(int argc, char** argv)
       render3dCfg.lightDirX = lx;
       render3dCfg.lightDirY = ly;
       render3dCfg.lightDirZ = lz;
-    } else if (arg == "--3d-ambient") {
+      continue;
+    }
+    if (arg == "--3d-ambient") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-ambient requires 0..100\n";
         return 2;
@@ -995,7 +1153,9 @@ int main(int argc, char** argv)
         return 2;
       }
       render3dCfg.ambient = static_cast<float>(p) / 100.0f;
-    } else if (arg == "--3d-diffuse") {
+      continue;
+    }
+    if (arg == "--3d-diffuse") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-diffuse requires 0..100\n";
         return 2;
@@ -1006,7 +1166,9 @@ int main(int argc, char** argv)
         return 2;
       }
       render3dCfg.diffuse = static_cast<float>(p) / 100.0f;
-    } else if (arg == "--3d-bg") {
+      continue;
+    }
+    if (arg == "--3d-bg") {
       std::uint8_t r = 0, g = 0, b = 0;
       if (!requireValue(i, val) || !ParseU8Triple(val, &r, &g, &b)) {
         std::cerr << "--3d-bg requires: r,g,b (0..255)\n";
@@ -1015,7 +1177,9 @@ int main(int argc, char** argv)
       render3dCfg.bgR = r;
       render3dCfg.bgG = g;
       render3dCfg.bgB = b;
-    } else if (arg == "--3d-fog") {
+      continue;
+    }
+    if (arg == "--3d-fog") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-fog requires 0 or 1\n";
         return 2;
@@ -1026,7 +1190,9 @@ int main(int argc, char** argv)
         return 2;
       }
       render3dCfg.fog = (f != 0);
-    } else if (arg == "--3d-fog-strength") {
+      continue;
+    }
+    if (arg == "--3d-fog-strength") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-fog-strength requires 0..100\n";
         return 2;
@@ -1037,7 +1203,9 @@ int main(int argc, char** argv)
         return 2;
       }
       render3dCfg.fogStrength = static_cast<float>(p) / 100.0f;
-    } else if (arg == "--3d-fog-start") {
+      continue;
+    }
+    if (arg == "--3d-fog-start") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-fog-start requires 0..100\n";
         return 2;
@@ -1048,7 +1216,9 @@ int main(int argc, char** argv)
         return 2;
       }
       render3dCfg.fogStart = static_cast<float>(p) / 100.0f;
-    } else if (arg == "--3d-fog-end") {
+      continue;
+    }
+    if (arg == "--3d-fog-end") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-fog-end requires 0..100\n";
         return 2;
@@ -1059,7 +1229,9 @@ int main(int argc, char** argv)
         return 2;
       }
       render3dCfg.fogEnd = static_cast<float>(p) / 100.0f;
-    } else if (arg == "--3d-gamma") {
+      continue;
+    }
+    if (arg == "--3d-gamma") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-gamma requires 0 or 1\n";
         return 2;
@@ -1071,7 +1243,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.gammaCorrectDownsample = (b != 0);
 
-    } else if (arg == "--3d-ao") {
+      continue;
+    }
+    if (arg == "--3d-ao") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-ao requires 0 or 1\n";
         return 2;
@@ -1083,7 +1257,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.postAO = (b != 0);
 
-    } else if (arg == "--3d-ao-strength") {
+      continue;
+    }
+    if (arg == "--3d-ao-strength") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-ao-strength requires 0..100\n";
         return 2;
@@ -1095,7 +1271,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.aoStrength = static_cast<float>(p) / 100.0f;
 
-    } else if (arg == "--3d-ao-radius") {
+      continue;
+    }
+    if (arg == "--3d-ao-radius") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-ao-radius requires an int >= 1\n";
         return 2;
@@ -1107,7 +1285,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.aoRadiusPx = r;
 
-    } else if (arg == "--3d-ao-range") {
+      continue;
+    }
+    if (arg == "--3d-ao-range") {
       float v = 0.0f;
       if (!requireValue(i, val) || !ParseF32(val, &v) || !(v > 0.0f)) {
         std::cerr << "--3d-ao-range requires a float > 0 (depth units, ~0.01..0.05 typical)\n";
@@ -1115,7 +1295,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.aoRange = v;
 
-    } else if (arg == "--3d-ao-bias") {
+      continue;
+    }
+    if (arg == "--3d-ao-bias") {
       float v = 0.0f;
       if (!requireValue(i, val) || !ParseF32(val, &v) || !(v >= 0.0f)) {
         std::cerr << "--3d-ao-bias requires a float >= 0\n";
@@ -1123,7 +1305,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.aoBias = v;
 
-    } else if (arg == "--3d-ao-power") {
+      continue;
+    }
+    if (arg == "--3d-ao-power") {
       float v = 0.0f;
       if (!requireValue(i, val) || !ParseF32(val, &v) || !(v > 0.0f)) {
         std::cerr << "--3d-ao-power requires a float > 0\n";
@@ -1131,7 +1315,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.aoPower = v;
 
-    } else if (arg == "--3d-ao-samples") {
+      continue;
+    }
+    if (arg == "--3d-ao-samples") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-ao-samples requires an int 4..32\n";
         return 2;
@@ -1143,7 +1329,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.aoSamples = s;
 
-    } else if (arg == "--3d-ao-blur") {
+      continue;
+    }
+    if (arg == "--3d-ao-blur") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-ao-blur requires 0 or 1\n";
         return 2;
@@ -1155,7 +1343,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.aoBlurRadiusPx = (b != 0) ? 1 : 0;
 
-    } else if (arg == "--3d-edge") {
+      continue;
+    }
+    if (arg == "--3d-edge") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-edge requires 0 or 1\n";
         return 2;
@@ -1167,7 +1357,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.postEdge = (b != 0);
 
-    } else if (arg == "--3d-edge-alpha") {
+      continue;
+    }
+    if (arg == "--3d-edge-alpha") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-edge-alpha requires 0..100\n";
         return 2;
@@ -1179,7 +1371,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.edgeAlpha = static_cast<float>(p) / 100.0f;
 
-    } else if (arg == "--3d-edge-threshold") {
+      continue;
+    }
+    if (arg == "--3d-edge-threshold") {
       float v = 0.0f;
       if (!requireValue(i, val) || !ParseF32(val, &v) || !(v >= 0.0f)) {
         std::cerr << "--3d-edge-threshold requires a float >= 0 (depth delta)\n";
@@ -1187,7 +1381,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.edgeThreshold = v;
 
-    } else if (arg == "--3d-edge-softness") {
+      continue;
+    }
+    if (arg == "--3d-edge-softness") {
       float v = 0.0f;
       if (!requireValue(i, val) || !ParseF32(val, &v) || !(v >= 0.0f)) {
         std::cerr << "--3d-edge-softness requires a float >= 0 (smoothstep width)\n";
@@ -1195,7 +1391,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.edgeSoftness = v;
 
-    } else if (arg == "--3d-edge-radius") {
+      continue;
+    }
+    if (arg == "--3d-edge-radius") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-edge-radius requires an int >= 1\n";
         return 2;
@@ -1207,7 +1405,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.edgeRadiusPx = r;
 
-    } else if (arg == "--3d-edge-color") {
+      continue;
+    }
+    if (arg == "--3d-edge-color") {
       std::uint8_t r = 0, g = 0, b = 0;
       if (!requireValue(i, val) || !ParseU8Triple(val, &r, &g, &b)) {
         std::cerr << "--3d-edge-color requires: r,g,b (0..255)\n";
@@ -1217,7 +1417,9 @@ int main(int argc, char** argv)
       render3dCfg.edgeG = g;
       render3dCfg.edgeB = b;
 
-    } else if (arg == "--3d-tonemap") {
+      continue;
+    }
+    if (arg == "--3d-tonemap") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-tonemap requires 0 or 1\n";
         return 2;
@@ -1229,7 +1431,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.postTonemap = (b != 0);
 
-    } else if (arg == "--3d-exposure") {
+      continue;
+    }
+    if (arg == "--3d-exposure") {
       float v = 0.0f;
       if (!requireValue(i, val) || !ParseF32(val, &v) || !(v >= 0.0f)) {
         std::cerr << "--3d-exposure requires a float >= 0\n";
@@ -1237,7 +1441,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.exposure = v;
 
-    } else if (arg == "--3d-contrast") {
+      continue;
+    }
+    if (arg == "--3d-contrast") {
       float v = 0.0f;
       if (!requireValue(i, val) || !ParseF32(val, &v) || !(v >= 0.0f)) {
         std::cerr << "--3d-contrast requires a float >= 0\n";
@@ -1245,7 +1451,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.contrast = v;
 
-    } else if (arg == "--3d-saturation") {
+      continue;
+    }
+    if (arg == "--3d-saturation") {
       float v = 0.0f;
       if (!requireValue(i, val) || !ParseF32(val, &v) || !(v >= 0.0f)) {
         std::cerr << "--3d-saturation requires a float >= 0\n";
@@ -1253,7 +1461,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.saturation = v;
 
-    } else if (arg == "--3d-vignette") {
+      continue;
+    }
+    if (arg == "--3d-vignette") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-vignette requires 0..100\n";
         return 2;
@@ -1265,7 +1475,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.vignette = static_cast<float>(p) / 100.0f;
 
-    } else if (arg == "--3d-dither") {
+      continue;
+    }
+    if (arg == "--3d-dither") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-dither requires 0 or 1\n";
         return 2;
@@ -1277,7 +1489,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.postDither = (b != 0);
 
-    } else if (arg == "--3d-dither-strength") {
+      continue;
+    }
+    if (arg == "--3d-dither-strength") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-dither-strength requires 0..100\n";
         return 2;
@@ -1289,7 +1503,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.ditherStrength = static_cast<float>(p) / 100.0f;
 
-    } else if (arg == "--3d-dither-bits") {
+      continue;
+    }
+    if (arg == "--3d-dither-bits") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-dither-bits requires an int 1..8\n";
         return 2;
@@ -1301,7 +1517,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.ditherBits = b;
 
-    } else if (arg == "--3d-post-seed") {
+      continue;
+    }
+    if (arg == "--3d-post-seed") {
       std::uint64_t s = 0;
       if (!requireValue(i, val) || !ParseU64(val, &s)) {
         std::cerr << "--3d-post-seed requires a u64\n";
@@ -1309,21 +1527,27 @@ int main(int argc, char** argv)
       }
       render3dCfg.postSeed = static_cast<std::uint32_t>(s & 0xFFFFFFFFu);
 
-    } else if (arg == "--3d-heightscale") {
+      continue;
+    }
+    if (arg == "--3d-heightscale") {
       float s = 0.0f;
       if (!requireValue(i, val) || !ParseF32(val, &s) || !(s > 0.0f)) {
         std::cerr << "--3d-heightscale requires a float > 0\n";
         return 2;
       }
       render3dCfg.meshCfg.heightScale = s;
-    } else if (arg == "--3d-quant") {
+      continue;
+    }
+    if (arg == "--3d-quant") {
       float q = 0.0f;
       if (!requireValue(i, val) || !ParseF32(val, &q) || !(q >= 0.0f)) {
         std::cerr << "--3d-quant requires a float >= 0\n";
         return 2;
       }
       render3dCfg.meshCfg.heightQuantization = q;
-    } else if (arg == "--3d-buildings") {
+      continue;
+    }
+    if (arg == "--3d-buildings") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-buildings requires 0 or 1\n";
         return 2;
@@ -1334,7 +1558,9 @@ int main(int argc, char** argv)
         return 2;
       }
       render3dCfg.meshCfg.includeBuildings = (b != 0);
-    } else if (arg == "--3d-cliffs") {
+      continue;
+    }
+    if (arg == "--3d-cliffs") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-cliffs requires 0 or 1\n";
         return 2;
@@ -1345,7 +1571,9 @@ int main(int argc, char** argv)
         return 2;
       }
       render3dCfg.meshCfg.includeCliffs = (b != 0);
-    } else if (arg == "--3d-top") {
+      continue;
+    }
+    if (arg == "--3d-top") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-top requires 0 or 1\n";
         return 2;
@@ -1357,7 +1585,9 @@ int main(int argc, char** argv)
       }
       render3dCfg.meshCfg.includeTopSurfaces = (b != 0);
 
-    } else if (arg == "--3d-heightfield") {
+      continue;
+    }
+    if (arg == "--3d-heightfield") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-heightfield requires 0 or 1\n";
         return 2;
@@ -1368,7 +1598,9 @@ int main(int argc, char** argv)
         return 2;
       }
       render3dCfg.heightfieldTopSurfaces = (b != 0);
-    } else if (arg == "--3d-skirt") {
+      continue;
+    }
+    if (arg == "--3d-skirt") {
       if (!requireValue(i, val)) {
         std::cerr << "--3d-skirt requires 0 or 1\n";
         return 2;
@@ -1379,14 +1611,18 @@ int main(int argc, char** argv)
         return 2;
       }
       render3dCfg.addSkirt = (b != 0);
-    } else if (arg == "--3d-skirt-drop") {
+      continue;
+    }
+    if (arg == "--3d-skirt-drop") {
       float d = 0.0f;
       if (!requireValue(i, val) || !ParseF32(val, &d) || !(d > 0.0f)) {
         std::cerr << "--3d-skirt-drop requires a float > 0 (world units)\n";
         return 2;
       }
       render3dCfg.skirtDrop = d;
-    } else if (arg == "--iso-tile") {
+      continue;
+    }
+    if (arg == "--iso-tile") {
       int tw = 0;
       int th = 0;
       if (!requireValue(i, val) || !ParseWxH(val, &tw, &th)) {
@@ -1399,7 +1635,9 @@ int main(int argc, char** argv)
       }
       isoCfg.tileW = tw;
       isoCfg.tileH = th;
-    } else if (arg == "--iso-height") {
+      continue;
+    }
+    if (arg == "--iso-height") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-height requires an integer\n";
         return 2;
@@ -1410,7 +1648,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.heightScalePx = hp;
-    } else if (arg == "--iso-margin") {
+      continue;
+    }
+    if (arg == "--iso-margin") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-margin requires an integer\n";
         return 2;
@@ -1421,7 +1661,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.marginPx = mp;
-    } else if (arg == "--iso-grid") {
+      continue;
+    }
+    if (arg == "--iso-grid") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-grid requires 0 or 1\n";
         return 2;
@@ -1432,7 +1674,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.drawGrid = (b != 0);
-    } else if (arg == "--iso-cliffs") {
+      continue;
+    }
+    if (arg == "--iso-cliffs") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-cliffs requires 0 or 1\n";
         return 2;
@@ -1443,7 +1687,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.drawCliffs = (b != 0);
-    } else if (arg == "--iso-fancy") {
+      continue;
+    }
+    if (arg == "--iso-fancy") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-fancy requires 0 or 1\n";
         return 2;
@@ -1454,7 +1700,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.fancy = (b != 0);
-    } else if (arg == "--iso-texture") {
+      continue;
+    }
+    if (arg == "--iso-texture") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-texture requires an integer percent (0..100)\n";
         return 2;
@@ -1465,7 +1713,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.textureStrength = static_cast<float>(p) / 100.0f;
-    } else if (arg == "--iso-shore") {
+      continue;
+    }
+    if (arg == "--iso-shore") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-shore requires 0 or 1\n";
         return 2;
@@ -1476,7 +1726,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.drawShore = (b != 0);
-    } else if (arg == "--iso-roadmarks") {
+      continue;
+    }
+    if (arg == "--iso-roadmarks") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-roadmarks requires 0 or 1\n";
         return 2;
@@ -1487,7 +1739,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.drawRoadMarkings = (b != 0);
-    } else if (arg == "--iso-zonepatterns") {
+      continue;
+    }
+    if (arg == "--iso-zonepatterns") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-zonepatterns requires 0 or 1\n";
         return 2;
@@ -1498,7 +1752,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.drawZonePatterns = (b != 0);
-    } else if (arg == "--iso-daynight") {
+      continue;
+    }
+    if (arg == "--iso-daynight") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-daynight requires 0 or 1\n";
         return 2;
@@ -1509,7 +1765,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.dayNight.enabled = (b != 0);
-    } else if (arg == "--iso-time") {
+      continue;
+    }
+    if (arg == "--iso-time") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-time requires an integer percent (0..100)\n";
         return 2;
@@ -1520,7 +1778,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.dayNight.phase01 = static_cast<float>(p) / 100.0f;
-    } else if (arg == "--iso-lights") {
+      continue;
+    }
+    if (arg == "--iso-lights") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-lights requires 0 or 1\n";
         return 2;
@@ -1531,7 +1791,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.dayNight.drawLights = (b != 0);
-    } else if (arg == "--iso-night") {
+      continue;
+    }
+    if (arg == "--iso-night") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-night requires an integer percent (0..100)\n";
         return 2;
@@ -1542,7 +1804,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.dayNight.nightDarken = static_cast<float>(p) / 100.0f;
-    } else if (arg == "--iso-dusk") {
+      continue;
+    }
+    if (arg == "--iso-dusk") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-dusk requires an integer percent (0..100)\n";
         return 2;
@@ -1553,7 +1817,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.dayNight.duskTint = static_cast<float>(p) / 100.0f;
-    } else if (arg == "--iso-weather") {
+      continue;
+    }
+    if (arg == "--iso-weather") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-weather requires one of: clear, rain, snow\n";
         return 2;
@@ -1568,7 +1834,9 @@ int main(int argc, char** argv)
         std::cerr << "--iso-weather requires one of: clear, rain, snow\n";
         return 2;
       }
-    } else if (arg == "--iso-wx-intensity") {
+      continue;
+    }
+    if (arg == "--iso-wx-intensity") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-wx-intensity requires an integer percent (0..100)\n";
         return 2;
@@ -1579,7 +1847,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.weather.intensity = static_cast<float>(p) / 100.0f;
-    } else if (arg == "--iso-wx-overcast") {
+      continue;
+    }
+    if (arg == "--iso-wx-overcast") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-wx-overcast requires an integer percent (0..100)\n";
         return 2;
@@ -1590,7 +1860,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.weather.overcast = static_cast<float>(p) / 100.0f;
-    } else if (arg == "--iso-wx-fog") {
+      continue;
+    }
+    if (arg == "--iso-wx-fog") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-wx-fog requires an integer percent (0..100)\n";
         return 2;
@@ -1601,7 +1873,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.weather.fog = static_cast<float>(p) / 100.0f;
-    } else if (arg == "--iso-wx-precip") {
+      continue;
+    }
+    if (arg == "--iso-wx-precip") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-wx-precip requires 0 or 1\n";
         return 2;
@@ -1612,7 +1886,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.weather.drawPrecipitation = (b != 0);
-    } else if (arg == "--iso-wx-reflect") {
+      continue;
+    }
+    if (arg == "--iso-wx-reflect") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-wx-reflect requires 0 or 1\n";
         return 2;
@@ -1623,7 +1899,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.weather.reflectLights = (b != 0);
-    } else if (arg == "--iso-clouds") {
+      continue;
+    }
+    if (arg == "--iso-clouds") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-clouds requires 0 or 1\n";
         return 2;
@@ -1634,7 +1912,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.clouds.enabled = (b != 0);
-    } else if (arg == "--iso-cloud-cover") {
+      continue;
+    }
+    if (arg == "--iso-cloud-cover") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-cloud-cover requires an integer percent (0..100)\n";
         return 2;
@@ -1645,7 +1925,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.clouds.coverage = static_cast<float>(p) / 100.0f;
-    } else if (arg == "--iso-cloud-strength") {
+      continue;
+    }
+    if (arg == "--iso-cloud-strength") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-cloud-strength requires an integer percent (0..100)\n";
         return 2;
@@ -1656,7 +1938,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.clouds.strength = static_cast<float>(p) / 100.0f;
-    } else if (arg == "--iso-cloud-scale") {
+      continue;
+    }
+    if (arg == "--iso-cloud-scale") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-cloud-scale requires an integer >= 1 (tiles)\n";
         return 2;
@@ -1667,7 +1951,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.clouds.scaleTiles = static_cast<float>(s);
-    } else if (arg == "--iso-tileset") {
+      continue;
+    }
+    if (arg == "--iso-tileset") {
       // Use a generated sprite atlas for ISO overviews.
       if (i + 2 >= argc) {
         std::cerr << "--iso-tileset requires: <atlas.png> <meta.json>\n";
@@ -1675,27 +1961,35 @@ int main(int argc, char** argv)
       }
       isoTilesetAtlasPath = argv[++i];
       isoTilesetMetaPath = argv[++i];
-    } else if (arg == "--iso-tileset-emit") {
+      continue;
+    }
+    if (arg == "--iso-tileset-emit") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-tileset-emit requires: <emissive.png>\n";
         return 2;
       }
       isoTilesetEmissivePath = val;
-    } else if (arg == "--iso-tileset-normal") {
+      continue;
+    }
+    if (arg == "--iso-tileset-normal") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-tileset-normal requires: <normal.png>\n";
         return 2;
       }
       isoTilesetNormalPath = val;
       isoCfg.tilesetLighting.enableNormals = true;
-    } else if (arg == "--iso-tileset-shadow") {
+      continue;
+    }
+    if (arg == "--iso-tileset-shadow") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-tileset-shadow requires: <shadow.png>\n";
         return 2;
       }
       isoTilesetShadowPath = val;
       isoCfg.tilesetLighting.enableShadows = true;
-    } else if (arg == "--iso-tileset-light") {
+      continue;
+    }
+    if (arg == "--iso-tileset-light") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-tileset-light requires: <x,y,z>\n";
         return 2;
@@ -1708,7 +2002,9 @@ int main(int argc, char** argv)
       isoCfg.tilesetLighting.lightDirX = lx;
       isoCfg.tilesetLighting.lightDirY = ly;
       isoCfg.tilesetLighting.lightDirZ = lz;
-    } else if (arg == "--iso-tileset-normal-strength") {
+      continue;
+    }
+    if (arg == "--iso-tileset-normal-strength") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-tileset-normal-strength requires an integer percent (0..100)\n";
         return 2;
@@ -1719,7 +2015,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.tilesetLighting.normalStrength = static_cast<float>(p) / 100.0f;
-    } else if (arg == "--iso-tileset-shadow-strength") {
+      continue;
+    }
+    if (arg == "--iso-tileset-shadow-strength") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-tileset-shadow-strength requires an integer percent (0..100)\n";
         return 2;
@@ -1730,7 +2028,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.tilesetLighting.shadowStrength = static_cast<float>(p) / 100.0f;
-    } else if (arg == "--iso-tileset-props") {
+      continue;
+    }
+    if (arg == "--iso-tileset-props") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-tileset-props requires 0 or 1\n";
         return 2;
@@ -1741,7 +2041,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.tilesetProps.enabled = (b != 0);
-    } else if (arg == "--iso-tileset-tree-density") {
+      continue;
+    }
+    if (arg == "--iso-tileset-tree-density") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-tileset-tree-density requires an integer percent (0..100)\n";
         return 2;
@@ -1752,7 +2054,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.tilesetProps.treeDensity = static_cast<float>(p) / 100.0f;
-    } else if (arg == "--iso-tileset-conifer") {
+      continue;
+    }
+    if (arg == "--iso-tileset-conifer") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-tileset-conifer requires an integer percent (0..100)\n";
         return 2;
@@ -1763,7 +2067,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.tilesetProps.coniferChance = static_cast<float>(p) / 100.0f;
-    } else if (arg == "--iso-tileset-streetlights") {
+      continue;
+    }
+    if (arg == "--iso-tileset-streetlights") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-tileset-streetlights requires 0 or 1\n";
         return 2;
@@ -1774,7 +2080,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.tilesetProps.drawStreetlights = (b != 0);
-    } else if (arg == "--iso-tileset-streetlight-chance") {
+      continue;
+    }
+    if (arg == "--iso-tileset-streetlight-chance") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-tileset-streetlight-chance requires an integer percent (0..100)\n";
         return 2;
@@ -1785,7 +2093,9 @@ int main(int argc, char** argv)
         return 2;
       }
       isoCfg.tilesetProps.streetlightChance = static_cast<float>(p) / 100.0f;
-    } else if (arg == "--export-scale") {
+      continue;
+    }
+    if (arg == "--export-scale") {
       if (!requireValue(i, val)) {
         std::cerr << "--export-scale requires an integer\n";
         return 2;
@@ -1796,13 +2106,17 @@ int main(int argc, char** argv)
         return 2;
       }
       exportScale = s;
-    } else if (arg == "--export-tiles-csv") {
+      continue;
+    }
+    if (arg == "--export-tiles-csv") {
       if (!requireValue(i, val)) {
         std::cerr << "--export-tiles-csv requires a path\n";
         return 2;
       }
       tilesCsvPath = val;
-    } else if (arg == "--batch") {
+      continue;
+    }
+    if (arg == "--batch") {
       if (!requireValue(i, val)) {
         std::cerr << "--batch requires an integer\n";
         return 2;
@@ -1813,8 +2127,14 @@ int main(int argc, char** argv)
         return 2;
       }
       batchRuns = n;
+      continue;
     } else {
-      std::cerr << "Unknown argument: " << arg << "\n\n";
+      std::cerr << "Unknown argument: " << arg << "\n";
+      const std::string sugg = SuggestClosestCliArg(arg);
+      if (!sugg.empty()) {
+        std::cerr << "Did you mean: " << sugg << " ?\n";
+      }
+      std::cerr << "\n";
       PrintHelp();
       return 2;
     }
