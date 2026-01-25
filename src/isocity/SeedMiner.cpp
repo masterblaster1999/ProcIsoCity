@@ -1403,23 +1403,23 @@ static std::vector<MineMetric> DefaultOutlierMetrics()
   };
 }
 
-static double MedianOfSorted(const std::vector<double>& v)
+static double Median(std::vector<double>& v)
 {
   if (v.empty()) return 0.0;
+
+  // Fast median via nth_element (O(n) average). For even-sized vectors we
+  // average the two middle order statistics.
   const std::size_t n = v.size();
   const std::size_t mid = n / 2;
-  if ((n & 1u) == 1u) {
-    return v[mid];
-  }
-  // even: average middle two
-  return 0.5 * (v[mid - 1] + v[mid]);
-}
 
-static double Median(std::vector<double> v)
-{
-  if (v.empty()) return 0.0;
-  std::sort(v.begin(), v.end());
-  return MedianOfSorted(v);
+  std::nth_element(v.begin(), v.begin() + mid, v.end());
+  const double upper = v[mid];
+
+  if ((n & 1u) == 1u) return upper;
+
+  // The lower median is the maximum element in the lower partition.
+  const double lower = *std::max_element(v.begin(), v.begin() + mid);
+  return 0.5 * (lower + upper);
 }
 
 static void FitStandardizer(const std::vector<MineRecord>& recs,
@@ -1438,6 +1438,9 @@ static void FitStandardizer(const std::vector<MineRecord>& recs,
   std::vector<double> col;
   col.reserve(static_cast<std::size_t>(n));
 
+  std::vector<double> dev;
+  dev.reserve(static_cast<std::size_t>(n));
+
   for (int j = 0; j < d; ++j) {
     col.clear();
     const MineMetric m = metrics[static_cast<std::size_t>(j)];
@@ -1447,14 +1450,12 @@ static void FitStandardizer(const std::vector<MineRecord>& recs,
     }
 
     if (robust) {
-      std::sort(col.begin(), col.end());
-      const double med = MedianOfSorted(col);
+      const double med = Median(col);
 
-      std::vector<double> dev;
+      dev.clear();
       dev.reserve(col.size());
       for (double v : col) dev.push_back(std::fabs(v - med));
-      std::sort(dev.begin(), dev.end());
-      const double mad = MedianOfSorted(dev);
+      const double mad = Median(dev);
 
       // Consistent MAD scale factor for normal distributions.
       // 1.4826 ~= 1 / Phi^-1(3/4)
@@ -1945,9 +1946,10 @@ bool MineRecordFromJson(const JsonValue& obj, MineRecord& out, std::string* outE
   // Prefer exact seed parsing via seed_hex.
   {
     const JsonValue* seedHex = FindJsonMember(obj, "seed_hex");
-    if (seedHex && seedHex->isString()) {
+    std::string seedHexStr;
+    if (ReadString(seedHex, seedHexStr)) {
       std::uint64_t sv = 0;
-      if (!ParseHexU64(seedHex->stringValue, sv)) return fail("invalid seed_hex");
+      if (!ParseHexU64(seedHexStr, sv)) return fail("invalid seed_hex");
       r.seed = sv;
     } else {
       const JsonValue* seed = FindJsonMember(obj, "seed");

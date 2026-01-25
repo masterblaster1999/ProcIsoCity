@@ -8191,19 +8191,19 @@ void TestSeedMinerParetoRankingAndSelection()
   // record 0 dominates record 3 (higher pop, lower congestion).
   recs[0].seed = 1;
   recs[0].stats.population = 100;
-  recs[0].stats.trafficCongestion = 0.20;
+  recs[0].stats.trafficCongestion = 0.20f;
 
   recs[1].seed = 2;
   recs[1].stats.population = 80;
-  recs[1].stats.trafficCongestion = 0.10;
+  recs[1].stats.trafficCongestion = 0.10f;
 
   recs[2].seed = 3;
   recs[2].stats.population = 120;
-  recs[2].stats.trafficCongestion = 0.30;
+  recs[2].stats.trafficCongestion = 0.30f;
 
   recs[3].seed = 4;
   recs[3].stats.population = 90;
-  recs[3].stats.trafficCongestion = 0.25;
+  recs[3].stats.trafficCongestion = 0.25f;
 
   std::vector<ParetoObjective> obj;
   obj.push_back({MineMetric::Population, true});
@@ -8250,28 +8250,28 @@ void TestSeedMinerMapElitesBasic()
   recs[0].w = 10;
   recs[0].h = 10;
   recs[0].waterFrac = 0.10f;
-  recs[0].stats.trafficCongestion = 0.20;
+  recs[0].stats.trafficCongestion = 0.20f;
   recs[0].score = 10.0;
 
   recs[1].seed = 2;
   recs[1].w = 10;
   recs[1].h = 10;
   recs[1].waterFrac = 0.10f;
-  recs[1].stats.trafficCongestion = 0.20;
+  recs[1].stats.trafficCongestion = 0.20f;
   recs[1].score = 12.0;
 
   recs[2].seed = 3;
   recs[2].w = 10;
   recs[2].h = 10;
   recs[2].waterFrac = 0.90f;
-  recs[2].stats.trafficCongestion = 0.20;
+  recs[2].stats.trafficCongestion = 0.20f;
   recs[2].score = 9.0;
 
   recs[3].seed = 4;
   recs[3].w = 10;
   recs[3].h = 10;
   recs[3].waterFrac = 0.90f;
-  recs[3].stats.trafficCongestion = 0.80;
+  recs[3].stats.trafficCongestion = 0.80f;
   recs[3].score = 11.0;
 
   MapElitesConfig cfg;
