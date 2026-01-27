@@ -6618,6 +6618,10 @@ Color HeatmapColor(float v, Renderer::HeatmapRamp ramp) {
   float alphaF = 0.0f;
   if (ramp == Renderer::HeatmapRamp::Water) {
     alphaF = std::clamp(40.0f + 160.0f * v, 0.0f, 255.0f);
+  } else if (ramp == Renderer::HeatmapRamp::Diverging) {
+    // Keep neutral values subtle so the underlying tiles remain visible.
+    const float t = std::abs(v - 0.5f) * 2.0f; // 0 at center, 1 at extremes
+    alphaF = std::clamp(40.0f + 160.0f * t, 0.0f, 255.0f);
   } else {
     alphaF = std::clamp(70.0f + 110.0f * v, 0.0f, 255.0f);
   }
@@ -6634,6 +6638,17 @@ Color HeatmapColor(float v, Renderer::HeatmapRamp ramp) {
     const Color shallow{150, 220, 255, a};
     const Color deep{40, 120, 255, a};
     return LerpColor(shallow, deep, v);
+  }
+
+  if (ramp == Renderer::HeatmapRamp::Diverging) {
+    // 0 (cold) -> blue ... 0.5 (neutral) -> near-white ... 1 (hot) -> red
+    const Color cold{60, 130, 255, a};
+    const Color neutral{245, 245, 245, a};
+    const Color hot{240, 80, 70, a};
+    if (v < 0.5f) {
+      return LerpColor(cold, neutral, v / 0.5f);
+    }
+    return LerpColor(neutral, hot, (v - 0.5f) / 0.5f);
   }
 
   if (ramp == Renderer::HeatmapRamp::Bad) {

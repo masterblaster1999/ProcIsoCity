@@ -2838,6 +2838,422 @@ static void StitchNarrowWaterBridges(World& world, const std::vector<P>& hubs, s
   }
 }
 
+
+// -----------------------------
+// Road-network connectivity enforcement
+// -----------------------------
+//
+// Some procedural passes (especially internal block subdivision) can create tiny,
+// disconnected road stubs. These read as "roads to nowhere" and also harm later
+// routing/centrality computations.
+//
+// This pass enforces a single connected road component by either:
+//  - stitching meaningful components back to the main hub network via a short connector, or
+//  - pruning tiny, far-away fragments (cheaper than carving a long access road).
+//
+// The algorithm is deterministic (seeded hashing, no dependence on RNG call order).
+static void EnsureRoadNetworkConnectivity(World& world, const std::vector<P>& hubs, std::uint32_t seed32)
+{
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return;
+
+  // ---------------------------------------------------------------------------
+  // Pass 0: detect current road components.
+  // ---------------------------------------------------------------------------
+  std::vector<int> comp;
+  std::vector<int> compSize;
+  ComputeRoadComponents(world, comp, compSize);
+  if (compSize.size() <= 1) return;
+
+  const int compN0 = static_cast<int>(compSize.size());
+  const int minDim0 = std::min(w, h);
+
+  // ---------------------------------------------------------------------------
+  // Pass 1: "cheap stitches" across 1-tile land gaps between *different* road
+  // components. This fixes the most common cause of fragmentation (a single
+  // missed tile during block subdivision), without any routing/pathfinding.
+  // ---------------------------------------------------------------------------
+  struct GapCand {
+    int x = 0;
+    int y = 0;
+    int a = -1;
+    int b = -1;
+    int level = 1;
+    float score = 0.0f;
+    std::uint32_t tie = 0;
+  };
+
+  auto compAt = [&](int x, int y) -> int {
+    if (x < 0 || y < 0 || x >= w || y >= h) return -1;
+    if (world.at(x, y).overlay != Overlay::Road) return -1;
+    return comp[static_cast<std::size_t>(y * w + x)];
+  };
+
+  std::vector<GapCand> gaps;
+  gaps.reserve(256);
+
+  for (int y = 1; y < h - 1; ++y) {
+    for (int x = 1; x < w - 1; ++x) {
+      const Tile& t = world.at(x, y);
+      if (t.overlay != Overlay::None) continue;
+      if (t.terrain == Terrain::Water) continue;
+      if (!world.isBuildable(x, y)) continue;
+
+      // East-west gap.
+      {
+        const int ca = compAt(x - 1, y);
+        const int cb = compAt(x + 1, y);
+        if (ca >= 0 && cb >= 0 && ca != cb) {
+          const int lvl = std::max(world.at(x - 1, y).level, world.at(x + 1, y).level);
+          const int sizeScore = compSize[static_cast<std::size_t>(ca)] + compSize[static_cast<std::size_t>(cb)];
+          const int hubD = NearestHubDist(hubs, x, y);
+          const float hub01 = std::clamp(static_cast<float>(hubD) / std::max(1.0f, static_cast<float>(w + h)), 0.0f, 1.0f);
+
+          GapCand gc;
+          gc.x = x;
+          gc.y = y;
+          gc.a = ca;
+          gc.b = cb;
+          gc.level = std::clamp(lvl, 1, 3);
+          gc.score = static_cast<float>(sizeScore) + (1.0f - hub01) * 30.0f + static_cast<float>(gc.level) * 10.0f;
+          gc.tie = HashCoords32(x, y, seed32 ^ 0x1A1DF17u);
+          gaps.push_back(gc);
+        }
+      }
+
+      // North-south gap.
+      {
+        const int ca = compAt(x, y - 1);
+        const int cb = compAt(x, y + 1);
+        if (ca >= 0 && cb >= 0 && ca != cb) {
+          const int lvl = std::max(world.at(x, y - 1).level, world.at(x, y + 1).level);
+          const int sizeScore = compSize[static_cast<std::size_t>(ca)] + compSize[static_cast<std::size_t>(cb)];
+          const int hubD = NearestHubDist(hubs, x, y);
+          const float hub01 = std::clamp(static_cast<float>(hubD) / std::max(1.0f, static_cast<float>(w + h)), 0.0f, 1.0f);
+
+          GapCand gc;
+          gc.x = x;
+          gc.y = y;
+          gc.a = ca;
+          gc.b = cb;
+          gc.level = std::clamp(lvl, 1, 3);
+          gc.score = static_cast<float>(sizeScore) + (1.0f - hub01) * 30.0f + static_cast<float>(gc.level) * 10.0f;
+          gc.tie = HashCoords32(x, y, seed32 ^ 0x1A1DF17u);
+          gaps.push_back(gc);
+        }
+      }
+    }
+  }
+
+  if (!gaps.empty()) {
+    std::sort(gaps.begin(), gaps.end(), [](const GapCand& a, const GapCand& b) {
+      if (a.score != b.score) return a.score > b.score;
+      return a.tie < b.tie;
+    });
+
+    // Budget: keep it bounded (runtime & morphology control).
+    int maxStitches = std::clamp(minDim0 / 10, 8, 24);
+    if (compN0 >= 6) maxStitches = std::min(32, maxStitches + 8);
+
+    int placed = 0;
+    for (const GapCand& gc : gaps) {
+      if (placed >= maxStitches) break;
+
+      if (!world.inBounds(gc.x, gc.y)) continue;
+      Tile& t = world.at(gc.x, gc.y);
+      if (t.overlay != Overlay::None) continue;
+      if (t.terrain == Terrain::Water) continue;
+      if (!world.isBuildable(gc.x, gc.y)) continue;
+
+      // Re-validate the pattern (we don't try to keep comp[] up to date here).
+      if (gc.a >= 0 && gc.b >= 0) {
+        bool ok = false;
+        // E-W
+        if (world.at(gc.x - 1, gc.y).overlay == Overlay::Road && world.at(gc.x + 1, gc.y).overlay == Overlay::Road) ok = true;
+        // N-S
+        if (world.at(gc.x, gc.y - 1).overlay == Overlay::Road && world.at(gc.x, gc.y + 1).overlay == Overlay::Road) ok = true;
+        if (!ok) continue;
+      }
+
+      SetRoadWithLevel(world, gc.x, gc.y, gc.level, /*allowBridges=*/false);
+      ++placed;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Pass 2: Recompute components after stitches; if still fragmented, connect a
+  // small number of "significant" components, and prune the rest.
+  // ---------------------------------------------------------------------------
+  ComputeRoadComponents(world, comp, compSize);
+  if (compSize.size() <= 1) return;
+
+  const int compN = static_cast<int>(compSize.size());
+  const int minDim = std::min(w, h);
+  const int n = w * h;
+
+  // Group road tiles by component + deterministic tie key.
+  std::vector<std::vector<int>> compTiles(static_cast<std::size_t>(compN));
+  std::vector<std::uint32_t> compTie(static_cast<std::size_t>(compN), std::numeric_limits<std::uint32_t>::max());
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      if (world.at(x, y).overlay != Overlay::Road) continue;
+      const int idx = y * w + x;
+      const int c = comp[static_cast<std::size_t>(idx)];
+      if (c < 0 || c >= compN) continue;
+
+      compTiles[static_cast<std::size_t>(c)].push_back(idx);
+
+      const std::uint32_t t = HashCoords32(x, y, seed32 ^ 0xC011EC7u);
+      if (t < compTie[static_cast<std::size_t>(c)]) compTie[static_cast<std::size_t>(c)] = t;
+    }
+  }
+
+  // Hub counts per component (used to choose the "main" network).
+  std::vector<int> hubCount(static_cast<std::size_t>(compN), 0);
+  for (const P& hub : hubs) {
+    if (!world.inBounds(hub.x, hub.y)) continue;
+    if (world.at(hub.x, hub.y).overlay != Overlay::Road) continue;
+    const int idx = hub.y * w + hub.x;
+    const int c = comp[static_cast<std::size_t>(idx)];
+    if (c < 0 || c >= compN) continue;
+    hubCount[static_cast<std::size_t>(c)] += 1;
+  }
+
+  // Choose main component: hubs first, then size, then deterministic tie.
+  int mainC = 0;
+  for (int c = 1; c < compN; ++c) {
+    const int hc = hubCount[static_cast<std::size_t>(c)];
+    const int hm = hubCount[static_cast<std::size_t>(mainC)];
+    if (hc > hm) {
+      mainC = c;
+      continue;
+    }
+    if (hc == hm) {
+      const int sc = compSize[static_cast<std::size_t>(c)];
+      const int sm = compSize[static_cast<std::size_t>(mainC)];
+      if (sc > sm) {
+        mainC = c;
+        continue;
+      }
+      if (sc == sm && compTie[static_cast<std::size_t>(c)] < compTie[static_cast<std::size_t>(mainC)]) {
+        mainC = c;
+      }
+    }
+  }
+
+  if (compTiles[static_cast<std::size_t>(mainC)].empty()) return;
+
+  // Multi-source BFS from the main component: compute Manhattan distance to the nearest main road tile.
+  constexpr int kInf = std::numeric_limits<int>::max() / 4;
+  std::vector<int> dist(static_cast<std::size_t>(n), kInf);
+  std::vector<int> nearest(static_cast<std::size_t>(n), -1);
+
+  std::vector<int> q;
+  q.reserve(static_cast<std::size_t>(n));
+  std::size_t head = 0;
+
+  for (const int idx0 : compTiles[static_cast<std::size_t>(mainC)]) {
+    dist[static_cast<std::size_t>(idx0)] = 0;
+    nearest[static_cast<std::size_t>(idx0)] = idx0;
+    q.push_back(idx0);
+  }
+
+  constexpr int dx4[4] = {1, -1, 0, 0};
+  constexpr int dy4[4] = {0, 0, 1, -1};
+
+  while (head < q.size()) {
+    const int cur = q[head++];
+    const int cx = cur % w;
+    const int cy = cur / w;
+    const int nd = dist[static_cast<std::size_t>(cur)] + 1;
+
+    for (int k = 0; k < 4; ++k) {
+      const int nx = cx + dx4[k];
+      const int ny = cy + dy4[k];
+      if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+
+      const int nidx = ny * w + nx;
+      if (nd < dist[static_cast<std::size_t>(nidx)]) {
+        dist[static_cast<std::size_t>(nidx)] = nd;
+        nearest[static_cast<std::size_t>(nidx)] = nearest[static_cast<std::size_t>(cur)];
+        q.push_back(nidx);
+      }
+    }
+  }
+
+  struct Plan {
+    int comp = -1;
+    int fromIdx = -1;
+    int toIdx = -1;
+    int dist = kInf;
+    int size = 0;
+    bool hasHub = false;
+    std::uint32_t tie = 0;
+  };
+
+  std::vector<Plan> plans;
+  plans.reserve(static_cast<std::size_t>(std::max(0, compN - 1)));
+
+  for (int c = 0; c < compN; ++c) {
+    if (c == mainC) continue;
+    const auto& tiles = compTiles[static_cast<std::size_t>(c)];
+    if (tiles.empty()) continue;
+
+    int bestIdx = -1;
+    int bestD = kInf;
+    std::uint32_t bestTie = std::numeric_limits<std::uint32_t>::max();
+
+    for (const int idx0 : tiles) {
+      const int d = dist[static_cast<std::size_t>(idx0)];
+      const int x = idx0 % w;
+      const int y = idx0 / w;
+      const std::uint32_t t = HashCoords32(x, y, seed32 ^ 0xC011EC7u);
+      if (d < bestD || (d == bestD && t < bestTie)) {
+        bestD = d;
+        bestIdx = idx0;
+        bestTie = t;
+      }
+    }
+
+    if (bestIdx < 0) continue;
+    const int to = nearest[static_cast<std::size_t>(bestIdx)];
+    if (to < 0 || to >= n) continue;
+
+    Plan p;
+    p.comp = c;
+    p.fromIdx = bestIdx;
+    p.toIdx = to;
+    p.dist = bestD;
+    p.size = compSize[static_cast<std::size_t>(c)];
+    p.hasHub = (hubCount[static_cast<std::size_t>(c)] > 0);
+    p.tie = (static_cast<std::uint32_t>(bestD) << 16) ^ bestTie;
+    plans.push_back(p);
+  }
+
+  // Priority: keep hub components, then larger components, then closer components.
+  std::sort(plans.begin(), plans.end(), [](const Plan& a, const Plan& b) {
+    if (a.hasHub != b.hasHub) return a.hasHub > b.hasHub;
+    if (a.size != b.size) return a.size > b.size;
+    if (a.dist != b.dist) return a.dist < b.dist;
+    return a.tie < b.tie;
+  });
+
+  auto pruneComponent = [&](int c) {
+    auto& tiles = compTiles[static_cast<std::size_t>(c)];
+    for (const int idx0 : tiles) {
+      const int x = idx0 % w;
+      const int y = idx0 / w;
+      Tile& t = world.at(x, y);
+      if (t.overlay != Overlay::Road) continue;
+      t.overlay = Overlay::None;
+      t.level = 1;
+      t.occupants = 0;
+    }
+    tiles.clear();
+  };
+
+  const int pruneDist = std::clamp(minDim / 2, 20, 64);
+
+  // Connect only a small number of significant components; prune everything else.
+  const int connectMinSize = std::clamp(minDim / 5, 14, 40);
+  const int maxConnect = std::clamp(minDim / 64, 1, 3) + ((compN <= 4) ? 1 : 0);
+
+  int connected = 0;
+
+  for (const Plan& p : plans) {
+    // Always prune very small fragments (they're almost always street stubs).
+    if (!p.hasHub && p.size <= 8) {
+      pruneComponent(p.comp);
+      continue;
+    }
+
+    const bool big = (p.size >= connectMinSize);
+    const bool close = (p.dist <= 8);
+    const bool far = (p.dist >= pruneDist);
+
+    bool shouldConnect = false;
+
+    if (p.hasHub) {
+      // Rare, but never prune a hub component: connect it.
+      shouldConnect = true;
+    } else if (big && !far) {
+      shouldConnect = true;
+    } else if (close && connected < maxConnect) {
+      // Allow a few close-in connections to preserve nearby neighborhoods.
+      shouldConnect = true;
+    }
+
+    if (shouldConnect && connected < maxConnect) {
+      const P a{p.fromIdx % w, p.fromIdx / w};
+      const P b{p.toIdx % w, p.toIdx / w};
+
+      int lvl = ChooseHubConnectionLevel(world, a, b);
+      if (p.dist <= 4) lvl = std::min(lvl, 2);
+      if (p.dist > 18) lvl = std::max(lvl, 2);
+
+      const std::uint32_t connSeed = seed32 ^ HashCoords32(a.x, a.y, 0xC011EC7u) ^ HashCoords32(b.x, b.y, 0xC011EC7u) ^
+                                     (static_cast<std::uint32_t>(p.comp) * 0x9E3779B9u);
+
+      // Local RNG so we don't perturb other procedural steps.
+      RNG rr(connSeed);
+
+      // Use the direct routing pass (cheaper than curvy/waypoint routing).
+      CarveRoad(world, rr, a, b, lvl, /*allowBridges=*/true);
+
+      ++connected;
+    } else {
+      pruneComponent(p.comp);
+    }
+  }
+
+  // Final safety: if something still remains disconnected, prune all non-main components.
+  std::vector<int> comp2;
+  std::vector<int> size2;
+  ComputeRoadComponents(world, comp2, size2);
+  if (size2.size() <= 1) return;
+
+  // Choose main component in the new labeling using the same hub-first heuristic.
+  int main2 = 0;
+  std::vector<int> hub2(size2.size(), 0);
+  for (const P& hub : hubs) {
+    if (!world.inBounds(hub.x, hub.y)) continue;
+    if (world.at(hub.x, hub.y).overlay != Overlay::Road) continue;
+    const int idx = hub.y * w + hub.x;
+    const int c = comp2[static_cast<std::size_t>(idx)];
+    if (c < 0 || c >= static_cast<int>(size2.size())) continue;
+    hub2[static_cast<std::size_t>(c)] += 1;
+  }
+
+  for (int c = 1; c < static_cast<int>(size2.size()); ++c) {
+    const int hc = hub2[static_cast<std::size_t>(c)];
+    const int hm = hub2[static_cast<std::size_t>(main2)];
+    if (hc > hm) {
+      main2 = c;
+      continue;
+    }
+    if (hc == hm && size2[static_cast<std::size_t>(c)] > size2[static_cast<std::size_t>(main2)]) {
+      main2 = c;
+    }
+  }
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      if (world.at(x, y).overlay != Overlay::Road) continue;
+      const int idx = y * w + x;
+      const int c = comp2[static_cast<std::size_t>(idx)];
+      if (c == main2) continue;
+
+      Tile& t = world.at(x, y);
+      t.overlay = Overlay::None;
+      t.level = 1;
+      t.occupants = 0;
+    }
+  }
+}
+
+
 // -----------------------------
 // Signature parks / greenways
 // -----------------------------
@@ -5372,6 +5788,8 @@ World GenerateWorld(int width, int height, std::uint64_t seed, const ProcGenConf
   CarveInternalStreets(world, hubPts, seed32 ^ 0x1337C0DEu);
   // Opportunistically stitch disconnected local networks across narrow water gaps.
   StitchNarrowWaterBridges(world, hubPts, seed32 ^ 0xB16B00B5u);
+  // Ensure the road network is fully connected (stitch or prune any disconnected fragments).
+  EnsureRoadNetworkConnectivity(world, hubPts, seed32 ^ 0xC011EC7u);
 
   // v11: post-process the generated road network to create a clearer
   // hierarchy of streets/avenues/highways based on sampled road-graph centrality.

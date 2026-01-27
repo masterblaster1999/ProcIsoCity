@@ -17,7 +17,6 @@
 #include "isocity/World.hpp"
 
 #include <algorithm>
-#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -35,12 +34,27 @@ struct PHashOptions {
   int dctSize = 8;
 };
 
-inline int HammingDistance64(std::uint64_t a, std::uint64_t b)
+namespace detail {
+
+inline int Popcount64(std::uint64_t x)
 {
-  return static_cast<int>(std::popcount(a ^ b));
+#if defined(__clang__) || defined(__GNUG__)
+  return __builtin_popcountll(static_cast<unsigned long long>(x));
+#else
+  // Portable 64-bit popcount (Hacker's Delight).
+  x = x - ((x >> 1) & 0x5555555555555555ULL);
+  x = (x & 0x3333333333333333ULL) + ((x >> 2) & 0x3333333333333333ULL);
+  x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0FULL;
+  return static_cast<int>((x * 0x0101010101010101ULL) >> 56);
+#endif
 }
 
-namespace detail {
+inline int HammingDistance64(std::uint64_t a, std::uint64_t b)
+{
+  return Popcount64(a ^ b);
+}
+
+// (namespace detail intentionally remains open; more helper functions follow)
 
 template <typename SampleFn>
 inline double SampleBilinear(int srcW, int srcH, const SampleFn& sample, double x, double y)
@@ -89,6 +103,11 @@ inline double MedianOf(std::vector<double> v)
 }
 
 } // namespace detail
+
+inline int HammingDistance64(std::uint64_t a, std::uint64_t b)
+{
+  return detail::HammingDistance64(a, b);
+}
 
 // Compute a 64-bit perceptual hash over an implicit grayscale image via a
 // caller-provided sampler.

@@ -12,8 +12,24 @@
 #include "isocity/DepressionFill.hpp"
 #include "isocity/NoisePollution.hpp"
 #include "isocity/HeatIsland.hpp"
+#include "isocity/AirPollution.hpp"
+#include "isocity/RunoffPollution.hpp"
+#include "isocity/RunoffMitigation.hpp"
+#include "isocity/SolarPotential.hpp"
+#include "isocity/SkyView.hpp"
+#include "isocity/EnergyModel.hpp"
+#include "isocity/CarbonModel.hpp"
+#include "isocity/CrimeModel.hpp"
+#include "isocity/TrafficSafety.hpp"
+#include "isocity/TransitAccessibility.hpp"
 #include "isocity/FireRisk.hpp"
 #include "isocity/LandUseMix.hpp"
+#include "isocity/Walkability.hpp"
+#include "isocity/RoadHealth.hpp"
+#include "isocity/Livability.hpp"
+#include "isocity/HotspotAnalysis.hpp"
+
+#include "isocity/JobOpportunity.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -551,6 +567,24 @@ inline void HeatRampRedYellowGreen(float v01, std::uint8_t& r, std::uint8_t& g, 
   }
 }
 
+// Diverging ramp useful for hotspot/coldspot visualization.
+// 0 -> blue (cold), 0.5 -> white (neutral), 1 -> red (hot)
+inline void DivergingBlueWhiteRed(float v01, std::uint8_t& r, std::uint8_t& g, std::uint8_t& b)
+{
+  const float t = Clamp01(v01);
+  if (t <= 0.5f) {
+    const float u = (t <= 0.0f) ? 0.0f : (t / 0.5f);
+    r = ToByte(255.0f * u);
+    g = ToByte(255.0f * u);
+    b = 255;
+  } else {
+    const float u = (t >= 1.0f) ? 1.0f : ((t - 0.5f) / 0.5f);
+    r = 255;
+    g = ToByte(255.0f * (1.0f - u));
+    b = ToByte(255.0f * (1.0f - u));
+  }
+}
+
 inline void HeatRampPurple(float v01, std::uint8_t& r, std::uint8_t& g, std::uint8_t& b)
 {
   const float t = Clamp01(v01);
@@ -717,7 +751,23 @@ struct TileColorContext {
   const NoiseResult* noise = nullptr;
   const LandUseMixResult* landUseMix = nullptr;
   const HeatIslandResult* heatIsland = nullptr;
+  const AirPollutionResult* airPollution = nullptr;
+  const RunoffPollutionResult* runoff = nullptr;
+  const RunoffMitigationResult* runoffMitigation = nullptr;
+  const SolarPotentialResult* solar = nullptr;
+  const SkyViewResult* skyView = nullptr;
+  const EnergyModelResult* energy = nullptr;
+  const CarbonModelResult* carbon = nullptr;
+  const CrimeModelResult* crime = nullptr;
+  const TrafficSafetyResult* trafficSafety = nullptr;
+  const TransitAccessibilityResult* transit = nullptr;
   const FireRiskResult* fireRisk = nullptr;
+  const WalkabilityResult* walkability = nullptr;
+  const JobOpportunityResult* jobs = nullptr;
+  const RoadHealthResult* roadHealth = nullptr;
+  const LivabilityResult* livability = nullptr;
+  const HotspotResult* livabilityHotspot = nullptr;
+  const HotspotResult* interventionHotspot = nullptr;
 
   std::uint16_t maxTraffic = 0;
   std::uint16_t maxGoodsTraffic = 0;
@@ -818,6 +868,71 @@ inline void ComputeTileColor(const World& world, int x, int y, ExportLayer layer
       r = static_cast<std::uint8_t>((static_cast<int>(r) + static_cast<int>(hr) * 2) / 3);
       g = static_cast<std::uint8_t>((static_cast<int>(g) + static_cast<int>(hg) * 2) / 3);
       b = static_cast<std::uint8_t>((static_cast<int>(b) + static_cast<int>(hb) * 2) / 3);
+    }
+  } break;
+
+  case ExportLayer::TrafficCrashRisk: {
+    // Crash risk proxy on roads.
+    MulPixel(r, g, b, shade);
+
+    const std::size_t nTiles = static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h);
+    if (ctx.trafficSafety && ctx.trafficSafety->risk01.size() == nTiles && t.overlay == Overlay::Road) {
+      const float v01 = Clamp01(ctx.trafficSafety->risk01[FlatIdx(x, y, ctx.w)]);
+      std::uint8_t hr, hg, hb;
+      // High risk => red.
+      HeatRampRedYellowGreen(1.0f - v01, hr, hg, hb);
+      r = static_cast<std::uint8_t>((static_cast<int>(r) + static_cast<int>(hr) * 2) / 3);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) + static_cast<int>(hg) * 2) / 3);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) + static_cast<int>(hb) * 2) / 3);
+    }
+  } break;
+
+  case ExportLayer::TrafficCrashExposure: {
+    // Neighborhood exposure to nearby road crash risk.
+    MulPixel(r, g, b, shade);
+
+    const std::size_t nTiles = static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h);
+    if (ctx.trafficSafety && ctx.trafficSafety->exposure01.size() == nTiles) {
+      const float v01 = Clamp01(ctx.trafficSafety->exposure01[FlatIdx(x, y, ctx.w)]);
+      std::uint8_t hr, hg, hb;
+      HeatRampRedYellowGreen(1.0f - v01, hr, hg, hb);
+      const float a = 0.85f;
+      r = LerpU8(r, hr, a);
+      g = LerpU8(g, hg, a);
+      b = LerpU8(b, hb, a);
+    }
+
+    // Keep overlay context visible (roads/parks/zones/civic).
+    if (t.overlay != Overlay::None) {
+      std::uint8_t orr = r, org = g, orb = b;
+      OverlayColor(t, orr, org, orb);
+      r = static_cast<std::uint8_t>((static_cast<int>(r) * 2 + static_cast<int>(orr)) / 3);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) * 2 + static_cast<int>(org)) / 3);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) * 2 + static_cast<int>(orb)) / 3);
+    }
+  } break;
+
+  case ExportLayer::TrafficCrashPriority: {
+    // Resident-weighted intervention priority.
+    MulPixel(r, g, b, shade);
+
+    const std::size_t nTiles = static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h);
+    if (ctx.trafficSafety && ctx.trafficSafety->priority01.size() == nTiles) {
+      const float v01 = Clamp01(ctx.trafficSafety->priority01[FlatIdx(x, y, ctx.w)]);
+      std::uint8_t hr, hg, hb;
+      HeatRampRedYellowGreen(1.0f - v01, hr, hg, hb);
+      const float a = 0.85f;
+      r = LerpU8(r, hr, a);
+      g = LerpU8(g, hg, a);
+      b = LerpU8(b, hb, a);
+    }
+
+    if (t.overlay != Overlay::None) {
+      std::uint8_t orr = r, org = g, orb = b;
+      OverlayColor(t, orr, org, orb);
+      r = static_cast<std::uint8_t>((static_cast<int>(r) * 2 + static_cast<int>(orr)) / 3);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) * 2 + static_cast<int>(org)) / 3);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) * 2 + static_cast<int>(orb)) / 3);
     }
   } break;
 
@@ -1019,6 +1134,379 @@ inline void ComputeTileColor(const World& world, int x, int y, ExportLayer layer
     }
   } break;
 
+
+  case ExportLayer::AirPollution:
+  case ExportLayer::AirPollutionEmission: {
+    // Heuristic transported air pollution.
+    // Background: terrain with height shading.
+    MulPixel(r, g, b, shade);
+
+    if (ctx.airPollution && ctx.airPollution->pollution01.size() == static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h) &&
+        ctx.airPollution->emission01.size() == static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h)) {
+      const std::size_t i = FlatIdx(x, y, ctx.w);
+      float v01 = 0.0f;
+      if (layer == ExportLayer::AirPollution) {
+        v01 = ctx.airPollution->pollution01[i];
+      } else {
+        v01 = ctx.airPollution->emission01[i];
+      }
+
+      std::uint8_t hr, hg, hb;
+      // Invert so polluted is red, clean is green.
+      HeatRampRedYellowGreen(1.0f - Clamp01(v01), hr, hg, hb);
+      r = static_cast<std::uint8_t>((static_cast<int>(r) + static_cast<int>(hr) * 2) / 3);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) + static_cast<int>(hg) * 2) / 3);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) + static_cast<int>(hb) * 2) / 3);
+    }
+
+    // Keep overlay context visible for parks/zones (helps interpret sources/sinks).
+    if (t.overlay == Overlay::Park) {
+      r = static_cast<std::uint8_t>((static_cast<int>(r) + 30) / 2);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) + 220) / 2);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) + 30) / 2);
+    }
+    if (t.terrain == Terrain::Water) {
+      r = static_cast<std::uint8_t>((static_cast<int>(r) + 20) / 2);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) + 80) / 2);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) + 200) / 2);
+    }
+  } break;
+
+
+  case ExportLayer::RunoffPollution:
+  case ExportLayer::RunoffPollutionLoad: {
+    // Runoff / stormwater pollution heuristic.
+    // Background: terrain with height shading.
+    MulPixel(r, g, b, shade);
+
+    const std::size_t nTiles = static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h);
+    if (ctx.runoff && ctx.runoff->pollution01.size() == nTiles && ctx.runoff->localLoad01.size() == nTiles) {
+      const std::size_t i = FlatIdx(x, y, ctx.w);
+      float v01 = 0.0f;
+      if (layer == ExportLayer::RunoffPollution) {
+        v01 = ctx.runoff->pollution01[i];
+
+        // Emphasize stream channels slightly so the routed field is readable.
+        if (ctx.runoff->flowAccum.size() == nTiles && ctx.runoff->maxFlowAccum > 0) {
+          const int a = ctx.runoff->flowAccum[i];
+          const int maxA = std::max(1, ctx.runoff->maxFlowAccum);
+          const float minA = static_cast<float>(std::max(2, maxA / 128));
+          const float maxA2 = static_cast<float>(std::max(std::max(3, maxA / 16), maxA / 32 + 1));
+          const float stream01 = SmoothStep(minA, maxA2, static_cast<float>(a));
+          v01 = Clamp01(v01 * (0.55f + 0.45f * stream01));
+        }
+      } else {
+        v01 = ctx.runoff->localLoad01[i];
+      }
+
+      std::uint8_t hr, hg, hb;
+      // Invert so high pollution/load is red, low is green.
+      HeatRampRedYellowGreen(1.0f - Clamp01(v01), hr, hg, hb);
+      r = static_cast<std::uint8_t>((static_cast<int>(r) + static_cast<int>(hr) * 2) / 3);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) + static_cast<int>(hg) * 2) / 3);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) + static_cast<int>(hb) * 2) / 3);
+    }
+
+    // Keep overlay context visible for parks/zones (helps interpret sources/sinks).
+    if (t.overlay == Overlay::Park) {
+      r = static_cast<std::uint8_t>((static_cast<int>(r) + 30) / 2);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) + 220) / 2);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) + 30) / 2);
+    }
+    if (t.terrain == Terrain::Water) {
+      r = static_cast<std::uint8_t>((static_cast<int>(r) + 20) / 2);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) + 80) / 2);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) + 200) / 2);
+    }
+  } break;
+
+  case ExportLayer::RunoffMitigationPriority:
+  case ExportLayer::RunoffMitigationPlan: {
+    // Stormwater mitigation guidance (park placement):
+    // - priority: green=high benefit, red=low
+    // - plan: highlights the selected park tiles over the shaded basemap
+    MulPixel(r, g, b, shade);
+
+    const std::size_t nTiles = static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h);
+    if (ctx.runoffMitigation && ctx.runoffMitigation->priority01.size() == nTiles &&
+        ctx.runoffMitigation->planMask.size() == nTiles) {
+      const std::size_t i = FlatIdx(x, y, ctx.w);
+      if (layer == ExportLayer::RunoffMitigationPriority) {
+        const float v01 = Clamp01(ctx.runoffMitigation->priority01[i]);
+        std::uint8_t hr, hg, hb;
+        // High benefit => green.
+        HeatRampRedYellowGreen(v01, hr, hg, hb);
+        r = static_cast<std::uint8_t>((static_cast<int>(r) + static_cast<int>(hr) * 2) / 3);
+        g = static_cast<std::uint8_t>((static_cast<int>(g) + static_cast<int>(hg) * 2) / 3);
+        b = static_cast<std::uint8_t>((static_cast<int>(b) + static_cast<int>(hb) * 2) / 3);
+      } else {
+        // Plan layer: overlay the suggested tiles in a bright cyan.
+        if (ctx.runoffMitigation->planMask[i] != 0) {
+          r = 40;
+          g = 230;
+          b = 255;
+        }
+      }
+    }
+
+    // Keep overlay context visible for parks/water/zones.
+    if (t.overlay == Overlay::Park) {
+      r = static_cast<std::uint8_t>((static_cast<int>(r) + 30) / 2);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) + 220) / 2);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) + 30) / 2);
+    }
+    if (t.terrain == Terrain::Water) {
+      r = static_cast<std::uint8_t>((static_cast<int>(r) + 20) / 2);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) + 80) / 2);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) + 200) / 2);
+    }
+  } break;
+
+  case ExportLayer::SolarExposure:
+  case ExportLayer::SolarPotential: {
+    // Solar exposure / rooftop PV potential proxy.
+    // Background: terrain with height shading.
+    MulPixel(r, g, b, shade);
+
+    if (ctx.solar && ctx.solar->exposure01.size() == static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h) &&
+        ctx.solar->roofArea01.size() == static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h) &&
+        ctx.solar->potential01.size() == static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h)) {
+      const std::size_t i = FlatIdx(x, y, ctx.w);
+      const float roof = ctx.solar->roofArea01[i];
+
+      // For rooftop potential, only highlight tiles that plausibly have a roof.
+      if (layer == ExportLayer::SolarPotential && roof <= 0.0f) {
+        break;
+      }
+
+      const float v01 = (layer == ExportLayer::SolarExposure) ? ctx.solar->exposure01[i] : ctx.solar->potential01[i];
+
+      std::uint8_t hr, hg, hb;
+      HeatRampRedYellowGreen(Clamp01(v01), hr, hg, hb);
+
+      // Blend so the underlying map context is still visible.
+      r = static_cast<std::uint8_t>((static_cast<int>(r) + static_cast<int>(hr) * 2) / 3);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) + static_cast<int>(hg) * 2) / 3);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) + static_cast<int>(hb) * 2) / 3);
+    }
+  } break;
+
+  case ExportLayer::SkyView:
+  case ExportLayer::CanyonConfinement: {
+    // Urban morphology openness / canyon confinement.
+    // Background: terrain with height shading for context.
+    MulPixel(r, g, b, shade);
+
+    const std::size_t nTiles = static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h);
+    if (ctx.skyView && ctx.skyView->skyView01.size() == nTiles && ctx.skyView->canyon01.size() == nTiles) {
+      const std::size_t i = FlatIdx(x, y, ctx.w);
+      const float v01 = (layer == ExportLayer::SkyView) ? Clamp01(ctx.skyView->skyView01[i])
+                                                       : Clamp01(ctx.skyView->canyon01[i]);
+
+      std::uint8_t hr, hg, hb;
+      if (layer == ExportLayer::SkyView) {
+        // More open sky is "better" -> green.
+        HeatRampRedYellowGreen(v01, hr, hg, hb);
+      } else {
+        // More confinement is "worse" -> red.
+        HeatRampRedYellowGreen(1.0f - v01, hr, hg, hb);
+      }
+
+      // Blend strongly on road + built tiles, more lightly elsewhere.
+      float a = 0.62f;
+      if (t.overlay == Overlay::Road || t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
+          t.overlay == Overlay::Industrial || t.overlay == Overlay::School || t.overlay == Overlay::Hospital ||
+          t.overlay == Overlay::PoliceStation || t.overlay == Overlay::FireStation) {
+        a = 0.84f;
+      } else if (t.terrain == Terrain::Water) {
+        a = 0.48f;
+      }
+
+      r = LerpU8(r, hr, a);
+      g = LerpU8(g, hg, a);
+      b = LerpU8(b, hb, a);
+    }
+
+    // Keep overlay context visible for parks/water.
+    if (t.overlay == Overlay::Park) {
+      r = static_cast<std::uint8_t>((static_cast<int>(r) + 30) / 2);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) + 220) / 2);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) + 30) / 2);
+    }
+    if (t.terrain == Terrain::Water) {
+      r = static_cast<std::uint8_t>((static_cast<int>(r) + 20) / 2);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) + 80) / 2);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) + 200) / 2);
+    }
+  } break;
+
+  case ExportLayer::RoadCentrality: {
+    // Road network betweenness centrality.
+    // Background: overlay map so it's actionable.
+    MulPixel(r, g, b, shade);
+    if (t.overlay != Overlay::None) {
+      std::uint8_t orr = r, org = g, orb = b;
+      OverlayColor(t, orr, org, orb);
+      if (t.overlay != Overlay::None) {
+        r = orr; g = org; b = orb;
+      }
+    }
+
+    if (ctx.roadHealth && ctx.roadHealth->centrality01.size() == static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h) &&
+        t.overlay == Overlay::Road) {
+      const float c01 = ctx.roadHealth->centrality01[FlatIdx(x, y, ctx.w)];
+      if (c01 > 0.0f) {
+        std::uint8_t hr, hg, hb;
+        // Invert so high centrality is red.
+        HeatRampRedYellowGreen(1.0f - Clamp01(c01), hr, hg, hb);
+        const float a = 0.88f;
+        r = LerpU8(r, hr, a);
+        g = LerpU8(g, hg, a);
+        b = LerpU8(b, hb, a);
+      }
+    }
+  } break;
+
+  case ExportLayer::RoadVulnerability: {
+    // Road network vulnerability: bridge impact + articulation markers.
+    // Background: overlay map so it's interpretable.
+    MulPixel(r, g, b, shade);
+    if (t.overlay != Overlay::None) {
+      std::uint8_t orr = r, org = g, orb = b;
+      OverlayColor(t, orr, org, orb);
+      if (t.overlay != Overlay::None) {
+        r = orr; g = org; b = orb;
+      }
+    }
+
+    if (ctx.roadHealth && ctx.roadHealth->vulnerability01.size() == static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h) &&
+        t.overlay == Overlay::Road) {
+      const float v01 = ctx.roadHealth->vulnerability01[FlatIdx(x, y, ctx.w)];
+      if (v01 > 0.0f) {
+        std::uint8_t hr, hg, hb;
+        // Invert so high vulnerability is red.
+        HeatRampRedYellowGreen(1.0f - Clamp01(v01), hr, hg, hb);
+        const float a = 0.90f;
+        r = LerpU8(r, hr, a);
+        g = LerpU8(g, hg, a);
+        b = LerpU8(b, hb, a);
+      }
+    }
+  } break;
+
+  case ExportLayer::RoadBypass: {
+    // Suggested resilience bypass paths (overlay).
+    // Background: overlay map, then draw bypass path as a vivid line and
+    // keep vulnerability shading on roads.
+    MulPixel(r, g, b, shade);
+    if (t.overlay != Overlay::None) {
+      std::uint8_t orr = r, org = g, orb = b;
+      OverlayColor(t, orr, org, orb);
+      if (t.overlay != Overlay::None) {
+        r = orr; g = org; b = orb;
+      }
+    }
+
+    if (ctx.roadHealth) {
+      const std::size_t i = FlatIdx(x, y, ctx.w);
+
+      if (ctx.roadHealth->bypassMask.size() == static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h) &&
+          ctx.roadHealth->bypassMask[i]) {
+        // Bright cyan for recommended bypass tiles.
+        r = 20; g = 245; b = 245;
+        break;
+      }
+
+      if (t.overlay == Overlay::Road && ctx.roadHealth->vulnerability01.size() == static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h)) {
+        const float v01 = ctx.roadHealth->vulnerability01[i];
+        if (v01 > 0.0f) {
+          std::uint8_t hr, hg, hb;
+          HeatRampRedYellowGreen(1.0f - Clamp01(v01), hr, hg, hb);
+          const float a = 0.80f;
+          r = LerpU8(r, hr, a);
+          g = LerpU8(g, hg, a);
+          b = LerpU8(b, hb, a);
+        }
+      }
+    }
+  } break;
+
+
+  case ExportLayer::Livability:
+  case ExportLayer::InterventionPriority: {
+    // Composite livability index + intervention priority.
+    // Background: terrain with height shading.
+    MulPixel(r, g, b, shade);
+
+    if (ctx.livability &&
+        ctx.livability->livability01.size() == static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h) &&
+        ctx.livability->priority01.size() == static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h)) {
+      const std::size_t i = FlatIdx(x, y, ctx.w);
+
+      float v01 = 0.0f;
+      if (layer == ExportLayer::Livability) {
+        v01 = ctx.livability->livability01[i];
+        // 0 -> red (poor), 1 -> green (great).
+        std::uint8_t hr, hg, hb;
+        HeatRampRedYellowGreen(Clamp01(v01), hr, hg, hb);
+        const float a = 0.88f;
+        r = LerpU8(r, hr, a);
+        g = LerpU8(g, hg, a);
+        b = LerpU8(b, hb, a);
+      } else {
+        v01 = ctx.livability->priority01[i];
+        // 0 -> green (low urgency), 1 -> red (high urgency).
+        std::uint8_t hr, hg, hb;
+        HeatRampRedYellowGreen(1.0f - Clamp01(v01), hr, hg, hb);
+        const float a = 0.90f;
+        r = LerpU8(r, hr, a);
+        g = LerpU8(g, hg, a);
+        b = LerpU8(b, hb, a);
+      }
+    }
+
+    // Keep overlay context visible so interventions are actionable.
+    if (t.overlay != Overlay::None) {
+      std::uint8_t orr = r, org = g, orb = b;
+      OverlayColor(t, orr, org, orb);
+      r = static_cast<std::uint8_t>((static_cast<int>(r) * 2 + static_cast<int>(orr)) / 3);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) * 2 + static_cast<int>(org)) / 3);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) * 2 + static_cast<int>(orb)) / 3);
+    }
+  } break;
+
+
+  case ExportLayer::LivabilityHotspot:
+  case ExportLayer::InterventionHotspot: {
+    // Getis-Ord Gi* hotspot visualization.
+    // Background: terrain with height shading.
+    MulPixel(r, g, b, shade);
+
+    const HotspotResult* hs = (layer == ExportLayer::LivabilityHotspot) ? ctx.livabilityHotspot : ctx.interventionHotspot;
+
+    if (hs && hs->z01.size() == static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h)) {
+      const std::size_t i = FlatIdx(x, y, ctx.w);
+      const float v01 = hs->z01[i];
+      std::uint8_t hr, hg, hb;
+      DivergingBlueWhiteRed(v01, hr, hg, hb);
+
+      const float a = (t.terrain == Terrain::Water) ? 0.30f : 0.88f;
+      r = LerpU8(r, hr, a);
+      g = LerpU8(g, hg, a);
+      b = LerpU8(b, hb, a);
+    }
+
+    // Keep overlay context visible so clusters remain actionable.
+    if (t.overlay != Overlay::None) {
+      std::uint8_t orr = r, org = g, orb = b;
+      OverlayColor(t, orr, org, orb);
+      r = static_cast<std::uint8_t>((static_cast<int>(r) * 2 + static_cast<int>(orr)) / 3);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) * 2 + static_cast<int>(org)) / 3);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) * 2 + static_cast<int>(orb)) / 3);
+    }
+  } break;
+
+
   case ExportLayer::FireRisk: {
     // Heuristic fire risk (dense development + weak fire station coverage).
     // Background: terrain with height shading.
@@ -1046,6 +1534,336 @@ inline void ComputeTileColor(const World& world, int x, int y, ExportLayer layer
 
     // Keep overlay context visible (roads/parks/zones/civic) so the causes of
     // risk hot-spots are readable.
+    if (t.overlay != Overlay::None) {
+      std::uint8_t orr = r, org = g, orb = b;
+      OverlayColor(t, orr, org, orb);
+      r = static_cast<std::uint8_t>((static_cast<int>(r) * 2 + static_cast<int>(orr)) / 3);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) * 2 + static_cast<int>(org)) / 3);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) * 2 + static_cast<int>(orb)) / 3);
+    }
+  } break;
+
+  case ExportLayer::Walkability:
+  case ExportLayer::WalkabilityPark:
+  case ExportLayer::WalkabilityRetail:
+  case ExportLayer::WalkabilityEducation:
+  case ExportLayer::WalkabilityHealth:
+  case ExportLayer::WalkabilitySafety: {
+    // Walkability / 15-minute city amenity accessibility heuristic.
+    // Background: terrain with height shading.
+    MulPixel(r, g, b, shade);
+
+    // Highlight amenity supply tiles so it's obvious *why* a neighborhood scores well/poorly.
+    if (t.overlay == Overlay::Park || t.overlay == Overlay::School || t.overlay == Overlay::Hospital ||
+        t.overlay == Overlay::PoliceStation || t.overlay == Overlay::FireStation) {
+      OverlayColor(t, r, g, b);
+      break;
+    }
+
+    const bool isZone = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial || t.overlay == Overlay::Industrial);
+    if (!isZone) break;
+
+    if (ctx.walkability) {
+      const std::size_t i = FlatIdx(x, y, ctx.w);
+      const std::size_t n = static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h);
+
+      const std::vector<float>* field = nullptr;
+      if (layer == ExportLayer::Walkability) field = &ctx.walkability->overall01;
+      else if (layer == ExportLayer::WalkabilityPark) field = &ctx.walkability->park01;
+      else if (layer == ExportLayer::WalkabilityRetail) field = &ctx.walkability->retail01;
+      else if (layer == ExportLayer::WalkabilityEducation) field = &ctx.walkability->education01;
+      else if (layer == ExportLayer::WalkabilityHealth) field = &ctx.walkability->health01;
+      else if (layer == ExportLayer::WalkabilitySafety) field = &ctx.walkability->safety01;
+
+      if (field && field->size() == n && i < field->size()) {
+        const float v01 = std::clamp((*field)[i], 0.0f, 1.0f);
+
+        std::uint8_t hr, hg, hb;
+        // 0 -> red (amenity desert), 1 -> green (excellent access).
+        HeatRampRedYellowGreen(v01, hr, hg, hb);
+
+        const float a = (t.terrain == Terrain::Water) ? 0.35f : 0.85f;
+        r = LerpU8(r, hr, a);
+        g = LerpU8(g, hg, a);
+        b = LerpU8(b, hb, a);
+      }
+    }
+
+    // Keep overlay context visible for zones so the viewer can interpret
+    // which land uses drive walkability outcomes.
+    if (t.overlay != Overlay::None) {
+      std::uint8_t orr = r, org = g, orb = b;
+      OverlayColor(t, orr, org, orb);
+      r = static_cast<std::uint8_t>((static_cast<int>(r) * 2 + static_cast<int>(orr)) / 3);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) * 2 + static_cast<int>(org)) / 3);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) * 2 + static_cast<int>(orb)) / 3);
+    }
+  } break;
+
+  case ExportLayer::JobAccess:
+  case ExportLayer::JobOpportunity: {
+    // Job accessibility / opportunity analytics.
+    // Background: terrain with height shading.
+    MulPixel(r, g, b, shade);
+
+    // Highlight job source tiles so it's obvious *why* neighborhoods score well/poorly.
+    if (t.overlay == Overlay::Commercial || t.overlay == Overlay::Industrial) {
+      OverlayColor(t, r, g, b);
+      break;
+    }
+
+    if (ctx.jobs) {
+      const std::size_t i = FlatIdx(x, y, ctx.w);
+      const std::size_t n = static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h);
+
+      const std::vector<float>* field = nullptr;
+      if (layer == ExportLayer::JobAccess) field = &ctx.jobs->jobAccess01;
+      else if (layer == ExportLayer::JobOpportunity) field = &ctx.jobs->jobOpportunity01;
+
+      if (field && field->size() == n && i < field->size()) {
+        const float v01 = std::clamp((*field)[i], 0.0f, 1.0f);
+
+        std::uint8_t hr, hg, hb;
+        // 0 -> red (job desert), 1 -> green (excellent access/opportunity).
+        HeatRampRedYellowGreen(v01, hr, hg, hb);
+
+        const float a = (t.terrain == Terrain::Water) ? 0.35f : 0.85f;
+        r = LerpU8(r, hr, a);
+        g = LerpU8(g, hg, a);
+        b = LerpU8(b, hb, a);
+      }
+    }
+
+    // Keep overlay context visible (roads/parks/zones/civic) so the causes of
+    // outcomes are readable.
+    if (t.overlay != Overlay::None) {
+      std::uint8_t orr = r, org = g, orb = b;
+      OverlayColor(t, orr, org, orb);
+      r = static_cast<std::uint8_t>((static_cast<int>(r) * 2 + static_cast<int>(orr)) / 3);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) * 2 + static_cast<int>(org)) / 3);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) * 2 + static_cast<int>(orb)) / 3);
+    }
+  } break;
+
+
+  case ExportLayer::EnergyDemand:
+  case ExportLayer::EnergySolar:
+  case ExportLayer::EnergyBalance: {
+    // Urban energy system analytics.
+    // Background: terrain with height shading.
+    MulPixel(r, g, b, shade);
+
+    const bool isBuilding = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
+                             t.overlay == Overlay::Industrial || t.overlay == Overlay::School ||
+                             t.overlay == Overlay::Hospital || t.overlay == Overlay::PoliceStation ||
+                             t.overlay == Overlay::FireStation);
+    if (!isBuilding) break;
+
+    if (ctx.energy) {
+      const std::size_t i = FlatIdx(x, y, ctx.w);
+      const std::size_t n = static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h);
+
+      const std::vector<float>* field = nullptr;
+      if (layer == ExportLayer::EnergyDemand) field = &ctx.energy->demand01;
+      else if (layer == ExportLayer::EnergySolar) field = &ctx.energy->solar01;
+      else if (layer == ExportLayer::EnergyBalance) field = &ctx.energy->balance01;
+
+      if (field && field->size() == n && i < field->size()) {
+        const float v01 = std::clamp((*field)[i], 0.0f, 1.0f);
+
+        std::uint8_t hr, hg, hb;
+        // Demand: high demand is "worse" -> red. Supply/balance: high is "better" -> green.
+        if (layer == ExportLayer::EnergyDemand) {
+          HeatRampRedYellowGreen(1.0f - v01, hr, hg, hb);
+        } else {
+          HeatRampRedYellowGreen(v01, hr, hg, hb);
+        }
+
+        const float a = (t.terrain == Terrain::Water) ? 0.35f : 0.85f;
+        r = LerpU8(r, hr, a);
+        g = LerpU8(g, hg, a);
+        b = LerpU8(b, hb, a);
+      }
+    }
+
+    // Keep overlay context visible so the viewer can interpret causes.
+    if (t.overlay != Overlay::None) {
+      std::uint8_t orr = r, org = g, orb = b;
+      OverlayColor(t, orr, org, orb);
+      r = static_cast<std::uint8_t>((static_cast<int>(r) * 2 + static_cast<int>(orr)) / 3);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) * 2 + static_cast<int>(org)) / 3);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) * 2 + static_cast<int>(orb)) / 3);
+    }
+  } break;
+
+  case ExportLayer::CarbonEmission:
+  case ExportLayer::CarbonSequestration:
+  case ExportLayer::CarbonBalance: {
+    // Carbon proxy: emissions (bad), sinks (good), and net balance (good).
+    // Background: terrain with height shading.
+    MulPixel(r, g, b, shade);
+
+    if (ctx.carbon) {
+      const std::size_t i = FlatIdx(x, y, ctx.w);
+      const std::size_t n = static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h);
+
+      const std::vector<float>* field = nullptr;
+      if (layer == ExportLayer::CarbonEmission) field = &ctx.carbon->emission01;
+      else if (layer == ExportLayer::CarbonSequestration) field = &ctx.carbon->sequestration01;
+      else if (layer == ExportLayer::CarbonBalance) field = &ctx.carbon->balance01;
+
+      if (field && field->size() == n && i < field->size()) {
+        const float v01 = std::clamp((*field)[i], 0.0f, 1.0f);
+
+        std::uint8_t hr, hg, hb;
+        if (layer == ExportLayer::CarbonEmission) {
+          // High emission is worse -> red.
+          HeatRampRedYellowGreen(1.0f - v01, hr, hg, hb);
+        } else {
+          // High sinks / positive balance is better -> green.
+          HeatRampRedYellowGreen(v01, hr, hg, hb);
+        }
+
+        float a = 0.0f;
+        if (layer == ExportLayer::CarbonEmission) {
+          const bool isBuilding = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
+                                   t.overlay == Overlay::Industrial || t.overlay == Overlay::School ||
+                                   t.overlay == Overlay::Hospital || t.overlay == Overlay::PoliceStation ||
+                                   t.overlay == Overlay::FireStation);
+          const bool isEmitter = isBuilding || (t.overlay == Overlay::Road);
+          a = isEmitter ? 0.85f : 0.25f;
+        } else if (layer == ExportLayer::CarbonSequestration) {
+          const bool isSink = (t.overlay == Overlay::Park) || (t.overlay == Overlay::None && t.terrain == Terrain::Grass);
+          a = isSink ? 0.85f : 0.25f;
+        } else {
+          // Net balance: show on most tiles, but keep empty land a bit subtler.
+          a = (t.terrain == Terrain::Water) ? 0.35f : 0.80f;
+          if (t.overlay == Overlay::None) a = (t.terrain == Terrain::Grass) ? 0.65f : 0.55f;
+        }
+
+        r = LerpU8(r, hr, a);
+        g = LerpU8(g, hg, a);
+        b = LerpU8(b, hb, a);
+      }
+    }
+
+    // Keep overlay context visible so the viewer can interpret causes.
+    if (t.overlay != Overlay::None) {
+      std::uint8_t orr = r, org = g, orb = b;
+      OverlayColor(t, orr, org, orb);
+      r = static_cast<std::uint8_t>((static_cast<int>(r) * 2 + static_cast<int>(orr)) / 3);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) * 2 + static_cast<int>(org)) / 3);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) * 2 + static_cast<int>(orb)) / 3);
+    }
+  } break;
+
+  case ExportLayer::CrimeRisk:
+  case ExportLayer::PoliceAccess: {
+    // Crime risk / policing accessibility.
+    // Background: terrain with height shading.
+    MulPixel(r, g, b, shade);
+
+    if (ctx.crime) {
+      const std::size_t i = FlatIdx(x, y, ctx.w);
+      const std::size_t n = static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h);
+      if (i < n && ctx.crime->risk01.size() == n && ctx.crime->policeAccess01.size() == n) {
+        float v01 = 0.0f;
+        if (layer == ExportLayer::CrimeRisk) {
+          v01 = std::clamp(ctx.crime->risk01[i], 0.0f, 1.0f);
+        } else {
+          v01 = std::clamp(ctx.crime->policeAccess01[i], 0.0f, 1.0f);
+        }
+
+        std::uint8_t hr, hg, hb;
+        if (layer == ExportLayer::CrimeRisk) {
+          HeatRampPurple(v01, hr, hg, hb);
+        } else {
+          HeatRampRedYellowGreen(v01, hr, hg, hb);
+        }
+
+        float a = 0.0f;
+        if (layer == ExportLayer::PoliceAccess) {
+          const bool isDemand = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
+                                 t.overlay == Overlay::Industrial || t.overlay == Overlay::School ||
+                                 t.overlay == Overlay::Hospital || t.overlay == Overlay::PoliceStation ||
+                                 t.overlay == Overlay::FireStation);
+          a = isDemand ? 0.85f : ((t.overlay == Overlay::Road) ? 0.60f : 0.35f);
+        } else {
+          const bool meaningful = (t.overlay != Overlay::None && t.terrain != Terrain::Water);
+          a = meaningful ? 0.85f : 0.40f;
+          if (t.terrain == Terrain::Water) a = 0.25f;
+        }
+
+        r = LerpU8(r, hr, a);
+        g = LerpU8(g, hg, a);
+        b = LerpU8(b, hb, a);
+      }
+    }
+
+    // Keep overlay context visible so the viewer can interpret causes.
+    if (t.overlay != Overlay::None) {
+      std::uint8_t orr = r, org = g, orb = b;
+      OverlayColor(t, orr, org, orb);
+      r = static_cast<std::uint8_t>((static_cast<int>(r) * 2 + static_cast<int>(orr)) / 3);
+      g = static_cast<std::uint8_t>((static_cast<int>(g) * 2 + static_cast<int>(org)) / 3);
+      b = static_cast<std::uint8_t>((static_cast<int>(b) * 2 + static_cast<int>(orb)) / 3);
+    }
+  } break;
+
+  case ExportLayer::TransitAccess:
+  case ExportLayer::TransitModeSharePotential: {
+    // Transit accessibility + localized mode-share potential.
+    // Background: terrain with height shading.
+    MulPixel(r, g, b, shade);
+
+    if (ctx.transit) {
+      const std::size_t i = FlatIdx(x, y, ctx.w);
+      const std::size_t n = static_cast<std::size_t>(ctx.w) * static_cast<std::size_t>(ctx.h);
+      if (i < n) {
+        float v01 = 0.0f;
+        if (layer == ExportLayer::TransitAccess && ctx.transit->access01.size() == n) {
+          v01 = std::clamp(ctx.transit->access01[i], 0.0f, 1.0f);
+        } else if (layer == ExportLayer::TransitModeSharePotential && ctx.transit->modeSharePotential01.size() == n) {
+          v01 = std::clamp(ctx.transit->modeSharePotential01[i], 0.0f, 1.0f);
+        }
+
+        std::uint8_t hr, hg, hb;
+        // 0 -> red (poor access / low potential), 1 -> green (excellent).
+        HeatRampRedYellowGreen(v01, hr, hg, hb);
+
+        float a = 0.0f;
+        if (layer == ExportLayer::TransitAccess) {
+          // Show on most non-water tiles, but keep roads/empty land a bit subtler.
+          const bool isZone = (t.overlay == Overlay::Residential || t.overlay == Overlay::Commercial ||
+                               t.overlay == Overlay::Industrial || t.overlay == Overlay::School ||
+                               t.overlay == Overlay::Hospital || t.overlay == Overlay::PoliceStation ||
+                               t.overlay == Overlay::FireStation);
+          a = isZone ? 0.85f : ((t.overlay == Overlay::Road) ? 0.55f : 0.65f);
+        } else {
+          // Mode-share potential is only meaningful on residential/job tiles.
+          const bool isR = (t.overlay == Overlay::Residential);
+          const bool isJ = (t.overlay == Overlay::Commercial || t.overlay == Overlay::Industrial);
+          a = (isR || isJ) ? 0.85f : 0.25f;
+        }
+
+        r = LerpU8(r, hr, a);
+        g = LerpU8(g, hg, a);
+        b = LerpU8(b, hb, a);
+
+        // Highlight planned stops and served corridors for readability.
+        if (ctx.transit->stopMask.size() == n && ctx.transit->stopMask[i]) {
+          r = 235;
+          g = 250;
+          b = 255;
+        } else if (ctx.transit->corridorMask.size() == n && ctx.transit->corridorMask[i]) {
+          r = LerpU8(r, 64, 0.15f);
+          g = LerpU8(g, 96, 0.15f);
+          b = LerpU8(b, 200, 0.15f);
+        }
+      }
+    }
+
+    // Keep overlay context visible so viewers can interpret why access differs.
     if (t.overlay != Overlay::None) {
       std::uint8_t orr = r, org = g, orb = b;
       OverlayColor(t, orr, org, orb);
@@ -1255,10 +2073,186 @@ bool ParseExportLayer(const std::string& s, ExportLayer& outLayer)
     outLayer = ExportLayer::HeatIsland;
     return true;
   }
+  
+  if (k == "air_pollution" || k == "air" || k == "airquality" || k == "air_quality" || k == "smog" || k == "aq") {
+    outLayer = ExportLayer::AirPollution;
+    return true;
+  }
+  if (k == "air_emission" || k == "air_source" || k == "air_sources" || k == "smog_sources" || k == "pollution_source") {
+    outLayer = ExportLayer::AirPollutionEmission;
+    return true;
+  }
+
+  if (k == "runoff_pollution" || k == "runoff" || k == "stormwater" || k == "storm_water" || k == "water_quality") {
+    outLayer = ExportLayer::RunoffPollution;
+    return true;
+  }
+  if (k == "runoff_load" || k == "runoff_source" || k == "stormwater_load" || k == "stormwater_source" || k == "runoff_emission") {
+    outLayer = ExportLayer::RunoffPollutionLoad;
+    return true;
+  }
+
+  if (k == "runoff_mitigation_priority" || k == "stormwater_mitigation_priority" || k == "gi_priority" ||
+      k == "runoff_priority" || k == "stormwater_priority") {
+    outLayer = ExportLayer::RunoffMitigationPriority;
+    return true;
+  }
+  if (k == "runoff_mitigation_plan" || k == "stormwater_mitigation_plan" || k == "gi_plan" ||
+      k == "runoff_plan" || k == "stormwater_plan" || k == "runoff_mitigation" || k == "stormwater_mitigation") {
+    outLayer = ExportLayer::RunoffMitigationPlan;
+    return true;
+  }
+
+  if (k == "solar_exposure" || k == "solar" || k == "insolation" || k == "sun" || k == "sunlight") {
+    outLayer = ExportLayer::SolarExposure;
+    return true;
+  }
+  if (k == "solar_potential" || k == "solar_rooftop" || k == "pv" || k == "pv_potential" || k == "rooftop_pv") {
+    outLayer = ExportLayer::SolarPotential;
+    return true;
+  }
+
+  if (k == "sky_view" || k == "skyview" || k == "svf" || k == "sky_view_factor") {
+    outLayer = ExportLayer::SkyView;
+    return true;
+  }
+  if (k == "canyon" || k == "canyon_confinement" || k == "urban_canyon" || k == "confinement" || k == "canyon01") {
+    outLayer = ExportLayer::CanyonConfinement;
+    return true;
+  }
+
+  if (k == "road_centrality" || k == "roadcentrality" || k == "centrality_road" || k == "road_betweenness" || k == "road_betweenness_centrality") {
+    outLayer = ExportLayer::RoadCentrality;
+    return true;
+  }
+  if (k == "road_vulnerability" || k == "roadvulnerability" || k == "road_fragility" || k == "road_fragile" || k == "road_resilience_risk") {
+    outLayer = ExportLayer::RoadVulnerability;
+    return true;
+  }
+  if (k == "road_bypass" || k == "roadbypass" || k == "resilience_bypass" || k == "bypass_road" || k == "bypass") {
+    outLayer = ExportLayer::RoadBypass;
+    return true;
+  }
+
+  if (k == "livability" || k == "liveability" || k == "quality_of_life" || k == "qol") {
+    outLayer = ExportLayer::Livability;
+    return true;
+  }
+  if (k == "intervention_priority" || k == "priority" || k == "intervention" || k == "action_priority") {
+    outLayer = ExportLayer::InterventionPriority;
+    return true;
+  }
+
+  if (k == "livability_hotspot" || k == "livability_cluster" || k == "hotspot_livability" || k == "livability_gistar") {
+    outLayer = ExportLayer::LivabilityHotspot;
+    return true;
+  }
+  if (k == "intervention_hotspot" || k == "priority_hotspot" || k == "need_hotspot" || k == "hotspot_priority" || k == "priority_gistar") {
+    outLayer = ExportLayer::InterventionHotspot;
+    return true;
+  }
+
   if (k == "fire_risk" || k == "firerisk" || k == "fire" || k == "firehazard" || k == "hazard_fire") {
     outLayer = ExportLayer::FireRisk;
     return true;
   }
+
+  if (k == "walkability" || k == "walk" || k == "walk_score" || k == "walkscore" || k == "15min") {
+    outLayer = ExportLayer::Walkability;
+    return true;
+  }
+  if (k == "walkability_park" || k == "walk_park" || k == "walkability_parks" || k == "walk_parks") {
+    outLayer = ExportLayer::WalkabilityPark;
+    return true;
+  }
+  if (k == "walkability_retail" || k == "walk_retail" || k == "walkability_shops" || k == "walk_shops") {
+    outLayer = ExportLayer::WalkabilityRetail;
+    return true;
+  }
+  if (k == "walkability_education" || k == "walk_education" || k == "walkability_schools" || k == "walk_schools") {
+    outLayer = ExportLayer::WalkabilityEducation;
+    return true;
+  }
+  if (k == "walkability_health" || k == "walk_health" || k == "walkability_hospitals" || k == "walk_hospitals") {
+    outLayer = ExportLayer::WalkabilityHealth;
+    return true;
+  }
+  if (k == "walkability_safety" || k == "walk_safety" || k == "walkability_emergency" || k == "walk_emergency") {
+    outLayer = ExportLayer::WalkabilitySafety;
+    return true;
+  }
+  if (k == "job_access" || k == "jobaccess" || k == "jobs_access" || k == "job_accessibility" || k == "access_jobs" ||
+      k == "employment_access" || k == "employment_accessibility") {
+    outLayer = ExportLayer::JobAccess;
+    return true;
+  }
+  if (k == "job_opportunity" || k == "jobopportunity" || k == "jobs_opportunity" || k == "employment" || k == "jobs" ||
+      k == "job_market" || k == "employment_opportunity") {
+    outLayer = ExportLayer::JobOpportunity;
+    return true;
+  }
+
+
+  if (k == "energy_demand" || k == "power_demand" || k == "electricity_demand" || k == "demand_energy") {
+    outLayer = ExportLayer::EnergyDemand;
+    return true;
+  }
+  if (k == "energy_solar" || k == "solar_supply" || k == "pv_supply" || k == "rooftop_solar_supply") {
+    outLayer = ExportLayer::EnergySolar;
+    return true;
+  }
+  if (k == "energy_balance" || k == "energy_net" || k == "net_energy" || k == "renewable_balance") {
+    outLayer = ExportLayer::EnergyBalance;
+    return true;
+  }
+
+  if (k == "carbon_emission" || k == "carbon_emissions" || k == "co2_emission") {
+    outLayer = ExportLayer::CarbonEmission;
+    return true;
+  }
+  if (k == "carbon_sequestration" || k == "carbon_sink" || k == "co2_sink") {
+    outLayer = ExportLayer::CarbonSequestration;
+    return true;
+  }
+  if (k == "carbon_balance" || k == "carbon_net" || k == "co2_balance") {
+    outLayer = ExportLayer::CarbonBalance;
+    return true;
+  }
+
+  if (k == "crime_risk" || k == "crime" || k == "crime_index" || k == "crime_rate" || k == "crime_heat") {
+    outLayer = ExportLayer::CrimeRisk;
+    return true;
+  }
+  if (k == "police_access" || k == "police_response" || k == "police" || k == "police_coverage" ||
+      k == "police_accessibility") {
+    outLayer = ExportLayer::PoliceAccess;
+    return true;
+  }
+
+  if (k == "traffic_crash_risk" || k == "traffic_crash" || k == "traffic_safety_risk" || k == "traffic_collision_risk") {
+    outLayer = ExportLayer::TrafficCrashRisk;
+    return true;
+  }
+  if (k == "traffic_crash_exposure" || k == "traffic_exposure" || k == "traffic_safety_exposure" || k == "collision_exposure") {
+    outLayer = ExportLayer::TrafficCrashExposure;
+    return true;
+  }
+  if (k == "traffic_crash_priority" || k == "traffic_safety_priority" || k == "crash_priority" || k == "collision_priority") {
+    outLayer = ExportLayer::TrafficCrashPriority;
+    return true;
+  }
+
+  if (k == "transit_access" || k == "bus_access" || k == "stop_access" || k == "transit_stop_access" ||
+      k == "public_transit_access" || k == "pt_access") {
+    outLayer = ExportLayer::TransitAccess;
+    return true;
+  }
+  if (k == "transit_mode_share_potential" || k == "transit_mode_share" || k == "mode_share_transit" ||
+      k == "bus_mode_share" || k == "pt_mode_share" || k == "transit_potential") {
+    outLayer = ExportLayer::TransitModeSharePotential;
+    return true;
+  }
+
   if (k == "zone_pressure_residential" || k == "zonepressure_residential" || k == "res_pressure" || k == "pressure_res" ||
       k == "rci_res" || k == "rci_r" || k == "demand_res" || k == "zoning_res") {
     outLayer = ExportLayer::ZonePressureResidential;
@@ -1298,6 +2292,70 @@ const char* ExportLayerName(ExportLayer layer)
   case ExportLayer::LandUseMix: return "landuse_mix";
   case ExportLayer::HeatIsland: return "heat_island";
   case ExportLayer::FireRisk: return "fire_risk";
+  case ExportLayer::Walkability: return "walkability";
+  case ExportLayer::WalkabilityPark: return "walkability_park";
+  case ExportLayer::WalkabilityRetail: return "walkability_retail";
+  case ExportLayer::WalkabilityEducation: return "walkability_education";
+  case ExportLayer::WalkabilityHealth: return "walkability_health";
+  case ExportLayer::WalkabilitySafety: return "walkability_safety";
+  case ExportLayer::AirPollution:
+    return "air_pollution";
+  case ExportLayer::AirPollutionEmission:
+    return "air_emission";
+
+  case ExportLayer::RunoffPollution:
+    return "runoff_pollution";
+  case ExportLayer::RunoffPollutionLoad:
+    return "runoff_load";
+  case ExportLayer::RunoffMitigationPriority:
+    return "runoff_mitigation_priority";
+  case ExportLayer::RunoffMitigationPlan:
+    return "runoff_mitigation_plan";
+
+  case ExportLayer::SolarExposure:
+    return "solar_exposure";
+  case ExportLayer::SolarPotential:
+    return "solar_potential";
+
+  case ExportLayer::RoadCentrality:
+    return "road_centrality";
+  case ExportLayer::RoadVulnerability:
+    return "road_vulnerability";
+  case ExportLayer::RoadBypass:
+    return "road_bypass";
+
+  case ExportLayer::Livability:
+    return "livability";
+  case ExportLayer::InterventionPriority:
+    return "intervention_priority";
+
+  case ExportLayer::LivabilityHotspot:
+    return "livability_hotspot";
+  case ExportLayer::InterventionHotspot:
+    return "intervention_hotspot";
+
+  case ExportLayer::JobAccess: return "job_access";
+  case ExportLayer::JobOpportunity: return "job_opportunity";
+  case ExportLayer::EnergyDemand: return "energy_demand";
+  case ExportLayer::EnergySolar: return "energy_solar";
+  case ExportLayer::EnergyBalance: return "energy_balance";
+
+  case ExportLayer::CarbonEmission: return "carbon_emission";
+  case ExportLayer::CarbonSequestration: return "carbon_sequestration";
+  case ExportLayer::CarbonBalance: return "carbon_balance";
+
+  case ExportLayer::CrimeRisk: return "crime_risk";
+  case ExportLayer::PoliceAccess: return "police_access";
+
+  case ExportLayer::SkyView: return "sky_view";
+  case ExportLayer::CanyonConfinement: return "canyon_confinement";
+
+  case ExportLayer::TrafficCrashRisk: return "traffic_crash_risk";
+  case ExportLayer::TrafficCrashExposure: return "traffic_crash_exposure";
+  case ExportLayer::TrafficCrashPriority: return "traffic_crash_priority";
+
+  case ExportLayer::TransitAccess: return "transit_access";
+  case ExportLayer::TransitModeSharePotential: return "transit_mode_share_potential";
   case ExportLayer::ZonePressureResidential: return "zone_pressure_residential";
   case ExportLayer::ZonePressureCommercial: return "zone_pressure_commercial";
   case ExportLayer::ZonePressureIndustrial: return "zone_pressure_industrial";
@@ -1382,10 +2440,145 @@ PpmImage RenderPpmLayer(const World& world, ExportLayer layer, const LandValueRe
 
   HeatIslandResult heatIsland{};
   bool haveHeatIsland = false;
-  if (layer == ExportLayer::HeatIsland) {
+  if (layer == ExportLayer::HeatIsland ||
+      layer == ExportLayer::EnergyDemand || layer == ExportLayer::EnergySolar || layer == ExportLayer::EnergyBalance ||
+      layer == ExportLayer::CarbonEmission || layer == ExportLayer::CarbonSequestration || layer == ExportLayer::CarbonBalance) {
     HeatIslandConfig hc{};
     heatIsland = ComputeHeatIsland(world, hc, traffic, goods);
     haveHeatIsland = true;
+  }
+
+
+  AirPollutionResult airPollution{};
+  bool haveAirPollution = false;
+  if (layer == ExportLayer::AirPollution || layer == ExportLayer::AirPollutionEmission) {
+    AirPollutionConfig ac{};
+    // Keep exports deterministic, and pick a stable "prevailing wind" per seed.
+    ac.windFromSeed = true;
+    airPollution = ComputeAirPollution(world, ac, traffic, goods);
+    haveAirPollution = true;
+  }
+
+
+  RunoffPollutionResult runoff{};
+  bool haveRunoff = false;
+  if (layer == ExportLayer::RunoffPollution || layer == ExportLayer::RunoffPollutionLoad) {
+    RunoffPollutionConfig rc{};
+    runoff = ComputeRunoffPollution(world, rc, traffic);
+    haveRunoff = true;
+  }
+
+  RunoffMitigationResult runoffMitigation{};
+  bool haveRunoffMitigation = false;
+  if (layer == ExportLayer::RunoffMitigationPriority || layer == ExportLayer::RunoffMitigationPlan) {
+    RunoffMitigationConfig mc{};
+    // Reasonable defaults for a visual planning layer.
+    mc.demandMode = RunoffMitigationDemandMode::ResidentialOccupants;
+    mc.parksToAdd = 12;
+    mc.minSeparation = 3;
+    mc.excludeWater = true;
+    mc.allowReplaceRoad = false;
+    mc.allowReplaceZones = false;
+
+    runoffMitigation = SuggestRunoffMitigationParks(world, mc, traffic);
+    haveRunoffMitigation = true;
+  }
+
+
+  SolarPotentialResult solar{};
+  bool haveSolar = false;
+  if (layer == ExportLayer::SolarExposure || layer == ExportLayer::SolarPotential ||
+      layer == ExportLayer::EnergyDemand || layer == ExportLayer::EnergySolar || layer == ExportLayer::EnergyBalance ||
+      layer == ExportLayer::CarbonEmission || layer == ExportLayer::CarbonSequestration || layer == ExportLayer::CarbonBalance) {
+    SolarPotentialConfig sc{};
+    // Keep exports deterministic: no random elements and stable shading sampling.
+    sc.azimuthSamples = 16;
+    solar = ComputeSolarPotential(world, sc);
+    haveSolar = true;
+  }
+
+
+  SkyViewResult skyView{};
+  bool haveSkyView = false;
+  if (layer == ExportLayer::SkyView || layer == ExportLayer::CanyonConfinement ||
+      layer == ExportLayer::TrafficCrashRisk || layer == ExportLayer::TrafficCrashExposure ||
+      layer == ExportLayer::TrafficCrashPriority) {
+    SkyViewConfig vc{};
+    vc.azimuthSamples = 16;
+    vc.maxHorizonRadius = 64;
+    vc.includeBuildings = true;
+    skyView = ComputeSkyViewFactor(world, vc);
+    haveSkyView = true;
+  }
+
+  TrafficSafetyResult trafficSafety{};
+  bool haveTrafficSafety = false;
+  if (layer == ExportLayer::TrafficCrashRisk || layer == ExportLayer::TrafficCrashExposure ||
+      layer == ExportLayer::TrafficCrashPriority) {
+    TrafficSafetyConfig tc{};
+    tc.requireOutsideConnection = true;
+    tc.exposureRadius = 6;
+    trafficSafety = ComputeTrafficSafety(world, tc, traffic, haveSkyView ? &skyView : nullptr);
+    haveTrafficSafety = true;
+  }
+
+
+
+  EnergyModelResult energy{};
+  bool haveEnergy = false;
+  if (layer == ExportLayer::EnergyDemand || layer == ExportLayer::EnergySolar || layer == ExportLayer::EnergyBalance ||
+      layer == ExportLayer::CarbonEmission || layer == ExportLayer::CarbonSequestration || layer == ExportLayer::CarbonBalance) {
+    EnergyModelConfig ec{};
+    energy = ComputeEnergyModel(world, ec, haveSolar ? &solar : nullptr, haveHeatIsland ? &heatIsland : nullptr);
+    haveEnergy = true;
+  }
+
+
+
+  CarbonModelResult carbon{};
+  bool haveCarbon = false;
+  if (layer == ExportLayer::CarbonEmission || layer == ExportLayer::CarbonSequestration || layer == ExportLayer::CarbonBalance) {
+    CarbonModelConfig cc{};
+    carbon = ComputeCarbonModel(world, cc, haveEnergy ? &energy : nullptr, traffic, goods);
+    haveCarbon = true;
+  }
+
+  CrimeModelResult crime{};
+  bool haveCrime = false;
+  NoiseResult crimeNoise{};
+  JobOpportunityResult crimeJobs{};
+  bool haveCrimeJobs = false;
+  if (layer == ExportLayer::CrimeRisk || layer == ExportLayer::PoliceAccess) {
+    // Crime uses optional noise + job stress proxies.
+    NoiseConfig nc{};
+    crimeNoise = ComputeNoisePollution(world, nc, traffic, goods);
+
+    JobOpportunityConfig jc{};
+    jc.requireOutsideConnection = true;
+    jc.useTravelTime = true;
+    jc.congestionCosts = true;
+    crimeJobs = ComputeJobOpportunity(world, jc, traffic, /*precomputedRoadToEdge=*/nullptr, /*precomputedZoneAccess=*/nullptr);
+    haveCrimeJobs = true;
+
+    CrimeModelConfig crc{};
+    crc.requireOutsideConnection = true;
+    crc.weightMode = IsochroneWeightMode::TravelTime;
+    crime = ComputeCrimeModel(world, crc, traffic, goods, (haveCrimeJobs ? &crimeJobs : nullptr), &crimeNoise,
+                              /*precomputedRoadToEdge=*/nullptr, /*precomputedZoneAccess=*/nullptr);
+    haveCrime = true;
+  }
+
+  TransitAccessibilityResult transit{};
+  bool haveTransit = false;
+  if (layer == ExportLayer::TransitAccess || layer == ExportLayer::TransitModeSharePotential) {
+    TransitAccessibilityConfig tc{};
+    // Align with the game: enforce outside connectivity and plan lines from demand.
+    tc.requireOutsideConnection = true;
+    TransitAccessibilityInputs ti{};
+    ti.traffic = traffic;
+    ti.goods = goods;
+    transit = ComputeTransitAccessibility(world, tc, ti);
+    haveTransit = true;
   }
 
   FireRiskResult fireRisk{};
@@ -1398,6 +2591,97 @@ PpmImage RenderPpmLayer(const World& world, ExportLayer layer, const LandValueRe
     fireRisk = ComputeFireRisk(world, fc);
     haveFireRisk = true;
   }
+
+  WalkabilityResult walkability{};
+  bool haveWalkability = false;
+  if (layer == ExportLayer::Walkability || layer == ExportLayer::WalkabilityPark || layer == ExportLayer::WalkabilityRetail ||
+      layer == ExportLayer::WalkabilityEducation || layer == ExportLayer::WalkabilityHealth || layer == ExportLayer::WalkabilitySafety) {
+    WalkabilityConfig wc{};
+    wc.enabled = true;
+    // Keep exports deterministic and aligned with in-game defaults (outside connectivity and travel-time weighting).
+    wc.requireOutsideConnection = true;
+    wc.weightMode = IsochroneWeightMode::TravelTime;
+    wc.coverageThresholdSteps = 15;
+    walkability = ComputeWalkability(world, wc);
+    haveWalkability = true;
+  }
+
+  JobOpportunityResult jobs{};
+  bool haveJobs = false;
+  if (layer == ExportLayer::JobAccess || layer == ExportLayer::JobOpportunity) {
+    JobOpportunityConfig jc{};
+    jc.requireOutsideConnection = true;
+    jc.useTravelTime = true;
+    jc.congestionCosts = true;
+    // Exports default to travel-time accessibility; when traffic is provided, congestion is incorporated.
+    jobs = ComputeJobOpportunity(world, jc, traffic, /*precomputedRoadToEdge=*/nullptr, /*precomputedZoneAccess=*/nullptr);
+    haveJobs = true;
+  }
+
+
+  RoadHealthResult roadHealth{};
+  bool haveRoadHealth = false;
+  if (layer == ExportLayer::RoadCentrality || layer == ExportLayer::RoadVulnerability || layer == ExportLayer::RoadBypass) {
+    RoadHealthConfig rc{};
+    rc.weightMode = RoadGraphEdgeWeightMode::TravelTimeMilli;
+    rc.maxSources = 0; // auto
+    rc.autoExactMaxNodes = 650;
+    rc.autoSampleSources = 256;
+    rc.includeNodeCentrality = true;
+    rc.articulationVulnerabilityBase = 0.70f;
+
+    // Bypass planning is fairly expensive; only do it for the bypass layer.
+    rc.includeBypass = (layer == ExportLayer::RoadBypass);
+    if (rc.includeBypass) {
+      rc.bypassCfg.top = 3;
+      rc.bypassCfg.moneyObjective = true;
+      rc.bypassCfg.targetLevel = 1;
+      rc.bypassCfg.allowBridges = false;
+      rc.bypassCfg.rankByTraffic = true;
+    }
+
+    roadHealth = ComputeRoadHealth(world, rc, traffic);
+    haveRoadHealth = true;
+  }
+
+
+  LivabilityResult livability{};
+  bool haveLivability = false;
+  if (layer == ExportLayer::Livability || layer == ExportLayer::InterventionPriority ||
+      layer == ExportLayer::LivabilityHotspot || layer == ExportLayer::InterventionHotspot) {
+    LivabilityConfig lc{};
+    lc.requireOutsideConnection = true;
+    lc.weightMode = IsochroneWeightMode::TravelTime;
+    lc.servicesCatchmentRadiusSteps = 18;
+    lc.walkCoverageThresholdSteps = 15;
+    livability = ComputeLivability(world, lc, traffic, goods);
+    haveLivability = true;
+  }
+
+
+  HotspotResult livHot{};
+  HotspotResult priHot{};
+  bool haveLivHot = false;
+  bool havePriHot = false;
+  if (layer == ExportLayer::LivabilityHotspot && haveLivability) {
+    HotspotConfig hc{};
+    hc.radius = 8;
+    hc.excludeWater = true;
+    hc.zThreshold = 1.96f;
+    hc.zScale = 3.0f;
+    livHot = ComputeHotspotsGiStar(world, livability.livability01, hc);
+    haveLivHot = true;
+  }
+  if (layer == ExportLayer::InterventionHotspot && haveLivability) {
+    HotspotConfig hc{};
+    hc.radius = 8;
+    hc.excludeWater = true;
+    hc.zThreshold = 1.96f;
+    hc.zScale = 3.0f;
+    priHot = ComputeHotspotsGiStar(world, livability.priority01, hc);
+    havePriHot = true;
+  }
+
 
   ZoneAccessMap zoneAccess{};
   bool haveZoneAccess = false;
@@ -1422,8 +2706,56 @@ PpmImage RenderPpmLayer(const World& world, ExportLayer layer, const LandValueRe
   if (haveHeatIsland) {
     ctx.heatIsland = &heatIsland;
   }
+  if (haveAirPollution) {
+    ctx.airPollution = &airPollution;
+  }
+  if (haveRunoff) {
+    ctx.runoff = &runoff;
+  }
+  if (haveRunoffMitigation) {
+    ctx.runoffMitigation = &runoffMitigation;
+  }
+  if (haveSolar) {
+    ctx.solar = &solar;
+  }
+  if (haveSkyView) {
+    ctx.skyView = &skyView;
+  }
+  if (haveEnergy) {
+    ctx.energy = &energy;
+  }
+  if (haveCarbon) {
+    ctx.carbon = &carbon;
+  }
+  if (haveCrime) {
+    ctx.crime = &crime;
+  }
+  if (haveTrafficSafety) {
+    ctx.trafficSafety = &trafficSafety;
+  }
+  if (haveTransit) {
+    ctx.transit = &transit;
+  }
   if (haveFireRisk) {
     ctx.fireRisk = &fireRisk;
+  }
+  if (haveWalkability) {
+    ctx.walkability = &walkability;
+  }
+  if (haveJobs) {
+    ctx.jobs = &jobs;
+  }
+  if (haveRoadHealth) {
+    ctx.roadHealth = &roadHealth;
+  }
+  if (haveLivability) {
+    ctx.livability = &livability;
+  }
+  if (haveLivHot) {
+    ctx.livabilityHotspot = &livHot;
+  }
+  if (havePriHot) {
+    ctx.interventionHotspot = &priHot;
   }
   if (haveZoneAccess) {
     ctx.zoneAccess = &zoneAccess;
@@ -1580,10 +2912,143 @@ IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const
 
   HeatIslandResult heatIsland{};
   bool haveHeatIsland = false;
-  if (layer == ExportLayer::HeatIsland) {
+  if (layer == ExportLayer::HeatIsland ||
+      layer == ExportLayer::EnergyDemand || layer == ExportLayer::EnergySolar || layer == ExportLayer::EnergyBalance ||
+      layer == ExportLayer::CarbonEmission || layer == ExportLayer::CarbonSequestration || layer == ExportLayer::CarbonBalance) {
     HeatIslandConfig hc{};
     heatIsland = ComputeHeatIsland(world, hc, traffic, goods);
     haveHeatIsland = true;
+  }
+
+
+  AirPollutionResult airPollution{};
+  bool haveAirPollution = false;
+  if (layer == ExportLayer::AirPollution || layer == ExportLayer::AirPollutionEmission) {
+    AirPollutionConfig ac{};
+    // Keep exports deterministic, and pick a stable "prevailing wind" per seed.
+    ac.windFromSeed = true;
+    airPollution = ComputeAirPollution(world, ac, traffic, goods);
+    haveAirPollution = true;
+  }
+
+
+  RunoffPollutionResult runoff{};
+  bool haveRunoff = false;
+  if (layer == ExportLayer::RunoffPollution || layer == ExportLayer::RunoffPollutionLoad) {
+    RunoffPollutionConfig rc{};
+    runoff = ComputeRunoffPollution(world, rc, traffic);
+    haveRunoff = true;
+  }
+
+  RunoffMitigationResult runoffMitigation{};
+  bool haveRunoffMitigation = false;
+  if (layer == ExportLayer::RunoffMitigationPriority || layer == ExportLayer::RunoffMitigationPlan) {
+    RunoffMitigationConfig mc{};
+    // Reasonable defaults for a visual planning layer.
+    mc.demandMode = RunoffMitigationDemandMode::ResidentialOccupants;
+    mc.parksToAdd = 12;
+    mc.minSeparation = 3;
+    mc.excludeWater = true;
+    mc.allowReplaceRoad = false;
+    mc.allowReplaceZones = false;
+
+    runoffMitigation = SuggestRunoffMitigationParks(world, mc, traffic);
+    haveRunoffMitigation = true;
+  }
+
+
+  SolarPotentialResult solar{};
+  bool haveSolar = false;
+  if (layer == ExportLayer::SolarExposure || layer == ExportLayer::SolarPotential ||
+      layer == ExportLayer::EnergyDemand || layer == ExportLayer::EnergySolar || layer == ExportLayer::EnergyBalance ||
+      layer == ExportLayer::CarbonEmission || layer == ExportLayer::CarbonSequestration || layer == ExportLayer::CarbonBalance) {
+    SolarPotentialConfig sc{};
+    // Keep exports deterministic: no random elements and stable shading sampling.
+    sc.azimuthSamples = 16;
+    solar = ComputeSolarPotential(world, sc);
+    haveSolar = true;
+  }
+
+
+  SkyViewResult skyView{};
+  bool haveSkyView = false;
+  if (layer == ExportLayer::SkyView || layer == ExportLayer::CanyonConfinement ||
+      layer == ExportLayer::TrafficCrashRisk || layer == ExportLayer::TrafficCrashExposure ||
+      layer == ExportLayer::TrafficCrashPriority) {
+    SkyViewConfig vc{};
+    vc.azimuthSamples = 16;
+    vc.maxHorizonRadius = 64;
+    vc.includeBuildings = true;
+    skyView = ComputeSkyViewFactor(world, vc);
+    haveSkyView = true;
+  }
+
+  TrafficSafetyResult trafficSafety{};
+  bool haveTrafficSafety = false;
+  if (layer == ExportLayer::TrafficCrashRisk || layer == ExportLayer::TrafficCrashExposure ||
+      layer == ExportLayer::TrafficCrashPriority) {
+    TrafficSafetyConfig tc{};
+    tc.requireOutsideConnection = true;
+    tc.exposureRadius = 6;
+    trafficSafety = ComputeTrafficSafety(world, tc, traffic, haveSkyView ? &skyView : nullptr);
+    haveTrafficSafety = true;
+  }
+
+
+
+
+  EnergyModelResult energy{};
+  bool haveEnergy = false;
+  if (layer == ExportLayer::EnergyDemand || layer == ExportLayer::EnergySolar || layer == ExportLayer::EnergyBalance ||
+      layer == ExportLayer::CarbonEmission || layer == ExportLayer::CarbonSequestration || layer == ExportLayer::CarbonBalance) {
+    EnergyModelConfig ec{};
+    energy = ComputeEnergyModel(world, ec, haveSolar ? &solar : nullptr, haveHeatIsland ? &heatIsland : nullptr);
+    haveEnergy = true;
+  }
+
+
+
+  CarbonModelResult carbon{};
+  bool haveCarbon = false;
+  if (layer == ExportLayer::CarbonEmission || layer == ExportLayer::CarbonSequestration || layer == ExportLayer::CarbonBalance) {
+    CarbonModelConfig cc{};
+    carbon = ComputeCarbonModel(world, cc, haveEnergy ? &energy : nullptr, traffic, goods);
+    haveCarbon = true;
+  }
+
+  CrimeModelResult crime{};
+  bool haveCrime = false;
+  NoiseResult crimeNoise{};
+  JobOpportunityResult crimeJobs{};
+  bool haveCrimeJobs = false;
+  if (layer == ExportLayer::CrimeRisk || layer == ExportLayer::PoliceAccess) {
+    NoiseConfig nc{};
+    crimeNoise = ComputeNoisePollution(world, nc, traffic, goods);
+
+    JobOpportunityConfig jc{};
+    jc.requireOutsideConnection = true;
+    jc.useTravelTime = true;
+    jc.congestionCosts = true;
+    crimeJobs = ComputeJobOpportunity(world, jc, traffic, /*precomputedRoadToEdge=*/nullptr, /*precomputedZoneAccess=*/nullptr);
+    haveCrimeJobs = true;
+
+    CrimeModelConfig crc{};
+    crc.requireOutsideConnection = true;
+    crc.weightMode = IsochroneWeightMode::TravelTime;
+    crime = ComputeCrimeModel(world, crc, traffic, goods, (haveCrimeJobs ? &crimeJobs : nullptr), &crimeNoise,
+                              /*precomputedRoadToEdge=*/nullptr, /*precomputedZoneAccess=*/nullptr);
+    haveCrime = true;
+  }
+  TransitAccessibilityResult transit{};
+  bool haveTransit = false;
+  if (layer == ExportLayer::TransitAccess || layer == ExportLayer::TransitModeSharePotential) {
+    TransitAccessibilityConfig tc{};
+    tc.requireOutsideConnection = true;
+    TransitAccessibilityInputs ti{};
+    ti.traffic = traffic;
+    ti.goods = goods;
+    transit = ComputeTransitAccessibility(world, tc, ti);
+    haveTransit = true;
   }
 
   FireRiskResult fireRisk{};
@@ -1596,6 +3061,96 @@ IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const
     fireRisk = ComputeFireRisk(world, fc);
     haveFireRisk = true;
   }
+
+  WalkabilityResult walkability{};
+  bool haveWalkability = false;
+  if (layer == ExportLayer::Walkability || layer == ExportLayer::WalkabilityPark || layer == ExportLayer::WalkabilityRetail ||
+      layer == ExportLayer::WalkabilityEducation || layer == ExportLayer::WalkabilityHealth || layer == ExportLayer::WalkabilitySafety) {
+    WalkabilityConfig wc{};
+    wc.enabled = true;
+    wc.requireOutsideConnection = true;
+    wc.weightMode = IsochroneWeightMode::TravelTime;
+    wc.coverageThresholdSteps = 15;
+    walkability = ComputeWalkability(world, wc);
+    haveWalkability = true;
+  }
+
+  JobOpportunityResult jobs{};
+  bool haveJobs = false;
+  if (layer == ExportLayer::JobAccess || layer == ExportLayer::JobOpportunity) {
+    JobOpportunityConfig jc{};
+    jc.requireOutsideConnection = true;
+    jc.useTravelTime = true;
+    jc.congestionCosts = true;
+    // Exports default to travel-time accessibility; when traffic is provided, congestion is incorporated.
+    jobs = ComputeJobOpportunity(world, jc, traffic, /*precomputedRoadToEdge=*/nullptr, /*precomputedZoneAccess=*/nullptr);
+    haveJobs = true;
+  }
+
+
+  RoadHealthResult roadHealth{};
+  bool haveRoadHealth = false;
+  if (layer == ExportLayer::RoadCentrality || layer == ExportLayer::RoadVulnerability || layer == ExportLayer::RoadBypass) {
+    RoadHealthConfig rc{};
+    rc.weightMode = RoadGraphEdgeWeightMode::TravelTimeMilli;
+    rc.maxSources = 0; // auto
+    rc.autoExactMaxNodes = 650;
+    rc.autoSampleSources = 256;
+    rc.includeNodeCentrality = true;
+    rc.articulationVulnerabilityBase = 0.70f;
+
+    // Bypass planning is fairly expensive; only do it for the bypass layer.
+    rc.includeBypass = (layer == ExportLayer::RoadBypass);
+    if (rc.includeBypass) {
+      rc.bypassCfg.top = 3;
+      rc.bypassCfg.moneyObjective = true;
+      rc.bypassCfg.targetLevel = 1;
+      rc.bypassCfg.allowBridges = false;
+      rc.bypassCfg.rankByTraffic = true;
+    }
+
+    roadHealth = ComputeRoadHealth(world, rc, traffic);
+    haveRoadHealth = true;
+  }
+
+
+  LivabilityResult livability{};
+  bool haveLivability = false;
+  if (layer == ExportLayer::Livability || layer == ExportLayer::InterventionPriority ||
+      layer == ExportLayer::LivabilityHotspot || layer == ExportLayer::InterventionHotspot) {
+    LivabilityConfig lc{};
+    lc.requireOutsideConnection = true;
+    lc.weightMode = IsochroneWeightMode::TravelTime;
+    lc.servicesCatchmentRadiusSteps = 18;
+    lc.walkCoverageThresholdSteps = 15;
+    livability = ComputeLivability(world, lc, traffic, goods);
+    haveLivability = true;
+  }
+
+
+  HotspotResult livHot{};
+  HotspotResult priHot{};
+  bool haveLivHot = false;
+  bool havePriHot = false;
+  if (layer == ExportLayer::LivabilityHotspot && haveLivability) {
+    HotspotConfig hc{};
+    hc.radius = 8;
+    hc.excludeWater = true;
+    hc.zThreshold = 1.96f;
+    hc.zScale = 3.0f;
+    livHot = ComputeHotspotsGiStar(world, livability.livability01, hc);
+    haveLivHot = true;
+  }
+  if (layer == ExportLayer::InterventionHotspot && haveLivability) {
+    HotspotConfig hc{};
+    hc.radius = 8;
+    hc.excludeWater = true;
+    hc.zThreshold = 1.96f;
+    hc.zScale = 3.0f;
+    priHot = ComputeHotspotsGiStar(world, livability.priority01, hc);
+    havePriHot = true;
+  }
+
 
   ZoneAccessMap zoneAccess{};
   bool haveZoneAccess = false;
@@ -1618,8 +3173,56 @@ IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const
   if (haveHeatIsland) {
     ctx.heatIsland = &heatIsland;
   }
+  if (haveAirPollution) {
+    ctx.airPollution = &airPollution;
+  }
+  if (haveRunoff) {
+    ctx.runoff = &runoff;
+  }
+  if (haveRunoffMitigation) {
+    ctx.runoffMitigation = &runoffMitigation;
+  }
+  if (haveSolar) {
+    ctx.solar = &solar;
+  }
+  if (haveSkyView) {
+    ctx.skyView = &skyView;
+  }
+  if (haveEnergy) {
+    ctx.energy = &energy;
+  }
+  if (haveCarbon) {
+    ctx.carbon = &carbon;
+  }
+  if (haveCrime) {
+    ctx.crime = &crime;
+  }
+  if (haveTrafficSafety) {
+    ctx.trafficSafety = &trafficSafety;
+  }
+  if (haveTransit) {
+    ctx.transit = &transit;
+  }
   if (haveFireRisk) {
     ctx.fireRisk = &fireRisk;
+  }
+  if (haveWalkability) {
+    ctx.walkability = &walkability;
+  }
+  if (haveJobs) {
+    ctx.jobs = &jobs;
+  }
+  if (haveRoadHealth) {
+    ctx.roadHealth = &roadHealth;
+  }
+  if (haveLivability) {
+    ctx.livability = &livability;
+  }
+  if (haveLivHot) {
+    ctx.livabilityHotspot = &livHot;
+  }
+  if (havePriHot) {
+    ctx.interventionHotspot = &priHot;
   }
   if (haveZoneAccess) {
     ctx.zoneAccess = &zoneAccess;
@@ -3399,12 +5002,219 @@ bool WriteTileMetricsCsv(const World& world, const std::string& path, std::strin
     }
   }
 
+  
+  if (inputs.airPollution && opt.includeAirPollution) {
+    if (!validateGridSize("AirPollutionResult", inputs.airPollution->w, inputs.airPollution->h,
+                          inputs.airPollution->pollution01.size())) {
+      return false;
+    }
+    if (inputs.airPollution->emission01.size() != n) {
+      outError = "AirPollutionResult emission01 size does not match world";
+      return false;
+    }
+  }
+
+  if (inputs.runoff && opt.includeRunoffPollution) {
+    if (!validateGridSize("RunoffPollutionResult", inputs.runoff->w, inputs.runoff->h,
+                          inputs.runoff->pollution01.size())) {
+      return false;
+    }
+    if (inputs.runoff->localLoad01.size() != n) {
+      outError = "RunoffPollutionResult localLoad01 size does not match world";
+      return false;
+    }
+    if (!inputs.runoff->flowAccum.empty() && inputs.runoff->flowAccum.size() != n) {
+      outError = "RunoffPollutionResult flowAccum size does not match world";
+      return false;
+    }
+  }
+
+  if (inputs.runoffMitigation && opt.includeRunoffMitigation) {
+    if (!validateGridSize("RunoffMitigationResult", inputs.runoffMitigation->w, inputs.runoffMitigation->h,
+                          inputs.runoffMitigation->priority01.size())) {
+      return false;
+    }
+    if (inputs.runoffMitigation->priorityRaw.size() != n || inputs.runoffMitigation->planMask.size() != n) {
+      outError = "RunoffMitigationResult arrays do not match world";
+      return false;
+    }
+  }
+
+  if (inputs.solar && opt.includeSolar) {
+    if (!validateGridSize("SolarPotentialResult", inputs.solar->w, inputs.solar->h,
+                          inputs.solar->exposure01.size())) {
+      return false;
+    }
+    if (inputs.solar->roofArea01.size() != n || inputs.solar->potential01.size() != n) {
+      outError = "SolarPotentialResult arrays do not match world";
+      return false;
+    }
+  }
+
+  if (inputs.skyView && opt.includeSkyView) {
+    if (!validateGridSize("SkyViewResult", inputs.skyView->w, inputs.skyView->h,
+                          inputs.skyView->skyView01.size())) {
+      return false;
+    }
+    if (inputs.skyView->canyon01.size() != n) {
+      outError = "SkyViewResult canyon01 size does not match world";
+      return false;
+    }
+  }
+
+  if (inputs.energy && opt.includeEnergy) {
+    if (!validateGridSize("EnergyModelResult", inputs.energy->w, inputs.energy->h,
+                          inputs.energy->demand01.size())) {
+      return false;
+    }
+    if (inputs.energy->solar01.size() != n || inputs.energy->balance01.size() != n ||
+        inputs.energy->demandRaw.size() != n || inputs.energy->solarRaw.size() != n ||
+        inputs.energy->netRaw.size() != n) {
+      outError = "EnergyModelResult arrays do not match world";
+      return false;
+    }
+  }
+
+
+
+  if (inputs.carbon && opt.includeCarbon) {
+    if (!validateGridSize("CarbonModelResult", inputs.carbon->w, inputs.carbon->h,
+                          inputs.carbon->emission01.size())) {
+      return false;
+    }
+    if (inputs.carbon->sequestration01.size() != n || inputs.carbon->balance01.size() != n ||
+        inputs.carbon->emissionRaw.size() != n || inputs.carbon->sequestrationRaw.size() != n ||
+        inputs.carbon->netRaw.size() != n) {
+      outError = "CarbonModelResult arrays do not match world";
+      return false;
+    }
+  }
+
+  if (inputs.crime && opt.includeCrime) {
+    if (!validateGridSize("CrimeModelResult", inputs.crime->w, inputs.crime->h,
+                          inputs.crime->risk01.size())) {
+      return false;
+    }
+    if (inputs.crime->policeAccess01.size() != n || inputs.crime->policeCostMilli.size() != n) {
+      outError = "CrimeModelResult arrays do not match world";
+      return false;
+    }
+  }
+
+  if (inputs.trafficSafety && opt.includeTrafficSafety) {
+    if (!validateGridSize("TrafficSafetyResult", inputs.trafficSafety->w, inputs.trafficSafety->h,
+                          inputs.trafficSafety->risk01.size())) {
+      return false;
+    }
+    if (inputs.trafficSafety->exposure01.size() != n || inputs.trafficSafety->priority01.size() != n) {
+      outError = "TrafficSafetyResult arrays do not match world";
+      return false;
+    }
+  }
+
+  if (inputs.transit && opt.includeTransit) {
+    if (!validateGridSize("TransitAccessibilityResult", inputs.transit->w, inputs.transit->h,
+                          inputs.transit->access01.size())) {
+      return false;
+    }
+    if (inputs.transit->modeSharePotential01.size() != n || inputs.transit->stopMask.size() != n ||
+        inputs.transit->corridorMask.size() != n) {
+      outError = "TransitAccessibilityResult arrays do not match world";
+      return false;
+    }
+    if (opt.includeTransitSteps && inputs.transit->stepsToStop.size() != n) {
+      outError = "TransitAccessibilityResult stepsToStop does not match world";
+      return false;
+    }
+  }
+
   if (inputs.fireRisk && opt.includeFireRisk) {
     if (!validateGridSize("FireRiskResult", inputs.fireRisk->w, inputs.fireRisk->h, inputs.fireRisk->risk01.size())) {
       return false;
     }
     if (inputs.fireRisk->coverage01.size() != n || inputs.fireRisk->responseCostMilli.size() != n) {
       outError = "FireRiskResult arrays do not match world";
+      return false;
+    }
+  }
+
+  if (inputs.walkability && opt.includeWalkability) {
+    if (!validateGridSize("WalkabilityResult", inputs.walkability->w, inputs.walkability->h,
+                          inputs.walkability->overall01.size())) {
+      return false;
+    }
+    if (opt.includeWalkabilityComponents) {
+      if (inputs.walkability->park01.size() != n || inputs.walkability->retail01.size() != n ||
+          inputs.walkability->education01.size() != n || inputs.walkability->health01.size() != n ||
+          inputs.walkability->safety01.size() != n || inputs.walkability->coverageMask.size() != n) {
+        outError = "WalkabilityResult component arrays do not match world";
+        return false;
+      }
+      if (opt.includeWalkabilityDistances) {
+        if (inputs.walkability->costParkMilli.size() != n || inputs.walkability->costRetailMilli.size() != n ||
+            inputs.walkability->costEducationMilli.size() != n || inputs.walkability->costHealthMilli.size() != n ||
+            inputs.walkability->costSafetyMilli.size() != n) {
+          outError = "WalkabilityResult cost arrays do not match world";
+          return false;
+        }
+      }
+    }
+  }
+
+  if (inputs.jobs && opt.includeJobs) {
+    if (!validateGridSize("JobOpportunityResult", inputs.jobs->w, inputs.jobs->h, inputs.jobs->jobAccess01.size())) {
+      return false;
+    }
+    if (inputs.jobs->jobOpportunity01.size() != n || inputs.jobs->jobAccessCostMilli.size() != n) {
+      outError = "JobOpportunityResult arrays do not match world";
+      return false;
+    }
+  }
+
+  if (inputs.roadHealth && opt.includeRoadHealth) {
+    if (!validateGridSize("RoadHealthResult", inputs.roadHealth->w, inputs.roadHealth->h,
+                          inputs.roadHealth->centrality01.size())) {
+      return false;
+    }
+    if (inputs.roadHealth->vulnerability01.size() != n) {
+      outError = "RoadHealthResult vulnerability01 size does not match world";
+      return false;
+    }
+    if (!inputs.roadHealth->bypassMask.empty() && inputs.roadHealth->bypassMask.size() != n) {
+      outError = "RoadHealthResult bypassMask size does not match world";
+      return false;
+    }
+  }
+
+  if (inputs.livability && opt.includeLivability) {
+    if (!validateGridSize("LivabilityResult", inputs.livability->w, inputs.livability->h,
+                          inputs.livability->livability01.size())) {
+      return false;
+    }
+    if (inputs.livability->priority01.size() != n) {
+      outError = "LivabilityResult priority01 size does not match world";
+      return false;
+    }
+  }
+
+  if (inputs.livabilityHotspot && opt.includeHotspots) {
+    if (!validateGridSize("HotspotResult(livability)", inputs.livabilityHotspot->w, inputs.livabilityHotspot->h,
+                          inputs.livabilityHotspot->z01.size())) {
+      return false;
+    }
+    if (inputs.livabilityHotspot->z.size() != n || inputs.livabilityHotspot->cls.size() != n) {
+      outError = "HotspotResult(livability) arrays do not match world";
+      return false;
+    }
+  }
+
+  if (inputs.interventionHotspot && opt.includeHotspots) {
+    if (!validateGridSize("HotspotResult(intervention)", inputs.interventionHotspot->w, inputs.interventionHotspot->h,
+                          inputs.interventionHotspot->z01.size())) {
+      return false;
+    }
+    if (inputs.interventionHotspot->z.size() != n || inputs.interventionHotspot->cls.size() != n) {
+      outError = "HotspotResult(intervention) arrays do not match world";
       return false;
     }
   }
@@ -3460,8 +5270,71 @@ bool WriteTileMetricsCsv(const World& world, const std::string& path, std::strin
   if (opt.includeHeatIsland && inputs.heatIsland) {
     f << ",heat_island,heat_island_raw";
   }
+  
+  if (opt.includeAirPollution && inputs.airPollution) {
+    f << ",air_pollution,air_emission";
+  }
+  if (opt.includeRunoffPollution && inputs.runoff) {
+    f << ",runoff_pollution,runoff_load,runoff_flow_accum";
+  }
+  if (opt.includeRunoffMitigation && inputs.runoffMitigation) {
+    f << ",runoff_mitigation_priority,runoff_mitigation_plan";
+  }
+
+  if (opt.includeSolar && inputs.solar) {
+    f << ",solar_exposure,solar_roof_area,solar_potential";
+  }
+  if (opt.includeSkyView && inputs.skyView) {
+    f << ",sky_view,canyon_confinement";
+  }
+  if (opt.includeEnergy && inputs.energy) {
+    f << ",energy_demand,energy_solar,energy_balance,energy_demand_raw,energy_solar_raw,energy_net_raw";
+  }
+
+
+  if (opt.includeCarbon && inputs.carbon) {
+    f << ",carbon_emission,carbon_sequestration,carbon_balance,carbon_emission_raw,carbon_sequestration_raw,carbon_net_raw";
+  }
+  if (opt.includeCrime && inputs.crime) {
+    f << ",crime_risk,police_access,police_cost";
+  }
+  if (opt.includeTrafficSafety && inputs.trafficSafety) {
+    f << ",traffic_crash_risk,traffic_crash_exposure,traffic_crash_priority";
+  }
+  if (opt.includeTransit && inputs.transit) {
+    f << ",transit_access,transit_mode_share_potential,transit_is_stop,transit_on_corridor";
+    if (opt.includeTransitSteps) {
+      f << ",transit_stop_steps";
+    }
+  }
+
   if (opt.includeFireRisk && inputs.fireRisk) {
     f << ",fire_risk,fire_coverage,fire_response_cost";
+  }
+  if (opt.includeWalkability && inputs.walkability) {
+    f << ",walkability";
+    if (opt.includeWalkabilityComponents) {
+      f << ",walkability_park,walkability_retail,walkability_education,walkability_health,walkability_safety";
+      f << ",walk_cover_mask,walk_cover_count";
+      if (opt.includeWalkabilityDistances) {
+        f << ",walk_dist_park,walk_dist_retail,walk_dist_education,walk_dist_health,walk_dist_safety";
+      }
+    }
+  }
+  if (opt.includeJobs && inputs.jobs) {
+    f << ",job_access,job_opportunity,job_access_cost";
+  }
+  if (opt.includeRoadHealth && inputs.roadHealth) {
+    f << ",road_centrality,road_vulnerability,road_bypass";
+  }
+  if (opt.includeLivability && inputs.livability) {
+    f << ",livability,intervention_priority";
+  }
+  if (opt.includeHotspots && inputs.livabilityHotspot) {
+    f << ",livability_hotspot,livability_hotspot_z,livability_hotspot_class";
+  }
+  if (opt.includeHotspots && inputs.interventionHotspot) {
+    f << ",intervention_hotspot,intervention_hotspot_z,intervention_hotspot_class";
   }
   if (opt.includeRciPressure) {
     f << ",zone_pressure_residential,zone_pressure_commercial,zone_pressure_industrial";
@@ -3476,6 +5349,20 @@ bool WriteTileMetricsCsv(const World& world, const std::string& path, std::strin
 
   const int prec = std::clamp(opt.floatPrecision, 0, 12);
   f << std::fixed << std::setprecision(prec);
+
+  auto popcountU8 = [](std::uint8_t v) -> int {
+    int c = 0;
+    while (v) {
+      c += (v & 1u) ? 1 : 0;
+      v = static_cast<std::uint8_t>(v >> 1);
+    }
+    return c;
+  };
+
+  auto costToSteps = [](int costMilli) -> int {
+    if (costMilli < 0) return -1;
+    return costMilli / 1000;
+  };
 
   for (int y = 0; y < h; ++y) {
     for (int x = 0; x < w; ++x) {
@@ -3515,11 +5402,130 @@ bool WriteTileMetricsCsv(const World& world, const std::string& path, std::strin
         f << ',' << static_cast<double>(inputs.heatIsland->heat01[i]);
         f << ',' << static_cast<double>(inputs.heatIsland->heat[i]);
       }
+      
+      if (opt.includeAirPollution && inputs.airPollution) {
+        f << ',' << static_cast<double>(inputs.airPollution->pollution01[i]);
+        f << ',' << static_cast<double>(inputs.airPollution->emission01[i]);
+      }
+      if (opt.includeRunoffPollution && inputs.runoff) {
+        f << ',' << static_cast<double>(inputs.runoff->pollution01[i]);
+        f << ',' << static_cast<double>(inputs.runoff->localLoad01[i]);
+        int acc = 0;
+        if (inputs.runoff->flowAccum.size() == n) {
+          acc = inputs.runoff->flowAccum[i];
+        }
+        f << ',' << acc;
+      }
+      if (opt.includeRunoffMitigation && inputs.runoffMitigation) {
+        f << ',' << static_cast<double>(inputs.runoffMitigation->priority01[i]);
+        f << ',' << static_cast<int>(inputs.runoffMitigation->planMask[i]);
+      }
+      if (opt.includeSolar && inputs.solar) {
+        f << ',' << static_cast<double>(inputs.solar->exposure01[i]);
+        f << ',' << static_cast<double>(inputs.solar->roofArea01[i]);
+        f << ',' << static_cast<double>(inputs.solar->potential01[i]);
+      }
+      if (opt.includeSkyView && inputs.skyView) {
+        f << ',' << static_cast<double>(inputs.skyView->skyView01[i]);
+        f << ',' << static_cast<double>(inputs.skyView->canyon01[i]);
+      }
+      if (opt.includeEnergy && inputs.energy) {
+        f << ',' << static_cast<double>(inputs.energy->demand01[i]);
+        f << ',' << static_cast<double>(inputs.energy->solar01[i]);
+        f << ',' << static_cast<double>(inputs.energy->balance01[i]);
+        f << ',' << static_cast<double>(inputs.energy->demandRaw[i]);
+        f << ',' << static_cast<double>(inputs.energy->solarRaw[i]);
+        f << ',' << static_cast<double>(inputs.energy->netRaw[i]);
+      }
+
+
+      if (opt.includeCarbon && inputs.carbon) {
+        f << ',' << static_cast<double>(inputs.carbon->emission01[i]);
+        f << ',' << static_cast<double>(inputs.carbon->sequestration01[i]);
+        f << ',' << static_cast<double>(inputs.carbon->balance01[i]);
+        f << ',' << static_cast<double>(inputs.carbon->emissionRaw[i]);
+        f << ',' << static_cast<double>(inputs.carbon->sequestrationRaw[i]);
+        f << ',' << static_cast<double>(inputs.carbon->netRaw[i]);
+      }
+
+      if (opt.includeCrime && inputs.crime) {
+        f << ',' << static_cast<double>(inputs.crime->risk01[i]);
+        f << ',' << static_cast<double>(inputs.crime->policeAccess01[i]);
+        f << ',' << static_cast<int>(inputs.crime->policeCostMilli[i]);
+      }
+
+      if (opt.includeTrafficSafety && inputs.trafficSafety) {
+        f << ',' << static_cast<double>(inputs.trafficSafety->risk01[i]);
+        f << ',' << static_cast<double>(inputs.trafficSafety->exposure01[i]);
+        f << ',' << static_cast<double>(inputs.trafficSafety->priority01[i]);
+      }
+
+      if (opt.includeTransit && inputs.transit) {
+        f << ',' << static_cast<double>(inputs.transit->access01[i]);
+        f << ',' << static_cast<double>(inputs.transit->modeSharePotential01[i]);
+        f << ',' << static_cast<int>(inputs.transit->stopMask[i]);
+        f << ',' << static_cast<int>(inputs.transit->corridorMask[i]);
+        if (opt.includeTransitSteps) {
+          f << ',' << static_cast<int>(inputs.transit->stepsToStop[i]);
+        }
+      }
+
       if (opt.includeFireRisk && inputs.fireRisk) {
         f << ',' << static_cast<double>(inputs.fireRisk->risk01[i]);
         f << ',' << static_cast<double>(inputs.fireRisk->coverage01[i]);
         f << ',' << static_cast<int>(inputs.fireRisk->responseCostMilli[i]);
       }
+      if (opt.includeWalkability && inputs.walkability) {
+        f << ',' << static_cast<double>(inputs.walkability->overall01[i]);
+        if (opt.includeWalkabilityComponents) {
+          f << ',' << static_cast<double>(inputs.walkability->park01[i]);
+          f << ',' << static_cast<double>(inputs.walkability->retail01[i]);
+          f << ',' << static_cast<double>(inputs.walkability->education01[i]);
+          f << ',' << static_cast<double>(inputs.walkability->health01[i]);
+          f << ',' << static_cast<double>(inputs.walkability->safety01[i]);
+
+          const std::uint8_t m = inputs.walkability->coverageMask[i];
+          f << ',' << static_cast<int>(m);
+          f << ',' << static_cast<int>(popcountU8(m));
+
+          if (opt.includeWalkabilityDistances) {
+            f << ',' << static_cast<int>(costToSteps(inputs.walkability->costParkMilli[i]));
+            f << ',' << static_cast<int>(costToSteps(inputs.walkability->costRetailMilli[i]));
+            f << ',' << static_cast<int>(costToSteps(inputs.walkability->costEducationMilli[i]));
+            f << ',' << static_cast<int>(costToSteps(inputs.walkability->costHealthMilli[i]));
+            f << ',' << static_cast<int>(costToSteps(inputs.walkability->costSafetyMilli[i]));
+          }
+        }
+      }
+      if (opt.includeJobs && inputs.jobs) {
+        f << ',' << static_cast<double>(inputs.jobs->jobAccess01[i]);
+        f << ',' << static_cast<double>(inputs.jobs->jobOpportunity01[i]);
+        f << ',' << static_cast<int>(costToSteps(inputs.jobs->jobAccessCostMilli[i]));
+      }
+      if (opt.includeRoadHealth && inputs.roadHealth) {
+        f << ',' << static_cast<double>(inputs.roadHealth->centrality01[i]);
+        f << ',' << static_cast<double>(inputs.roadHealth->vulnerability01[i]);
+        int bypass = 0;
+        if (inputs.roadHealth->bypassMask.size() == n) {
+          bypass = static_cast<int>(inputs.roadHealth->bypassMask[i]);
+        }
+        f << ',' << bypass;
+      }
+      if (opt.includeLivability && inputs.livability) {
+        f << ',' << static_cast<double>(inputs.livability->livability01[i]);
+        f << ',' << static_cast<double>(inputs.livability->priority01[i]);
+      }
+      if (opt.includeHotspots && inputs.livabilityHotspot) {
+        f << ',' << static_cast<double>(inputs.livabilityHotspot->z01[i]);
+        f << ',' << static_cast<double>(inputs.livabilityHotspot->z[i]);
+        f << ',' << static_cast<int>(inputs.livabilityHotspot->cls[i]);
+      }
+      if (opt.includeHotspots && inputs.interventionHotspot) {
+        f << ',' << static_cast<double>(inputs.interventionHotspot->z01[i]);
+        f << ',' << static_cast<double>(inputs.interventionHotspot->z[i]);
+        f << ',' << static_cast<int>(inputs.interventionHotspot->cls[i]);
+      }
+
       if (opt.includeRciPressure) {
         float lvVal = 0.5f;
         if (inputs.landValue && inputs.landValue->value.size() == n) {

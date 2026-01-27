@@ -8,6 +8,7 @@
 #include "isocity/RoadGraphResilience.hpp"
 #include "isocity/RoadResilienceBypass.hpp"
 #include "isocity/RoadGraphCentrality.hpp"
+#include "isocity/RoadHealth.hpp"
 #include "isocity/RoadUpgradePlanner.hpp"
 #include "isocity/PolicyOptimizer.hpp"
 #include "isocity/ProcGen.hpp"
@@ -33,12 +34,24 @@
 #include "isocity/Json.hpp"
 #include "isocity/Compression.hpp"
 #include "isocity/Export.hpp"
+#include "isocity/AirPollution.hpp"
+#include "isocity/RunoffPollution.hpp"
+#include "isocity/RunoffMitigation.hpp"
+#include "isocity/SolarPotential.hpp"
+#include "isocity/SkyView.hpp"
+#include "isocity/EnergyModel.hpp"
+#include "isocity/CrimeModel.hpp"
+#include "isocity/TrafficSafety.hpp"
+#include "isocity/TransitAccessibility.hpp"
+#include "isocity/Livability.hpp"
+#include "isocity/HotspotAnalysis.hpp"
 #include "isocity/FloodRisk.hpp"
 #include "isocity/DepressionFill.hpp"
 #include "isocity/GfxCanvas.hpp"
 #include "isocity/GfxPalette.hpp"
 #include "isocity/GfxFacilities.hpp"
 #include "isocity/Isochrone.hpp"
+#include "isocity/Walkability.hpp"
 #include "isocity/Heightmap.hpp"
 #include "isocity/Contours.hpp"
 #include "isocity/DepressionFill.hpp"
@@ -9146,6 +9159,1024 @@ static void TestMineGalleryExport()
 
 
 
+static void TestWalkabilityBasic()
+{
+  // Minimal deterministic smoke test: build a tiny grid with a single road
+  // spine and a handful of amenities, then verify the computed walkability
+  // fields are sane.
+
+  World world(10, 10, 123);
+
+  // Initialize all tiles to land.
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      Tile& t = world.at(x, y);
+      t.terrain = Terrain::Grass;
+      t.overlay = Overlay::None;
+      t.height = 0.0f;
+      t.level = 0;
+      t.occupants = 0;
+      t.variation = 0;
+    }
+  }
+
+  // Road spine connects to both left + right edges (outside connection).
+  for (int x = 0; x < world.width(); ++x) {
+    world.at(x, 5).overlay = Overlay::Road;
+  }
+
+  // Amenities adjacent to the road.
+  world.at(2, 4).overlay = Overlay::Park;
+  world.at(4, 4).overlay = Overlay::School;
+  world.at(6, 4).overlay = Overlay::Hospital;
+  world.at(8, 4).overlay = Overlay::PoliceStation;
+
+  // Retail proxy: a commercial zone tile.
+  world.at(3, 6).overlay = Overlay::Commercial;
+
+  // Residential tile with population.
+  world.at(5, 6).overlay = Overlay::Residential;
+  world.at(5, 6).occupants = 10;
+
+  WalkabilityConfig cfg{};
+  cfg.enabled = true;
+  cfg.requireOutsideConnection = true;
+  cfg.weightMode = IsochroneWeightMode::Steps;
+  cfg.coverageThresholdSteps = 8;
+
+  const WalkabilityResult r = ComputeWalkability(world, cfg);
+
+  ASSERT_EQ(r.w, world.width());
+  ASSERT_EQ(r.h, world.height());
+  ASSERT_EQ(r.overall01.size(), static_cast<std::size_t>(world.width() * world.height()));
+
+  const std::size_t ridx = static_cast<std::size_t>(6 * world.width() + 5);
+  EXPECT_TRUE(r.overall01[ridx] > 0.5f);
+  EXPECT_EQ(r.residentPopulation, 10);
+  EXPECT_TRUE(r.residentAvgOverall01 > 0.5f);
+
+  // All five amenity categories should be reachable within 8 steps here.
+  EXPECT_EQ(static_cast<int>(r.coverageMask[ridx]), 0x1F);
+  EXPECT_TRUE(r.residentAllCategoriesFrac > 0.99f);
+
+  // Non-zero amenity source counts.
+  EXPECT_TRUE(r.sourceCount[0] > 0); // parks
+  EXPECT_TRUE(r.sourceCount[1] > 0); // retail
+  EXPECT_TRUE(r.sourceCount[2] > 0); // education
+  EXPECT_TRUE(r.sourceCount[3] > 0); // health
+  EXPECT_TRUE(r.sourceCount[4] > 0); // safety
+}
+
+
+
+
+
+static void TestAirPollutionBasic()
+{
+  // Minimal deterministic smoke test:
+  //  - single strong industrial emitter
+  //  - constant wind to the east
+  //  - verify downwind concentration > upwind
+  //  - verify parks act as deposition sinks
+
+  World world(14, 7, 4242);
+
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      Tile& t = world.at(x, y);
+      t.terrain = Terrain::Grass;
+      t.overlay = Overlay::None;
+      t.height = 0.0f;
+      t.level = 1;
+      t.variation = 0;
+      t.occupants = 0;
+    }
+  }
+
+  // Emitter (industry).
+  world.at(2, 3).overlay = Overlay::Industrial;
+
+  // Deposition sink (park) downwind.
+  world.at(10, 3).overlay = Overlay::Park;
+
+  AirPollutionConfig cfg{};
+  cfg.iterations = 140;
+  cfg.diffusion = 0.06f;
+  cfg.advection = 0.70f;
+  cfg.windSpeed = 1.0f;
+  cfg.decayPerIteration = 0.0f;
+  cfg.eightConnected = true;
+
+  cfg.windFromSeed = false;
+  cfg.fixedWindDir = WindDir::E;
+
+  // Make the test easier to reason about: isolate the industrial source.
+  cfg.roadBase = 0.0f;
+  cfg.roadClassBoost = 0.0f;
+  cfg.commuteTrafficBoost = 0.0f;
+  cfg.goodsTrafficBoost = 0.0f;
+
+  cfg.residentialSource = 0.0f;
+  cfg.commercialSource = 0.0f;
+  cfg.civicSource = 0.0f;
+  cfg.occupantBoost = 0.0f;
+
+  cfg.industrialSource = 1.0f;
+
+  // Only deposition, no negative source-term sinks.
+  cfg.parkSink = 0.0f;
+  cfg.waterSink = 0.0f;
+  cfg.elevationVentilation = 0.0f;
+
+  cfg.depositionPark = 0.30f;
+  cfg.depositionWater = 0.0f;
+
+  const AirPollutionResult a = ComputeAirPollution(world, cfg, nullptr, nullptr);
+  const AirPollutionResult b = ComputeAirPollution(world, cfg, nullptr, nullptr);
+
+  EXPECT_EQ(a.w, world.width());
+  EXPECT_EQ(a.h, world.height());
+  EXPECT_TRUE(a.emission01 == b.emission01);
+  EXPECT_TRUE(a.pollution01 == b.pollution01);
+
+  const int w = world.width();
+  auto idx = [&](int x, int y) -> std::size_t { return static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x); };
+
+  const float emEmitter = a.emission01[idx(2, 3)];
+  const float emFar = a.emission01[idx(0, 0)];
+  EXPECT_TRUE(emEmitter > 0.90f);
+  EXPECT_TRUE(emFar < 0.01f);
+
+  const float upwind = a.pollution01[idx(0, 3)];
+  const float downwind = a.pollution01[idx(12, 3)];
+  EXPECT_TRUE(downwind > upwind);
+
+  const float park = a.pollution01[idx(10, 3)];
+  const float parkNeighbor = a.pollution01[idx(9, 3)];
+  EXPECT_TRUE(park <= parkNeighbor);
+}
+
+static void TestRunoffPollutionBasic()
+{
+  // Deterministic routing smoke test:
+  //  - 3x1 downhill slope (x increases downhill)
+  //  - road source upstream
+  //  - park filtration in the middle reduces downstream concentration by filterPark
+
+  World world(3, 1, 2025);
+
+  for (int x = 0; x < world.width(); ++x) {
+    Tile& t = world.at(x, 0);
+    t.terrain = Terrain::Grass;
+    t.overlay = Overlay::None;
+    t.height = 0.0f;
+    t.level = 1;
+    t.variation = 0;
+    t.occupants = 0;
+  }
+
+  world.at(0, 0).height = 2.0f;
+  world.at(1, 0).height = 1.0f;
+  world.at(2, 0).height = 0.0f;
+
+  world.at(0, 0).overlay = Overlay::Road;
+  world.at(1, 0).overlay = Overlay::Park;
+
+  RunoffPollutionConfig cfg{};
+  cfg.roadBase = 1.0f;
+  cfg.roadClassBoost = 0.0f;
+  cfg.roadTrafficBoost = 0.0f;
+  cfg.residentialLoad = 0.0f;
+  cfg.commercialLoad = 0.0f;
+  cfg.industrialLoad = 0.0f;
+  cfg.civicLoad = 0.0f;
+  cfg.occupantBoost = 0.0f;
+  cfg.occupantScale = 1;
+  cfg.filterPark = 0.50f;
+  cfg.filterGrass = 0.0f;
+  cfg.filterSand = 0.0f;
+  cfg.filterRoad = 0.0f;
+  cfg.waterIsSink = false;
+  cfg.filterWater = 0.0f;
+  cfg.dilutionExponent = 1.0f;
+  cfg.clampLoad = 1.0f;
+
+  auto idx = [&](int x) -> std::size_t { return static_cast<std::size_t>(x); };
+
+  const RunoffPollutionResult withPark = ComputeRunoffPollution(world, cfg, nullptr);
+  RunoffPollutionConfig cfgNoPark = cfg;
+  cfgNoPark.filterPark = 0.0f;
+  const RunoffPollutionResult noPark = ComputeRunoffPollution(world, cfgNoPark, nullptr);
+
+  EXPECT_EQ(withPark.w, world.width());
+  EXPECT_EQ(withPark.h, world.height());
+  EXPECT_TRUE(withPark.concentration.size() == 3);
+  EXPECT_TRUE(noPark.concentration.size() == 3);
+
+  // Accumulation should be [1,2,3] on a simple 1D slope.
+  EXPECT_TRUE(withPark.flowAccum.size() == 3);
+  EXPECT_EQ(withPark.flowAccum[idx(0)], 1);
+  EXPECT_EQ(withPark.flowAccum[idx(1)], 2);
+  EXPECT_EQ(withPark.flowAccum[idx(2)], 3);
+
+  // With upstream unit load and dilutionExponent=1:
+  //  - upstream concentration = 1/1
+  //  - park filters 50%, so downstream mass is halved
+  const float c0 = withPark.concentration[idx(0)];
+  const float c1 = withPark.concentration[idx(1)];
+  const float c2 = withPark.concentration[idx(2)];
+
+  EXPECT_NEAR(c0, 1.0f, 1e-6f);
+  EXPECT_NEAR(c1, 0.25f, 1e-5f);            // (0.5 / accum=2)
+  EXPECT_NEAR(c2, 0.5f / 3.0f, 1e-5f);      // (0.5 / accum=3)
+
+  const float c2No = noPark.concentration[idx(2)];
+  EXPECT_NEAR(c2No, 1.0f / 3.0f, 1e-5f);
+
+  // Park filtration should halve downstream concentration.
+  EXPECT_NEAR(c2 / c2No, 0.5f, 1e-4f);
+}
+
+static void TestRunoffMitigationBasic()
+{
+  // Deterministic park siting smoke test:
+  //  - 3x1 downhill slope (x increases downhill)
+  //  - road source upstream
+  //  - residential demand downstream
+  //  - only the middle tile is a valid candidate
+
+  World world(3, 1, 4242);
+
+  for (int x = 0; x < world.width(); ++x) {
+    Tile& t = world.at(x, 0);
+    t.terrain = Terrain::Grass;
+    t.overlay = Overlay::None;
+    t.height = 0.0f;
+    t.level = 1;
+    t.variation = 0;
+    t.occupants = 0;
+  }
+
+  world.at(0, 0).height = 2.0f;
+  world.at(1, 0).height = 1.0f;
+  world.at(2, 0).height = 0.0f;
+
+  world.at(0, 0).overlay = Overlay::Road;
+
+  // Downstream demand.
+  world.at(2, 0).overlay = Overlay::Residential;
+  world.at(2, 0).occupants = 50;
+
+  RunoffMitigationConfig cfg{};
+  cfg.demandMode = RunoffMitigationDemandMode::ResidentialOccupants;
+  cfg.parksToAdd = 1;
+  cfg.minSeparation = 0;
+  cfg.excludeWater = true;
+  cfg.allowReplaceRoad = false;
+  cfg.allowReplaceZones = false;
+
+  // Match the runoff routing assumptions:
+  cfg.runoffCfg.roadBase = 1.0f;
+  cfg.runoffCfg.roadClassBoost = 0.0f;
+  cfg.runoffCfg.roadTrafficBoost = 0.0f;
+  cfg.runoffCfg.residentialLoad = 0.0f;
+  cfg.runoffCfg.commercialLoad = 0.0f;
+  cfg.runoffCfg.industrialLoad = 0.0f;
+  cfg.runoffCfg.civicLoad = 0.0f;
+  cfg.runoffCfg.occupantBoost = 0.0f;
+  cfg.runoffCfg.occupantScale = 1;
+  cfg.runoffCfg.filterPark = 0.50f;
+  cfg.runoffCfg.filterGrass = 0.0f;
+  cfg.runoffCfg.filterSand = 0.0f;
+  cfg.runoffCfg.filterRoad = 0.0f;
+  cfg.runoffCfg.waterIsSink = false;
+  cfg.runoffCfg.filterWater = 0.0f;
+  cfg.runoffCfg.dilutionExponent = 1.0f;
+  cfg.runoffCfg.clampLoad = 1.0f;
+
+  const RunoffMitigationResult res = SuggestRunoffMitigationParks(world, cfg, nullptr);
+  EXPECT_EQ(res.w, world.width());
+  EXPECT_EQ(res.h, world.height());
+  ASSERT_TRUE(res.priority01.size() == 3);
+  ASSERT_TRUE(res.planMask.size() == 3);
+
+  // Middle tile should be selected.
+  ASSERT_TRUE(res.placements.size() == 1);
+  EXPECT_EQ(res.placements[0].tile.x, 1);
+  EXPECT_EQ(res.placements[0].tile.y, 0);
+  EXPECT_EQ(res.planMask[1], 1);
+  EXPECT_TRUE(res.priority01[1] > 0.0f);
+
+  // Objective is population-weighted concentration on the residential tile:
+  //  - without parks: conc = 1/3, obj = 50 * (1/3)
+  //  - with a park on tile1 filtering 50%: conc = 0.5/3, obj = 50*(0.5/3)
+  const double obj0 = 50.0 / 3.0;
+  const double obj1 = 25.0 / 3.0;
+  EXPECT_NEAR(res.objectiveBefore, obj0, 1e-6);
+  EXPECT_NEAR(res.objectiveAfter, obj1, 1e-6);
+  EXPECT_NEAR(res.objectiveReduction, obj0 - obj1, 1e-6);
+
+  // If the middle tile is already a park, there should be no candidates.
+  world.at(1, 0).overlay = Overlay::Park;
+  const RunoffMitigationResult resNo = SuggestRunoffMitigationParks(world, cfg, nullptr);
+  EXPECT_TRUE(resNo.placements.empty());
+  EXPECT_NEAR(resNo.objectiveReduction, 0.0, 1e-6);
+}
+
+void TestSolarPotentialBasic()
+{
+  // Deterministic shadowing smoke test:
+  //  - flat terrain
+  //  - tall blocker tile directly east of a target roof tile
+  //  - single sun sample from the east at low altitude => target is shaded
+  //  - at high altitude => target is lit
+  //  - with building shading disabled => target is lit even at low altitude
+
+  World world(7, 3, 1337);
+
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      Tile& t = world.at(x, y);
+      t.terrain = Terrain::Grass;
+      t.overlay = Overlay::None;
+      t.height = 0.0f;
+      t.level = 1;
+      t.variation = 0;
+      t.occupants = 0;
+    }
+  }
+
+  // Tall blocker east of the target.
+  {
+    Tile& b = world.at(4, 1);
+    b.overlay = Overlay::Industrial;
+    b.level = 3;
+    b.occupants = 200;
+  }
+
+  // Target roof tile (west of blocker).
+  {
+    Tile& t = world.at(3, 1);
+    t.overlay = Overlay::Residential;
+    t.level = 3;
+    t.occupants = 80;
+  }
+
+  // A non-roof tile should always have zero rooftop potential.
+  world.at(2, 1).overlay = Overlay::Park;
+
+  auto idx = [&](int x, int y) -> std::size_t {
+    return static_cast<std::size_t>(y) * static_cast<std::size_t>(world.width()) + static_cast<std::size_t>(x);
+  };
+
+  const std::size_t iTarget = idx(3, 1);
+
+  SolarPotentialConfig cfg{};
+  cfg.singleSample = true;
+  cfg.singleAzimuthDeg = 0.0f;   // sun from East
+  cfg.singleAltitudeDeg = 10.0f; // low sun
+  cfg.maxHorizonRadius = 6;
+  cfg.azimuthSamples = 8;
+  cfg.includeBuildings = true;
+
+  const SolarPotentialResult shaded = ComputeSolarPotential(world, cfg);
+  EXPECT_NEAR(shaded.exposure01[iTarget], 0.0f, 1e-6f);
+  EXPECT_NEAR(shaded.potential01[iTarget], 0.0f, 1e-6f);
+
+  cfg.singleAltitudeDeg = 80.0f; // high sun
+  const SolarPotentialResult lit = ComputeSolarPotential(world, cfg);
+  EXPECT_NEAR(lit.exposure01[iTarget], 1.0f, 1e-6f);
+  ASSERT_TRUE(lit.potential01[iTarget] > 0.0f);
+
+  const std::size_t iPark = idx(2, 1);
+  EXPECT_NEAR(lit.potential01[iPark], 0.0f, 1e-6f);
+
+  cfg.singleAltitudeDeg = 10.0f;
+  cfg.includeBuildings = false;
+  const SolarPotentialResult noBldgShade = ComputeSolarPotential(world, cfg);
+  EXPECT_NEAR(noBldgShade.exposure01[iTarget], 1.0f, 1e-6f);
+}
+
+
+void TestSkyViewFactorBasic()
+{
+  // Simple SVF sanity:
+  //  - flat terrain, all empty => SVF ~ 1 everywhere
+  //  - add a tall blocker near the target => target SVF decreases
+  //  - canyon01 == 1 - skyView01
+
+  World world(7, 3, 1337);
+
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      Tile& t = world.at(x, y);
+      t.terrain = Terrain::Grass;
+      t.overlay = Overlay::None;
+      t.height = 0.0f;
+      t.level = 1;
+      t.variation = 0;
+      t.occupants = 0;
+    }
+  }
+
+  auto idx = [&](int x, int y) -> std::size_t {
+    return static_cast<std::size_t>(y) * static_cast<std::size_t>(world.width()) + static_cast<std::size_t>(x);
+  };
+
+  const std::size_t iTarget = idx(3, 1);
+  const std::size_t iOpen = idx(0, 1);
+
+  SkyViewConfig cfg{};
+  cfg.maxHorizonRadius = 6;
+  cfg.azimuthSamples = 8;
+  cfg.includeBuildings = false;
+  cfg.residentialHeightPerLevel = 0.4f;
+  cfg.commercialHeightPerLevel = 0.4f;
+  cfg.industrialHeightPerLevel = 0.4f;
+  cfg.civicHeightPerLevel = 0.4f;
+
+  {
+    const SkyViewResult flat = ComputeSkyViewFactor(world, cfg);
+    EXPECT_NEAR(flat.skyView01[iTarget], 1.0f, 1e-6f);
+    EXPECT_NEAR(flat.skyView01[iOpen], 1.0f, 1e-6f);
+    EXPECT_NEAR(flat.canyon01[iTarget], 0.0f, 1e-6f);
+  }
+
+  // Add a tall blocker east of the target.
+  {
+    Tile& b = world.at(4, 1);
+    b.overlay = Overlay::Industrial;
+    b.level = 3;
+    b.occupants = 200;
+  }
+
+  cfg.includeBuildings = true;
+  const SkyViewResult blocked = ComputeSkyViewFactor(world, cfg);
+  EXPECT_TRUE(blocked.skyView01[iTarget] < blocked.skyView01[iOpen]);
+  EXPECT_TRUE(blocked.skyView01[iTarget] < 0.95f);
+  EXPECT_NEAR(blocked.canyon01[iTarget], 1.0f - blocked.skyView01[iTarget], 1e-6f);
+
+  // Ignoring buildings should recover the flat field.
+  cfg.includeBuildings = false;
+  const SkyViewResult noBldg = ComputeSkyViewFactor(world, cfg);
+  EXPECT_NEAR(noBldg.skyView01[iTarget], 1.0f, 1e-6f);
+}
+
+
+void TestEnergyModelBasic()
+{
+  // Smoke test for the energy model proxy:
+  // - Industrial tiles have higher demand than residential tiles at the same occupancy.
+  // - Industrial tiles also tend to have higher rooftop solar potential (roof bonus) and therefore higher supply.
+  // - Net balance responds accordingly.
+
+  World world(10, 10, 123456);
+
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      Tile& t = world.at(x, y);
+      t.terrain = Terrain::Grass;
+      t.overlay = Overlay::None;
+      t.height = 0.0f;
+      t.level = 1;
+      t.variation = 0;
+      t.occupants = 0;
+    }
+  }
+
+  const auto idx2 = [&](int x, int y) -> std::size_t {
+    return static_cast<std::size_t>(y) * static_cast<std::size_t>(world.width()) + static_cast<std::size_t>(x);
+  };
+
+  const int rx = 3;
+  const int ry = 3;
+  {
+    Tile& r = world.at(rx, ry);
+    r.overlay = Overlay::Residential;
+    r.level = 2;
+    r.occupants = 50;
+  }
+
+  const int ix = 6;
+  const int iy = 6;
+  {
+    Tile& i = world.at(ix, iy);
+    i.overlay = Overlay::Industrial;
+    i.level = 3;
+    i.occupants = 200;
+  }
+
+  // Compute an unshaded solar field so supply is driven mostly by roof config.
+  SolarPotentialConfig spc{};
+  spc.azimuthSamples = 8;
+  spc.includeBuildings = false;
+  spc.roofOccupantBoost = 0.0f;
+  const SolarPotentialResult solar = ComputeSolarPotential(world, spc);
+
+  EnergyModelConfig ec{};
+  ec.useHeatIslandCooling = false;
+  const EnergyModelResult energy = ComputeEnergyModel(world, ec, &solar, nullptr);
+
+  ASSERT_EQ(energy.w, world.width());
+  ASSERT_EQ(energy.h, world.height());
+  ASSERT_EQ(energy.demand01.size(), static_cast<std::size_t>(world.width() * world.height()));
+  ASSERT_EQ(energy.solar01.size(), energy.demand01.size());
+  ASSERT_EQ(energy.balance01.size(), energy.demand01.size());
+
+  const std::size_t ir = idx2(rx, ry);
+  const std::size_t ii = idx2(ix, iy);
+
+  ASSERT_TRUE(energy.demandRaw[ii] > energy.demandRaw[ir]);
+  ASSERT_TRUE(energy.solarRaw[ii] > energy.solarRaw[ir]);
+  ASSERT_TRUE(energy.renewableShare01 >= 0.0f && energy.renewableShare01 <= 1.0f);
+}
+
+void TestCrimeModelBasic()
+{
+  // Basic sanity check:
+  // - Tiles closer to a police station should have higher police access.
+  // - Policing should suppress crime risk nearby.
+  World world(12, 5, 424242);
+
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      Tile& t = world.at(x, y);
+      t.terrain = Terrain::Grass;
+      t.overlay = Overlay::None;
+      t.height = 0.0f;
+      t.level = 1;
+      t.variation = 0;
+      t.occupants = 0;
+    }
+  }
+
+  // Road spine connected to both edges.
+  for (int x = 0; x < world.width(); ++x) {
+    world.at(x, 2).overlay = Overlay::Road;
+    world.at(x, 2).level = 1;
+  }
+
+  // Police station near the left.
+  world.at(1, 1).overlay = Overlay::PoliceStation;
+
+  // Two similar residential tiles: one near, one far.
+  world.at(2, 1).overlay = Overlay::Residential;
+  world.at(2, 1).level = 2;
+  world.at(2, 1).occupants = 50;
+
+  world.at(10, 1).overlay = Overlay::Residential;
+  world.at(10, 1).level = 2;
+  world.at(10, 1).occupants = 50;
+
+  auto idx = [&](int x, int y) -> std::size_t {
+    return static_cast<std::size_t>(y) * static_cast<std::size_t>(world.width()) + static_cast<std::size_t>(x);
+  };
+
+  CrimeModelConfig cfg{};
+  cfg.requireOutsideConnection = true;
+  cfg.weightMode = IsochroneWeightMode::TravelTime;
+
+  const CrimeModelResult withPolice = ComputeCrimeModel(world, cfg, nullptr, nullptr, nullptr, nullptr);
+  ASSERT_EQ(withPolice.w, world.width());
+  ASSERT_EQ(withPolice.h, world.height());
+  ASSERT_EQ(withPolice.risk01.size(), static_cast<std::size_t>(world.width() * world.height()));
+
+  const std::size_t iNear = idx(2, 1);
+  const std::size_t iFar = idx(10, 1);
+
+  EXPECT_TRUE(withPolice.policeAccess01[iNear] > withPolice.policeAccess01[iFar]);
+  EXPECT_TRUE(withPolice.risk01[iNear] < withPolice.risk01[iFar]);
+
+  // Remove the police station and recompute; risk should rise near the old station.
+  world.at(1, 1).overlay = Overlay::None;
+  const CrimeModelResult noPolice = ComputeCrimeModel(world, cfg, nullptr, nullptr, nullptr, nullptr);
+
+  EXPECT_NEAR(noPolice.policeAccess01[iNear], 0.0f, 1e-6f);
+  EXPECT_TRUE(noPolice.risk01[iNear] > withPolice.risk01[iNear]);
+}
+
+void TestTrafficSafetyBasic()
+{
+  // Basic sanity check for crash risk proxy:
+  //  - A 4-way intersection should have higher risk than a straight segment (all else equal).
+  //  - Nearby residential tiles should have higher exposure/priority than far-away ones.
+
+  World world(9, 5, 202601);
+
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      Tile& t = world.at(x, y);
+      t.terrain = Terrain::Grass;
+      t.overlay = Overlay::None;
+      t.height = 0.0f;
+      t.level = 1;
+      t.variation = 0;
+      t.occupants = 0;
+    }
+  }
+
+  // Cross-shaped road network connected to edges.
+  for (int x = 0; x < world.width(); ++x) {
+    world.at(x, 2).overlay = Overlay::Road;
+    world.at(x, 2).level = 1;
+  }
+  for (int y = 0; y < world.height(); ++y) {
+    world.at(4, y).overlay = Overlay::Road;
+    world.at(4, y).level = 1;
+  }
+
+  // Add some tall-ish buildings near the intersection to increase canyon confinement.
+  // (Doesn't need to be realistic, just deterministic.)
+  {
+    Tile& a = world.at(3, 1);
+    a.overlay = Overlay::Commercial;
+    a.level = 3;
+    a.occupants = 120;
+  }
+  {
+    Tile& b = world.at(5, 1);
+    b.overlay = Overlay::Commercial;
+    b.level = 3;
+    b.occupants = 120;
+  }
+  {
+    Tile& c = world.at(3, 3);
+    c.overlay = Overlay::Industrial;
+    c.level = 3;
+    c.occupants = 200;
+  }
+  {
+    Tile& d = world.at(5, 3);
+    d.overlay = Overlay::Industrial;
+    d.level = 3;
+    d.occupants = 200;
+  }
+
+  // Residential near the intersection vs far away.
+  {
+    Tile& r = world.at(2, 1);
+    r.overlay = Overlay::Residential;
+    r.level = 2;
+    r.occupants = 80;
+  }
+  {
+    Tile& r = world.at(0, 0);
+    r.overlay = Overlay::Residential;
+    r.level = 2;
+    r.occupants = 80;
+  }
+
+  const auto idx = [&](int x, int y) -> std::size_t {
+    return static_cast<std::size_t>(y) * static_cast<std::size_t>(world.width()) + static_cast<std::size_t>(x);
+  };
+
+  // Build a deterministic traffic field.
+  TrafficResult traffic{};
+  traffic.roadTraffic.assign(static_cast<std::size_t>(world.width() * world.height()), 0);
+
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      if (world.at(x, y).overlay == Overlay::Road) {
+        traffic.roadTraffic[idx(x, y)] = 100;
+      }
+    }
+  }
+  // Make the central intersection a bit busier.
+  traffic.roadTraffic[idx(4, 2)] = 150;
+
+  SkyViewConfig svc{};
+  svc.includeBuildings = true;
+  svc.maxHorizonRadius = 24;
+  svc.azimuthSamples = 8;
+  const SkyViewResult sv = ComputeSkyViewFactor(world, svc);
+
+  TrafficSafetyConfig cfg{};
+  cfg.requireOutsideConnection = true;
+  cfg.exposureRadius = 2;
+
+  const TrafficSafetyResult ts = ComputeTrafficSafety(world, cfg, &traffic, &sv, nullptr);
+  ASSERT_EQ(ts.w, world.width());
+  ASSERT_EQ(ts.h, world.height());
+  ASSERT_EQ(ts.risk01.size(), static_cast<std::size_t>(world.width() * world.height()));
+  ASSERT_EQ(ts.exposure01.size(), ts.risk01.size());
+  ASSERT_EQ(ts.priority01.size(), ts.risk01.size());
+
+  const std::size_t iIntersection = idx(4, 2);
+  const std::size_t iStraight = idx(1, 2);
+  ASSERT_TRUE(ts.risk01[iIntersection] > ts.risk01[iStraight]);
+
+  const std::size_t iNearRes = idx(2, 1);
+  const std::size_t iFarRes = idx(0, 0);
+  ASSERT_TRUE(ts.exposure01[iNearRes] > ts.exposure01[iFarRes]);
+  ASSERT_TRUE(ts.priority01[iNearRes] > ts.priority01[iFarRes]);
+}
+
+void TestTransitAccessibilityBasic()
+{
+  World world(16, 16, 1337);
+
+  // Flatten the terrain to keep pathing deterministic.
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      Tile& t = world.at(x, y);
+      t.terrain = Terrain::Grass;
+      t.overlay = Overlay::None;
+      t.height = 0;
+      t.level = 1;
+      t.occupants = 0;
+      t.variation = 0;
+    }
+  }
+
+  // Simple arterial road connected to the world edges.
+  for (int x = 0; x < world.width(); ++x) {
+    Tile& r = world.at(x, 8);
+    r.overlay = Overlay::Road;
+    r.level = 1;
+  }
+
+  // Residential near the left, commercial near the right.
+  {
+    Tile& r = world.at(2, 7);
+    r.overlay = Overlay::Residential;
+    r.level = 2;
+    r.occupants = 100;
+  }
+  {
+    Tile& c = world.at(13, 7);
+    c.overlay = Overlay::Commercial;
+    c.level = 2;
+    c.occupants = 200;
+  }
+
+  std::vector<std::uint8_t> roadToEdge;
+  ComputeRoadsConnectedToEdge(world, roadToEdge);
+
+  TrafficConfig tc{};
+  tc.requireOutsideConnection = true;
+  const TrafficResult traffic = ComputeCommuteTraffic(world, tc, 1.0f, &roadToEdge);
+
+  TransitAccessibilityConfig tac{};
+  tac.requireOutsideConnection = true;
+  tac.demandMode = TransitDemandMode::Commute;
+  tac.plannerCfg.maxLines = 1;
+  tac.plannerCfg.minLineDemand = 1;
+  tac.plannerCfg.minEdgeDemand = 1;
+  tac.stopSpacingTiles = 4;
+  tac.walkRadiusSteps = 10;
+
+  TransitAccessibilityInputs ti{};
+  ti.traffic = &traffic;
+  ti.roadToEdgeMask = &roadToEdge;
+  const TransitAccessibilityResult tr = ComputeTransitAccessibility(world, tac, ti);
+
+  ASSERT_TRUE(tr.plannedLines >= 1);
+  ASSERT_TRUE(tr.plannedStops >= 2);
+
+  const int resIdx = 7 * world.width() + 2;
+  ASSERT_TRUE(tr.stepsToStop[resIdx] >= 0);
+  ASSERT_TRUE(tr.stepsToStop[resIdx] <= 4);
+  ASSERT_TRUE(tr.access01[resIdx] > 0.2f);
+  ASSERT_TRUE(tr.modeSharePotential01[resIdx] > 0.0f);
+
+  // Far from any road/stops -> unreachable.
+  const int farIdx = 0 * world.width() + 8;
+  ASSERT_EQ(tr.stepsToStop[farIdx], -1);
+  ASSERT_EQ(tr.access01[farIdx], 0.0f);
+}
+
+void TestLivabilityBasic()
+{
+  // Smoke test for composite livability:
+  //  - Two equally populated residential tiles.
+  //  - One is near parks (a sink).
+  //  - One is adjacent to industrial + road tiles (sources).
+  // => Source-adjacent tile should have lower livability and higher intervention priority.
+
+  World world(10, 10, 424242);
+
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      Tile& t = world.at(x, y);
+      t.terrain = Terrain::Grass;
+      t.overlay = Overlay::None;
+      t.height = 0.0f;
+      t.level = 1;
+      t.variation = 0;
+      t.occupants = 0;
+    }
+  }
+
+  // Residential A (quieter, cleaner).
+  {
+    Tile& a = world.at(2, 2);
+    a.overlay = Overlay::Residential;
+    a.level = 2;
+    a.occupants = 80;
+
+    // Nearby park sink.
+    world.at(2, 3).overlay = Overlay::Park;
+  }
+
+  // Residential B (near sources).
+  {
+    Tile& b = world.at(7, 7);
+    b.overlay = Overlay::Residential;
+    b.level = 2;
+    b.occupants = 80;
+
+    Tile& i1 = world.at(7, 6);
+    i1.overlay = Overlay::Industrial;
+    i1.level = 3;
+    i1.occupants = 200;
+
+    Tile& i2 = world.at(6, 7);
+    i2.overlay = Overlay::Industrial;
+    i2.level = 3;
+    i2.occupants = 200;
+
+    // Nearby roads.
+    world.at(8, 7).overlay = Overlay::Road;
+    world.at(7, 8).overlay = Overlay::Road;
+  }
+
+  LivabilityConfig cfg{};
+  cfg.requireOutsideConnection = false; // keep this test independent of edge connectivity
+
+  // Make this test robust against future changes in services/walkability:
+  // only consider environmental hazards.
+  cfg.weightServices = 0.0f;
+  cfg.weightWalkability = 0.0f;
+  cfg.weightCleanAir = 1.0f;
+  cfg.weightQuiet = 1.0f;
+  cfg.weightThermalComfort = 1.0f;
+
+  const LivabilityResult r = ComputeLivability(world, cfg, nullptr, nullptr);
+  ASSERT_EQ(r.w, world.width());
+  ASSERT_EQ(r.h, world.height());
+
+  auto idx = [&](int x, int y) -> std::size_t {
+    return static_cast<std::size_t>(y) * static_cast<std::size_t>(world.width()) + static_cast<std::size_t>(x);
+  };
+
+  const std::size_t iA = idx(2, 2);
+  const std::size_t iB = idx(7, 7);
+
+  EXPECT_TRUE(r.livability01[iA] > r.livability01[iB]);
+  EXPECT_TRUE(r.priority01[iB] > r.priority01[iA]);
+
+  EXPECT_EQ(r.residentPopulation, 160);
+}
+
+
+
+void TestHotspotGiStarBasic()
+{
+  // Basic Getis-Ord Gi* sanity check: a strong central cluster should produce
+  // a positive (hot) z-score at the center and a negative z-score far away.
+
+  const int w = 11;
+  const int h = 11;
+
+  std::vector<float> field(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), 0.0f);
+
+  auto idx = [&](int x, int y) -> std::size_t {
+    return static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+  };
+
+  // 3x3 high-value cluster in the middle.
+  for (int y = 4; y <= 6; ++y) {
+    for (int x = 4; x <= 6; ++x) {
+      field[idx(x, y)] = 100.0f;
+    }
+  }
+
+  HotspotConfig cfg{};
+  cfg.enabled = true;
+  cfg.excludeWater = false;
+  cfg.radius = 2;
+  cfg.zThreshold = 1.96f;
+  cfg.zScale = 3.0f;
+
+  const HotspotResult r = ComputeHotspotsGiStar(w, h, field, nullptr, cfg);
+
+  ASSERT_EQ(r.w, w);
+  ASSERT_EQ(r.h, h);
+  ASSERT_EQ(r.z.size(), field.size());
+  ASSERT_EQ(r.z01.size(), field.size());
+  ASSERT_EQ(r.cls.size(), field.size());
+
+  const std::size_t iCenter = idx(w / 2, h / 2);
+  const std::size_t iCorner = idx(0, 0);
+
+  EXPECT_TRUE(r.z[iCenter] > 2.0f);
+  EXPECT_TRUE(r.z01[iCenter] > 0.8f);
+  EXPECT_EQ(r.cls[iCenter], static_cast<std::uint8_t>(HotspotClass::Hot));
+
+  // Far corner should be below global mean (negative z).
+  EXPECT_TRUE(r.z[iCorner] < 0.0f);
+  EXPECT_TRUE(r.z01[iCorner] < 0.5f);
+}
+
+
+
+
+static void TestRoadHealthLoopHasNoVulnerability()
+{
+  // A simple road loop has no bridges and no articulation nodes, so the
+  // vulnerability field should be identically zero.
+  World world(8, 8, 2026);
+
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      Tile& t = world.at(x, y);
+      t.terrain = Terrain::Grass;
+      t.overlay = Overlay::None;
+      t.height = 0.0f;
+      t.level = 1;
+      t.variation = 0;
+      t.occupants = 0;
+    }
+  }
+
+  // Square loop from (2,2) to (5,5).
+  for (int x = 2; x <= 5; ++x) {
+    world.at(x, 2).overlay = Overlay::Road;
+    world.at(x, 5).overlay = Overlay::Road;
+  }
+  for (int y = 2; y <= 5; ++y) {
+    world.at(2, y).overlay = Overlay::Road;
+    world.at(5, y).overlay = Overlay::Road;
+  }
+
+  RoadHealthConfig cfg{};
+  cfg.weightMode = RoadGraphEdgeWeightMode::Steps;
+  cfg.maxSources = 0;
+  cfg.includeBypass = true;
+  cfg.bypassCfg.top = 3;
+
+  const RoadHealthResult r = ComputeRoadHealth(world, cfg, nullptr);
+  ASSERT_EQ(r.w, world.width());
+  ASSERT_EQ(r.h, world.height());
+
+  EXPECT_EQ(r.bridgeEdges, 0);
+  EXPECT_EQ(r.articulationNodes, 0);
+  EXPECT_TRUE(r.bypasses.empty());
+
+  auto idx = [&](int x, int y) -> std::size_t {
+    return static_cast<std::size_t>(y) * static_cast<std::size_t>(world.width()) + static_cast<std::size_t>(x);
+  };
+
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      const Tile& t = world.at(x, y);
+      if (t.overlay != Overlay::Road) continue;
+      EXPECT_NEAR(r.vulnerability01[idx(x, y)], 0.0f, 1e-6f);
+    }
+  }
+}
+
+static void TestRoadHealthCrossHasVulnerability()
+{
+  // A plus-intersection has an articulation at the center and bridge edges
+  // on each branch.
+  World world(7, 7, 2027);
+
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      Tile& t = world.at(x, y);
+      t.terrain = Terrain::Grass;
+      t.overlay = Overlay::None;
+      t.height = 0.0f;
+      t.level = 1;
+      t.variation = 0;
+      t.occupants = 0;
+    }
+  }
+
+  // Vertical and horizontal roads crossing at (3,3).
+  for (int y = 1; y <= 5; ++y) {
+    world.at(3, y).overlay = Overlay::Road;
+  }
+  for (int x = 1; x <= 5; ++x) {
+    world.at(x, 3).overlay = Overlay::Road;
+  }
+
+  RoadHealthConfig cfg{};
+  cfg.weightMode = RoadGraphEdgeWeightMode::Steps;
+  cfg.maxSources = 0;
+  cfg.includeNodeCentrality = true;
+  cfg.articulationVulnerabilityBase = 0.70f;
+  cfg.includeBypass = false;
+
+  const RoadHealthResult r = ComputeRoadHealth(world, cfg, nullptr);
+  EXPECT_TRUE(r.bridgeEdges > 0);
+  EXPECT_TRUE(r.articulationNodes > 0);
+
+  const std::size_t center = static_cast<std::size_t>(3 + 3 * world.width());
+  EXPECT_TRUE(r.vulnerability01[center] >= (cfg.articulationVulnerabilityBase - 1e-6f));
+}
+
 int main()
 {
   TestRoadAutoTilingMasks();
@@ -9185,6 +10216,20 @@ int main()
   TestOutsideConnectionAffectsZoneAccess();
   TestZoneAccessMapAllowsInteriorTilesViaZoneConnectivity();
   TestIsochroneTileAccessCostsRespectInteriorZoneAccess();
+  TestWalkabilityBasic();
+  TestAirPollutionBasic();
+  TestRunoffPollutionBasic();
+  TestRunoffMitigationBasic();
+  TestSolarPotentialBasic();
+  TestSkyViewFactorBasic();
+  TestEnergyModelBasic();
+  TestCrimeModelBasic();
+  TestTrafficSafetyBasic();
+  TestTransitAccessibilityBasic();
+  TestLivabilityBasic();
+  TestHotspotGiStarBasic();
+  TestRoadHealthLoopHasNoVulnerability();
+  TestRoadHealthCrossHasVulnerability();
   TestSimulatorStepInvariants();
   TestEmploymentCountsOnlyAccessibleJobs();
   TestRoadPathfindingToEdge();

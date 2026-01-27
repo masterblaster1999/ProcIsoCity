@@ -580,6 +580,7 @@ void Game::adoptLoadedWorld(World&& loaded, const ProcGenConfig& loadedProcCfg, 
   m_roadUpgradePlanDirty = true;
   m_roadUpgradeSelectedMaskDirty = true;
   invalidateHydrology();
+  invalidateAnalysisLayers();
   m_vehiclesDirty = true;
   m_vehicles.clear();
 
@@ -709,6 +710,25 @@ void Game::invalidateHydrology()
   m_seaFloodDirty = true;
   m_pondingDirty = true;
   m_evacDirty = true;
+}
+
+void Game::invalidateAnalysisLayers()
+{
+  m_airPollutionDirty = true;
+  m_skyViewDirty = true;
+  m_solarDirty = true;
+  m_energyDirty = true;
+  m_carbonDirty = true;
+  m_crimeDirty = true;
+  m_trafficSafetyDirty = true;
+  m_transitAccessDirty = true;
+  m_walkabilityDirty = true;
+  m_jobsDirty = true;
+  m_roadHealthDirty = true;
+  m_livabilityDirty = true;
+  m_hotspotsDirty = true;
+  m_runoffDirty = true;
+  m_runoffMitigationDirty = true;
 }
 
 
@@ -942,6 +962,48 @@ void Game::setupDevConsole()
     case HeatmapOverlay::EvacuationTime: return "evac";
     case HeatmapOverlay::EvacuationUnreachable: return "evac_unreach";
     case HeatmapOverlay::EvacuationFlow: return "evac_flow";
+    case HeatmapOverlay::AirPollution: return "air_pollution";
+    case HeatmapOverlay::AirPollutionEmission: return "air_emission";
+    case HeatmapOverlay::SkyView: return "sky_view";
+    case HeatmapOverlay::CanyonConfinement: return "canyon_confinement";
+    case HeatmapOverlay::SolarExposure: return "solar_exposure";
+    case HeatmapOverlay::SolarPotential: return "solar_potential";
+    case HeatmapOverlay::EnergyDemand: return "energy_demand";
+    case HeatmapOverlay::EnergySolar: return "energy_solar";
+    case HeatmapOverlay::EnergyBalance: return "energy_balance";
+    case HeatmapOverlay::CarbonEmission: return "carbon_emission";
+    case HeatmapOverlay::CarbonSequestration: return "carbon_sequestration";
+    case HeatmapOverlay::CarbonBalance: return "carbon_balance";
+
+    case HeatmapOverlay::CrimeRisk: return "crime_risk";
+    case HeatmapOverlay::PoliceAccess: return "police_access";
+
+    case HeatmapOverlay::TrafficCrashRisk: return "traffic_crash_risk";
+    case HeatmapOverlay::TrafficCrashExposure: return "traffic_crash_exposure";
+    case HeatmapOverlay::TrafficCrashPriority: return "traffic_crash_priority";
+
+
+    case HeatmapOverlay::TransitAccess: return "transit_access";
+    case HeatmapOverlay::TransitModeSharePotential: return "transit_mode_share_potential";
+    case HeatmapOverlay::Walkability: return "walkability";
+    case HeatmapOverlay::WalkabilityPark: return "walkability_park";
+    case HeatmapOverlay::WalkabilityRetail: return "walkability_retail";
+    case HeatmapOverlay::WalkabilityEducation: return "walkability_education";
+    case HeatmapOverlay::WalkabilityHealth: return "walkability_health";
+    case HeatmapOverlay::WalkabilitySafety: return "walkability_safety";
+    case HeatmapOverlay::JobAccess: return "job_access";
+    case HeatmapOverlay::JobOpportunity: return "job_opportunity";
+    case HeatmapOverlay::RoadCentrality: return "road_centrality";
+    case HeatmapOverlay::RoadVulnerability: return "road_vulnerability";
+    case HeatmapOverlay::RoadBypass: return "road_bypass";
+    case HeatmapOverlay::Livability: return "livability";
+    case HeatmapOverlay::InterventionPriority: return "intervention_priority";
+    case HeatmapOverlay::LivabilityHotspot: return "livability_hotspot";
+    case HeatmapOverlay::InterventionHotspot: return "intervention_hotspot";
+    case HeatmapOverlay::RunoffPollution: return "runoff_pollution";
+    case HeatmapOverlay::RunoffPollutionLoad: return "runoff_load";
+    case HeatmapOverlay::RunoffMitigationPriority: return "runoff_mitigation_priority";
+    case HeatmapOverlay::RunoffMitigationPlan: return "runoff_mitigation_plan";
     default: return "?";
     }
   };
@@ -2557,6 +2619,7 @@ void Game::setupDevConsole()
         m_evacDirty = true;
         m_roadUpgradePlanDirty = true;
         m_roadUpgradeSelectedMaskDirty = true;
+        invalidateAnalysisLayers();
         showToast("Sim step");
         c.print("stepped");
       });
@@ -2700,15 +2763,93 @@ void Game::setupDevConsole()
       });
 
   m_console.registerCommand(
-      "heatmap", "heatmap <off|land|park|water|pollution|traffic|services|services_edu|services_health|services_safety|fire_risk|flood|pond|evac|evac_unreach|evac_flow> - set heatmap overlay",
+      "heatmap",
+      "heatmap <name|list> - set heatmap overlay (try: heatmap list)",
       [this, toLower, heatmapName](DevConsole& c, const DevConsole::Args& args) {
         if (args.size() != 1) {
-          c.print("Usage: heatmap <off|land|park|water|pollution|traffic|services|services_edu|services_health|services_safety|fire_risk|flood|pond|evac|evac_unreach|evac_flow>");
+          c.print("Usage: heatmap <name|list>");
+          c.print("Try: heatmap list");
           return;
         }
+
         const std::string h = toLower(args[0]);
+        if (h == "list" || h == "ls" || h == "?" || h == "help") {
+          c.print("Heatmaps:");
+          static constexpr HeatmapOverlay kAll[] = {
+              HeatmapOverlay::Off,
+              HeatmapOverlay::LandValue,
+              HeatmapOverlay::ParkAmenity,
+              HeatmapOverlay::WaterAmenity,
+              HeatmapOverlay::Pollution,
+              HeatmapOverlay::TrafficSpill,
+              HeatmapOverlay::ServicesOverall,
+              HeatmapOverlay::ServicesEducation,
+              HeatmapOverlay::ServicesHealth,
+              HeatmapOverlay::ServicesSafety,
+              HeatmapOverlay::FireRisk,
+              HeatmapOverlay::FloodDepth,
+              HeatmapOverlay::PondingDepth,
+              HeatmapOverlay::EvacuationTime,
+              HeatmapOverlay::EvacuationUnreachable,
+              HeatmapOverlay::EvacuationFlow,
+
+              HeatmapOverlay::AirPollution,
+              HeatmapOverlay::AirPollutionEmission,
+              HeatmapOverlay::SkyView,
+              HeatmapOverlay::CanyonConfinement,
+              HeatmapOverlay::SolarExposure,
+              HeatmapOverlay::SolarPotential,
+              HeatmapOverlay::EnergyDemand,
+              HeatmapOverlay::EnergySolar,
+              HeatmapOverlay::EnergyBalance,
+
+              HeatmapOverlay::CarbonEmission,
+              HeatmapOverlay::CarbonSequestration,
+              HeatmapOverlay::CarbonBalance,
+
+              HeatmapOverlay::CrimeRisk,
+              HeatmapOverlay::PoliceAccess,
+
+              HeatmapOverlay::TrafficCrashRisk,
+              HeatmapOverlay::TrafficCrashExposure,
+              HeatmapOverlay::TrafficCrashPriority,
+
+              HeatmapOverlay::TransitAccess,
+              HeatmapOverlay::TransitModeSharePotential,
+
+              HeatmapOverlay::Walkability,
+              HeatmapOverlay::WalkabilityPark,
+              HeatmapOverlay::WalkabilityRetail,
+              HeatmapOverlay::WalkabilityEducation,
+              HeatmapOverlay::WalkabilityHealth,
+              HeatmapOverlay::WalkabilitySafety,
+
+              HeatmapOverlay::JobAccess,
+              HeatmapOverlay::JobOpportunity,
+
+              HeatmapOverlay::RoadCentrality,
+              HeatmapOverlay::RoadVulnerability,
+              HeatmapOverlay::RoadBypass,
+
+              HeatmapOverlay::Livability,
+              HeatmapOverlay::InterventionPriority,
+              HeatmapOverlay::LivabilityHotspot,
+              HeatmapOverlay::InterventionHotspot,
+
+              HeatmapOverlay::RunoffPollution,
+              HeatmapOverlay::RunoffPollutionLoad,
+              HeatmapOverlay::RunoffMitigationPriority,
+              HeatmapOverlay::RunoffMitigationPlan,
+          };
+
+          for (HeatmapOverlay hm : kAll) {
+            c.print(std::string("  ") + heatmapName(hm));
+          }
+          return;
+        }
+
         if (h == "off") m_heatmapOverlay = HeatmapOverlay::Off;
-        else if (h == "land") m_heatmapOverlay = HeatmapOverlay::LandValue;
+        else if (h == "land" || h == "landvalue") m_heatmapOverlay = HeatmapOverlay::LandValue;
         else if (h == "park") m_heatmapOverlay = HeatmapOverlay::ParkAmenity;
         else if (h == "water") m_heatmapOverlay = HeatmapOverlay::WaterAmenity;
         else if (h == "pollution") m_heatmapOverlay = HeatmapOverlay::Pollution;
@@ -2723,8 +2864,74 @@ void Game::setupDevConsole()
         else if (h == "evac" || h == "evactime" || h == "evac_time") m_heatmapOverlay = HeatmapOverlay::EvacuationTime;
         else if (h == "evac_unreach" || h == "evacunreach" || h == "evac_unreachable" || h == "unreach") m_heatmapOverlay = HeatmapOverlay::EvacuationUnreachable;
         else if (h == "evac_flow" || h == "evacflow" || h == "flow" || h == "evacuationflow") m_heatmapOverlay = HeatmapOverlay::EvacuationFlow;
+
+        else if (h == "air_pollution" || h == "air" || h == "airquality" || h == "air_quality" || h == "smog" || h == "aq") m_heatmapOverlay = HeatmapOverlay::AirPollution;
+        else if (h == "air_emission" || h == "air_source" || h == "air_sources" || h == "smog_sources" || h == "pollution_source") m_heatmapOverlay = HeatmapOverlay::AirPollutionEmission;
+
+        else if (h == "sky_view" || h == "skyview" || h == "svf") m_heatmapOverlay = HeatmapOverlay::SkyView;
+        else if (h == "canyon_confinement" || h == "canyon" || h == "urban_canyon" || h == "confinement") m_heatmapOverlay = HeatmapOverlay::CanyonConfinement;
+
+        else if (h == "solar_exposure" || h == "solar") m_heatmapOverlay = HeatmapOverlay::SolarExposure;
+        else if (h == "solar_potential" || h == "pv") m_heatmapOverlay = HeatmapOverlay::SolarPotential;
+
+        else if (h == "energy_demand" || h == "power_demand" || h == "electricity_demand" || h == "demand_energy")
+          m_heatmapOverlay = HeatmapOverlay::EnergyDemand;
+        else if (h == "energy_solar" || h == "solar_supply" || h == "pv_supply" || h == "rooftop_solar")
+          m_heatmapOverlay = HeatmapOverlay::EnergySolar;
+        else if (h == "energy_balance" || h == "energy_net" || h == "net_energy" || h == "renewable_balance" || h == "energy")
+          m_heatmapOverlay = HeatmapOverlay::EnergyBalance;
+
+
+
+        else if (h == "carbon_emission" || h == "co2_emission" || h == "carbon_emissions")
+          m_heatmapOverlay = HeatmapOverlay::CarbonEmission;
+        else if (h == "carbon_sequestration" || h == "carbon_sink" || h == "co2_sink" || h == "sequestration")
+          m_heatmapOverlay = HeatmapOverlay::CarbonSequestration;
+        else if (h == "carbon_balance" || h == "carbon_net" || h == "co2_balance" || h == "net_carbon" || h == "carbon")
+          m_heatmapOverlay = HeatmapOverlay::CarbonBalance;
+
+        else if (h == "crime_risk" || h == "crime" || h == "crime_index" || h == "safety_risk")
+          m_heatmapOverlay = HeatmapOverlay::CrimeRisk;
+        else if (h == "police_access" || h == "police_response" || h == "police_coverage" || h == "response_time")
+          m_heatmapOverlay = HeatmapOverlay::PoliceAccess;
+
+        else if (h == "traffic_crash_risk" || h == "traffic_collision_risk" || h == "crash_risk" || h == "safety_crash")
+          m_heatmapOverlay = HeatmapOverlay::TrafficCrashRisk;
+        else if (h == "traffic_crash_exposure" || h == "crash_exposure" || h == "safety_exposure")
+          m_heatmapOverlay = HeatmapOverlay::TrafficCrashExposure;
+        else if (h == "traffic_crash_priority" || h == "crash_priority" || h == "safety_priority")
+          m_heatmapOverlay = HeatmapOverlay::TrafficCrashPriority;
+
+        else if (h == "walkability" || h == "walk" || h == "walkscore" || h == "15min") m_heatmapOverlay = HeatmapOverlay::Walkability;
+        else if (h == "walkability_park" || h == "walk_park") m_heatmapOverlay = HeatmapOverlay::WalkabilityPark;
+        else if (h == "walkability_retail" || h == "walk_retail") m_heatmapOverlay = HeatmapOverlay::WalkabilityRetail;
+        else if (h == "walkability_education" || h == "walk_education") m_heatmapOverlay = HeatmapOverlay::WalkabilityEducation;
+        else if (h == "walkability_health" || h == "walk_health") m_heatmapOverlay = HeatmapOverlay::WalkabilityHealth;
+        else if (h == "walkability_safety" || h == "walk_safety") m_heatmapOverlay = HeatmapOverlay::WalkabilitySafety;
+
+        else if (h == "job_access" || h == "jobs_access" || h == "employment_access" || h == "access_jobs" || h == "jobaccess")
+          m_heatmapOverlay = HeatmapOverlay::JobAccess;
+        else if (h == "job_opportunity" || h == "jobs" || h == "employment" || h == "job_market" || h == "jobopportunity")
+          m_heatmapOverlay = HeatmapOverlay::JobOpportunity;
+
+        else if (h == "road_centrality" || h == "centrality") m_heatmapOverlay = HeatmapOverlay::RoadCentrality;
+        else if (h == "road_vulnerability" || h == "vulnerability") m_heatmapOverlay = HeatmapOverlay::RoadVulnerability;
+        else if (h == "road_bypass" || h == "bypass") m_heatmapOverlay = HeatmapOverlay::RoadBypass;
+
+        else if (h == "livability" || h == "live") m_heatmapOverlay = HeatmapOverlay::Livability;
+        else if (h == "intervention_priority" || h == "priority") m_heatmapOverlay = HeatmapOverlay::InterventionPriority;
+
+        else if (h == "livability_hotspot" || h == "live_hotspot") m_heatmapOverlay = HeatmapOverlay::LivabilityHotspot;
+        else if (h == "intervention_hotspot" || h == "priority_hotspot") m_heatmapOverlay = HeatmapOverlay::InterventionHotspot;
+
+        else if (h == "runoff_pollution" || h == "runoff" || h == "stormwater" || h == "water_quality") m_heatmapOverlay = HeatmapOverlay::RunoffPollution;
+        else if (h == "runoff_load" || h == "runoff_source" || h == "stormwater_load") m_heatmapOverlay = HeatmapOverlay::RunoffPollutionLoad;
+        else if (h == "runoff_mitigation_priority" || h == "mitigation_priority") m_heatmapOverlay = HeatmapOverlay::RunoffMitigationPriority;
+        else if (h == "runoff_mitigation_plan" || h == "mitigation_plan") m_heatmapOverlay = HeatmapOverlay::RunoffMitigationPlan;
+
         else {
           c.print("Unknown heatmap: " + args[0]);
+          c.print("Try: heatmap list");
           return;
         }
 
@@ -2733,6 +2940,7 @@ void Game::setupDevConsole()
         m_servicesHeatmapsDirty = true;
         m_fireRiskDirty = true;
         invalidateHydrology();
+        invalidateAnalysisLayers();
 
         showToast(TextFormat("Heatmap: %s", heatmapName(m_heatmapOverlay)));
         c.print(TextFormat("heatmap = %s", heatmapName(m_heatmapOverlay)));
@@ -7703,6 +7911,7 @@ void Game::applyPolicyCandidate(const PolicyCandidate& p, const char* toastLabel
   m_transitVizDirty = true;
   m_evacDirty = true;
   m_outsideOverlayRoadToEdge.clear();
+  invalidateAnalysisLayers();
 
   if (toastLabel) {
     showToast(toastLabel, 2.0f);
@@ -7993,6 +8202,8 @@ enum class NewsKind : std::uint8_t {
   Traffic,
   Services,
   FireRisk,
+  AirPollution,
+  RunoffPollution,
   Goods,
   Trade,
   EconomyEvent,
@@ -8103,6 +8314,87 @@ inline std::string JsonEscape(const std::string& s)
   return out;
 }
 
+struct DistrictExposureSummary {
+  int population = 0;      // total residents included
+  int tiles = 0;           // residential tiles with occupants > 0
+  float avg01 = 0.0f;      // population-weighted mean
+  float highFrac = 0.0f;   // share of residents above threshold
+  int highPopulation = 0;  // residents above threshold
+
+  int worstDistrict = 0;
+  float worstAvg01 = 0.0f; // population-weighted mean in worst district
+  int worstPopulation = 0; // residents in worst district
+};
+
+inline DistrictExposureSummary ComputeResidentialExposureByDistrict(const World& world,
+                                                                   const std::vector<float>& field01,
+                                                                   float highThreshold01)
+{
+  DistrictExposureSummary out;
+  const int w = world.width();
+  const int h = world.height();
+  const std::size_t n = static_cast<std::size_t>(std::max(0, w) * std::max(0, h));
+  if (w <= 0 || h <= 0) return out;
+  if (field01.size() != n) return out;
+
+  std::array<double, kDistrictCount> sum{};
+  std::array<int, kDistrictCount> pop{};
+  std::array<int, kDistrictCount> highPop{};
+
+  double citySum = 0.0;
+  int cityPop = 0;
+  int cityHighPop = 0;
+  int tiles = 0;
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const std::size_t i = static_cast<std::size_t>(y * w + x);
+      const Tile& t = world.at(x, y);
+      if (t.overlay != Overlay::Residential) continue;
+      if (t.occupants <= 0) continue;
+      ++tiles;
+
+      const int p = t.occupants;
+      const float v = Clamp01(field01[i]);
+      citySum += static_cast<double>(v) * static_cast<double>(p);
+      cityPop += p;
+      if (v >= highThreshold01) cityHighPop += p;
+
+      const int d = static_cast<int>(t.district) % kDistrictCount;
+      sum[d] += static_cast<double>(v) * static_cast<double>(p);
+      pop[d] += p;
+      if (v >= highThreshold01) highPop[d] += p;
+    }
+  }
+
+  out.tiles = tiles;
+  out.population = cityPop;
+  out.highPopulation = cityHighPop;
+  if (cityPop > 0) {
+    out.avg01 = static_cast<float>(citySum / static_cast<double>(cityPop));
+    out.highFrac = static_cast<float>(static_cast<double>(cityHighPop) / static_cast<double>(cityPop));
+  }
+
+  // Worst district by population-weighted mean exposure.
+  int worstD = 0;
+  double worstAvg = -1.0;
+  for (int d = 0; d < kDistrictCount; ++d) {
+    if (pop[d] <= 0) continue;
+    const double a = sum[d] / static_cast<double>(pop[d]);
+    if (a > worstAvg) {
+      worstAvg = a;
+      worstD = d;
+    }
+  }
+  if (worstAvg >= 0.0) {
+    out.worstDistrict = worstD;
+    out.worstAvg01 = static_cast<float>(worstAvg);
+    out.worstPopulation = pop[worstD];
+  }
+
+  return out;
+}
+
 } // namespace
 
 void Game::clearCityNews()
@@ -8112,6 +8404,8 @@ void Game::clearCityNews()
   m_newsFirst = 0;
   m_mayorRatingEma = 50.0f;
   m_mayorRatingPrev = 50.0f;
+  m_newsEnvLastComputeSec = -1.0;
+  m_newsEnvLastComputeDay = -1;
 }
 
 void Game::recordCityNews(const Stats& s)
@@ -8164,7 +8458,7 @@ void Game::recordCityNews(const Stats& s)
 
   // --- Story scoring (pick the strongest "headline" of the day). ---
   std::vector<NewsCandidate> cands;
-  cands.reserve(13);
+  cands.reserve(18);
 
   auto add = [&](NewsKind k, float score) {
     if (score > 0.0f) cands.push_back(NewsCandidate{k, score});
@@ -8221,6 +8515,56 @@ void Game::recordCityNews(const Stats& s)
     }
   }
 
+  // --- Environmental advisor snapshots (air + runoff), computed opportunistically ---
+  // These layers are intentionally recomputed on a small wall-clock cooldown so
+  // the City News feed doesn't stall the sim when running at high speed.
+  DistrictExposureSummary airExp{};
+  DistrictExposureSummary runoffExp{};
+  {
+    const int w = m_world.width();
+    const int h = m_world.height();
+    const std::size_t n = static_cast<std::size_t>(std::max(0, w) * std::max(0, h));
+    const bool wantEnv = (s.population >= 60);
+
+    if (wantEnv && w > 0 && h > 0) {
+      const double now = GetTime();
+      constexpr double kEnvCooldownSec = 0.45;
+      const bool cooldownOk = (m_newsEnvLastComputeSec < 0.0) || ((now - m_newsEnvLastComputeSec) >= kEnvCooldownSec);
+
+      const bool haveAir = (m_airPollution.pollution01.size() == n);
+      const bool haveRunoff = (m_runoff.pollution01.size() == n);
+
+      if (cooldownOk && (m_airPollutionDirty || m_runoffDirty || !haveAir || !haveRunoff)) {
+        // Use the most recent traffic/goods caches if available (even if marked dirty):
+        // they are cheap to reuse and provide a more informative spatial pattern.
+        const TrafficResult* tptr = (!m_traffic.roadTraffic.empty() && m_traffic.roadTraffic.size() == n) ? &m_traffic : nullptr;
+        const GoodsResult* gptr = (!m_goods.roadGoodsTraffic.empty() && m_goods.roadGoodsTraffic.size() == n) ? &m_goods : nullptr;
+
+        // Air pollution.
+        if (!haveAir || m_airPollutionDirty) {
+          m_airPollution = ComputeAirPollution(m_world, m_airPollutionCfg, tptr, gptr);
+          m_airPollutionDirty = false;
+        }
+
+        // Runoff pollution.
+        if (!haveRunoff || m_runoffDirty) {
+          m_runoff = ComputeRunoffPollution(m_world, m_runoffCfg, tptr);
+          m_runoffDirty = false;
+        }
+
+        m_newsEnvLastComputeSec = now;
+        m_newsEnvLastComputeDay = s.day;
+      }
+
+      if (m_airPollution.pollution01.size() == n) {
+        airExp = ComputeResidentialExposureByDistrict(m_world, m_airPollution.pollution01, m_airPollution.highExposureThreshold);
+      }
+      if (m_runoff.pollution01.size() == n) {
+        runoffExp = ComputeResidentialExposureByDistrict(m_world, m_runoff.pollution01, m_runoff.cfg.highExposureThreshold01);
+      }
+    }
+  }
+
   // Economy events (start-of-event gets a big boost so it headlines immediately).
   if (s.economyEventKind != 0) {
     const bool newEvent = (prev->economyEventKind != s.economyEventKind);
@@ -8257,6 +8601,36 @@ void Game::recordCityNews(const Stats& s)
     score += highFrac * 1.6f;
     if (fireWorstDistrictRisk > 0.75f) score += 0.35f;
     add(NewsKind::FireRisk, score);
+  }
+
+  // Air quality advisory (derived from the air pollution layer).
+  if (airExp.population > 0) {
+    const float avg = Clamp01(airExp.avg01);
+    const float high = Clamp01(airExp.highFrac);
+    if (avg > 0.52f || high > 0.18f) {
+      float score = 0.80f + (avg - 0.52f) * 3.0f + high * 2.2f;
+      score += Clamp01(static_cast<float>(airExp.population) / 1200.0f) * 0.35f;
+      if (airExp.worstAvg01 > 0.72f) score += 0.35f;
+      add(NewsKind::AirPollution, score);
+    } else if (avg > 0.44f && high > 0.10f) {
+      const float score = 0.55f + (avg - 0.44f) * 2.5f + high * 1.6f;
+      add(NewsKind::AirPollution, score);
+    }
+  }
+
+  // Runoff / stormwater pollution advisory.
+  if (runoffExp.population > 0) {
+    const float avg = Clamp01(runoffExp.avg01);
+    const float high = Clamp01(runoffExp.highFrac);
+    if (avg > 0.52f || high > 0.18f) {
+      float score = 0.75f + (avg - 0.52f) * 2.8f + high * 2.0f;
+      score += Clamp01(static_cast<float>(runoffExp.population) / 1200.0f) * 0.30f;
+      if (runoffExp.worstAvg01 > 0.72f) score += 0.30f;
+      add(NewsKind::RunoffPollution, score);
+    } else if (avg > 0.44f && high > 0.10f) {
+      const float score = 0.50f + (avg - 0.44f) * 2.2f + high * 1.4f;
+      add(NewsKind::RunoffPollution, score);
+    }
   }
 
   // Services / goods.
@@ -8463,6 +8837,61 @@ void Game::recordCityNews(const Stats& s)
         "Tip: press L until 'Fire risk' appears, then add/upgrade Fire Stations near dense industrial/commercial blocks. "
         "Roads and parks can act as simple firebreaks.",
         avgPct, m_fireRisk.highRiskZones, stations, fireWorstDistrict, worstPct);
+      appendMayorLine();
+    } break;
+
+    case NewsKind::AirPollution: {
+      const int avgPct = Pct100(airExp.avg01);
+      const int worstPct = Pct100(airExp.worstAvg01);
+      const int highPct = static_cast<int>(std::round(static_cast<double>(Clamp01(airExp.highFrac)) * 100.0));
+
+      if (avgPct >= 65 || highPct >= 25) e.tone = CityNewsTone::Alert;
+      else e.tone = CityNewsTone::Bad;
+
+      const int pick = static_cast<int>(rng.rangeU32(3));
+      if (pick == 0) {
+        e.headline = TextFormat("Air quality advisory: District %d under watch", airExp.worstDistrict);
+      } else if (pick == 1) {
+        e.headline = TextFormat("Smog concerns rise (%d%% residential exposure)", avgPct);
+      } else {
+        e.headline = "Residents call for cleaner air";
+      }
+
+      WindDir wdir = m_airPollution.cfg.windFromSeed ? InferWindDirFromSeed(m_world.seed()) : m_airPollution.cfg.fixedWindDir;
+      const char* windName = WindDirName(wdir);
+
+      e.body = TextFormat(
+        "Residential exposure (avg): %d%% | High exposure: %d residents (%d%%)\n"
+        "Worst district: %d (%d%%) | Wind: %s\n"
+        "Tip: press L until 'Air pollution' / 'Air emission' appears. Add parks/water buffers near busy roads, keep heavy industry away from housing, and reduce congestion with better connections or Ctrl+U upgrades.",
+        avgPct, airExp.highPopulation, highPct,
+        airExp.worstDistrict, worstPct, windName);
+      appendMayorLine();
+    } break;
+
+    case NewsKind::RunoffPollution: {
+      const int avgPct = Pct100(runoffExp.avg01);
+      const int worstPct = Pct100(runoffExp.worstAvg01);
+      const int highPct = static_cast<int>(std::round(static_cast<double>(Clamp01(runoffExp.highFrac)) * 100.0));
+
+      if (avgPct >= 65 || highPct >= 25) e.tone = CityNewsTone::Alert;
+      else e.tone = CityNewsTone::Bad;
+
+      const int pick = static_cast<int>(rng.rangeU32(3));
+      if (pick == 0) {
+        e.headline = TextFormat("Stormwater warning: District %d flagged", runoffExp.worstDistrict);
+      } else if (pick == 1) {
+        e.headline = TextFormat("Runoff pollution rising (%d%% residential exposure)", avgPct);
+      } else {
+        e.headline = "Creeks run dirty after storms";
+      }
+
+      e.body = TextFormat(
+        "Residential runoff exposure (avg): %d%% | High exposure: %d residents (%d%%)\n"
+        "Worst district: %d (%d%%)\n"
+        "Tip: press L until 'Runoff pollution' or 'Mitigation plan' appears. Parks and grass filter runoff; prioritize green buffers downhill from roads and industry.",
+        avgPct, runoffExp.highPopulation, highPct,
+        runoffExp.worstDistrict, worstPct);
       appendMayorLine();
     } break;
 
@@ -10074,6 +10503,7 @@ void Game::endPaintStroke()
   m_fireRiskDirty = true;
   m_servicesPlanDirty = true;
   m_servicesPlanValid = false;
+  invalidateAnalysisLayers();
 
   // Street naming + address geocoding depend on roads/parcels; invalidate them and clear any
   // existing navigation route so we never render stale turn-by-turn guidance.
@@ -10200,6 +10630,7 @@ bool Game::stampBlueprintAt(const Point& anchorTile)
   m_goodsDirty = true;
   m_landValueDirty = true;
   invalidateHydrology();
+  invalidateAnalysisLayers();
   m_vehiclesDirty = true;
 
   endPaintStroke();
@@ -11360,6 +11791,7 @@ void Game::ensureTransitPlanUpToDate()
       const std::vector<std::uint8_t>* pre = (tc.requireOutsideConnection ? roadToEdgeMask : nullptr);
       m_traffic = ComputeCommuteTraffic(m_world, tc, share, pre);
       m_trafficDirty = false;
+      m_carbonDirty = true;
     }
   }
 
@@ -11380,6 +11812,9 @@ void Game::ensureTransitPlanUpToDate()
       const std::vector<std::uint8_t>* pre = (gc.requireOutsideConnection ? roadToEdgeMask : nullptr);
       m_goods = ComputeGoodsFlow(m_world, gc, pre);
       m_goodsDirty = false;
+      m_carbonDirty = true;
+      m_carbonDirty = true;
+      m_carbonDirty = true;
     }
   }
 
@@ -11867,6 +12302,7 @@ bool Game::applyServicePlacement(std::size_t idx)
   m_servicesHeatmapsDirty = true;
   m_servicesPlanDirty = true;
   m_servicesPlanValid = false;
+  invalidateAnalysisLayers();
 
   m_wayfindingDirty = true;
   clearWayfindingRoute();
@@ -13427,6 +13863,7 @@ void Game::ensureRoadUpgradePlanUpToDate()
       const std::vector<std::uint8_t>* pre = (tc.requireOutsideConnection ? roadToEdgeMask : nullptr);
       m_traffic = ComputeCommuteTraffic(m_world, tc, employedShare, pre);
       m_trafficDirty = false;
+      m_carbonDirty = true;
     }
   }
 
@@ -13446,6 +13883,7 @@ void Game::ensureRoadUpgradePlanUpToDate()
       const std::vector<std::uint8_t>* pre = (gc.requireOutsideConnection ? roadToEdgeMask : nullptr);
       m_goods = ComputeGoodsFlow(m_world, gc, pre);
       m_goodsDirty = false;
+      m_carbonDirty = true;
     }
   }
 
@@ -14754,6 +15192,7 @@ void Game::resetWorld(std::uint64_t newSeed)
   m_transitVizDirty = true;
   m_evacDirty = true;
   invalidateHydrology();
+  invalidateAnalysisLayers();
   m_vehiclesDirty = true;
   m_vehicles.clear();
 
@@ -16171,6 +16610,7 @@ void Game::handleInput(float dt)
     m_evacDirty = true;
     m_roadUpgradePlanDirty = true;
     m_roadUpgradeSelectedMaskDirty = true;
+    invalidateAnalysisLayers();
     showToast("Sim step");
   }
 
@@ -16569,6 +17009,7 @@ void Game::handleInput(float dt)
 
       m_traffic = ComputeCommuteTraffic(m_world, tc, share, pre);
       m_trafficDirty = false;
+      m_carbonDirty = true;
 
       showToast(TextFormat(
           "Traffic overlay: ON (%d commuters, avg %.1f (t %.1f), cong %.0f%%, %s x%d)", m_traffic.totalCommuters,
@@ -16611,6 +17052,7 @@ void Game::handleInput(float dt)
 
       m_goods = ComputeGoodsFlow(m_world, gc, pre);
       m_goodsDirty = false;
+      m_carbonDirty = true;
 
       showToast(TextFormat("Goods overlay: ON (deliv %d/%d, sat %.0f%%, imp %d, exp %d)",
                            m_goods.goodsDelivered, m_goods.goodsDemand,
@@ -16627,9 +17069,9 @@ void Game::handleInput(float dt)
     showToast(m_showResiliencePanel ? "Resilience panel: ON" : "Resilience panel: OFF");
   }
 
-  // Heatmap overlay: cycle through land value + components.
+  // Heatmap overlay: cycle through all built-in and analysis heatmaps.
   if (IsKeyPressed(KEY_L)) {
-    auto nameOf = [&](HeatmapOverlay m) -> const char* {
+    auto labelOf = [&](HeatmapOverlay m) -> const char* {
       switch (m) {
       case HeatmapOverlay::Off: return "OFF";
       case HeatmapOverlay::LandValue: return "Land value";
@@ -16647,66 +17089,147 @@ void Game::handleInput(float dt)
       case HeatmapOverlay::EvacuationTime: return "Evac time";
       case HeatmapOverlay::EvacuationUnreachable: return "Evac unreachable";
       case HeatmapOverlay::EvacuationFlow: return "Evac flow";
+
+      case HeatmapOverlay::AirPollution: return "Air pollution";
+      case HeatmapOverlay::AirPollutionEmission: return "Air emission";
+      case HeatmapOverlay::SkyView: return "Sky view";
+      case HeatmapOverlay::CanyonConfinement: return "Canyon confinement";
+      case HeatmapOverlay::SolarExposure: return "Solar exposure";
+      case HeatmapOverlay::SolarPotential: return "Solar potential";
+      case HeatmapOverlay::EnergyDemand: return "Energy demand";
+      case HeatmapOverlay::EnergySolar: return "Rooftop solar";
+      case HeatmapOverlay::EnergyBalance: return "Energy balance";
+      case HeatmapOverlay::CarbonEmission: return "Carbon emission";
+      case HeatmapOverlay::CarbonSequestration: return "Carbon sequestration";
+      case HeatmapOverlay::CarbonBalance: return "Carbon balance";
+
+      case HeatmapOverlay::CrimeRisk: return "Crime risk";
+      case HeatmapOverlay::PoliceAccess: return "Police access";
+
+      case HeatmapOverlay::TrafficCrashRisk: return "Traffic crash risk";
+      case HeatmapOverlay::TrafficCrashExposure: return "Traffic crash exposure";
+      case HeatmapOverlay::TrafficCrashPriority: return "Traffic crash priority";
+
+      case HeatmapOverlay::TransitAccess: return "Transit access";
+      case HeatmapOverlay::TransitModeSharePotential: return "Transit mode share";
+
+      case HeatmapOverlay::Walkability: return "Walkability";
+      case HeatmapOverlay::WalkabilityPark: return "Walkability (parks)";
+      case HeatmapOverlay::WalkabilityRetail: return "Walkability (retail)";
+      case HeatmapOverlay::WalkabilityEducation: return "Walkability (education)";
+      case HeatmapOverlay::WalkabilityHealth: return "Walkability (health)";
+      case HeatmapOverlay::WalkabilitySafety: return "Walkability (safety)";
+
+      case HeatmapOverlay::JobAccess: return "Job access";
+      case HeatmapOverlay::JobOpportunity: return "Job opportunity";
+
+      case HeatmapOverlay::RoadCentrality: return "Road centrality";
+      case HeatmapOverlay::RoadVulnerability: return "Road vulnerability";
+      case HeatmapOverlay::RoadBypass: return "Road bypass plan";
+
+      case HeatmapOverlay::Livability: return "Livability";
+      case HeatmapOverlay::InterventionPriority: return "Intervention priority";
+      case HeatmapOverlay::LivabilityHotspot: return "Livability hotspot";
+      case HeatmapOverlay::InterventionHotspot: return "Priority hotspot";
+
+      case HeatmapOverlay::RunoffPollution: return "Runoff pollution";
+      case HeatmapOverlay::RunoffPollutionLoad: return "Runoff load";
+      case HeatmapOverlay::RunoffMitigationPriority: return "Mitigation priority";
+      case HeatmapOverlay::RunoffMitigationPlan: return "Mitigation plan";
       default: return "Heatmap";
       }
     };
 
-    auto toIndex = [&](HeatmapOverlay m) -> int {
-      switch (m) {
-      case HeatmapOverlay::Off: return 0;
-      case HeatmapOverlay::LandValue: return 1;
-      case HeatmapOverlay::ParkAmenity: return 2;
-      case HeatmapOverlay::WaterAmenity: return 3;
-      case HeatmapOverlay::Pollution: return 4;
-      case HeatmapOverlay::TrafficSpill: return 5;
-      case HeatmapOverlay::ServicesOverall: return 6;
-      case HeatmapOverlay::ServicesEducation: return 7;
-      case HeatmapOverlay::ServicesHealth: return 8;
-      case HeatmapOverlay::ServicesSafety: return 9;
-      case HeatmapOverlay::FireRisk: return 10;
-      case HeatmapOverlay::FloodDepth: return 11;
-      case HeatmapOverlay::PondingDepth: return 12;
-      case HeatmapOverlay::EvacuationTime: return 13;
-      case HeatmapOverlay::EvacuationUnreachable: return 14;
-      case HeatmapOverlay::EvacuationFlow: return 15;
-      default: return 0;
-      }
+    static constexpr HeatmapOverlay kCycle[] = {
+        HeatmapOverlay::Off,
+        HeatmapOverlay::LandValue,
+        HeatmapOverlay::ParkAmenity,
+        HeatmapOverlay::WaterAmenity,
+        HeatmapOverlay::Pollution,
+        HeatmapOverlay::TrafficSpill,
+        HeatmapOverlay::ServicesOverall,
+        HeatmapOverlay::ServicesEducation,
+        HeatmapOverlay::ServicesHealth,
+        HeatmapOverlay::ServicesSafety,
+        HeatmapOverlay::FireRisk,
+        HeatmapOverlay::FloodDepth,
+        HeatmapOverlay::PondingDepth,
+        HeatmapOverlay::EvacuationTime,
+        HeatmapOverlay::EvacuationUnreachable,
+        HeatmapOverlay::EvacuationFlow,
+
+        HeatmapOverlay::AirPollution,
+        HeatmapOverlay::AirPollutionEmission,
+        HeatmapOverlay::SkyView,
+        HeatmapOverlay::CanyonConfinement,
+        HeatmapOverlay::SolarExposure,
+        HeatmapOverlay::SolarPotential,
+        HeatmapOverlay::EnergyDemand,
+        HeatmapOverlay::EnergySolar,
+        HeatmapOverlay::EnergyBalance,
+
+        HeatmapOverlay::CarbonEmission,
+        HeatmapOverlay::CarbonSequestration,
+        HeatmapOverlay::CarbonBalance,
+
+        HeatmapOverlay::CrimeRisk,
+        HeatmapOverlay::PoliceAccess,
+
+        HeatmapOverlay::TrafficCrashRisk,
+        HeatmapOverlay::TrafficCrashExposure,
+        HeatmapOverlay::TrafficCrashPriority,
+
+        HeatmapOverlay::TransitAccess,
+        HeatmapOverlay::TransitModeSharePotential,
+
+        HeatmapOverlay::Walkability,
+        HeatmapOverlay::WalkabilityPark,
+        HeatmapOverlay::WalkabilityRetail,
+        HeatmapOverlay::WalkabilityEducation,
+        HeatmapOverlay::WalkabilityHealth,
+        HeatmapOverlay::WalkabilitySafety,
+
+        HeatmapOverlay::JobAccess,
+        HeatmapOverlay::JobOpportunity,
+
+        HeatmapOverlay::RoadCentrality,
+        HeatmapOverlay::RoadVulnerability,
+        HeatmapOverlay::RoadBypass,
+
+        HeatmapOverlay::Livability,
+        HeatmapOverlay::InterventionPriority,
+        HeatmapOverlay::LivabilityHotspot,
+        HeatmapOverlay::InterventionHotspot,
+
+        HeatmapOverlay::RunoffPollution,
+        HeatmapOverlay::RunoffPollutionLoad,
+        HeatmapOverlay::RunoffMitigationPriority,
+        HeatmapOverlay::RunoffMitigationPlan,
     };
 
-    auto fromIndex = [&](int i) -> HeatmapOverlay {
-      switch (i) {
-      case 0: return HeatmapOverlay::Off;
-      case 1: return HeatmapOverlay::LandValue;
-      case 2: return HeatmapOverlay::ParkAmenity;
-      case 3: return HeatmapOverlay::WaterAmenity;
-      case 4: return HeatmapOverlay::Pollution;
-      case 5: return HeatmapOverlay::TrafficSpill;
-      case 6: return HeatmapOverlay::ServicesOverall;
-      case 7: return HeatmapOverlay::ServicesEducation;
-      case 8: return HeatmapOverlay::ServicesHealth;
-      case 9: return HeatmapOverlay::ServicesSafety;
-      case 10: return HeatmapOverlay::FireRisk;
-      case 11: return HeatmapOverlay::FloodDepth;
-      case 12: return HeatmapOverlay::PondingDepth;
-      case 13: return HeatmapOverlay::EvacuationTime;
-      case 14: return HeatmapOverlay::EvacuationUnreachable;
-      case 15: return HeatmapOverlay::EvacuationFlow;
-      default: return HeatmapOverlay::Off;
+    constexpr int count = static_cast<int>(sizeof(kCycle) / sizeof(kCycle[0]));
+    int idx = 0;
+    for (int i = 0; i < count; ++i) {
+      if (kCycle[i] == m_heatmapOverlay) {
+        idx = i;
+        break;
       }
-    };
+    }
 
-    const int count = 16;
     const int delta = shift ? -1 : 1;
-    int idx = toIndex(m_heatmapOverlay);
     idx = (idx + delta + count) % count;
-    m_heatmapOverlay = fromIndex(idx);
+    m_heatmapOverlay = kCycle[idx];
 
+    // Mark derived fields dirty (they will be recomputed on demand).
     m_landValueDirty = true;
     m_servicesHeatmapsDirty = true;
     m_fireRiskDirty = true;
     invalidateHydrology();
-    showToast(TextFormat("Heatmap: %s", nameOf(m_heatmapOverlay)));
+    invalidateAnalysisLayers();
+
+    showToast(TextFormat("Heatmap: %s", labelOf(m_heatmapOverlay)));
   }
+
 
 // Brush radius
   if (IsKeyPressed(KEY_LEFT_BRACKET)) {
@@ -17970,6 +18493,15 @@ void Game::update(float dt)
         m_fireRiskTimer = kFireRiskUpdateInterval;
       }
 
+      // Advanced analysis layers (air/solar/walkability/livability/runoff/etc) can be expensive.
+      // Refresh them periodically while the sim runs so heatmap previews stay reasonably current.
+      m_analysisHeatmapsTimer += dt;
+      constexpr float kAnalysisUpdateInterval = 1.25f;
+      if (m_analysisHeatmapsTimer >= kAnalysisUpdateInterval) {
+        invalidateAnalysisLayers();
+        m_analysisHeatmapsTimer = kAnalysisUpdateInterval;
+      }
+
       // Keep the software 3D preview in sync with sim-driven changes.
       m_3dPreviewDirty = true;
 
@@ -18992,14 +19524,123 @@ void Game::draw()
   }
 
   const bool heatmapActive = (m_heatmapOverlay != HeatmapOverlay::Off);
-  const bool heatmapUsesLandValue = heatmapActive && (m_heatmapOverlay != HeatmapOverlay::FloodDepth) && (m_heatmapOverlay != HeatmapOverlay::PondingDepth) && (m_heatmapOverlay != HeatmapOverlay::EvacuationTime) && (m_heatmapOverlay != HeatmapOverlay::EvacuationUnreachable) && (m_heatmapOverlay != HeatmapOverlay::EvacuationFlow);
+
+  auto isLandValueHeatmap = [](HeatmapOverlay h) -> bool {
+    return (h == HeatmapOverlay::LandValue) ||
+           (h == HeatmapOverlay::ParkAmenity) ||
+           (h == HeatmapOverlay::WaterAmenity) ||
+           (h == HeatmapOverlay::Pollution) ||
+           (h == HeatmapOverlay::TrafficSpill);
+  };
+
+  const bool landValueHeatmapActive = heatmapActive && isLandValueHeatmap(m_heatmapOverlay);
+  const bool servicesHeatmapActive =
+      heatmapActive && (m_heatmapOverlay == HeatmapOverlay::ServicesOverall ||
+                        m_heatmapOverlay == HeatmapOverlay::ServicesEducation ||
+                        m_heatmapOverlay == HeatmapOverlay::ServicesHealth ||
+                        m_heatmapOverlay == HeatmapOverlay::ServicesSafety);
+
+  const bool airHeatmapActive =
+      heatmapActive && (m_heatmapOverlay == HeatmapOverlay::AirPollution ||
+                        m_heatmapOverlay == HeatmapOverlay::AirPollutionEmission);
+
+  const bool skyViewHeatmapActive =
+      heatmapActive && (m_heatmapOverlay == HeatmapOverlay::SkyView ||
+                        m_heatmapOverlay == HeatmapOverlay::CanyonConfinement);
+
+  const bool solarHeatmapActive =
+      heatmapActive && (m_heatmapOverlay == HeatmapOverlay::SolarExposure ||
+                        m_heatmapOverlay == HeatmapOverlay::SolarPotential ||
+                        m_heatmapOverlay == HeatmapOverlay::EnergyDemand ||
+                        m_heatmapOverlay == HeatmapOverlay::EnergySolar ||
+                        m_heatmapOverlay == HeatmapOverlay::EnergyBalance ||
+                        m_heatmapOverlay == HeatmapOverlay::CarbonEmission ||
+                        m_heatmapOverlay == HeatmapOverlay::CarbonSequestration ||
+                        m_heatmapOverlay == HeatmapOverlay::CarbonBalance);
+
+  const bool energyHeatmapActive =
+      heatmapActive && (m_heatmapOverlay == HeatmapOverlay::EnergyDemand ||
+                        m_heatmapOverlay == HeatmapOverlay::EnergySolar ||
+                        m_heatmapOverlay == HeatmapOverlay::EnergyBalance ||
+                        m_heatmapOverlay == HeatmapOverlay::CarbonEmission ||
+                        m_heatmapOverlay == HeatmapOverlay::CarbonSequestration ||
+                        m_heatmapOverlay == HeatmapOverlay::CarbonBalance);
+
+  const bool carbonHeatmapActive =
+      heatmapActive && (m_heatmapOverlay == HeatmapOverlay::CarbonEmission ||
+                        m_heatmapOverlay == HeatmapOverlay::CarbonSequestration ||
+                        m_heatmapOverlay == HeatmapOverlay::CarbonBalance);
+
+  const bool crimeHeatmapActive =
+      heatmapActive && (m_heatmapOverlay == HeatmapOverlay::CrimeRisk ||
+                        m_heatmapOverlay == HeatmapOverlay::PoliceAccess);
+
+  const bool trafficSafetyHeatmapActive =
+      heatmapActive && (m_heatmapOverlay == HeatmapOverlay::TrafficCrashRisk ||
+                        m_heatmapOverlay == HeatmapOverlay::TrafficCrashExposure ||
+                        m_heatmapOverlay == HeatmapOverlay::TrafficCrashPriority);
+
+  const bool needSkyViewResult = skyViewHeatmapActive || trafficSafetyHeatmapActive;
+
+  const bool transitHeatmapActive =
+      heatmapActive && (m_heatmapOverlay == HeatmapOverlay::TransitAccess ||
+                        m_heatmapOverlay == HeatmapOverlay::TransitModeSharePotential);
+
+  const bool walkHeatmapActive =
+      heatmapActive && (m_heatmapOverlay == HeatmapOverlay::Walkability ||
+                        m_heatmapOverlay == HeatmapOverlay::WalkabilityPark ||
+                        m_heatmapOverlay == HeatmapOverlay::WalkabilityRetail ||
+                        m_heatmapOverlay == HeatmapOverlay::WalkabilityEducation ||
+                        m_heatmapOverlay == HeatmapOverlay::WalkabilityHealth ||
+                        m_heatmapOverlay == HeatmapOverlay::WalkabilitySafety);
+
+  const bool jobsHeatmapActive =
+      heatmapActive && (m_heatmapOverlay == HeatmapOverlay::JobAccess ||
+                        m_heatmapOverlay == HeatmapOverlay::JobOpportunity);
+
+  const bool jobsNeeded = jobsHeatmapActive || crimeHeatmapActive;
+
+  const bool roadHealthHeatmapActive =
+      heatmapActive && (m_heatmapOverlay == HeatmapOverlay::RoadCentrality ||
+                        m_heatmapOverlay == HeatmapOverlay::RoadVulnerability ||
+                        m_heatmapOverlay == HeatmapOverlay::RoadBypass);
+
+  const bool livabilityHeatmapActive =
+      heatmapActive && (m_heatmapOverlay == HeatmapOverlay::Livability ||
+                        m_heatmapOverlay == HeatmapOverlay::InterventionPriority);
+
+  const bool hotspotHeatmapActive =
+      heatmapActive && (m_heatmapOverlay == HeatmapOverlay::LivabilityHotspot ||
+                        m_heatmapOverlay == HeatmapOverlay::InterventionHotspot);
+
+  const bool runoffHeatmapActive =
+      heatmapActive && (m_heatmapOverlay == HeatmapOverlay::RunoffPollution ||
+                        m_heatmapOverlay == HeatmapOverlay::RunoffPollutionLoad);
+
+  const bool runoffMitigationHeatmapActive =
+      heatmapActive && (m_heatmapOverlay == HeatmapOverlay::RunoffMitigationPriority ||
+                        m_heatmapOverlay == HeatmapOverlay::RunoffMitigationPlan);
+
   const bool districtStatsActive = m_showDistrictPanel || (m_showReport && m_reportPage == 4);
 
   // Many derived systems need the "road component touches map edge" mask.
   // This should be computed regardless of whether the connectivity overlay is *drawn*.
   const bool requireOutside = m_sim.config().requireOutsideConnection;
-  const bool needRoadToEdgeMask = requireOutside &&
-                                (m_showOutsideOverlay || m_showTrafficOverlay || m_showGoodsOverlay || heatmapUsesLandValue || districtStatsActive);
+
+  // Traffic/goods are used by multiple overlays and analysis layers.
+  const bool needTrafficResult =
+      (m_showTrafficOverlay || districtStatsActive || landValueHeatmapActive ||
+       airHeatmapActive || runoffHeatmapActive || runoffMitigationHeatmapActive ||
+       jobsNeeded || crimeHeatmapActive || trafficSafetyHeatmapActive || roadHealthHeatmapActive ||
+       livabilityHeatmapActive || transitHeatmapActive || carbonHeatmapActive);
+
+  const bool needGoodsResult = (m_showGoodsOverlay || airHeatmapActive || livabilityHeatmapActive ||
+                                transitHeatmapActive || carbonHeatmapActive || crimeHeatmapActive);
+
+  const bool needRoadToEdgeMask =
+      requireOutside &&
+      (m_showOutsideOverlay || needTrafficResult || needGoodsResult || walkHeatmapActive || districtStatsActive ||
+       transitHeatmapActive);
 
   const std::vector<std::uint8_t>* roadToEdgeMask = nullptr;
   if (needRoadToEdgeMask) {
@@ -19010,8 +19651,6 @@ void Game::draw()
   // Only pass the mask to the renderer if the user wants the overlay.
   const std::vector<std::uint8_t>* outsideMask = m_showOutsideOverlay ? roadToEdgeMask : nullptr;
 
-  // Traffic is used by both the explicit traffic overlay and the land value heatmap.
-  const bool needTrafficResult = (m_showTrafficOverlay || heatmapUsesLandValue || districtStatsActive);
   if (needTrafficResult && m_trafficDirty) {
     const float share = (m_world.stats().population > 0)
                             ? (static_cast<float>(m_world.stats().employed) /
@@ -19036,6 +19675,10 @@ void Game::draw()
     const std::vector<std::uint8_t>* pre = (tc.requireOutsideConnection ? roadToEdgeMask : nullptr);
     m_traffic = ComputeCommuteTraffic(m_world, tc, share, pre);
     m_trafficDirty = false;
+    m_carbonDirty = true;
+    m_crimeDirty = true;
+    // Job accessibility depends on congestion costs when available.
+    m_jobsDirty = true;
   }
 
   const std::vector<std::uint16_t>* trafficMask = nullptr;
@@ -19048,7 +19691,7 @@ void Game::draw()
   const std::vector<std::uint16_t>* goodsTrafficMask = nullptr;
   int goodsMax = 0;
   const std::vector<std::uint8_t>* commercialGoodsFill = nullptr;
-  if (m_showGoodsOverlay) {
+  if (needGoodsResult) {
     if (m_goodsDirty) {
       GoodsConfig gc;
       gc.requireOutsideConnection = requireOutside;
@@ -19065,15 +19708,19 @@ void Game::draw()
       const std::vector<std::uint8_t>* pre = (gc.requireOutsideConnection ? roadToEdgeMask : nullptr);
       m_goods = ComputeGoodsFlow(m_world, gc, pre);
       m_goodsDirty = false;
+      m_carbonDirty = true;
+      m_crimeDirty = true;
     }
+  }
 
+  if (m_showGoodsOverlay) {
     goodsTrafficMask = &m_goods.roadGoodsTraffic;
     goodsMax = m_goods.maxRoadGoodsTraffic;
     commercialGoodsFill = &m_goods.commercialFill;
   }
 
   // --- Land value (heatmap + district stats) ---
-  const bool needLandValueResult = heatmapUsesLandValue || districtStatsActive;
+  const bool needLandValueResult = landValueHeatmapActive || districtStatsActive;
   if (needLandValueResult) {
     if (m_landValueDirty ||
         m_landValue.value.size() != static_cast<std::size_t>(std::max(0, m_world.width()) * std::max(0, m_world.height()))) {
@@ -19168,6 +19815,270 @@ void Game::draw()
   const char* heatmapName = nullptr;
 
   if (heatmapActive) {
+    const int w = m_world.width();
+    const int h = m_world.height();
+    const std::size_t n = static_cast<std::size_t>(std::max(0, w) * std::max(0, h));
+
+    auto ensureAirPollutionUpToDate = [&]() {
+      if (!airHeatmapActive) return;
+      if (!m_airPollutionDirty && m_airPollution.w == w && m_airPollution.h == h &&
+          m_airPollution.pollution01.size() == n && m_airPollution.emission01.size() == n) {
+        return;
+      }
+      const TrafficResult* tr = needTrafficResult ? &m_traffic : nullptr;
+      const GoodsResult* gr = needGoodsResult ? &m_goods : nullptr;
+      m_airPollution = ComputeAirPollution(m_world, m_airPollutionCfg, tr, gr);
+      m_airPollutionDirty = false;
+    };
+
+    auto ensureSkyViewUpToDate = [&]() {
+      if (!needSkyViewResult) return;
+      if (!m_skyViewDirty && m_skyView.w == w && m_skyView.h == h &&
+          m_skyView.skyView01.size() == n && m_skyView.canyon01.size() == n) {
+        return;
+      }
+
+      // Defaults tuned for an inexpensive but stable horizon scan.
+      m_skyViewCfg.azimuthSamples = 16;
+      m_skyViewCfg.maxHorizonRadius = 64;
+      m_skyViewCfg.includeBuildings = true;
+      m_skyView = ComputeSkyViewFactor(m_world, m_skyViewCfg);
+      m_skyViewDirty = false;
+    };
+
+    auto ensureSolarUpToDate = [&]() {
+      if (!solarHeatmapActive) return;
+      if (!m_solarDirty && m_solar.w == w && m_solar.h == h &&
+          m_solar.potential01.size() == n && m_solar.exposure01.size() == n) {
+        return;
+      }
+      m_solar = ComputeSolarPotential(m_world, m_solarCfg);
+      m_solarDirty = false;
+      m_energyDirty = true;
+      m_carbonDirty = true;
+    };
+
+    auto ensureEnergyUpToDate = [&]() {
+      if (!energyHeatmapActive) {
+        return;
+      }
+      if (!m_energyDirty && m_energy.w == w && m_energy.h == h &&
+          m_energy.demand01.size() == n && m_energy.solar01.size() == n &&
+          m_energy.balance01.size() == n) {
+        return;
+      }
+
+      // Energy uses solar supply; reuse the cached solar layer and keep this cheap in-game by
+      // skipping the heat island cooling adjustment (the dossier export includes it).
+      ensureSolarUpToDate();
+
+      EnergyModelConfig ec = m_energyCfg;
+      ec.useHeatIslandCooling = false;
+
+      m_energy = ComputeEnergyModel(m_world, ec, &m_solar, nullptr);
+      m_energyDirty = false;
+      m_carbonDirty = true;
+    };
+
+
+
+    auto ensureCarbonUpToDate = [&]() {
+      if (!carbonHeatmapActive) {
+        return;
+      }
+
+      ensureEnergyUpToDate();
+
+      const int w = m_world.w;
+      const int h = m_world.h;
+      const int n = w * h;
+      const bool sizeOk = (m_carbon.w == w && m_carbon.h == h &&
+                           static_cast<int>(m_carbon.balance01.size()) == n);
+      if (!m_carbonDirty && sizeOk) {
+        return;
+      }
+
+      const TrafficResult* tr = needTrafficResult ? &m_traffic : nullptr;
+      const GoodsResult* gr = needGoodsResult ? &m_goods : nullptr;
+
+      m_carbon = ComputeCarbonModel(m_world, m_carbonCfg, &m_energy, tr, gr);
+      m_carbonDirty = false;
+    };
+    auto ensureTransitAccessUpToDate = [&]() {
+      if (!transitHeatmapActive) {
+        return;
+      }
+
+      // Transit access depends on the planner outputs. If the plan changes, we must recompute.
+      const bool planWasDirty = m_transitPlanDirty;
+      ensureTransitPlanUpToDate();
+
+      if (!m_transitAccessDirty && !planWasDirty && m_transitAccess.w == w && m_transitAccess.h == h &&
+          m_transitAccess.access01.size() == n && m_transitAccess.modeSharePotential01.size() == n) {
+        return;
+      }
+
+      TransitAccessibilityConfig tc = m_transitAccessCfg;
+      tc.requireOutsideConnection = requireOutside;
+
+      const TransitModelSettings& tm = m_sim.transitModel();
+      tc.demandMode = tm.demandMode;
+      tc.walkRadiusSteps = tm.walkRadiusSteps;
+      tc.stopSpacingTiles = tm.stopSpacingTiles;
+      tc.serviceLevel = tm.serviceLevel;
+      tc.maxModeShare = tm.maxModeShare;
+      tc.travelTimeMultiplier = tm.travelTimeMultiplier;
+      tc.plannerCfg = tm.plannerCfg;
+
+      TransitAccessibilityInputs in;
+      in.traffic = needTrafficResult ? &m_traffic : nullptr;
+      in.goods = needGoodsResult ? &m_goods : nullptr;
+      in.roadGraph = &m_roadGraph;
+      in.plan = &m_transitPlan;
+      in.roadToEdgeMask = (tc.requireOutsideConnection ? roadToEdgeMask : nullptr);
+
+      m_transitAccess = ComputeTransitAccessibility(m_world, tc, in);
+      m_transitAccessDirty = false;
+    };
+
+    auto ensureWalkabilityUpToDate = [&]() {
+      if (!walkHeatmapActive) return;
+      if (!m_walkabilityDirty && m_walkability.w == w && m_walkability.h == h &&
+          m_walkability.overall01.size() == n) {
+        return;
+      }
+      WalkabilityConfig wc = m_walkabilityCfg;
+      wc.requireOutsideConnection = requireOutside;
+      m_walkability = ComputeWalkability(m_world, wc, roadToEdgeMask, /*precomputedZoneAccess=*/nullptr);
+      m_walkabilityDirty = false;
+    };
+
+    auto ensureJobsUpToDate = [&]() {
+      if (!jobsNeeded) return;
+      if (!m_jobsDirty && m_jobs.w == w && m_jobs.h == h &&
+          m_jobs.jobAccess01.size() == n && m_jobs.jobOpportunity01.size() == n) {
+        return;
+      }
+      JobOpportunityConfig jc = m_jobsCfg;
+      jc.requireOutsideConnection = requireOutside;
+
+      const TrafficResult* tr = needTrafficResult ? &m_traffic : nullptr;
+      const std::vector<std::uint8_t>* pre = (jc.requireOutsideConnection ? roadToEdgeMask : nullptr);
+
+      m_jobs = ComputeJobOpportunity(m_world, jc, tr, pre, /*precomputedZoneAccess=*/nullptr);
+      m_jobsDirty = false;
+      m_crimeDirty = true;
+    };
+
+    auto ensureCrimeUpToDate = [&]() {
+      if (!crimeHeatmapActive) return;
+
+      // Crime depends on job accessibility and road connectivity.
+      ensureJobsUpToDate();
+
+      if (!m_crimeDirty && m_crime.w == w && m_crime.h == h &&
+          m_crime.risk01.size() == n && m_crime.policeAccess01.size() == n &&
+          m_crime.policeCostMilli.size() == n) {
+        return;
+      }
+
+      const TrafficResult* tr = needTrafficResult ? &m_traffic : nullptr;
+      const GoodsResult* gr = needGoodsResult ? &m_goods : nullptr;
+
+      NoiseConfig nc{};
+      const NoiseResult noise = ComputeNoisePollution(m_world, nc, tr, gr);
+
+      CrimeModelConfig cc = m_crimeCfg;
+      cc.requireOutsideConnection = requireOutside;
+      cc.weightMode = IsochroneWeightMode::TravelTime;
+
+      const std::vector<std::uint8_t>* pre = (cc.requireOutsideConnection ? roadToEdgeMask : nullptr);
+      m_crime = ComputeCrimeModel(m_world, cc, tr, gr, &m_jobs, &noise, pre, /*precomputedZoneAccess=*/nullptr);
+      m_crimeDirty = false;
+    };
+
+    auto ensureTrafficSafetyUpToDate = [&]() {
+      if (!trafficSafetyHeatmapActive) return;
+      if (!m_trafficSafetyDirty && m_trafficSafety.w == w && m_trafficSafety.h == h &&
+          m_trafficSafety.risk01.size() == n && m_trafficSafety.exposure01.size() == n &&
+          m_trafficSafety.priority01.size() == n) {
+        return;
+      }
+
+      // Canyon confinement leverages sky view (urban canyons) where available.
+      ensureSkyViewUpToDate();
+
+      TrafficSafetyConfig tc = m_trafficSafetyCfg;
+      tc.requireOutsideConnection = requireOutside;
+
+      const TrafficResult* tr = needTrafficResult ? &m_traffic : nullptr;
+      const SkyViewResult* sv = needSkyViewResult ? &m_skyView : nullptr;
+      const std::vector<std::uint8_t>* pre = (tc.requireOutsideConnection ? roadToEdgeMask : nullptr);
+
+      m_trafficSafety = ComputeTrafficSafety(m_world, tc, tr, sv, pre);
+      m_trafficSafetyDirty = false;
+    };
+
+    auto ensureRoadHealthUpToDate = [&]() {
+      if (!roadHealthHeatmapActive) return;
+      if (!m_roadHealthDirty && m_roadHealth.w == w && m_roadHealth.h == h &&
+          m_roadHealth.centrality01.size() == n && m_roadHealth.vulnerability01.size() == n) {
+        return;
+      }
+      const TrafficResult* tr = needTrafficResult ? &m_traffic : nullptr;
+      m_roadHealth = ComputeRoadHealth(m_world, m_roadHealthCfg, tr);
+      m_roadHealthDirty = false;
+    };
+
+    auto ensureLivabilityUpToDate = [&]() {
+      if (!(livabilityHeatmapActive || hotspotHeatmapActive)) return;
+      if (!m_livabilityDirty && m_livability.w == w && m_livability.h == h &&
+          m_livability.livability01.size() == n && m_livability.priority01.size() == n) {
+        return;
+      }
+      LivabilityConfig lc = m_livabilityCfg;
+      lc.requireOutsideConnection = requireOutside;
+      const TrafficResult* tr = needTrafficResult ? &m_traffic : nullptr;
+      const GoodsResult* gr = needGoodsResult ? &m_goods : nullptr;
+      m_livability = ComputeLivability(m_world, lc, tr, gr);
+      m_livabilityDirty = false;
+      m_hotspotsDirty = true; // hotspots derive from livability fields
+    };
+
+    auto ensureHotspotsUpToDate = [&]() {
+      if (!hotspotHeatmapActive) return;
+      ensureLivabilityUpToDate();
+      if (!m_hotspotsDirty && m_livabilityHotspot.w == w && m_livabilityHotspot.h == h &&
+          m_livabilityHotspot.z01.size() == n && m_interventionHotspot.z01.size() == n) {
+        return;
+      }
+      m_livabilityHotspot = ComputeHotspotsGiStar(m_world, m_livability.livability01, m_hotspotCfg);
+      m_interventionHotspot = ComputeHotspotsGiStar(m_world, m_livability.priority01, m_hotspotCfg);
+      m_hotspotsDirty = false;
+    };
+
+    auto ensureRunoffUpToDate = [&]() {
+      if (!runoffHeatmapActive) return;
+      if (!m_runoffDirty && m_runoff.w == w && m_runoff.h == h &&
+          m_runoff.pollution01.size() == n && m_runoff.localLoad01.size() == n) {
+        return;
+      }
+      const TrafficResult* tr = needTrafficResult ? &m_traffic : nullptr;
+      m_runoff = ComputeRunoffPollution(m_world, m_runoffCfg, tr);
+      m_runoffDirty = false;
+    };
+
+    auto ensureRunoffMitigationUpToDate = [&]() {
+      if (!runoffMitigationHeatmapActive) return;
+      if (!m_runoffMitigationDirty && m_runoffMitigation.w == w && m_runoffMitigation.h == h &&
+          m_runoffMitigation.priority01.size() == n && m_runoffMitigation.planMask.size() == n) {
+        return;
+      }
+      const TrafficResult* tr = needTrafficResult ? &m_traffic : nullptr;
+      m_runoffMitigation = SuggestRunoffMitigationParks(m_world, m_runoffMitigationCfg, tr);
+      m_runoffMitigationDirty = false;
+    };
+
     switch (m_heatmapOverlay) {
     case HeatmapOverlay::LandValue:
       heatmapName = "Land value";
@@ -19252,6 +20163,260 @@ void Game::draw()
       heatmap = &m_evacHeatmaps.evacFlow;
       heatmapRamp = Renderer::HeatmapRamp::Bad;
       break;
+    case HeatmapOverlay::AirPollution:
+      ensureAirPollutionUpToDate();
+      heatmapName = "Air pollution";
+      heatmap = &m_airPollution.pollution01;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
+    case HeatmapOverlay::AirPollutionEmission:
+      ensureAirPollutionUpToDate();
+      heatmapName = "Air emission";
+      heatmap = &m_airPollution.emission01;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
+    case HeatmapOverlay::SkyView:
+      ensureSkyViewUpToDate();
+      heatmapName = "Sky view";
+      heatmap = &m_skyView.skyView01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+    case HeatmapOverlay::CanyonConfinement:
+      ensureSkyViewUpToDate();
+      heatmapName = "Canyon confinement";
+      heatmap = &m_skyView.canyon01;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
+    case HeatmapOverlay::SolarExposure:
+      ensureSolarUpToDate();
+      heatmapName = "Solar exposure";
+      heatmap = &m_solar.exposure01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+    case HeatmapOverlay::SolarPotential:
+      ensureSolarUpToDate();
+      heatmapName = "Solar potential";
+      heatmap = &m_solar.potential01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+
+    case HeatmapOverlay::EnergyDemand:
+      ensureEnergyUpToDate();
+      heatmapName = "Energy demand";
+      heatmap = &m_energy.demand01;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
+    case HeatmapOverlay::EnergySolar:
+      ensureEnergyUpToDate();
+      heatmapName = "Rooftop solar supply";
+      heatmap = &m_energy.solar01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+    case HeatmapOverlay::EnergyBalance:
+      ensureEnergyUpToDate();
+      heatmapName = "Energy balance";
+      heatmap = &m_energy.balance01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+
+    case HeatmapOverlay::CarbonEmission:
+      ensureCarbonUpToDate();
+      heatmapName = "Carbon emission";
+      heatmap = &m_carbon.emission01;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
+    case HeatmapOverlay::CarbonSequestration:
+      ensureCarbonUpToDate();
+      heatmapName = "Carbon sequestration";
+      heatmap = &m_carbon.sequestration01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+    case HeatmapOverlay::CarbonBalance:
+      ensureCarbonUpToDate();
+      heatmapName = "Carbon balance";
+      heatmap = &m_carbon.balance01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+
+    case HeatmapOverlay::CrimeRisk:
+      ensureCrimeUpToDate();
+      heatmapName = "Crime risk";
+      heatmap = &m_crime.risk01;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
+    case HeatmapOverlay::PoliceAccess:
+      ensureCrimeUpToDate();
+      heatmapName = "Police access";
+      heatmap = &m_crime.policeAccess01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+
+    case HeatmapOverlay::TrafficCrashRisk:
+      ensureTrafficSafetyUpToDate();
+      heatmapName = "Traffic crash risk";
+      heatmap = &m_trafficSafety.risk01;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
+    case HeatmapOverlay::TrafficCrashExposure:
+      ensureTrafficSafetyUpToDate();
+      heatmapName = "Traffic crash exposure";
+      heatmap = &m_trafficSafety.exposure01;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
+    case HeatmapOverlay::TrafficCrashPriority:
+      ensureTrafficSafetyUpToDate();
+      heatmapName = "Traffic crash priority";
+      heatmap = &m_trafficSafety.priority01;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
+
+    case HeatmapOverlay::TransitAccess:
+      ensureTransitAccessUpToDate();
+      heatmapName = "Transit access";
+      heatmap = &m_transitAccess.access01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+    case HeatmapOverlay::TransitModeSharePotential:
+      ensureTransitAccessUpToDate();
+      heatmapName = "Transit mode share potential";
+      heatmap = &m_transitAccess.modeSharePotential01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+
+    case HeatmapOverlay::Walkability:
+      ensureWalkabilityUpToDate();
+      heatmapName = "Walkability";
+      heatmap = &m_walkability.overall01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+    case HeatmapOverlay::WalkabilityPark:
+      ensureWalkabilityUpToDate();
+      heatmapName = "Walkability (parks)";
+      heatmap = &m_walkability.park01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+    case HeatmapOverlay::WalkabilityRetail:
+      ensureWalkabilityUpToDate();
+      heatmapName = "Walkability (retail)";
+      heatmap = &m_walkability.retail01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+    case HeatmapOverlay::WalkabilityEducation:
+      ensureWalkabilityUpToDate();
+      heatmapName = "Walkability (education)";
+      heatmap = &m_walkability.education01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+    case HeatmapOverlay::WalkabilityHealth:
+      ensureWalkabilityUpToDate();
+      heatmapName = "Walkability (health)";
+      heatmap = &m_walkability.health01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+    case HeatmapOverlay::WalkabilitySafety:
+      ensureWalkabilityUpToDate();
+      heatmapName = "Walkability (safety)";
+      heatmap = &m_walkability.safety01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+
+    case HeatmapOverlay::JobAccess:
+      ensureJobsUpToDate();
+      heatmapName = "Job access";
+      heatmap = &m_jobs.jobAccess01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+    case HeatmapOverlay::JobOpportunity:
+      ensureJobsUpToDate();
+      heatmapName = "Job opportunity";
+      heatmap = &m_jobs.jobOpportunity01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+
+    case HeatmapOverlay::RoadCentrality:
+      ensureRoadHealthUpToDate();
+      heatmapName = "Road centrality";
+      heatmap = &m_roadHealth.centrality01;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
+    case HeatmapOverlay::RoadVulnerability:
+      ensureRoadHealthUpToDate();
+      heatmapName = "Road vulnerability";
+      heatmap = &m_roadHealth.vulnerability01;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
+    case HeatmapOverlay::RoadBypass: {
+      ensureRoadHealthUpToDate();
+      heatmapName = "Road bypass plan";
+      m_heatmapTmp01.assign(n, 0.0f);
+      if (m_roadHealth.bypassMask.size() == n) {
+        for (std::size_t i = 0; i < n; ++i) {
+          m_heatmapTmp01[i] = (m_roadHealth.bypassMask[i] != 0) ? 1.0f : 0.0f;
+        }
+      }
+      heatmap = &m_heatmapTmp01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+    }
+
+    case HeatmapOverlay::Livability:
+      ensureLivabilityUpToDate();
+      heatmapName = "Livability";
+      heatmap = &m_livability.livability01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+    case HeatmapOverlay::InterventionPriority:
+      ensureLivabilityUpToDate();
+      heatmapName = "Intervention priority";
+      heatmap = &m_livability.priority01;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
+
+    case HeatmapOverlay::LivabilityHotspot:
+      ensureHotspotsUpToDate();
+      heatmapName = "Livability hotspot";
+      heatmap = &m_livabilityHotspot.z01;
+      heatmapRamp = Renderer::HeatmapRamp::Diverging;
+      break;
+    case HeatmapOverlay::InterventionHotspot:
+      ensureHotspotsUpToDate();
+      heatmapName = "Priority hotspot";
+      heatmap = &m_interventionHotspot.z01;
+      heatmapRamp = Renderer::HeatmapRamp::Diverging;
+      break;
+
+    case HeatmapOverlay::RunoffPollution:
+      ensureRunoffUpToDate();
+      heatmapName = "Runoff pollution";
+      heatmap = &m_runoff.pollution01;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
+    case HeatmapOverlay::RunoffPollutionLoad:
+      ensureRunoffUpToDate();
+      heatmapName = "Runoff load";
+      heatmap = &m_runoff.localLoad01;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
+
+    case HeatmapOverlay::RunoffMitigationPriority:
+      ensureRunoffMitigationUpToDate();
+      heatmapName = "Mitigation priority";
+      heatmap = &m_runoffMitigation.priority01;
+      heatmapRamp = Renderer::HeatmapRamp::Bad;
+      break;
+    case HeatmapOverlay::RunoffMitigationPlan: {
+      ensureRunoffMitigationUpToDate();
+      heatmapName = "Mitigation plan";
+      m_heatmapTmp01.assign(n, 0.0f);
+      if (m_runoffMitigation.planMask.size() == n) {
+        for (std::size_t i = 0; i < n; ++i) {
+          m_heatmapTmp01[i] = (m_runoffMitigation.planMask[i] != 0) ? 1.0f : 0.0f;
+        }
+      }
+      heatmap = &m_heatmapTmp01;
+      heatmapRamp = Renderer::HeatmapRamp::Good;
+      break;
+    }
     default: break;
     }
   }
@@ -19588,6 +20753,17 @@ void Game::draw()
       }
       std::snprintf(buf, sizeof(buf), "Heatmap: %s  tile %.0f%%  city %.0f%%  facilities %d", heatmapName,
                     static_cast<double>(hv * 100.0f), static_cast<double>(city * 100.0f), fac);
+    } else if (m_heatmapOverlay == HeatmapOverlay::LivabilityHotspot ||
+               m_heatmapOverlay == HeatmapOverlay::InterventionHotspot) {
+      ensureHotspotsUpToDate();
+      const HotspotResult& hr = (m_heatmapOverlay == HeatmapOverlay::LivabilityHotspot) ? m_livabilityHotspot : m_interventionHotspot;
+      const float z = (idx < hr.z.size()) ? hr.z[idx] : 0.0f;
+      const std::uint8_t cls = (idx < hr.cls.size()) ? hr.cls[idx] : static_cast<std::uint8_t>(HotspotClass::Neutral);
+      std::snprintf(buf, sizeof(buf), "Heatmap: %s  z %.2f  %s", heatmapName, static_cast<double>(z),
+                    HotspotClassName(static_cast<HotspotClass>(cls)));
+    } else if (m_heatmapOverlay == HeatmapOverlay::RoadBypass ||
+               m_heatmapOverlay == HeatmapOverlay::RunoffMitigationPlan) {
+      std::snprintf(buf, sizeof(buf), "Heatmap: %s  %s", heatmapName, (hv > 0.5f) ? "YES" : "no");
     } else {
       std::snprintf(buf, sizeof(buf), "Heatmap: %s  %.2f", heatmapName, static_cast<double>(hv));
     }
@@ -21183,6 +22359,7 @@ if (optHasBest) {
         const std::vector<std::uint8_t>* pre = (tc.requireOutsideConnection ? render3d_roadToEdgeMask : nullptr);
         m_traffic = ComputeCommuteTraffic(m_world, tc, share, pre);
         m_trafficDirty = false;
+        m_carbonDirty = true;
       }
       trPtr = &m_traffic;
     }
@@ -21204,6 +22381,7 @@ if (optHasBest) {
         const std::vector<std::uint8_t>* pre = (gc.requireOutsideConnection ? render3d_roadToEdgeMask : nullptr);
         m_goods = ComputeGoodsFlow(m_world, gc, pre);
         m_goodsDirty = false;
+        m_carbonDirty = true;
       }
       grPtr = &m_goods;
     }

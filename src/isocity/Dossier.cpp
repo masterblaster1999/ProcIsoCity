@@ -10,7 +10,22 @@
 #include "isocity/LandUseMix.hpp"
 #include "isocity/NoisePollution.hpp"
 #include "isocity/HeatIsland.hpp"
+#include "isocity/AirPollution.hpp"
+#include "isocity/RunoffPollution.hpp"
+#include "isocity/RunoffMitigation.hpp"
+#include "isocity/SolarPotential.hpp"
+#include "isocity/SkyView.hpp"
+#include "isocity/EnergyModel.hpp"
+#include "isocity/CarbonModel.hpp"
+#include "isocity/CrimeModel.hpp"
+#include "isocity/TrafficSafety.hpp"
+#include "isocity/TransitAccessibility.hpp"
 #include "isocity/FireRisk.hpp"
+#include "isocity/Walkability.hpp"
+#include "isocity/RoadHealth.hpp"
+#include "isocity/Livability.hpp"
+#include "isocity/HotspotAnalysis.hpp"
+#include "isocity/JobOpportunity.hpp"
 #include "isocity/Pathfinding.hpp"
 #include "isocity/SaveLoad.hpp"
 #include "isocity/Traffic.hpp"
@@ -813,12 +828,134 @@ bool WriteCityDossier(World& world,
     HeatIslandConfig hic{};
     const HeatIslandResult heatIslandRes = ComputeHeatIsland(world, hic, &trafficRes, &goodsRes);
 
+    // Heuristic transported air pollution (traffic + land use + wind advection/diffusion).
+    AirPollutionConfig apc{};
+    apc.windFromSeed = true;
+    const AirPollutionResult airPollutionRes = ComputeAirPollution(world, apc, &trafficRes, &goodsRes);
+
+    // Heuristic runoff / stormwater pollution (sources + downhill routing).
+    RunoffPollutionConfig rpc{};
+    const RunoffPollutionResult runoffRes = ComputeRunoffPollution(world, rpc, &trafficRes);
+
+    // Hydrology-aware green infrastructure (park) placement suggestions.
+    RunoffMitigationConfig rmc{};
+    rmc.demandMode = RunoffMitigationDemandMode::ResidentialOccupants;
+    rmc.parksToAdd = 12;
+    rmc.minSeparation = 3;
+    rmc.excludeWater = true;
+    rmc.allowReplaceRoad = false;
+    rmc.allowReplaceZones = false;
+    // Use the same runoff settings to keep the plan consistent with exported runoff layers.
+    rmc.runoffCfg = rpc;
+    const RunoffMitigationResult runoffMitRes = SuggestRunoffMitigationParks(world, rmc, &trafficRes);
+
+    // Solar exposure + rooftop PV potential (coarse horizon scan).
+    SolarPotentialConfig spc{};
+    spc.azimuthSamples = 16;
+    spc.maxHorizonRadius = 64;
+    const SolarPotentialResult solarRes = ComputeSolarPotential(world, spc);
+
+    // Urban openness / canyon confinement (sky view factor; uses the same urban height field).
+    SkyViewConfig svc{};
+    svc.azimuthSamples = 16;
+    svc.maxHorizonRadius = 64;
+    svc.includeBuildings = true;
+    const SkyViewResult skyViewRes = ComputeSkyViewFactor(world, svc);
+
+    // Building energy demand vs rooftop solar (normalized proxy).
+    EnergyModelConfig emc{};
+    const EnergyModelResult energyRes = ComputeEnergyModel(world, emc, &solarRes, &heatIslandRes);
+    const CarbonModelResult carbonRes = ComputeCarbonModel(world, CarbonModelConfig{}, &energyRes, &trafficRes, &goodsRes);
+
+
+    // Transit accessibility (stop proximity) + localized mode-share potential.
+    TransitAccessibilityConfig tac{};
+    tac.requireOutsideConnection = sim.config().requireOutsideConnection;
+    const TransitModelSettings& tm = sim.transitModel();
+    tac.demandMode = tm.demandMode;
+    tac.stopSpacingTiles = tm.stopSpacingTiles;
+    // TransitModelSettings does not currently expose a walk radius.
+    // Use a simple derived default: about half a stop spacing, clamped.
+    tac.walkRadiusSteps = std::clamp(tm.stopSpacingTiles / 2, 6, 20);
+    tac.serviceLevel = tm.serviceLevel;
+    tac.maxModeShare = tm.maxModeShare;
+    tac.travelTimeMultiplier = tm.travelTimeMultiplier;
+    tac.plannerCfg = tm.plannerCfg;
+    TransitAccessibilityInputs tai{};
+    tai.traffic = &trafficRes;
+    tai.goods = &goodsRes;
+    tai.roadToEdgeMask = roadToEdgePtr;
+    const TransitAccessibilityResult transitRes = ComputeTransitAccessibility(world, tac, tai);
+
     // SimCity-style fire risk (density + fire station response coverage).
     FireRiskConfig frc{};
     frc.requireOutsideConnection = true;
     frc.weightMode = IsochroneWeightMode::TravelTime;
     frc.responseRadiusSteps = 18;
     const FireRiskResult fireRiskRes = ComputeFireRisk(world, frc);
+
+    // Walkability / 15-minute city amenity accessibility.
+    WalkabilityConfig wc{};
+    wc.enabled = true;
+    wc.requireOutsideConnection = true;
+    wc.weightMode = IsochroneWeightMode::TravelTime;
+    wc.coverageThresholdSteps = 15;
+    const WalkabilityResult walkabilityRes = ComputeWalkability(world, wc);
+
+    // Job accessibility + opportunity (reachable jobs via the road graph).
+    JobOpportunityConfig joc{};
+    joc.requireOutsideConnection = sim.config().requireOutsideConnection;
+    joc.useTravelTime = true;
+    joc.congestionCosts = true;
+    const JobOpportunityResult jobsRes =
+        ComputeJobOpportunity(world, joc, &trafficRes, roadToEdgePtr, /*precomputedZoneAccess=*/nullptr);
+
+    // Crime risk + police access proxy (uses jobs + noise + traffic/goods).
+    CrimeModelConfig crc{};
+    crc.requireOutsideConnection = sim.config().requireOutsideConnection;
+    crc.weightMode = IsochroneWeightMode::TravelTime;
+    const CrimeModelResult crimeRes =
+        ComputeCrimeModel(world, crc, &trafficRes, &goodsRes, &jobsRes, &noiseRes, roadToEdgePtr, /*precomputedZoneAccess=*/nullptr);
+
+    // Traffic collision risk proxy (traffic volume + intersection geometry + canyon confinement).
+    TrafficSafetyConfig tsc{};
+    tsc.requireOutsideConnection = sim.config().requireOutsideConnection;
+    tsc.exposureRadius = 6;
+    const TrafficSafetyResult trafficSafetyRes =
+        ComputeTrafficSafety(world, tsc, &trafficRes, &skyViewRes, roadToEdgePtr);
+
+    // Road network structural analytics (centrality + vulnerability + suggested bypasses).
+    RoadHealthConfig rhc{};
+    rhc.weightMode = RoadGraphEdgeWeightMode::TravelTimeMilli;
+    rhc.maxSources = 0; // auto
+    rhc.autoExactMaxNodes = 650;
+    rhc.autoSampleSources = 256;
+    rhc.includeNodeCentrality = true;
+    rhc.articulationVulnerabilityBase = 0.70f;
+    rhc.includeBypass = true;
+    rhc.bypassCfg.top = 3;
+    rhc.bypassCfg.moneyObjective = true;
+    rhc.bypassCfg.targetLevel = 1;
+    rhc.bypassCfg.allowBridges = false;
+    rhc.bypassCfg.rankByTraffic = true;
+    const RoadHealthResult roadHealthRes = ComputeRoadHealth(world, rhc, &trafficRes);
+
+    // Composite livability index + intervention priority (services + walkability + environment).
+    LivabilityConfig lvc{};
+    lvc.requireOutsideConnection = true;
+    lvc.weightMode = IsochroneWeightMode::TravelTime;
+    lvc.servicesCatchmentRadiusSteps = 18;
+    lvc.walkCoverageThresholdSteps = 15;
+    const LivabilityResult livabilityRes = ComputeLivability(world, lvc, &trafficRes, &goodsRes);
+
+    // Spatial hotspots (Getis-Ord Gi*) for clustering analysis.
+    HotspotConfig hsc{};
+    hsc.radius = 8;
+    hsc.excludeWater = true;
+    hsc.zThreshold = 1.96f;
+    hsc.zScale = 3.0f;
+    const HotspotResult livHotRes = ComputeHotspotsGiStar(world, livabilityRes.livability01, hsc);
+    const HotspotResult priHotRes = ComputeHotspotsGiStar(world, livabilityRes.priority01, hsc);
 
     TileMetricsCsvInputs inputs;
     inputs.landValue = &landValueRes;
@@ -827,7 +964,23 @@ bool WriteCityDossier(World& world,
     inputs.noise = &noiseRes;
     inputs.landUseMix = &landUseMixRes;
     inputs.heatIsland = &heatIslandRes;
+    inputs.airPollution = &airPollutionRes;
+    inputs.runoff = &runoffRes;
+    inputs.runoffMitigation = &runoffMitRes;
+    inputs.solar = &solarRes;
+    inputs.skyView = &skyViewRes;
+    inputs.energy = &energyRes;
+    inputs.carbon = &carbonRes;
+    inputs.crime = &crimeRes;
+    inputs.trafficSafety = &trafficSafetyRes;
+    inputs.transit = &transitRes;
     inputs.fireRisk = &fireRiskRes;
+    inputs.walkability = &walkabilityRes;
+    inputs.jobs = &jobsRes;
+    inputs.roadHealth = &roadHealthRes;
+    inputs.livability = &livabilityRes;
+    inputs.livabilityHotspot = &livHotRes;
+    inputs.interventionHotspot = &priHotRes;
     inputs.seaFlood = &seaFlood;
     inputs.ponding = &ponding;
 
@@ -839,6 +992,24 @@ bool WriteCityDossier(World& world,
     opt.includeNoise = true;
     opt.includeLandUseMix = true;
     opt.includeHeatIsland = true;
+    opt.includeAirPollution = true;
+    opt.includeRunoffPollution = true;
+    opt.includeRunoffMitigation = true;
+    opt.includeSolar = true;
+    opt.includeSkyView = true;
+    opt.includeEnergy = true;
+    opt.includeCarbon = true;
+    opt.includeCrime = true;
+    opt.includeTrafficSafety = true;
+    opt.includeTransit = true;
+    opt.includeFireRisk = true;
+    opt.includeWalkability = true;
+    opt.includeJobs = true;
+    opt.includeWalkabilityComponents = true;
+    opt.includeWalkabilityDistances = false;
+    opt.includeRoadHealth = true;
+    opt.includeLivability = true;
+    opt.includeHotspots = true;
     opt.includeFlood = true;
     opt.includePonding = true;
     opt.floatPrecision = 6;

@@ -15,6 +15,14 @@ namespace isocity {
 struct SeaFloodResult;
 struct DepressionFillResult;
 struct FireRiskResult;
+struct WalkabilityResult;
+struct RoadHealthResult;
+struct HotspotResult;
+struct JobOpportunityResult;
+struct EnergyModelResult;
+struct CarbonModelResult;
+struct TransitAccessibilityResult;
+struct TrafficSafetyResult;
 
 // Small headless export utilities.
 // Intended for:
@@ -64,6 +72,112 @@ enum class ExportLayer : std::uint8_t {
 
   // Heuristic fire-risk / response coverage (derived from fire stations + density).
   FireRisk = 20,
+
+  // Walkability / amenity accessibility score (0..1). This reuses the road
+  // network isochrone machinery to estimate how "walkable" a tile is with
+  // respect to parks, retail, and essential civic services.
+  Walkability = 21,
+  WalkabilityPark = 22,
+  WalkabilityRetail = 23,
+  WalkabilityEducation = 24,
+  WalkabilityHealth = 25,
+  WalkabilitySafety = 26,
+
+  // Heuristic transported air-pollution concentration (0..1, higher=worse).
+  AirPollution = 27,
+
+  // Source term / emission field used by the air-pollution model (0..1).
+  AirPollutionEmission = 28,
+
+  // Heuristic solar exposure (0..1, higher=more sunlight / less shading).
+  SolarExposure = 29,
+
+  // Rooftop PV potential proxy (0..1): solar exposure multiplied by a rough roof-area factor.
+  SolarPotential = 30,
+
+  // Road network analytics mapped onto tiles.
+  //
+  // - RoadCentrality: edge/node betweenness centrality heatmap (0..1, higher=more critical)
+  // - RoadVulnerability: bridge/cut impact + articulation markers (0..1, higher=more fragile)
+  // - RoadBypass: suggested resilience bypass paths (overlay) - see RoadHealth module
+  RoadCentrality = 31,
+  RoadVulnerability = 32,
+  RoadBypass = 33,
+
+  // Composite human-centric index (0..1) derived from services, walkability, and environmental hazards.
+  Livability = 34,
+
+  // Population-weighted intervention priority (0..1): high when many residents experience low livability.
+  InterventionPriority = 35,
+
+  // Spatial clustering / hotspot analysis (Getis-Ord Gi* z-score mapped to 0..1).
+  LivabilityHotspot = 36,
+  InterventionHotspot = 37,
+
+  // Runoff / stormwater pollution concentration proxy (0..1, higher=worse).
+  RunoffPollution = 38,
+
+  // Local source/load term used by the runoff model (0..1).
+  RunoffPollutionLoad = 39,
+
+  // Hydrology-aware stormwater mitigation guidance.
+  //
+  // - RunoffMitigationPriority: where adding filtration (a new park) would most
+  //   reduce population-weighted downstream exposure (0..1, higher=better).
+  // - RunoffMitigationPlan: a greedy park siting plan (0/1 mask).
+  RunoffMitigationPriority = 40,
+  RunoffMitigationPlan = 41,
+
+  // Job accessibility + opportunity analytics.
+  //
+  // - JobAccess: nearest-job travel-time accessibility (0..1, higher=better)
+  // - JobOpportunity: diffusion/gravity-style reachable job opportunities (0..1, higher=better)
+  JobAccess = 42,
+  JobOpportunity = 43,
+
+  // Urban energy system analytics.
+  //
+  // - EnergyDemand: building energy demand proxy (0..1, higher=more demand)
+  // - EnergySolar: rooftop solar supply proxy (0..1, higher=more supply)
+  // - EnergyBalance: normalized net balance (0..1): 0 deficit, 0.5 neutral, 1 surplus
+  EnergyDemand = 44,
+  EnergySolar = 45,
+  EnergyBalance = 46,
+
+  // Transit accessibility + potential mode shift.
+  //
+  // - TransitAccess: per-tile proximity/accessibility to the nearest planned stop (0..1, higher=better)
+  // - TransitModeSharePotential: localized mode-share potential normalized by TransitModelSettings::maxModeShare (0..1)
+  TransitAccess = 47,
+  TransitModeSharePotential = 48,
+
+  CarbonEmission = 49,
+  CarbonSequestration = 50,
+  CarbonBalance = 51,
+
+  // Crime risk + policing accessibility.
+  //
+  // - CrimeRisk: heuristic crime risk proxy (0..1, higher=worse)
+  // - PoliceAccess: travel-time accessibility to the nearest police station (0..1, higher=better)
+  CrimeRisk = 52,
+  PoliceAccess = 53,
+
+  // Urban morphology / openness.
+  //
+  // - SkyView: approximate sky view factor (0..1, higher=more open)
+  // - CanyonConfinement: 1 - sky view factor (0..1, higher=more enclosed)
+  SkyView = 54,
+  CanyonConfinement = 55,
+
+  // Traffic safety proxy (deterministic heuristic).
+  //
+  // - TrafficCrashRisk: per-road crash-risk proxy (0..1, higher=worse)
+  // - TrafficCrashExposure: neighborhood exposure to nearby crash risk (0..1, higher=worse)
+  // - TrafficCrashPriority: resident-weighted intervention priority (0..1, higher=more urgent)
+  TrafficCrashRisk = 56,
+  TrafficCrashExposure = 57,
+  TrafficCrashPriority = 58,
+
 };
 
 // Back-compat alias: older UI code refers to the 2D export layer enum as ExportLayer2D.
@@ -647,7 +761,23 @@ struct TileMetricsCsvInputs {
   const struct NoiseResult* noise = nullptr;
   const struct LandUseMixResult* landUseMix = nullptr;
   const struct HeatIslandResult* heatIsland = nullptr;
+  const struct AirPollutionResult* airPollution = nullptr;
+  const struct RunoffPollutionResult* runoff = nullptr;
+  const struct RunoffMitigationResult* runoffMitigation = nullptr;
+  const struct SolarPotentialResult* solar = nullptr;
+  const struct SkyViewResult* skyView = nullptr;
+  const struct EnergyModelResult* energy = nullptr;
+  const struct CarbonModelResult* carbon = nullptr;
+  const struct CrimeModelResult* crime = nullptr;
+  const TrafficSafetyResult* trafficSafety = nullptr;
+  const TransitAccessibilityResult* transit = nullptr;
   const FireRiskResult* fireRisk = nullptr;
+  const WalkabilityResult* walkability = nullptr;
+  const JobOpportunityResult* jobs = nullptr;
+  const RoadHealthResult* roadHealth = nullptr;
+  const struct LivabilityResult* livability = nullptr;
+  const HotspotResult* livabilityHotspot = nullptr;
+  const HotspotResult* interventionHotspot = nullptr;
   const SeaFloodResult* seaFlood = nullptr;
   const DepressionFillResult* ponding = nullptr;
 };
@@ -660,7 +790,30 @@ struct TileMetricsCsvOptions {
   bool includeNoise = true;
   bool includeLandUseMix = true;
   bool includeHeatIsland = true;
+  bool includeAirPollution = true;
+  bool includeRunoffPollution = true;
+  bool includeRunoffMitigation = true;
+  bool includeSolar = true;
+  bool includeSkyView = true;
+  bool includeEnergy = true;
+  bool includeCarbon = true;
+  bool includeCrime = true;
+  bool includeTrafficSafety = true;
+  bool includeTransit = true;
+  bool includeTransitSteps = true;
   bool includeFireRisk = true;
+  bool includeWalkability = true;
+  bool includeJobs = true;
+  bool includeRoadHealth = true;
+  bool includeLivability = true;
+  bool includeHotspots = true;
+
+  // If true, include per-category scores + coverage mask/count. If false,
+  // only include the overall walkability score.
+  bool includeWalkabilityComponents = true;
+
+  // If true, also include per-category distance-in-steps columns.
+  bool includeWalkabilityDistances = false;
   bool includeFlood = true;
   bool includePonding = true;
 
@@ -684,7 +837,21 @@ struct TileMetricsCsvOptions {
 //   - noise: noise
 //   - land use mix: landuse_mix,landuse_density
 //   - heat island: heat_island,heat_island_raw
+//   - air pollution: air_pollution,air_emission
+//   - runoff pollution: runoff_pollution,runoff_load,runoff_flow_accum
+//   - solar: solar_exposure,solar_potential
+//   - sky view: sky_view,canyon_confinement
+//   - energy: energy_demand,energy_solar,energy_balance,energy_demand_raw,energy_solar_raw,energy_net_raw
+//   - carbon: carbon_emission,carbon_sequestration,carbon_balance,carbon_emission_raw,carbon_sequestration_raw,carbon_net_raw
+//   - crime: crime_risk,police_access,police_cost
+//   - transit: transit_access,transit_mode_share_potential,transit_is_stop,transit_on_corridor[,transit_stop_steps]
 //   - fire risk: fire_risk,fire_coverage,fire_response_cost
+//   - walkability: walkability[,walkability_park,walkability_retail,walkability_education,walkability_health,walkability_safety]
+//                  [,walk_cover_mask,walk_cover_count][,walk_dist_*]
+//   - jobs: job_access,job_opportunity,job_access_cost
+//   - road health: road_centrality,road_vulnerability,road_bypass
+//   - livability: livability,intervention_priority
+//   - hotspots: livability_hotspot,livability_hotspot_z,livability_hotspot_class,intervention_hotspot,intervention_hotspot_z,intervention_hotspot_class
 //   - zoning pressure: zone_pressure_residential,zone_pressure_commercial,zone_pressure_industrial
 //   - flood: flooded,flood_depth
 //   - ponding: ponding_depth

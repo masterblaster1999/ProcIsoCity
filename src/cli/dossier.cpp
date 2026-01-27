@@ -10,6 +10,9 @@
 #include "isocity/LandUseMix.hpp"
 #include "isocity/NoisePollution.hpp"
 #include "isocity/HeatIsland.hpp"
+#include "isocity/RunoffPollution.hpp"
+#include "isocity/RunoffMitigation.hpp"
+#include "isocity/Livability.hpp"
 #include "isocity/Pathfinding.hpp"
 #include "isocity/ProcGen.hpp"
 #include "isocity/SaveLoad.hpp"
@@ -777,9 +780,9 @@ void PrintHelp()
       << "Export:\n"
       << "  --format <png|ppm>             Image format (default png).\n"
       << "  --scale <N>                    Nearest-neighbor scale for top-down layers (default 2).\n"
-      << "  --layers <a,b,c>               Top-down layers to export (default: terrain,overlay,height,landvalue,traffic,goods_traffic,goods_fill,district,flood_depth,ponding_depth,noise,landuse_mix,heat_island).\n"
+      << "  --layers <a,b,c>               Top-down layers to export (default: terrain,overlay,height,landvalue,traffic,goods_traffic,goods_fill,district,flood_depth,ponding_depth,noise,landuse_mix,heat_island,sky_view,canyon_confinement,traffic_crash_risk,traffic_crash_exposure,traffic_crash_priority,runoff_pollution,runoff_load,runoff_mitigation_priority,runoff_mitigation_plan).\n"
       << "  --iso <0|1>                    Enable isometric exports (default 1).\n"
-      << "  --iso-layers <a,b,c>           Iso layers (default: overlay,landvalue,heat_island).\n"
+      << "  --iso-layers <a,b,c>           Iso layers (default: overlay,landvalue,heat_island,runoff_mitigation_priority,runoff_mitigation_plan).\n"
       << "  --3d <0|1>                     Enable a 3D overlay render (default 0).\n\n";
 }
 
@@ -818,6 +821,15 @@ int main(int argc, char** argv)
       ExportLayer::Noise,
       ExportLayer::LandUseMix,
       ExportLayer::HeatIsland,
+      ExportLayer::SkyView,
+      ExportLayer::CanyonConfinement,
+      ExportLayer::TrafficCrashRisk,
+      ExportLayer::TrafficCrashExposure,
+      ExportLayer::TrafficCrashPriority,
+      ExportLayer::RunoffPollution,
+      ExportLayer::RunoffPollutionLoad,
+      ExportLayer::RunoffMitigationPriority,
+      ExportLayer::RunoffMitigationPlan,
   };
 
   bool exportIso = true;
@@ -825,6 +837,10 @@ int main(int argc, char** argv)
       ExportLayer::Overlay,
       ExportLayer::LandValue,
       ExportLayer::HeatIsland,
+      ExportLayer::SkyView,
+      ExportLayer::CanyonConfinement,
+      ExportLayer::RunoffMitigationPriority,
+      ExportLayer::RunoffMitigationPlan,
   };
 
   bool export3d = false;
@@ -1142,6 +1158,28 @@ int main(int argc, char** argv)
   HeatIslandConfig hic{};
   const HeatIslandResult heatIslandRes = ComputeHeatIsland(world, hic, &trafficRes, &goodsRes);
 
+  // Heuristic runoff / stormwater pollution (sources + downhill routing).
+  RunoffPollutionConfig rpc{};
+  const RunoffPollutionResult runoffRes = ComputeRunoffPollution(world, rpc, &trafficRes);
+
+  // Hydrology-aware green infrastructure (park) placement suggestions.
+  RunoffMitigationConfig rmc{};
+  rmc.demandMode = RunoffMitigationDemandMode::ResidentialOccupants;
+  rmc.parksToAdd = 12;
+  rmc.minSeparation = 3;
+  rmc.excludeWater = true;
+  rmc.allowReplaceRoad = false;
+  rmc.allowReplaceZones = false;
+  rmc.runoffCfg = rpc;
+  const RunoffMitigationResult runoffMitRes = SuggestRunoffMitigationParks(world, rmc, &trafficRes);
+
+  LivabilityConfig lvc{};
+  lvc.requireOutsideConnection = simCfg.requireOutsideConnection;
+  lvc.weightMode = IsochroneWeightMode::TravelTime;
+  lvc.servicesCatchmentRadiusSteps = 18;
+  lvc.walkCoverageThresholdSteps = 15;
+  const LivabilityResult livabilityRes = ComputeLivability(world, lvc, &trafficRes, &goodsRes);
+
   std::vector<float> heights;
   std::vector<std::uint8_t> drainMask;
   BuildHeightFieldAndDrainMask(world, heights, drainMask);
@@ -1179,6 +1217,9 @@ int main(int argc, char** argv)
     inputs.noise = &noiseRes;
     inputs.landUseMix = &landUseMixRes;
     inputs.heatIsland = &heatIslandRes;
+    inputs.runoff = &runoffRes;
+    inputs.runoffMitigation = &runoffMitRes;
+    inputs.livability = &livabilityRes;
     inputs.seaFlood = &seaFlood;
     inputs.ponding = &ponding;
     TileMetricsCsvOptions opt;
@@ -1189,6 +1230,8 @@ int main(int argc, char** argv)
     opt.includeNoise = true;
     opt.includeLandUseMix = true;
     opt.includeHeatIsland = true;
+    opt.includeRunoffPollution = true;
+    opt.includeRunoffMitigation = true;
     opt.includeFlood = true;
     opt.includePonding = true;
     opt.floatPrecision = 6;

@@ -107,6 +107,7 @@ add_library(isocity_core
   src/isocity/Contours.cpp
   src/isocity/Isochrone.cpp
   src/isocity/TransitPlanner.cpp
+  src/isocity/TransitAccessibility.cpp
   src/isocity/TransitPlannerExport.cpp
   src/isocity/Sim.cpp
   src/isocity/Economy.cpp
@@ -116,7 +117,20 @@ add_library(isocity_core
   src/isocity/Traffic.cpp
   src/isocity/NoisePollution.cpp
   src/isocity/HeatIsland.cpp
+  src/isocity/AirPollution.cpp
+  src/isocity/RunoffPollution.cpp
+  src/isocity/RunoffMitigation.cpp
+  src/isocity/SolarPotential.cpp
+  src/isocity/SkyView.cpp
+  src/isocity/EnergyModel.cpp
+  src/isocity/CarbonModel.cpp
+  src/isocity/CrimeModel.cpp
+  src/isocity/TrafficSafety.cpp
   src/isocity/FireRisk.cpp
+  src/isocity/Walkability.cpp
+  src/isocity/Livability.cpp
+  src/isocity/JobOpportunity.cpp
+  src/isocity/HotspotAnalysis.cpp
   src/isocity/Goods.cpp
   src/isocity/TradeMarket.cpp
   src/isocity/ParkOptimizer.cpp
@@ -155,6 +169,7 @@ add_library(isocity_core
   src/isocity/RoadResilienceBypass.cpp
   src/isocity/RoadGraphCentrality.cpp
   src/isocity/RoadGraphCentralityExport.cpp
+  src/isocity/RoadHealth.cpp
   src/isocity/RoadUpgradePlanner.cpp
   src/isocity/RoadUpgradePlannerExport.cpp
   src/isocity/PolicyOptimizer.cpp
@@ -600,6 +615,27 @@ if (PROCISOCITY_BUILD_CLI)
 
   procisocity_set_strict_warnings(proc_isocity_roadcentrality)
 
+  # Road health tool (headless): centrality + vulnerability + suggested bypass paths.
+  add_executable(proc_isocity_roadhealth
+    src/cli/roadhealth.cpp
+  )
+
+  target_include_directories(proc_isocity_roadhealth PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_roadhealth PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_roadhealth)
+
+  add_executable(proc_isocity_livability
+    src/cli/livability.cpp
+  )
+
+  target_include_directories(proc_isocity_livability PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_livability PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_livability)
+
+
+
   # Traffic graph export tool (headless): compute commute traffic and aggregate onto the road graph.
   add_executable(proc_isocity_trafficgraph
     src/cli/trafficgraph.cpp
@@ -776,6 +812,36 @@ if (PROCISOCITY_BUILD_CLI)
   target_link_libraries(proc_isocity_districtreport PRIVATE isocity_core)
 
   procisocity_set_strict_warnings(proc_isocity_districtreport)
+
+  # Walkability tool (headless): amenity accessibility / "15-minute city" summary report.
+  add_executable(proc_isocity_walkability
+    src/cli/walkability.cpp
+  )
+
+  target_include_directories(proc_isocity_walkability PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_walkability PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_walkability)
+
+  # Solar potential tool (headless): solar exposure + rooftop PV potential summary report.
+  add_executable(proc_isocity_solar
+    src/cli/solar.cpp
+  )
+
+  target_include_directories(proc_isocity_solar PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_solar PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_solar)
+
+  # Runoff pollution tool (headless): route stormwater pollutant loads downhill.
+  add_executable(proc_isocity_runoff
+    src/cli/runoff.cpp
+  )
+
+  target_include_directories(proc_isocity_runoff PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_runoff PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_runoff)
 
   # Dossier tool (headless): one-command export of images + CSV/JSON + HTML.
   add_executable(proc_isocity_dossier

@@ -34,6 +34,21 @@
 #include "isocity/Goods.hpp"
 #include "isocity/LandValue.hpp"
 #include "isocity/FireRisk.hpp"
+#include "isocity/AirPollution.hpp"
+#include "isocity/SolarPotential.hpp"
+#include "isocity/SkyView.hpp"
+#include "isocity/EnergyModel.hpp"
+#include "isocity/CarbonModel.hpp"
+#include "isocity/CrimeModel.hpp"
+#include "isocity/TrafficSafety.hpp"
+#include "isocity/TransitAccessibility.hpp"
+#include "isocity/RoadHealth.hpp"
+#include "isocity/Walkability.hpp"
+#include "isocity/JobOpportunity.hpp"
+#include "isocity/Livability.hpp"
+#include "isocity/HotspotAnalysis.hpp"
+#include "isocity/RunoffPollution.hpp"
+#include "isocity/RunoffMitigation.hpp"
 #include "isocity/TransitPlanner.hpp"
 #include "isocity/Sim.hpp"
 #include "isocity/World.hpp"
@@ -115,6 +130,7 @@ public:
 private:
   void resetWorld(std::uint64_t newSeed);
   void invalidateHydrology();
+  void invalidateAnalysisLayers();
   void applyToolBrush(int centerX, int centerY);
   void floodFillDistrict(Point start, bool includeRoads);
   void floodFillTool(Point start, bool includeRoads);
@@ -448,6 +464,13 @@ private:
   float m_mayorRatingEma = 50.0f;
   float m_mayorRatingPrev = 50.0f;
 
+  // City News can reference expensive analysis layers (air/runoff/livability/etc).
+  // To avoid stalling the sim when running at high speed, we recompute these
+  // advisor snapshots on a small wall-clock cooldown and reuse cached values
+  // across multiple in-game days.
+  double m_newsEnvLastComputeSec = -1.0;
+  int m_newsEnvLastComputeDay = -1;
+
   // UI minimap overlay (toggle with M). Clicking the minimap recenters the camera.
   bool m_showMinimap = false;
   bool m_minimapDragActive = false;
@@ -745,11 +768,130 @@ private:
     EvacuationTime,
     EvacuationUnreachable,
     EvacuationFlow,
+
+    // Advanced analysis layers (export/dossier integrated).
+    AirPollution,
+    AirPollutionEmission,
+    SkyView,
+    CanyonConfinement,
+    SolarExposure,
+    SolarPotential,
+    EnergyDemand,
+    EnergySolar,
+    EnergyBalance,
+
+    CarbonEmission,
+    CarbonSequestration,
+    CarbonBalance,
+
+    CrimeRisk,
+    PoliceAccess,
+
+    TrafficCrashRisk,
+    TrafficCrashExposure,
+    TrafficCrashPriority,
+
+    TransitAccess,
+    TransitModeSharePotential,
+
+    Walkability,
+    WalkabilityPark,
+    WalkabilityRetail,
+    WalkabilityEducation,
+    WalkabilityHealth,
+    WalkabilitySafety,
+
+    JobAccess,
+    JobOpportunity,
+
+    RoadCentrality,
+    RoadVulnerability,
+    RoadBypass,
+
+    Livability,
+    InterventionPriority,
+
+    LivabilityHotspot,
+    InterventionHotspot,
+
+    RunoffPollution,
+    RunoffPollutionLoad,
+    RunoffMitigationPriority,
+    RunoffMitigationPlan,
   };
 
   HeatmapOverlay m_heatmapOverlay = HeatmapOverlay::Off;
   bool m_landValueDirty = true;
   LandValueResult m_landValue;
+
+  // ---------------------------------------------------------------------------
+  // Advanced analysis layers (computed on-demand for heatmaps).
+  // These mirror the export/dossier layers so the interactive app can preview them.
+  // ---------------------------------------------------------------------------
+  bool m_airPollutionDirty = true;
+  AirPollutionConfig m_airPollutionCfg{};
+  AirPollutionResult m_airPollution;
+
+  bool m_skyViewDirty = true;
+  SkyViewConfig m_skyViewCfg{};
+  SkyViewResult m_skyView;
+
+  bool m_solarDirty = true;
+  SolarPotentialConfig m_solarCfg{};
+  SolarPotentialResult m_solar;
+
+  bool m_energyDirty = true;
+  EnergyModelConfig m_energyCfg{};
+  EnergyModelResult m_energy;
+
+  bool m_carbonDirty = true;
+  CarbonModelConfig m_carbonCfg{};
+  CarbonModelResult m_carbon;
+
+  bool m_crimeDirty = true;
+  CrimeModelConfig m_crimeCfg{};
+  CrimeModelResult m_crime;
+
+  bool m_trafficSafetyDirty = true;
+  TrafficSafetyConfig m_trafficSafetyCfg{};
+  TrafficSafetyResult m_trafficSafety;
+
+  bool m_transitAccessDirty = true;
+  TransitAccessibilityConfig m_transitAccessCfg{};
+  TransitAccessibilityResult m_transitAccess;
+
+  bool m_walkabilityDirty = true;
+  WalkabilityConfig m_walkabilityCfg{};
+  WalkabilityResult m_walkability;
+
+  bool m_jobsDirty = true;
+  JobOpportunityConfig m_jobsCfg{};
+  JobOpportunityResult m_jobs;
+
+  bool m_roadHealthDirty = true;
+  RoadHealthConfig m_roadHealthCfg{};
+  RoadHealthResult m_roadHealth;
+
+  bool m_livabilityDirty = true;
+  LivabilityConfig m_livabilityCfg{};
+  LivabilityResult m_livability;
+
+  bool m_hotspotsDirty = true;
+  HotspotConfig m_hotspotCfg{};
+  HotspotResult m_livabilityHotspot;
+  HotspotResult m_interventionHotspot;
+
+  bool m_runoffDirty = true;
+  RunoffPollutionConfig m_runoffCfg{};
+  RunoffPollutionResult m_runoff;
+
+  bool m_runoffMitigationDirty = true;
+  RunoffMitigationConfig m_runoffMitigationCfg{};
+  RunoffMitigationResult m_runoffMitigation;
+
+  // Scratch buffer for displaying byte masks (bypass/plan) as a heatmap.
+  std::vector<float> m_heatmapTmp01;
+  float m_analysisHeatmapsTimer = 0.0f;
 
   // Sea-level flooding (heatmap): computed on-demand when the flood heatmap is active.
   bool m_seaFloodDirty = true;

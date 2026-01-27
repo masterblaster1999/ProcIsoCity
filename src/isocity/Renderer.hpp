@@ -60,6 +60,9 @@ public:
 
     // 0 => shallow/low (light blue), 1 => deep/high (dark blue)
     Water = 2,
+
+    // 0 => cold/low (blue), 0.5 => neutral (near-white), 1 => hot/high (red)
+    Diverging = 3,
   };
 
   // Multi-layer rendering (useful for debugging, capture, and future compositing).
