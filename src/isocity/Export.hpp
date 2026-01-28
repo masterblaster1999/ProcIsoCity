@@ -490,6 +490,10 @@ struct IsoOverviewConfig {
   struct TilesetPropsConfig {
     bool enabled = false;
 
+    // If true, use a deterministic tileable blue-noise threshold map for placement decisions.
+    // This reduces visible clumping compared to pure per-tile hashing at low densities.
+    bool blueNoise = true;
+
     // Park tree density in [0,1]. Higher values place more trees per park tile.
     float treeDensity = 0.35f;
 

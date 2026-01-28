@@ -2,6 +2,7 @@
 
 #include "isocity/Checksum.hpp"
 #include "isocity/Compression.hpp"
+#include "isocity/FileSync.hpp"
 #include "isocity/ProcGen.hpp"
 #include "isocity/Sim.hpp"
 
@@ -3022,13 +3023,36 @@ bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const Sim
   }
   f.close();
 
-  // Atomically replace the destination:
-  //  - move existing -> .bak
-  //  - move tmp -> destination
-  //  - cleanup .bak on success
-  fs::remove(bakPath, ec);
+  // Best-effort durability: flush the temp file contents to stable storage.
+  //
+  // std::ofstream::flush() only pushes data to the OS; it does not guarantee the
+  // bytes are durable across power loss. Syncing here makes the save pipeline
+  // significantly more robust on filesystems that reorder writes.
+  BestEffortSyncFile(tmpPath);
 
-  if (fs::exists(outPath, ec)) {
+  // Atomically replace the destination (with a last-known-good backup):
+  //  - if destination exists: move existing -> .bak (overwriting any prior backup)
+  //  - move tmp -> destination
+  //
+  // We intentionally KEEP the .bak file on success. It provides a simple recovery
+  // path if the newest save is corrupted (bug, disk issue, power loss, etc.).
+  //
+  // Important:
+  //  - If the destination is missing (e.g. crash mid-rename), we do NOT delete an
+  //    existing .bak; it may be the only remaining valid save.
+
+  ec.clear();
+  const bool hadOut = fs::exists(outPath, ec);
+  if (ec) {
+    outError = "Unable to stat save file: " + outPath.string() + " (" + ec.message() + ")";
+    return false;
+  }
+
+  if (hadOut) {
+    // Overwrite any prior backup.
+    fs::remove(bakPath, ec);
+    ec.clear();
+
     fs::rename(outPath, bakPath, ec);
     if (ec) {
       outError = "Unable to backup existing save: " + outPath.string() + " (" + ec.message() + ")";
@@ -3040,15 +3064,29 @@ bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const Sim
   if (ec) {
     // Best-effort rollback: restore the previous save if it exists.
     std::error_code ec2;
-    if (fs::exists(bakPath, ec2)) {
+    if (hadOut && fs::exists(bakPath, ec2)) {
       fs::rename(bakPath, outPath, ec2);
     }
     outError = "Unable to move temp save into place: " + outPath.string() + " (" + ec.message() + ")";
     return false;
   }
 
-  // Best-effort cleanup of the backup file.
-  fs::remove(bakPath, ec);
+  // Best-effort durability: sync the parent directory so the rename is durable.
+  //
+  // Without this, a crash/power loss after rename can still lose the directory
+  // entry on some systems (even if the file contents were synced).
+  {
+    fs::path dirToSync = parent;
+    if (dirToSync.empty()) {
+      std::error_code ecDir;
+      dirToSync = fs::current_path(ecDir);
+      if (ecDir) dirToSync.clear();
+    }
+    if (!dirToSync.empty()) {
+      BestEffortSyncDirectory(dirToSync);
+    }
+  }
+
 
   return true;
 }

@@ -120,12 +120,28 @@ struct CityNewsEntry {
 
 
 
+struct GameStartupOptions {
+  // Visual preferences JSON file to load/save (relative or absolute).
+  //
+  // If empty, the game will keep the built-in default (isocity_visual.json).
+  std::string visualPrefsPath = "isocity_visual.json";
+
+  // When false, existing prefs are ignored and the game starts with conservative
+  // defaults (useful for 'safe mode' bootstraps).
+  bool loadVisualPrefs = true;
+};
+
 class Game {
 public:
-  explicit Game(Config cfg);
+  explicit Game(Config cfg, GameStartupOptions startup = {});
   ~Game();
 
   void run();
+
+  // Load a save file into the running game instance.
+  //
+  // Intended for bootstraps/launchers (e.g. --load/--resume).
+  bool loadFromFile(const std::string& path, const char* toastLabel = nullptr);
 
 private:
   void resetWorld(std::uint64_t newSeed);

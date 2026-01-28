@@ -10,6 +10,8 @@
 #include "isocity/Pathfinding.hpp"
 #include "isocity/Version.hpp"
 
+#include "cli/CliMain.hpp"
+
 #include <algorithm>
 #include <array>
 #include <string_view>
@@ -134,7 +136,7 @@ std::string HexU64(std::uint64_t v)
 }
 
 // For unknown CLI args, offer a small "did you mean" hint.
-constexpr std::array<std::string_view, 126> kKnownCliArgs = {
+constexpr std::array<std::string_view, 127> kKnownCliArgs = {
   "--3d-ambient", "--3d-ao", "--3d-ao-bias", "--3d-ao-blur", "--3d-ao-power",
   "--3d-ao-radius", "--3d-ao-range", "--3d-ao-samples", "--3d-ao-strength", "--3d-bg",
   "--3d-buildings", "--3d-cliffs", "--3d-contrast", "--3d-diffuse", "--3d-dist",
@@ -153,7 +155,7 @@ constexpr std::array<std::string_view, 126> kKnownCliArgs = {
   "--iso-daynight", "--iso-dusk", "--iso-fancy", "--iso-grid", "--iso-height",
   "--iso-lights", "--iso-margin", "--iso-night", "--iso-roadmarks", "--iso-shore",
   "--iso-texture", "--iso-tile", "--iso-tileset", "--iso-tileset-conifer", "--iso-tileset-emit",
-  "--iso-tileset-light", "--iso-tileset-normal", "--iso-tileset-normal-strength", "--iso-tileset-props", "--iso-tileset-shadow",
+  "--iso-tileset-light", "--iso-tileset-normal", "--iso-tileset-normal-strength", "--iso-tileset-props", "--iso-tileset-props-blue-noise", "--iso-tileset-shadow",
   "--iso-tileset-shadow-strength", "--iso-tileset-streetlight-chance", "--iso-tileset-streetlights", "--iso-tileset-tree-density", "--iso-time",
   "--iso-weather", "--iso-wx-fog", "--iso-wx-intensity", "--iso-wx-overcast", "--iso-wx-precip",
   "--iso-wx-reflect", "--iso-zonepatterns", "--json", "--load", "--maint-park",
@@ -349,6 +351,19 @@ bool WriteRunManifestJson(const std::string& outPath,
   add(root, "tool_git_sha", JsonValue::MakeString(isocity::ProcIsoCityGitSha()));
   add(root, "build_stamp", JsonValue::MakeString(isocity::ProcIsoCityBuildStamp()));
 
+  // Record the working directory used to resolve relative artifact paths.
+  //
+  // This makes downstream tooling (like proc_isocity's renderer bridge) able
+  // to locate artifacts even when the manifest is moved or consumed from a
+  // different current directory.
+  {
+    std::error_code ec;
+    const std::filesystem::path cwd = std::filesystem::current_path(ec);
+    if (!ec && !cwd.empty()) {
+      add(root, "cwd", JsonValue::MakeString(cwd.string()));
+    }
+  }
+
   // Run parameters.
   add(root, "run_index", JsonValue::MakeNumber(static_cast<double>(runIdx)));
   add(root, "requested_seed", JsonValue::MakeNumber(static_cast<double>(requestedSeed)));
@@ -475,7 +490,7 @@ void PrintHelp()
       << "                 [--iso-tileset <atlas.png> <meta.json>] [--iso-tileset-emit <emissive.png>]\n"
       << "                 [--iso-tileset-normal <normal.png>] [--iso-tileset-shadow <shadow.png>]\n"
       << "                 [--iso-tileset-light <x,y,z>] [--iso-tileset-normal-strength <0..100>] [--iso-tileset-shadow-strength <0..100>]\n"
-      << "                 [--iso-tileset-props <0|1>] [--iso-tileset-tree-density <0..100>] [--iso-tileset-conifer <0..100>]\n"
+      << "                 [--iso-tileset-props <0|1>] [--iso-tileset-props-blue-noise <0|1>] [--iso-tileset-tree-density <0..100>] [--iso-tileset-conifer <0..100>]\n"
       << "                 [--iso-tileset-streetlights <0|1>] [--iso-tileset-streetlight-chance <0..100>]\n"
       << "                 [--export-tiles-csv <tiles.csv>]\n"
       << "                 [--batch <N>]\n\n"
@@ -600,9 +615,10 @@ bool WriteCsvRow(std::ostream& os, const isocity::Stats& s)
 
 } // namespace
 
-int main(int argc, char** argv)
+namespace isocity {
+
+int ProcIsoCityCliMain(int argc, char** argv)
 {
-  using namespace isocity;
 
   std::vector<std::string> argvList;
   argvList.reserve(static_cast<std::size_t>(argc));
@@ -2043,6 +2059,19 @@ int main(int argc, char** argv)
       isoCfg.tilesetProps.enabled = (b != 0);
       continue;
     }
+    if (arg == "--iso-tileset-props-blue-noise") {
+      if (!requireValue(i, val)) {
+        std::cerr << "--iso-tileset-props-blue-noise requires 0 or 1\n";
+        return 2;
+      }
+      int b = 1;
+      if (!ParseI32(val, &b) || (b != 0 && b != 1)) {
+        std::cerr << "--iso-tileset-props-blue-noise requires 0 or 1\n";
+        return 2;
+      }
+      isoCfg.tilesetProps.blueNoise = (b != 0);
+      continue;
+    }
     if (arg == "--iso-tileset-tree-density") {
       if (!requireValue(i, val)) {
         std::cerr << "--iso-tileset-tree-density requires an integer percent (0..100)\n";
@@ -2487,3 +2516,5 @@ int main(int argc, char** argv)
 
   return 0;
 }
+
+} // namespace isocity

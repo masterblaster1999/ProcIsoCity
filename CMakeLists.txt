@@ -31,7 +31,7 @@ endif()
 # ---- Options ----
 # NOTE: Default OFF to keep the default build fully offline-capable.
 # The interactive app requires raylib; enable explicitly when you have raylib available.
-option(PROCISOCITY_BUILD_APP "Build the interactive raylib application (requires raylib)" OFF)
+option(PROCISOCITY_BUILD_APP "Build the interactive raylib application (requires raylib)" ON)
 option(PROCISOCITY_BUILD_TESTS "Build headless tests (no raylib required)" OFF)
 option(PROCISOCITY_BUILD_CLI "Build headless command-line tools" ON)
 
@@ -69,6 +69,15 @@ endfunction()
 
 # ---- Core library (no raylib dependency) ----
 add_library(isocity_core
+  src/isocity/AppPaths.cpp
+  src/isocity/CrashHandler.cpp
+  src/isocity/LogTee.cpp
+  src/isocity/SupportBundle.cpp
+  src/isocity/ZipWriter.cpp
+  src/isocity/SessionLock.cpp
+  src/isocity/FileSync.cpp
+  src/isocity/HealthCheck.cpp
+  src/isocity/StackTrace.cpp
   src/isocity/Checksum.cpp
   src/isocity/Compression.cpp
   src/isocity/GltfExport.cpp
@@ -139,6 +148,7 @@ add_library(isocity_core
   src/isocity/DistrictStats.cpp
   src/isocity/ZoneAccess.cpp
   src/isocity/SaveLoad.cpp
+  src/isocity/SaveDiscovery.cpp
   src/isocity/Export.cpp
   src/isocity/Export3D.cpp
   src/isocity/ImageIO.cpp
@@ -160,6 +170,7 @@ add_library(isocity_core
   src/isocity/Heightmap.cpp
   src/isocity/Hash.cpp
   src/isocity/FileHash.cpp
+  src/isocity/CliManifest.cpp
   src/isocity/EditHistory.cpp
   src/isocity/Pathfinding.cpp
   src/isocity/RoadGraph.cpp
@@ -209,6 +220,32 @@ procisocity_set_strict_warnings(isocity_core)
 # Some platforms still need libm explicitly for <cmath>.
 if (UNIX AND NOT APPLE)
   target_link_libraries(isocity_core PUBLIC m)
+endif()
+
+# Stack trace symbolization on Windows uses DbgHelp.
+if (WIN32)
+  target_link_libraries(isocity_core PUBLIC dbghelp)
+endif()
+
+
+# ---- Shared CLI library (no raylib dependency) ----
+#
+# Build the CLI implementation as a reusable library so the interactive app can
+# optionally dispatch into the headless toolchain:
+#
+#   proc_isocity cli --help
+#
+# This also avoids compiling the (large) CLI translation unit twice.
+if (PROCISOCITY_BUILD_CLI OR PROCISOCITY_BUILD_APP)
+  add_library(isocity_cli_lib STATIC
+    src/cli/main.cpp
+    src/cli/CliMain.hpp
+  )
+
+  target_include_directories(isocity_cli_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(isocity_cli_lib PUBLIC isocity_core)
+
+  procisocity_set_strict_warnings(isocity_cli_lib)
 endif()
 
 # ---- App (raylib) ----
@@ -311,6 +348,10 @@ if (PROCISOCITY_BUILD_APP)
     src/isocity/Hash.hpp
     src/isocity/Console.hpp
     src/isocity/Console.cpp
+    src/isocity/RaylibLog.hpp
+    src/isocity/RaylibLog.cpp
+    src/isocity/RaylibTrace.hpp
+    src/isocity/RaylibTrace.cpp
     src/isocity/Game.hpp
     src/isocity/Game.cpp
 
@@ -342,12 +383,22 @@ if (PROCISOCITY_BUILD_APP)
     src/isocity/PostFx.hpp
     src/isocity/PostFx.cpp
 
+    src/isocity/RenderPipeline.hpp
+    src/isocity/RenderPipeline.cpp
+
     src/isocity/ShaderUtil.hpp
     src/isocity/ShaderUtil.cpp
   )
 
   target_include_directories(proc_isocity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(proc_isocity PRIVATE isocity_core raylib)
+
+  if (TARGET isocity_cli_lib)
+    target_link_libraries(proc_isocity PRIVATE isocity_cli_lib)
+    target_compile_definitions(proc_isocity PRIVATE PROCISOCITY_HAS_EMBEDDED_CLI=1)
+  else()
+    target_compile_definitions(proc_isocity PRIVATE PROCISOCITY_HAS_EMBEDDED_CLI=0)
+  endif()
 
   # raylib pulls in Windows headers; prevent `min`/`max` macro pollution that
   # breaks std::min/std::max in our sources.
@@ -356,6 +407,20 @@ if (PROCISOCITY_BUILD_APP)
   endif()
 
   procisocity_set_strict_warnings(proc_isocity)
+
+  # Convenience: copy the on-disk shader override directory next to the executable.
+  #
+  # The app embeds safe shader fallbacks, so this is not required to *run*.
+  # But having `./shaders/` available enables hot-reload (shader_reload) and makes
+  # packaged builds easier to mod.
+  if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
+    add_custom_command(TARGET proc_isocity POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_directory
+        ${CMAKE_CURRENT_SOURCE_DIR}/shaders
+        $<TARGET_FILE_DIR:proc_isocity>/shaders
+      COMMENT "Copying shader override directory next to the executable"
+    )
+  endif()
 
   # Convenience: copy DLLs on Windows when using MSVC + shared builds.
   #
@@ -377,13 +442,11 @@ endif()
 # ---- CLI (headless) ----
 if (PROCISOCITY_BUILD_CLI)
   add_executable(proc_isocity_cli
-    src/cli/main.cpp
-
-    src/isocity/Hash.hpp
+    src/cli/cli_entry.cpp
   )
 
   target_include_directories(proc_isocity_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  target_link_libraries(proc_isocity_cli PRIVATE isocity_core)
+  target_link_libraries(proc_isocity_cli PRIVATE isocity_cli_lib)
 
   procisocity_set_strict_warnings(proc_isocity_cli)
 

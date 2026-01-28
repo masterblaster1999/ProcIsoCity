@@ -1,9 +1,13 @@
 #include "isocity/ShaderUtil.hpp"
 
+#include "isocity/AppPaths.hpp"
+#include "isocity/RaylibTrace.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <unordered_set>
@@ -48,19 +52,24 @@ static void TraceCaptureCallback(int logLevel, const char* text, va_list args)
 
 struct ScopedTraceCapture {
   bool enabled = false;
+  RaylibTraceLogCallback prev = nullptr;
 
   explicit ScopedTraceCapture(std::string* out)
   {
     if (!out) return;
     g_traceCapture = out;
-    SetTraceLogCallback(TraceCaptureCallback);
+    // Preserve any callback installed by the app (e.g. RaylibLog) so we don't
+    // accidentally disable global logging after compiling a shader.
+    prev = GetRaylibTraceLogCallback();
+    SetRaylibTraceLogCallback(TraceCaptureCallback);
     enabled = true;
   }
 
   ~ScopedTraceCapture()
   {
     if (!enabled) return;
-    SetTraceLogCallback(nullptr);
+    // Restore the previous callback.
+    SetRaylibTraceLogCallback(prev);
     g_traceCapture = nullptr;
   }
 };
@@ -299,15 +308,14 @@ ShaderOverrideSearch FindShaderOverrideDir(int maxParentHops)
 {
   ShaderOverrideSearch out;
 
-  std::error_code ec;
-  std::filesystem::path p = std::filesystem::current_path(ec);
-  if (ec) {
-    // Fallback: still try relative "shaders".
-    p = std::filesystem::path(".");
-  }
+  // Deduplicate attempted paths (FindShaderOverrideDir is often called for diagnostics).
+  std::unordered_set<std::string> triedKeys;
 
   auto tryDir = [&](const std::filesystem::path& d) -> bool {
-    out.triedPaths.push_back(d);
+    const std::string key = d.lexically_normal().string();
+    if (triedKeys.insert(key).second) {
+      out.triedPaths.push_back(d);
+    }
     std::error_code ec2;
     if (std::filesystem::exists(d, ec2) && std::filesystem::is_directory(d, ec2)) {
       out.dir = d;
@@ -316,12 +324,36 @@ ShaderOverrideSearch FindShaderOverrideDir(int maxParentHops)
     return false;
   };
 
-  for (int hop = 0; hop <= maxParentHops; ++hop) {
-    if (tryDir(p / "shaders")) return out;
-    if (tryDir(p / "assets" / "shaders")) return out;
-    const std::filesystem::path parent = p.parent_path();
-    if (parent == p || parent.empty()) break;
-    p = parent;
+  auto searchUpwardFrom = [&](std::filesystem::path p) -> bool {
+    for (int hop = 0; hop <= maxParentHops; ++hop) {
+      if (tryDir(p / "shaders")) return true;
+      if (tryDir(p / "assets" / "shaders")) return true;
+      const std::filesystem::path parent = p.parent_path();
+      if (parent == p || parent.empty()) break;
+      p = parent;
+    }
+    return false;
+  };
+
+  // 1) Explicit override dir.
+  const char* env = std::getenv("PROCISOCITY_SHADER_DIR");
+  if (env && *env) {
+    const std::filesystem::path e(env);
+    if (tryDir(e)) return out;
+    if (tryDir(e / "shaders")) return out;
+    if (tryDir(e / "assets" / "shaders")) return out;
+  }
+
+  // 2) Search from current working directory upward.
+  std::error_code ec;
+  std::filesystem::path cwd = std::filesystem::current_path(ec);
+  if (ec || cwd.empty()) cwd = std::filesystem::path(".");
+  if (searchUpwardFrom(cwd)) return out;
+
+  // 3) Search from executable directory upward (supports installed binaries / portable zips).
+  const std::filesystem::path exeDir = AppPaths::ExecutableDir();
+  if (!exeDir.empty()) {
+    if (searchUpwardFrom(exeDir)) return out;
   }
 
   return out;

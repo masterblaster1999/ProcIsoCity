@@ -1,9 +1,15 @@
 #include "isocity/VisualPrefs.hpp"
 
+#include "isocity/FileSync.hpp"
+
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -1015,37 +1021,210 @@ bool ApplyVisualPrefsJson(const JsonValue& root, VisualPrefs& ioPrefs, std::stri
 
 bool LoadVisualPrefsJsonFile(const std::string& path, VisualPrefs& ioPrefs, std::string& outError)
 {
-  std::ifstream ifs(path);
-  if (!ifs.is_open()) {
-    outError = "could not open file";
+  outError.clear();
+  if (path.empty()) {
+    outError = "empty path";
     return false;
   }
 
-  std::stringstream ss;
-  ss << ifs.rdbuf();
+  namespace fs = std::filesystem;
+  const fs::path p(path);
+  const std::string ps = p.string();
+  const bool isTmp = ps.size() >= 4 && ps.compare(ps.size() - 4, 4, ".tmp") == 0;
+  const bool isBak = ps.size() >= 4 && ps.compare(ps.size() - 4, 4, ".bak") == 0;
 
-  JsonValue root;
-  if (!ParseJson(ss.str(), root, outError)) {
-    return false;
+  auto loadExact = [&](const fs::path& file, VisualPrefs& outPrefs, std::string& err) -> bool {
+    std::ifstream ifs(file, std::ios::in | std::ios::binary);
+    if (!ifs.is_open()) {
+      err = "could not open file";
+      return false;
+    }
+
+    std::stringstream ss;
+    ss << ifs.rdbuf();
+
+    JsonValue root;
+    if (!ParseJson(ss.str(), root, err)) {
+      return false;
+    }
+
+    VisualPrefs tmp = ioPrefs;
+    if (!ApplyVisualPrefsJson(root, tmp, err)) {
+      return false;
+    }
+    outPrefs = tmp;
+    return true;
+  };
+
+  // If the caller explicitly pointed at a transactional artifact, respect it and do not heal.
+  if (isTmp || isBak) {
+    VisualPrefs loaded;
+    if (!loadExact(p, loaded, outError)) return false;
+    ioPrefs = loaded;
+    return true;
   }
 
-  return ApplyVisualPrefsJson(root, ioPrefs, outError);
+  const fs::path tmpPath = fs::path(ps + ".tmp");
+  const fs::path bakPath = fs::path(ps + ".bak");
+
+  // 1) Try the primary file.
+  VisualPrefs loaded;
+  std::string primaryErr;
+  if (loadExact(p, loaded, primaryErr)) {
+    ioPrefs = loaded;
+
+    // If there's a stale tmp older than the committed file, clean it up (best-effort).
+    std::error_code ec;
+    if (fs::exists(tmpPath, ec) && !ec) {
+      const auto tTmp = fs::last_write_time(tmpPath, ec);
+      if (!ec) {
+        const auto tMain = fs::last_write_time(p, ec);
+        if (!ec && tTmp < tMain) {
+          fs::remove(tmpPath, ec);
+        }
+      }
+    }
+    return true;
+  }
+
+  // 2) If a temp file exists, try it and (best-effort) promote it into place.
+  {
+    std::error_code ec;
+    if (fs::exists(tmpPath, ec) && !ec) {
+      std::string tmpErr;
+      if (loadExact(tmpPath, loaded, tmpErr)) {
+        ioPrefs = loaded;
+
+        // Heal: rotate current prefs to .bak and move .tmp into place.
+        const fs::path dir = p.parent_path().empty() ? fs::path(".") : p.parent_path();
+        const bool hadMain = fs::exists(p, ec) && !ec;
+        if (hadMain) {
+          fs::remove(bakPath, ec);
+          ec.clear();
+          fs::rename(p, bakPath, ec);
+        }
+        ec.clear();
+        fs::rename(tmpPath, p, ec);
+        if (!ec) {
+          BestEffortSyncFile(p);
+          BestEffortSyncDirectory(dir);
+        }
+        return true;
+      }
+    }
+  }
+
+  // 3) If a backup exists, try it and (best-effort) restore it.
+  {
+    std::error_code ec;
+    if (fs::exists(bakPath, ec) && !ec) {
+      std::string bakErr;
+      if (loadExact(bakPath, loaded, bakErr)) {
+        ioPrefs = loaded;
+
+        // Preserve the corrupt file (if present) so users can attach it to bug reports.
+        if (fs::exists(p, ec) && !ec) {
+          std::tm tm{};
+          const std::time_t now = std::time(nullptr);
+#if defined(_WIN32)
+          gmtime_s(&tm, &now);
+#else
+          gmtime_r(&now, &tm);
+#endif
+          char buf[32] = {};
+          std::snprintf(buf, sizeof(buf), "%04d%02d%02d_%02d%02d%02dZ",
+                        tm.tm_year + 1900,
+                        tm.tm_mon + 1,
+                        tm.tm_mday,
+                        tm.tm_hour,
+                        tm.tm_min,
+                        tm.tm_sec);
+
+          const fs::path corrupt = fs::path(ps + ".corrupt_" + std::string(buf));
+          fs::rename(p, corrupt, ec);
+        }
+
+        ec.clear();
+        fs::copy_file(bakPath, p, fs::copy_options::overwrite_existing, ec);
+        if (!ec) {
+          const fs::path dir = p.parent_path().empty() ? fs::path(".") : p.parent_path();
+          BestEffortSyncFile(p);
+          BestEffortSyncDirectory(dir);
+        }
+        return true;
+      }
+    }
+  }
+
+  outError = primaryErr.empty() ? "failed to load prefs" : primaryErr;
+  return false;
 }
 
 bool WriteVisualPrefsJsonFile(const std::string& path, const VisualPrefs& prefs, std::string& outError, int indentSpaces)
 {
-  std::ofstream ofs(path, std::ios::binary);
-  if (!ofs.is_open()) {
-    outError = "could not open file for write";
+  outError.clear();
+  if (path.empty()) {
+    outError = "empty path";
     return false;
   }
 
-  ofs << VisualPrefsToJson(prefs, indentSpaces);
-  if (!ofs.good()) {
-    outError = "write failed";
+  namespace fs = std::filesystem;
+  const fs::path outPath(path);
+  const fs::path dir = outPath.parent_path().empty() ? fs::path(".") : outPath.parent_path();
+  const fs::path tmpPath = fs::path(outPath.string() + ".tmp");
+  const fs::path bakPath = fs::path(outPath.string() + ".bak");
+
+  // Ensure the directory exists (best-effort).
+  {
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+  }
+
+  // Write to a temp file first.
+  {
+    std::ofstream ofs(tmpPath, std::ios::binary | std::ios::trunc);
+    if (!ofs.is_open()) {
+      outError = "could not open temp file for write";
+      return false;
+    }
+
+    ofs << VisualPrefsToJson(prefs, indentSpaces);
+    ofs.flush();
+    if (!ofs.good()) {
+      outError = "write failed";
+      return false;
+    }
+  }
+
+  // Best-effort durable write: fsync temp file, atomically rename, then fsync directory.
+  BestEffortSyncFile(tmpPath);
+
+  std::error_code ec;
+  const bool hadOut = fs::exists(outPath, ec) && !ec;
+  if (hadOut) {
+    fs::remove(bakPath, ec);
+    ec.clear();
+    fs::rename(outPath, bakPath, ec);
+    if (ec) {
+      outError = "failed to rotate prefs backup: " + ec.message();
+      return false;
+    }
+  }
+
+  ec.clear();
+  fs::rename(tmpPath, outPath, ec);
+  if (ec) {
+    // Roll back if we moved the original aside.
+    std::error_code ec2;
+    if (hadOut && fs::exists(bakPath, ec2) && !ec2) {
+      fs::rename(bakPath, outPath, ec2);
+    }
+    outError = "failed to commit prefs file: " + ec.message();
     return false;
   }
 
+  BestEffortSyncFile(outPath);
+  BestEffortSyncDirectory(dir);
   return true;
 }
 

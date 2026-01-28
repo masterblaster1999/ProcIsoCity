@@ -13,7 +13,9 @@
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "PROCISOCITY_BUILD_APP": "ON",
+        "PROCISOCITY_BUILD_CLI": "ON"
       }
     },
     {

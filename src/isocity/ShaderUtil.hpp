@@ -30,8 +30,17 @@ struct ShaderOverrideSearch {
   std::vector<std::filesystem::path> triedPaths;   // for diagnostics
 };
 
-// Try to find a `shaders/` directory by searching from the current working
-// directory upward. This helps when running from `build/`.
+// Try to find a `shaders/` directory.
+//
+// Search order:
+//  - If PROCISOCITY_SHADER_DIR is set, use it (or its `shaders/` subdir).
+//  - Search upward from the current working directory.
+//  - Search upward from the executable directory.
+//
+// This makes shader overrides work in more scenarios:
+//  - running from `build/`
+//  - installed binaries launched from arbitrary working directories
+//  - portable zips where `shaders/` lives next to the executable
 ShaderOverrideSearch FindShaderOverrideDir(int maxParentHops = 4);
 
 struct ShaderSourceLoad {

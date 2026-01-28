@@ -17,6 +17,7 @@
 #include "isocity/RoadGraphTraffic.hpp"
 #include "isocity/RoadUpgradePlannerExport.hpp"
 #include "isocity/SaveLoad.hpp"
+#include "isocity/FileSync.hpp"
 #include "isocity/Script.hpp"
 #include "isocity/TransitPlannerExport.hpp"
 #include "isocity/TourPlanner.hpp"
@@ -522,24 +523,270 @@ bool Game::saveToPath(const std::string& path, bool makeThumbnail, const char* t
   return true;
 }
 
+bool Game::loadFromFile(const std::string& path, const char* toastLabel)
+{
+  return loadFromPath(path, toastLabel);
+}
+
 bool Game::loadFromPath(const std::string& path, const char* toastLabel)
 {
   endPaintStroke();
 
-  std::string err;
+  namespace fs = std::filesystem;
+
+  auto endsWith = [](const std::string& s, const char* suf) -> bool {
+    const std::size_t n = std::strlen(suf);
+    return s.size() >= n && s.compare(s.size() - n, n, suf) == 0;
+  };
+
+  const fs::path inputPath = fs::path(path);
+  fs::path basePath = inputPath;
+
+  const bool inputIsTmp = endsWith(path, ".tmp");
+  const bool inputIsBak = (!inputIsTmp && endsWith(path, ".bak"));
+
+  if (inputIsTmp || inputIsBak) {
+    if (path.size() >= 4) {
+      basePath = fs::path(path.substr(0, path.size() - 4));
+    }
+  }
+
+  fs::path tmpPath = basePath;
+  tmpPath += ".tmp";
+  fs::path bakPath = basePath;
+  bakPath += ".bak";
+
+  auto fileTimestamp = [](const fs::path& p, fs::file_time_type& out) -> bool {
+    std::error_code ec;
+    if (!fs::exists(p, ec) || ec) return false;
+    if (!fs::is_regular_file(p, ec) || ec) return false;
+    out = fs::last_write_time(p, ec);
+    return !ec;
+  };
+
+  // Attempt load into temporaries so a failed parse doesn't partially mutate outputs.
   World loaded;
   ProcGenConfig loadedProcCfg{};
   SimConfig loadedSimCfg{};
 
-  if (!LoadWorldBinary(loaded, loadedProcCfg, loadedSimCfg, path, err)) {
-    showToast(std::string("Load failed: ") + err, 4.0f);
+  auto tryLoad = [&](const fs::path& loadPath, std::string& outErr) -> bool {
+    outErr.clear();
+    World w;
+    ProcGenConfig pc{};
+    SimConfig sc{};
+    if (!LoadWorldBinary(w, pc, sc, loadPath.string(), outErr)) {
+      return false;
+    }
+    loaded = std::move(w);
+    loadedProcCfg = pc;
+    loadedSimCfg = sc;
+    return true;
+  };
+
+  enum class Source : std::uint8_t { Primary = 0, Temp = 1, Backup = 2 };
+
+  fs::path usedPath;
+  Source usedSrc = Source::Primary;
+  bool recovered = false;
+  bool baseAttemptedAndFailed = false;
+
+  std::string errPrimary; // error from the most relevant failure (requested path)
+  std::string err;
+
+  // Prefer a newer temp save when loading a canonical slot path.
+  if (!inputIsTmp && !inputIsBak) {
+    fs::file_time_type tBase{};
+    fs::file_time_type tTmp{};
+    const bool haveTmp = fileTimestamp(tmpPath, tTmp);
+    const bool haveBase = fileTimestamp(basePath, tBase);
+
+    if (haveTmp && (!haveBase || tTmp > tBase)) {
+      if (tryLoad(tmpPath, err)) {
+        usedPath = tmpPath;
+        usedSrc = Source::Temp;
+        recovered = true;
+      }
+    }
+  }
+
+  // If we didn't load a preferred temp save, load the requested path.
+  if (usedPath.empty()) {
+    if (tryLoad(inputPath, err)) {
+      usedPath = inputPath;
+      usedSrc = inputIsTmp ? Source::Temp : (inputIsBak ? Source::Backup : Source::Primary);
+      recovered = inputIsTmp || inputIsBak;
+    } else {
+      errPrimary = err;
+      if (!inputIsTmp && !inputIsBak) {
+        baseAttemptedAndFailed = true;
+      }
+    }
+  }
+
+  // Fallback chain (best-effort):
+  if (usedPath.empty()) {
+    // If the user asked for a temp/backup explicitly, try the canonical path next.
+    if ((inputIsTmp || inputIsBak) && inputPath != basePath) {
+      if (tryLoad(basePath, err)) {
+        usedPath = basePath;
+        usedSrc = Source::Primary;
+        recovered = true;
+      }
+    }
+  }
+
+  if (usedPath.empty() && !inputIsTmp) {
+    if (tryLoad(tmpPath, err)) {
+      usedPath = tmpPath;
+      usedSrc = Source::Temp;
+      recovered = true;
+    }
+  }
+
+  if (usedPath.empty() && !inputIsBak) {
+    if (tryLoad(bakPath, err)) {
+      usedPath = bakPath;
+      usedSrc = Source::Backup;
+      recovered = true;
+    }
+  }
+
+  if (usedPath.empty()) {
+    const std::string bestErr = !errPrimary.empty() ? errPrimary : err;
+    showToast(std::string("Load failed: ") + bestErr, 4.0f);
     return false;
   }
 
-  const std::string toast = toastLabel ? std::string(TextFormat("Loaded: %s", toastLabel))
-                                       : std::string(TextFormat("Loaded: %s", path.c_str()));
+  // Toast message: if the caller already provided a "Recovered: ..." label, honor it.
+  std::string toast;
+  if (toastLabel) {
+    const std::string lbl = toastLabel;
+    const bool lblIsRecovered = (lbl.rfind("Recovered", 0) == 0);
+    if (lblIsRecovered) {
+      toast = lbl;
+    } else {
+      toast = std::string(TextFormat("%s: %s", recovered ? "Recovered" : "Loaded", toastLabel));
+    }
+  } else {
+    toast = std::string(TextFormat("%s: %s", recovered ? "Recovered" : "Loaded", usedPath.string().c_str()));
+  }
+
+  if (recovered) {
+    m_console.print(TextFormat("save: recovered load from %s", usedPath.string().c_str()));
+  }
 
   adoptLoadedWorld(std::move(loaded), loadedProcCfg, loadedSimCfg, toast, nullptr);
+
+  // --- Best-effort on-disk healing ---
+  // If we successfully loaded from a temp/backup, try to promote it back to the canonical slot file.
+  auto ensureDirSynced = [&](const fs::path& filePath) {
+    fs::path dir = filePath.parent_path();
+    if (dir.empty()) {
+      std::error_code ec;
+      dir = fs::current_path(ec);
+      if (ec) dir.clear();
+    }
+    if (!dir.empty()) {
+      BestEffortSyncDirectory(dir);
+    }
+  };
+
+  auto utcStamp = []() -> std::string {
+    std::time_t t = std::time(nullptr);
+    std::tm tm{};
+#if defined(_WIN32)
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%SZ", &tm);
+    return std::string(buf);
+  };
+
+  if (usedSrc == Source::Temp) {
+    // Commit tmp -> base (and keep previous base as .bak if present).
+    std::error_code ec;
+    const bool tmpExists = fs::exists(tmpPath, ec) && !ec && fs::is_regular_file(tmpPath, ec);
+    if (tmpExists) {
+      ec.clear();
+      const bool hadBase = fs::exists(basePath, ec) && !ec && fs::is_regular_file(basePath, ec);
+
+      if (hadBase) {
+        // Overwrite any prior backup (best-effort).
+        fs::remove(bakPath, ec);
+        ec.clear();
+
+        fs::rename(basePath, bakPath, ec);
+        if (ec) {
+          m_console.print(TextFormat("save: warning: unable to backup stale save before tmp promotion: %s", ec.message().c_str()));
+          // If we can't move the base aside, we can't atomically promote the temp file.
+          // Leave the .tmp in place so the user can recover it manually.
+          return true;
+        }
+      }
+
+      ec.clear();
+      fs::rename(tmpPath, basePath, ec);
+      if (ec) {
+        // Best-effort rollback.
+        std::error_code ec2;
+        if (hadBase && fs::exists(bakPath, ec2)) {
+          fs::rename(bakPath, basePath, ec2);
+        }
+        m_console.print(TextFormat("save: warning: unable to promote temp save into place: %s", ec.message().c_str()));
+      } else {
+        ensureDirSynced(basePath);
+      }
+    }
+  } else if (usedSrc == Source::Backup) {
+    // If we fell back to a backup because the primary failed (or is missing), restore the slot file.
+    // Keep the .bak as a last-known-good copy.
+    std::error_code ec;
+    const bool bakExists = fs::exists(bakPath, ec) && !ec && fs::is_regular_file(bakPath, ec);
+    if (bakExists) {
+      ec.clear();
+      const bool baseExists = fs::exists(basePath, ec) && !ec && fs::is_regular_file(basePath, ec);
+
+      const bool shouldRestore = (!baseExists) || baseAttemptedAndFailed;
+      if (shouldRestore) {
+        if (baseExists && baseAttemptedAndFailed) {
+          // Preserve the corrupted file for debugging.
+          fs::path corrupt = basePath;
+          corrupt += ".corrupt_";
+          corrupt += utcStamp();
+
+          ec.clear();
+          fs::rename(basePath, corrupt, ec);
+          if (ec) {
+            m_console.print(TextFormat("save: warning: unable to preserve corrupt save: %s", ec.message().c_str()));
+          }
+        }
+
+        ec.clear();
+        fs::copy_file(bakPath, basePath, fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+          m_console.print(TextFormat("save: warning: unable to restore backup save: %s", ec.message().c_str()));
+        } else {
+          BestEffortSyncFile(basePath);
+          ensureDirSynced(basePath);
+        }
+      }
+    }
+  }
+
+  // Clean up a stale temp file if it's older than the canonical save.
+  {
+    std::error_code ec;
+    fs::file_time_type tBase{};
+    fs::file_time_type tTmp{};
+    const bool haveBase = fileTimestamp(basePath, tBase);
+    const bool haveTmp = fileTimestamp(tmpPath, tTmp);
+    if (haveBase && haveTmp && tBase >= tTmp) {
+      fs::remove(tmpPath, ec);
+    }
+  }
+
   return true;
 }
 
@@ -732,7 +979,7 @@ void Game::invalidateAnalysisLayers()
 }
 
 
-Game::Game(Config cfg)
+Game::Game(Config cfg, GameStartupOptions startup)
     : m_cfg(cfg)
     , m_rl(cfg, "ProcIsoCity")
     , m_world()
@@ -741,6 +988,11 @@ Game::Game(Config cfg)
 {
   // Prevent accidental Alt+F4 style exits while testing.
   SetExitKey(KEY_NULL);
+
+  // Startup overrides (used by the executable bootstrap).
+  if (!startup.visualPrefsPath.empty()) {
+    m_visualPrefsPath = startup.visualPrefsPath;
+  }
 
   // Blueprint stamping: by default, disallow placing non-road overlays onto water.
   m_blueprintApplyOpt.force = false;
@@ -788,7 +1040,7 @@ Game::Game(Config cfg)
   m_postFxPipeline.init();
 
   // Load persisted display/visual preferences if present (defaults to isocity_visual.json).
-  if (std::filesystem::exists(m_visualPrefsPath)) {
+  if (startup.loadVisualPrefs && !m_visualPrefsPath.empty() && std::filesystem::exists(m_visualPrefsPath)) {
     loadVisualPrefsFile(m_visualPrefsPath, false);
   }
   // Prime change detection for autosave (even if no prefs file exists yet).

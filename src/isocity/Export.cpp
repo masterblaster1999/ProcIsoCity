@@ -3,6 +3,7 @@
 
 #include "isocity/GfxTilesetAtlas.hpp"
 #include "isocity/Random.hpp"
+#include "isocity/BlueNoise.hpp"
 #include "isocity/ZoneMetrics.hpp"
 #include "isocity/ZoneAccess.hpp"
 
@@ -3347,6 +3348,8 @@ IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const
   const bool tilesetStreetlights = tilesetProps && cfg.tilesetProps.drawStreetlights;
   const float streetlightChance = tilesetStreetlights ? std::clamp(cfg.tilesetProps.streetlightChance, 0.0f, 1.0f) : 0.0f;
 
+  const bool propsBlueNoise = tilesetProps && cfg.tilesetProps.blueNoise;
+
   auto distPointSegment = [](float px, float py, float ax, float ay, float bx, float by, float& outT) -> float {
     const float vx = bx - ax;
     const float vy = by - ay;
@@ -3692,8 +3695,13 @@ IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const
             const std::uint32_t h0 = HashCoords32(x, y, seed32 ^ 0x2D1B5A49u);
             const std::uint32_t h1 = HashCoords32(x, y, seed32 ^ 0xA12F6B73u);
             int count = 0;
-            if (hash01(h0) < parkTreeDensity) count += 1;
-            if (parkTreeDensity > 0.5f && hash01(h1) < (parkTreeDensity - 0.5f) * 2.0f) count += 1;
+            if (propsBlueNoise) {
+              if (BlueNoiseChance(x, y, parkTreeDensity, seed32, 0x2D1B5A49u)) count += 1;
+              if (parkTreeDensity > 0.5f && BlueNoiseChance(x, y, (parkTreeDensity - 0.5f) * 2.0f, seed32, 0xA12F6B73u)) count += 1;
+            } else {
+              if (hash01(h0) < parkTreeDensity) count += 1;
+              if (parkTreeDensity > 0.5f && hash01(h1) < (parkTreeDensity - 0.5f) * 2.0f) count += 1;
+            }
 
             for (int i = 0; i < count; ++i) {
               const std::uint32_t ht = HashCoords32(x, y, seed32 ^ (0x6C8E9CF5u + static_cast<std::uint32_t>(i) * 0x9E3779B9u));
@@ -3735,7 +3743,9 @@ IsoOverviewResult RenderIsoOverview(const World& world, ExportLayer layer, const
           if (tilesetStreetlights && t.overlay == Overlay::Road && streetlightChance > 0.001f && tileset->propStreetlightVariants > 0) {
             const std::uint8_t roadMask = roadMaskAt(x, y);
             const std::uint32_t hl = HashCoords32(x, y, seed32 ^ 0x57E371A1u);
-            if (hash01(hl) < streetlightChance) {
+            const bool place = propsBlueNoise ? BlueNoiseChance(x, y, streetlightChance, seed32, 0x57E371A1u)
+                                             : (hash01(hl) < streetlightChance);
+            if (place) {
               const int v = static_cast<int>(hl % static_cast<std::uint32_t>(tileset->propStreetlightVariants));
               const std::string lname = std::string("prop_streetlight_v") + std::to_string(v);
               if (const GfxAtlasEntry* le = FindGfxAtlasEntry(*tileset, lname)) {
