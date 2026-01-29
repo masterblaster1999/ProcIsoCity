@@ -57,6 +57,8 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
 // v9: v8 + ProcGen erosion config
 // v10: v9 + ProcGen terrain preset config
 // v11: v10 + ProcGen road hierarchy config
+// v12: v11 + ProcGen districting mode config
+// v13: v12 + municipal bonds / debt state
 
 // Save using an explicit ProcGenConfig + SimConfig (recommended for v2+ delta saves).
 bool SaveWorldBinary(const World& world, const ProcGenConfig& procCfg, const SimConfig& simCfg, const std::string& path,
@@ -75,6 +77,8 @@ bool SaveWorldBinary(const World& world, const std::string& path, std::string& o
 // v9 additionally persists ProcGen erosion settings.
 // v10 additionally persists ProcGen terrain preset settings.
 // v11 additionally persists ProcGen road hierarchy settings.
+// v12 additionally persists ProcGen districting mode settings.
+// v13 additionally persists municipal bond / debt state.
 bool LoadWorldBinary(World& outWorld, ProcGenConfig& outProcCfg, SimConfig& outSimCfg, const std::string& path,
                      std::string& outError);
 

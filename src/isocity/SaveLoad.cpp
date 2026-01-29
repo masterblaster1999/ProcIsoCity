@@ -35,7 +35,8 @@ constexpr std::uint32_t kVersionV9 = 9; // v8 + ProcGen erosion config
 constexpr std::uint32_t kVersionV10 = 10; // v9 + ProcGen terrain preset config
 constexpr std::uint32_t kVersionV11 = 11; // v10 + ProcGen road hierarchy config
 constexpr std::uint32_t kVersionV12 = 12; // v11 + ProcGen districting mode config
-constexpr std::uint32_t kVersionCurrent = kVersionV12;
+constexpr std::uint32_t kVersionV13 = 13; // v12 + municipal bonds / debt state
+constexpr std::uint32_t kVersionCurrent = kVersionV13;
 
 // --- CRC32 ---
 // Used by v3+ saves to detect corruption/truncation.
@@ -277,6 +278,45 @@ void FromBin(Stats& s, const StatsBin& b)
   s.roads = static_cast<int>(b.roads);
   s.parks = static_cast<int>(b.parks);
 }
+
+struct DebtBinV13 {
+  std::int32_t id = 0;
+  std::int32_t principal = 0;
+  std::int32_t balance = 0;
+  std::int32_t termDays = 0;
+  std::int32_t daysLeft = 0;
+  std::int32_t aprBasisPoints = 0;
+  std::int32_t dailyPayment = 0;
+  std::int32_t issuedDay = 0;
+};
+
+inline DebtBinV13 ToBinV13(const DebtItem& d)
+{
+  DebtBinV13 b;
+  b.id = static_cast<std::int32_t>(d.id);
+  b.principal = static_cast<std::int32_t>(d.principal);
+  b.balance = static_cast<std::int32_t>(d.balance);
+  b.termDays = static_cast<std::int32_t>(d.termDays);
+  b.daysLeft = static_cast<std::int32_t>(d.daysLeft);
+  b.aprBasisPoints = static_cast<std::int32_t>(d.aprBasisPoints);
+  b.dailyPayment = static_cast<std::int32_t>(d.dailyPayment);
+  b.issuedDay = static_cast<std::int32_t>(d.issuedDay);
+  return b;
+}
+
+inline void FromBinV13(DebtItem& d, const DebtBinV13& b)
+{
+  d.id = static_cast<int>(b.id);
+  d.principal = static_cast<int>(b.principal);
+  d.balance = static_cast<int>(b.balance);
+  d.termDays = static_cast<int>(b.termDays);
+  d.daysLeft = static_cast<int>(b.daysLeft);
+  d.aprBasisPoints = static_cast<int>(b.aprBasisPoints);
+  d.dailyPayment = static_cast<int>(b.dailyPayment);
+  d.issuedDay = static_cast<int>(b.issuedDay);
+}
+
+
 
 struct ProcGenConfigBin {
   float terrainScale = 0.08f;
@@ -2242,6 +2282,170 @@ bool LoadBodyV12(std::istream& is, std::uint32_t w, std::uint32_t h, std::uint64
   return true;
 }
 
+bool LoadBodyV13(std::istream& is, std::uint32_t w, std::uint32_t h, std::uint64_t seed, World& outWorld,
+                 ProcGenConfig& outProcCfg, SimConfig& outSimCfg, std::string& outError)
+{
+  // v13: v12 + municipal bonds / debt state.
+  //
+  // Payload:
+  //   ProcGenConfigBinV12
+  //   ErosionConfigBin
+  //   StatsBin
+  //   SimConfigBin
+  //   u8 districtPoliciesEnabled
+  //   DistrictPolicyBin[kDistrictCount]
+  //   u32 debtCount
+  //   DebtBinV13[debtCount]
+  //   u8 compressionMethod (0=None, 1=SLLZ)
+  //   varint(uncompressedSize)
+  //   varint(storedSize)
+  //   stored bytes
+  //
+  // The uncompressed bytes are a v7-style delta stream (see ApplyDeltasV7).
+
+  ProcGenConfigBinV12 pcb{};
+  if (!Read(is, pcb)) {
+    outError = "Read failed (procgen config)";
+    return false;
+  }
+  FromBinV12(outProcCfg, pcb);
+
+  ErosionConfigBin ecb{};
+  if (!Read(is, ecb)) {
+    outError = "Read failed (erosion config)";
+    return false;
+  }
+  FromBin(outProcCfg.erosion, ecb);
+
+  StatsBin sb{};
+  if (!Read(is, sb)) {
+    outError = "Read failed (stats)";
+    return false;
+  }
+
+  SimConfigBin scb{};
+  if (!Read(is, scb)) {
+    outError = "Read failed (sim config)";
+    return false;
+  }
+  FromBin(outSimCfg, scb);
+
+  // District policy chunk (v7+).
+  std::uint8_t dpEnabled = 0;
+  if (!Read(is, dpEnabled)) {
+    outError = "Read failed (district policy enabled)";
+    return false;
+  }
+  outSimCfg.districtPoliciesEnabled = (dpEnabled != 0);
+
+  for (int d = 0; d < kDistrictCount; ++d) {
+    DistrictPolicyBin dpb{};
+    if (!Read(is, dpb)) {
+      outError = "Read failed (district policy)";
+      return false;
+    }
+    FromBin(outSimCfg.districtPolicies[static_cast<std::size_t>(d)], dpb);
+  }
+
+  // Debt state (v13+).
+  std::uint32_t debtCount = 0;
+  if (!Read(is, debtCount)) {
+    outError = "Read failed (debt count)";
+    return false;
+  }
+  if (debtCount > 1024u) {
+    outError = "Invalid debt count in save file";
+    return false;
+  }
+
+  std::vector<DebtItem> debts;
+  debts.reserve(static_cast<std::size_t>(debtCount));
+  for (std::uint32_t i = 0; i < debtCount; ++i) {
+    DebtBinV13 db{};
+    if (!Read(is, db)) {
+      outError = "Read failed (debt entry)";
+      return false;
+    }
+    DebtItem d{};
+    FromBinV13(d, db);
+
+    // Basic sanity clamps to avoid corrupt data.
+    d.id = std::max(0, d.id);
+    d.principal = std::max(0, d.principal);
+    d.balance = std::max(0, d.balance);
+    d.termDays = std::max(0, d.termDays);
+    d.daysLeft = std::max(0, d.daysLeft);
+    d.aprBasisPoints = std::clamp(d.aprBasisPoints, 0, 50000); // 0%..500%
+    d.dailyPayment = std::max(0, d.dailyPayment);
+    d.issuedDay = std::max(0, d.issuedDay);
+
+    debts.push_back(d);
+  }
+
+  // Compressed delta payload.
+  std::uint8_t methodU8 = 0;
+  if (!Read(is, methodU8)) {
+    outError = "Read failed (compression method)";
+    return false;
+  }
+
+  std::uint32_t uncompressedSize = 0;
+  std::uint32_t storedSize = 0;
+  if (!ReadVarU32(is, uncompressedSize) || !ReadVarU32(is, storedSize)) {
+    outError = "Read failed (compressed payload sizes)";
+    return false;
+  }
+
+  const std::uint64_t tileCount = static_cast<std::uint64_t>(w) * static_cast<std::uint64_t>(h);
+  const std::uint64_t maxReasonable = tileCount * 32ull + 1024ull;
+  if (static_cast<std::uint64_t>(uncompressedSize) > maxReasonable ||
+      static_cast<std::uint64_t>(storedSize) > maxReasonable) {
+    outError = "Invalid compressed payload size";
+    return false;
+  }
+
+  std::vector<std::uint8_t> stored(storedSize);
+  if (storedSize > 0) {
+    is.read(reinterpret_cast<char*>(stored.data()), static_cast<std::streamsize>(storedSize));
+    if (!is.good()) {
+      outError = "Read failed (compressed payload bytes)";
+      return false;
+    }
+  }
+
+  std::vector<std::uint8_t> delta;
+  if (methodU8 == static_cast<std::uint8_t>(CompressionMethod::None)) {
+    if (storedSize != uncompressedSize) {
+      outError = "Invalid payload sizes for uncompressed delta stream";
+      return false;
+    }
+    delta = std::move(stored);
+  } else if (methodU8 == static_cast<std::uint8_t>(CompressionMethod::SLLZ)) {
+    std::string decErr;
+    if (!DecompressSLLZ(stored.data(), stored.size(), static_cast<std::size_t>(uncompressedSize), delta, decErr)) {
+      outError = "Delta payload decompression failed: " + decErr;
+      return false;
+    }
+  } else {
+    outError = "Unknown compression method in save file";
+    return false;
+  }
+
+  World loaded = GenerateWorld(static_cast<int>(w), static_cast<int>(h), seed, outProcCfg);
+
+  // Parse delta stream from an in-memory buffer.
+  std::string deltaStr(reinterpret_cast<const char*>(delta.data()), delta.size());
+  std::istringstream ds(deltaStr, std::ios::binary);
+  if (!ApplyDeltasV7(ds, w, h, loaded, outProcCfg, outError)) {
+    return false;
+  }
+
+  FromBin(loaded.stats(), sb);
+  loaded.debts() = std::move(debts);
+  outWorld = std::move(loaded);
+  return true;
+}
+
 bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::string& outError, bool verifyCrc)
 {
   outError.clear();
@@ -2746,15 +2950,33 @@ bool WriteWorldBinaryPayload(Writer& cw, const World& world, const ProcGenConfig
     outError = "Write failed (district policy enabled)";
     return false;
   }
-  for (int d = 0; d < kDistrictCount; ++d) {
-    const DistrictPolicyBin dpb = ToBin(simCfg.districtPolicies[static_cast<std::size_t>(d)]);
-    if (!cw.write(dpb)) {
-      outError = "Write failed (district policy)";
+for (int d = 0; d < kDistrictCount; ++d) {
+  const DistrictPolicyBin dpb = ToBin(simCfg.districtPolicies[static_cast<std::size_t>(d)]);
+  if (!cw.write(dpb)) {
+    outError = "Write failed (district policy)";
+    return false;
+  }
+}
+
+// Municipal bonds / debt state (v13+).
+{
+  constexpr std::uint32_t kMaxDebtsToSave = 128;
+  const auto& debts = world.debts();
+  const std::uint32_t count = static_cast<std::uint32_t>(std::min<std::size_t>(debts.size(), kMaxDebtsToSave));
+  if (!cw.write(count)) {
+    outError = "Write failed (debt count)";
+    return false;
+  }
+  for (std::uint32_t i = 0; i < count; ++i) {
+    const DebtBinV13 db = ToBinV13(debts[static_cast<std::size_t>(i)]);
+    if (!cw.write(db)) {
+      outError = "Write failed (debt entry)";
       return false;
     }
   }
+}
 
-  // --- Tile deltas ---
+// --- Tile deltas ---
   // We store only the tiles whose mutable fields differ from a regenerated baseline.
   // This keeps save files small while still being deterministic.
   const World baseline = GenerateWorld(world.width(), world.height(), seed, procCfg);
@@ -3165,7 +3387,7 @@ bool LoadWorldBinary(World& outWorld, ProcGenConfig& outProcCfg, SimConfig& outS
 
   if (version == kVersionV3 || version == kVersionV4 || version == kVersionV5 || version == kVersionV6 ||
       version == kVersionV7 || version == kVersionV8 || version == kVersionV9 || version == kVersionV10 ||
-      version == kVersionV11 || version == kVersionV12) {
+      version == kVersionV11 || version == kVersionV12 || version == kVersionV13) {
     // v3+ saves append a CRC32 at the end of the file.
     //
     // We validate the CRC before parsing to detect corruption/truncation.
@@ -3226,15 +3448,20 @@ bool LoadWorldBinary(World& outWorld, ProcGenConfig& outProcCfg, SimConfig& outS
       return LoadBodyV11(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
     }
 
-    // v12: v11 + ProcGen districting mode config.
-    return LoadBodyV12(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
-  }
+    if (version == kVersionV12) {
+      // v12: v11 + ProcGen districting mode config.
+      return LoadBodyV12(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
+    }
+
+    // v13: v12 + municipal bonds / debt state.
+    return LoadBodyV13(f, w, h, seed, outWorld, outProcCfg, outSimCfg, outError);
+}
 
   std::ostringstream oss;
   oss << "Unsupported save version: " << version << " (supported: " << kVersionV1 << ", " << kVersionV2 << ", "
       << kVersionV3 << ", " << kVersionV4 << ", " << kVersionV5 << ", " << kVersionV6 << ", "
       << kVersionV7 << ", " << kVersionV8 << ", " << kVersionV9 << ", " << kVersionV10 << ", "
-      << kVersionV11 << ", " << kVersionV12 << ")";
+      << kVersionV11 << ", " << kVersionV12 << ", " << kVersionV13 << ")";
   outError = oss.str();
   return false;
 }
@@ -3288,7 +3515,7 @@ bool LoadWorldBinaryFromBytes(World& outWorld, ProcGenConfig& outProcCfg, SimCon
 
   if (version == kVersionV3 || version == kVersionV4 || version == kVersionV5 || version == kVersionV6 ||
       version == kVersionV7 || version == kVersionV8 || version == kVersionV9 || version == kVersionV10 ||
-      version == kVersionV11 || version == kVersionV12) {
+      version == kVersionV11 || version == kVersionV12 || version == kVersionV13) {
     // v3+ saves append a CRC32 at the end of the file.
     //
     // For in-memory loads we validate the CRC over the buffer (excluding the final CRC field).
@@ -3352,7 +3579,7 @@ bool LoadWorldBinaryFromBytes(World& outWorld, ProcGenConfig& outProcCfg, SimCon
   oss << "Unsupported save version: " << version << " (supported: " << kVersionV1 << ", " << kVersionV2 << ", "
       << kVersionV3 << ", " << kVersionV4 << ", " << kVersionV5 << ", " << kVersionV6 << ", "
       << kVersionV7 << ", " << kVersionV8 << ", " << kVersionV9 << ", " << kVersionV10 << ", "
-      << kVersionV11 << ", " << kVersionV12 << ")";
+      << kVersionV11 << ", " << kVersionV12 << ", " << kVersionV13 << ")";
   outError = oss.str();
   return false;
 }

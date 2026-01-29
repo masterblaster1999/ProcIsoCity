@@ -192,6 +192,35 @@ struct Stats {
   float avgLandValue = 0.0f;      // mean land value across non-water tiles
 };
 
+
+struct DebtItem {
+  // Unique id for UI / debugging (not used by the sim itself).
+  int id = 0;
+
+  // Original principal (for UI).
+  int principal = 0;
+
+  // Remaining balance (principal + accrued interest - payments).
+  int balance = 0;
+
+  // Original term in days (for UI).
+  int termDays = 0;
+
+  // Days remaining until maturity. The simulator forces full payoff on the final day.
+  int daysLeft = 0;
+
+  // Annual Percentage Rate in basis points (1bp = 0.01%).
+  int aprBasisPoints = 0;
+
+  // Scheduled daily payment (amortized). The simulator may override the final day to
+  // fully repay any remainder.
+  int dailyPayment = 0;
+
+  // The day this debt was issued (world.stats().day at issuance time).
+  int issuedDay = 0;
+};
+
+
 const char* ToString(Terrain t);
 const char* ToString(Overlay o);
 const char* ToString(Tool t);
@@ -212,6 +241,10 @@ public:
 
   const Stats& stats() const { return m_stats; }
   Stats& stats() { return m_stats; }
+
+  const std::vector<DebtItem>& debts() const { return m_debts; }
+  std::vector<DebtItem>& debts() { return m_debts; }
+
 
   bool isBuildable(int x, int y) const;  // Terrain != Water
   bool isEmptyLand(int x, int y) const;  // buildable and overlay == None

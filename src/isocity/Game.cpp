@@ -164,6 +164,10 @@ constexpr int kPolicyPanelW = 420;
 constexpr int kPolicyPanelH = 620;
 constexpr int kNewsPanelW = 460;
 constexpr int kNewsPanelH = 420;
+constexpr int kChallengesPanelW = 460;
+constexpr int kChallengesPanelH = 360;
+constexpr int kBondsPanelW = 460;
+constexpr int kBondsPanelH = 420;
 constexpr int kTrafficPanelW = 420;
 constexpr int kTrafficPanelH = 314;
 constexpr int kResiliencePanelW = 460;
@@ -793,6 +797,8 @@ bool Game::loadFromPath(const std::string& path, const char* toastLabel)
 void Game::adoptLoadedWorld(World&& loaded, const ProcGenConfig& loadedProcCfg, const SimConfig& loadedSimCfg,
                             const std::string& toastMessage, const std::vector<Stats>* tickStats)
 {
+  const std::uint64_t prevSeed = m_world.seed();
+
   // Any in-flight paint stroke must be ended by the caller, but defensively ensure we
   // aren't mid-stroke when replacing the world.
   m_painting = false;
@@ -809,6 +815,12 @@ void Game::adoptLoadedWorld(World&& loaded, const ProcGenConfig& loadedProcCfg, 
   m_procCfg = loadedProcCfg;
   m_sim.config() = loadedSimCfg;
   m_sim.resetTimer();
+
+  // New world (different seed) => reset non-persistent gameplay overlays.
+  // When the seed is unchanged (e.g., AutoBuild fast-forward), preserve challenges.
+  if (m_world.seed() != prevSeed) {
+    clearCityChallenges();
+  }
 
   m_renderer.markMinimapDirty();
   m_renderer.markBaseCacheDirtyAll();
@@ -894,11 +906,24 @@ m_policyOptTopFirst = 0;
   m_sim.refreshDerivedStats(m_world);
   clearHistory();
   if (tickStats && !tickStats->empty()) {
+    int moneyOffset = 0;
     for (const Stats& s : *tickStats) {
-      recordHistorySample(s);
+      Stats ss = s;
+      ss.money += moneyOffset;
+      const int grant = applyCityChallenges(ss);
+      moneyOffset += grant;
+      recordHistorySample(ss);
+    }
+    if (moneyOffset != 0) {
+      m_world.stats().money += moneyOffset;
     }
   } else {
-    recordHistorySample(m_world.stats());
+    {
+      Stats s = m_world.stats();
+      const int grant = applyCityChallenges(s);
+      if (grant != 0) m_world.stats().money += grant;
+      recordHistorySample(s);
+    }
   }
 
   showToast(toastMessage);
@@ -1495,7 +1520,12 @@ void Game::setupDevConsole()
           // Make HUD stats immediately correct (without waiting for the next sim tick).
           m_sim.refreshDerivedStats(m_world);
           clearHistory();
-          recordHistorySample(m_world.stats());
+          {
+            Stats s = m_world.stats();
+            const int grant = applyCityChallenges(s);
+            if (grant != 0) m_world.stats().money += grant;
+            recordHistorySample(s);
+          }
 
           if (toastLabel && toastLabel[0] != '\0') {
             showToast(toastLabel);
@@ -2840,10 +2870,11 @@ void Game::setupDevConsole()
   m_console.registerCommand(
       "pause", "pause        - toggle simulation pause", [this](DevConsole& c, const DevConsole::Args&) {
         endPaintStroke();
-        m_simPaused = !m_simPaused;
+        m_simPausedUser = !m_simPausedUser;
         m_sim.resetTimer();
-        showToast(m_simPaused ? "Sim paused" : "Sim running");
-        c.print(m_simPaused ? "paused" : "running");
+        const bool paused = simPaused();
+        showToast(paused ? "Sim paused" : "Sim running");
+        c.print(paused ? "paused" : "running");
       });
 
   m_console.registerCommand(
@@ -2861,7 +2892,12 @@ void Game::setupDevConsole()
         if (m_replayCapture.active()) {
           m_replayCapture.recordTicks(1);
         }
-        recordHistorySample(m_world.stats());
+        {
+          Stats s = m_world.stats();
+          const int grant = applyCityChallenges(s);
+          if (grant != 0) m_world.stats().money += grant;
+          recordHistorySample(s);
+        }
         m_trafficDirty = true;
         m_goodsDirty = true;
         m_landValueDirty = true;
@@ -2903,6 +2939,278 @@ void Game::setupDevConsole()
         showToast(TextFormat("Sim speed: x%.2f", static_cast<double>(kSimSpeeds[best])));
         c.print(TextFormat("sim speed set to x%.2f", static_cast<double>(kSimSpeeds[best])));
       });
+
+
+  m_console.registerCommand(
+      "loop",
+      "loop [show|perf|dtmax <s>|simdtmax <s>|fps <focused> <unfocused>|throttle_unfocused <0|1>|sim <auto|fixed|ticks <n>>|budget <ms>|backlog <ticks>|pause_unfocused <0|1>|pause_minimized <0|1>] - tweak game loop pacing",
+      [this, toLower, parseF32, parseI32](DevConsole& c, const DevConsole::Args& args) {
+        auto parseBool01 = [&](const std::string& s, bool& out) -> bool {
+          const std::string v = toLower(s);
+          if (v == "1" || v == "on" || v == "true" || v == "yes") {
+            out = true;
+            return true;
+          }
+          if (v == "0" || v == "off" || v == "false" || v == "no") {
+            out = false;
+            return true;
+          }
+          return false;
+        };
+
+        auto printState = [&]() {
+          c.print(TextFormat("dt clamp: frame %.3fs, sim %.3fs", static_cast<double>(m_loopCfg.maxFrameDt),
+                             static_cast<double>(m_loopCfg.maxSimDt)));
+          c.print(std::string("focus pause: unfocused ") + (m_loopCfg.pauseWhenUnfocused ? "on" : "off") +
+                  ", minimized " + (m_loopCfg.pauseWhenMinimized ? "on" : "off"));
+          c.print(TextFormat("fps cap: focused %d, unfocused %d | throttle %s | applied %d",
+                             m_loopCfg.targetFpsFocused, m_loopCfg.targetFpsUnfocused,
+                             m_loopCfg.throttleFpsWhenUnfocused ? "on" : "off", m_targetFpsApplied));
+
+          const char* mode = !m_loopCfg.simTickLimiter ? "unlimited" : (m_loopCfg.simTickAuto ? "auto" : "fixed");
+          c.print(TextFormat("sim limiter: %s | budget %.1fms | fixed %d ticks/frame | backlog cap %d ticks",
+                             mode, static_cast<double>(m_loopCfg.simBudgetMs), m_loopCfg.simMaxTicksPerFrame,
+                             m_loopCfg.simMaxBacklogTicks));
+          c.print(std::string("perf overlay: ") + (m_showPerfOverlay ? "on (Ctrl+F3)" : "off (Ctrl+F3)"));
+
+          c.print(TextFormat("last frame dt: %.2fms (raw %.2fms)%s | sim dt %.2fms",
+                             static_cast<double>(m_loopStats.dtFrame * 1000.0f),
+                             static_cast<double>(m_loopStats.dtRaw * 1000.0f),
+                             m_loopStats.dtClamped ? " CLAMP" : "",
+                             static_cast<double>(m_loopStats.dtSim * 1000.0f)));
+          c.print(TextFormat("sim: ticks %d (limit %d) | backlog %d ticks (%.2fs) | tick %.2fms (ema %.2fms)",
+                             m_loopStats.simTicks, m_loopStats.simTickLimit, m_loopStats.simBacklogTicks,
+                             static_cast<double>(m_loopStats.simBacklogSec), m_loopStats.simMsPerTick,
+                             m_loopStats.simMsPerTickEma));
+          c.print(TextFormat("cpu ms: in %.2f  up %.2f  draw %.2f  total %.2f", m_loopStats.cpuInputMs,
+                             m_loopStats.cpuUpdateMs, m_loopStats.cpuDrawMs, m_loopStats.cpuFrameMs));
+        };
+
+        if (args.empty()) {
+          printState();
+          return;
+        }
+
+        const std::string a0 = toLower(args[0]);
+        if (a0 == "show" || a0 == "stats") {
+          printState();
+          return;
+        }
+
+        if (a0 == "perf") {
+          if (args.size() == 1) {
+            m_showPerfOverlay = !m_showPerfOverlay;
+          } else {
+            bool b = false;
+            if (!parseBool01(args[1], b)) {
+              c.print("Usage: loop perf [on|off|0|1|true|false]");
+              return;
+            }
+            m_showPerfOverlay = b;
+          }
+          showToast(m_showPerfOverlay ? "Perf overlay: ON" : "Perf overlay: OFF");
+          printState();
+          return;
+        }
+
+        if (a0 == "dtmax") {
+          if (args.size() != 2) {
+            c.print("Usage: loop dtmax <seconds>");
+            return;
+          }
+          float v = 0.0f;
+          if (!parseF32(args[1], v)) {
+            c.print("Invalid float: " + args[1]);
+            return;
+          }
+          m_loopCfg.maxFrameDt = std::max(0.0f, v);
+          showToast(TextFormat("Loop dt clamp: %.3fs", static_cast<double>(m_loopCfg.maxFrameDt)));
+          printState();
+          return;
+        }
+
+        if (a0 == "simdtmax") {
+          if (args.size() != 2) {
+            c.print("Usage: loop simdtmax <seconds>");
+            return;
+          }
+          float v = 0.0f;
+          if (!parseF32(args[1], v)) {
+            c.print("Invalid float: " + args[1]);
+            return;
+          }
+          m_loopCfg.maxSimDt = std::max(0.0f, v);
+          showToast(TextFormat("Sim dt clamp: %.3fs", static_cast<double>(m_loopCfg.maxSimDt)));
+          printState();
+          return;
+        }
+
+
+        if (a0 == "throttle_unfocused") {
+          if (args.size() != 2) {
+            c.print("Usage: loop throttle_unfocused <0|1>");
+            return;
+          }
+          bool b = false;
+          if (!parseBool01(args[1], b)) {
+            c.print("Usage: loop throttle_unfocused <0|1>");
+            return;
+          }
+          m_loopCfg.throttleFpsWhenUnfocused = b;
+
+          // Apply immediately.
+          const bool focusedNow = IsWindowFocused();
+          const bool minimizedNow = IsWindowState(FLAG_WINDOW_MINIMIZED);
+          const int desired = (focusedNow && !minimizedNow) ? std::max(1, m_loopCfg.targetFpsFocused)
+                                                            : std::max(1, m_loopCfg.targetFpsUnfocused);
+          SetTargetFPS(desired);
+          m_targetFpsApplied = desired;
+          m_loopStats.targetFps = desired;
+
+          showToast(std::string("Throttle when unfocused: ") + (b ? "ON" : "OFF"));
+          printState();
+          return;
+        }
+
+        if (a0 == "fps") {
+          if (args.size() != 3) {
+            c.print("Usage: loop fps <focused> <unfocused>");
+            return;
+          }
+          int f = 0;
+          int u = 0;
+          if (!parseI32(args[1], f) || !parseI32(args[2], u)) {
+            c.print("Usage: loop fps <focused> <unfocused>");
+            return;
+          }
+          m_loopCfg.targetFpsFocused = std::clamp(f, 1, 1000);
+          m_loopCfg.targetFpsUnfocused = std::clamp(u, 1, 1000);
+
+          if (m_loopCfg.throttleFpsWhenUnfocused) {
+            // Apply immediately based on current focus state.
+            const bool focusedNow = IsWindowFocused();
+            const bool minimizedNow = IsWindowState(FLAG_WINDOW_MINIMIZED);
+            const int desired = (focusedNow && !minimizedNow) ? m_loopCfg.targetFpsFocused : m_loopCfg.targetFpsUnfocused;
+            SetTargetFPS(desired);
+            m_targetFpsApplied = desired;
+            m_loopStats.targetFps = desired;
+          }
+
+          showToast(TextFormat("FPS cap: %d (focused), %d (unfocused)", m_loopCfg.targetFpsFocused, m_loopCfg.targetFpsUnfocused));
+          printState();
+          return;
+        }
+
+        if (a0 == "budget") {
+          if (args.size() != 2) {
+            c.print("Usage: loop budget <ms>");
+            return;
+          }
+          float v = 0.0f;
+          if (!parseF32(args[1], v)) {
+            c.print("Invalid float: " + args[1]);
+            return;
+          }
+          m_loopCfg.simBudgetMs = std::max(0.0f, v);
+          m_loopCfg.simTickLimiter = true;
+          m_loopCfg.simTickAuto = true;
+          showToast(TextFormat("Sim tick budget: %.1fms", static_cast<double>(m_loopCfg.simBudgetMs)));
+          printState();
+          return;
+        }
+
+        if (a0 == "backlog") {
+          if (args.size() != 2) {
+            c.print("Usage: loop backlog <ticks>");
+            return;
+          }
+          int n = 0;
+          if (!parseI32(args[1], n)) {
+            c.print("Invalid int: " + args[1]);
+            return;
+          }
+          m_loopCfg.simMaxBacklogTicks = std::max(0, n);
+          showToast(TextFormat("Sim backlog cap: %d ticks", m_loopCfg.simMaxBacklogTicks));
+          printState();
+          return;
+        }
+
+        if (a0 == "pause_unfocused") {
+          if (args.size() != 2) {
+            c.print("Usage: loop pause_unfocused <0|1>");
+            return;
+          }
+          bool b = false;
+          if (!parseBool01(args[1], b)) {
+            c.print("Usage: loop pause_unfocused <0|1>");
+            return;
+          }
+          m_loopCfg.pauseWhenUnfocused = b;
+          showToast(std::string("Pause when unfocused: ") + (b ? "ON" : "OFF"));
+          printState();
+          return;
+        }
+
+        if (a0 == "pause_minimized") {
+          if (args.size() != 2) {
+            c.print("Usage: loop pause_minimized <0|1>");
+            return;
+          }
+          bool b = false;
+          if (!parseBool01(args[1], b)) {
+            c.print("Usage: loop pause_minimized <0|1>");
+            return;
+          }
+          m_loopCfg.pauseWhenMinimized = b;
+          showToast(std::string("Pause when minimized: ") + (b ? "ON" : "OFF"));
+          printState();
+          return;
+        }
+
+        if (a0 == "sim") {
+          if (args.size() < 2) {
+            c.print("Usage: loop sim <auto|fixed|ticks <n>>");
+            return;
+          }
+          const std::string a1 = toLower(args[1]);
+          if (a1 == "auto") {
+            m_loopCfg.simTickLimiter = true;
+            m_loopCfg.simTickAuto = true;
+            showToast("Sim tick limiter: AUTO");
+            printState();
+            return;
+          }
+          if (a1 == "fixed") {
+            m_loopCfg.simTickLimiter = true;
+            m_loopCfg.simTickAuto = false;
+            showToast("Sim tick limiter: FIXED");
+            printState();
+            return;
+          }
+          if (a1 == "ticks") {
+            if (args.size() != 3) {
+              c.print("Usage: loop sim ticks <n>");
+              return;
+            }
+            int n = 0;
+            if (!parseI32(args[2], n)) {
+              c.print("Invalid int: " + args[2]);
+              return;
+            }
+            m_loopCfg.simTickLimiter = true;
+            m_loopCfg.simTickAuto = false;
+            m_loopCfg.simMaxTicksPerFrame = std::max(0, n);
+            showToast(TextFormat("Sim tick limit: %d", m_loopCfg.simMaxTicksPerFrame));
+            printState();
+            return;
+          }
+          c.print("Usage: loop sim <auto|fixed|ticks <n>>");
+          return;
+        }
+
+        c.print("Unknown loop command. Try: loop show");
+      });
+
 
   m_console.registerCommand(
       "money", "money <amount>  - set current money", [this, parseI64](DevConsole& c, const DevConsole::Args& args) {
@@ -8700,8 +9008,18 @@ void Game::recordCityNews(const Stats& s)
     e.body = TextFormat(
       "A new city charter is signed and the first roads are surveyed.\n"
       "Tip: 1=Road, 2/3/4=RCI zones, 5=Parks. Watch demand (RCI) in the Report panel (F1).\n"
+      "Ctrl+O opens City Challenges - short goals that nudge you toward solving real city problems.\n"
       "Mayor approval: %.0f%% (%s).",
       static_cast<double>(rating), mood.c_str());
+
+    // Inject any addendum (e.g., challenge bulletins).
+    if (auto it = m_cityNewsAddendum.find(s.day); it != m_cityNewsAddendum.end()) {
+      if (!it->second.empty()) {
+        e.body += "\n\n";
+        e.body += it->second;
+      }
+      m_cityNewsAddendum.erase(it);
+    }
 
     m_cityNews.push_back(std::move(e));
     m_newsSelection = static_cast<int>(m_cityNews.size()) - 1;
@@ -9249,6 +9567,15 @@ void Game::recordCityNews(const Stats& s)
     } break;
   }
 
+  // Inject any addendum (e.g., challenge bulletins).
+  if (auto it = m_cityNewsAddendum.find(s.day); it != m_cityNewsAddendum.end()) {
+    if (!it->second.empty()) {
+      e.body += "\n\n";
+      e.body += it->second;
+    }
+    m_cityNewsAddendum.erase(it);
+  }
+
   // --- Commit ---
   const int countBefore = static_cast<int>(m_cityNews.size());
   const bool followTail = (countBefore <= 0) ? true : (m_newsSelection >= countBefore - 1);
@@ -9490,6 +9817,960 @@ void Game::drawNewsPanel(const Rectangle& panelR)
            "Ctrl+N: toggle  |  Ctrl+Shift+N: export  |  Wheel/Click: browse", uiTh.textFaint, /*bold=*/false,
            /*shadow=*/true, 1);
 }
+
+namespace {
+
+inline int DaysLeftInclusive(int today, int deadline) { return std::max(0, deadline - today); }
+
+inline float ProgressFromRange(int start, int cur, int target)
+{
+  if (target == start) return (cur >= target) ? 1.0f : 0.0f;
+  const double denom = static_cast<double>(target - start);
+  const double num = static_cast<double>(cur - start);
+  return static_cast<float>(std::clamp(num / denom, 0.0, 1.0));
+}
+
+inline float ProgressFromRange(float start, float cur, float target)
+{
+  const float denom = (target - start);
+  if (std::abs(denom) < 1e-6f) return (cur >= target) ? 1.0f : 0.0f;
+  const float t = (cur - start) / denom;
+  return Clamp01(t);
+}
+
+static float ChallengeProgress(const CityChallenge& c, const Stats& s)
+{
+  switch (c.kind) {
+    case CityChallengeKind::GrowPopulation: {
+      return ProgressFromRange(c.startInt, s.population, c.targetInt);
+    }
+    case CityChallengeKind::BuildParks: {
+      return ProgressFromRange(c.startInt, s.parks, c.targetInt);
+    }
+    case CityChallengeKind::ReduceCongestion: {
+      // Lower is better.
+      if (c.startF <= c.targetF) return (s.trafficCongestion <= c.targetF) ? 1.0f : 0.0f;
+      return ProgressFromRange(c.startF, s.trafficCongestion, c.targetF);
+    }
+    case CityChallengeKind::ImproveGoods: {
+      return ProgressFromRange(c.startF, s.goodsSatisfaction, c.targetF);
+    }
+    case CityChallengeKind::ImproveServices: {
+      return ProgressFromRange(c.startF, s.servicesOverallSatisfaction, c.targetF);
+    }
+    case CityChallengeKind::BalanceBudget: {
+      const int req = std::max(1, c.targetInt);
+      return Clamp01(static_cast<float>(std::clamp(c.stateInt, 0, req)) / static_cast<float>(req));
+    }
+    case CityChallengeKind::RestoreOutsideConnection: {
+      const int denom = std::max(1, c.startInt);
+      const int ok = std::max(0, denom - s.commutersUnreachable);
+      return Clamp01(static_cast<float>(ok) / static_cast<float>(denom));
+    }
+  }
+  return 0.0f;
+}
+
+static bool ChallengeComplete(const CityChallenge& c, const Stats& s)
+{
+  switch (c.kind) {
+    case CityChallengeKind::GrowPopulation: return s.population >= c.targetInt;
+    case CityChallengeKind::BuildParks: return s.parks >= c.targetInt;
+    case CityChallengeKind::ReduceCongestion: return s.trafficCongestion <= c.targetF;
+    case CityChallengeKind::ImproveGoods: return s.goodsSatisfaction >= c.targetF;
+    case CityChallengeKind::ImproveServices: return s.servicesOverallSatisfaction >= c.targetF;
+    case CityChallengeKind::BalanceBudget: return c.stateInt >= std::max(1, c.targetInt);
+    case CityChallengeKind::RestoreOutsideConnection: return s.commutersUnreachable <= 0;
+  }
+  return false;
+}
+
+static CityChallengeKind PickWeighted(RNG& rng, const std::vector<std::pair<CityChallengeKind, float>>& weights)
+{
+  double sum = 0.0;
+  for (const auto& w : weights) {
+    if (w.second > 0.0f && std::isfinite(w.second)) sum += static_cast<double>(w.second);
+  }
+  if (!(sum > 0.0)) {
+    return CityChallengeKind::GrowPopulation;
+  }
+  const double r = static_cast<double>(rng.nextF01()) * sum;
+  double acc = 0.0;
+  for (const auto& w : weights) {
+    if (!(w.second > 0.0f) || !std::isfinite(w.second)) continue;
+    acc += static_cast<double>(w.second);
+    if (r <= acc) return w.first;
+  }
+  return weights.back().first;
+}
+
+static int RngRangeI(RNG& rng, int lo, int hi)
+{
+  if (hi <= lo) return lo;
+  return rng.rangeInt(lo, hi);
+}
+
+static CityChallenge MakeChallenge(const World& world, const Stats& s, int day, std::uint32_t id, RNG& rng,
+                                  const std::vector<CityChallengeKind>& avoidKinds)
+{
+  auto isAvoid = [&](CityChallengeKind k) {
+    for (CityChallengeKind a : avoidKinds) {
+      if (a == k) return true;
+    }
+    return false;
+  };
+
+  // Heuristic needs -> weights.
+  const float congNeed = Clamp01((s.trafficCongestion - 0.25f) / 0.65f);
+  const float goodsNeed = Clamp01((0.85f - s.goodsSatisfaction) / 0.85f);
+  const float svcNeed = Clamp01((0.65f - s.servicesOverallSatisfaction) / 0.65f);
+  const float outsideNeed = (s.commuters > 0) ? Clamp01(static_cast<float>(s.commutersUnreachable) / static_cast<float>(s.commuters)) : 0.0f;
+
+  const float demandAvg = (s.demandResidential + s.demandCommercial + s.demandIndustrial) / 3.0f;
+  const float growthNeed = Clamp01(0.35f + 0.85f * demandAvg);
+
+  std::vector<std::pair<CityChallengeKind, float>> weights;
+  weights.reserve(10);
+  if (!isAvoid(CityChallengeKind::GrowPopulation)) weights.push_back({CityChallengeKind::GrowPopulation, 1.25f * growthNeed});
+  if (!isAvoid(CityChallengeKind::BuildParks)) weights.push_back({CityChallengeKind::BuildParks, 0.55f + 0.75f * Clamp01(0.5f - s.happiness)});
+  if (!isAvoid(CityChallengeKind::ReduceCongestion)) weights.push_back({CityChallengeKind::ReduceCongestion, 0.15f + 1.70f * congNeed});
+  if (!isAvoid(CityChallengeKind::ImproveGoods)) weights.push_back({CityChallengeKind::ImproveGoods, 0.25f + 1.30f * goodsNeed});
+  if (!isAvoid(CityChallengeKind::ImproveServices)) weights.push_back({CityChallengeKind::ImproveServices, 0.25f + 1.30f * svcNeed});
+  if (!isAvoid(CityChallengeKind::BalanceBudget)) weights.push_back({CityChallengeKind::BalanceBudget, 0.25f + 0.8f * Clamp01(static_cast<float>(s.expenses - s.income + 150) / 450.0f)});
+  if (!isAvoid(CityChallengeKind::RestoreOutsideConnection) && s.commutersUnreachable > 0) {
+    weights.push_back({CityChallengeKind::RestoreOutsideConnection, 0.25f + 1.75f * outsideNeed});
+  }
+
+  // Early game: bias toward growth.
+  if (s.day < 5 || s.population == 0) {
+    for (auto& w : weights) {
+      if (w.first == CityChallengeKind::GrowPopulation) w.second *= 3.0f;
+    }
+  }
+
+  CityChallenge c;
+  c.id = id;
+  c.dayIssued = day;
+  c.status = CityChallengeStatus::Active;
+
+  c.kind = PickWeighted(rng, weights);
+
+  // Build the actual parameters.
+  switch (c.kind) {
+    case CityChallengeKind::GrowPopulation: {
+      c.startInt = s.population;
+      const int base = std::max(20, std::min(900, 60 + s.population / 4));
+      const int delta = RngRangeI(rng, base / 2, base);
+      c.targetInt = c.startInt + delta;
+      const int dur = RngRangeI(rng, 10, 38);
+      c.dayDeadline = day + dur;
+      c.rewardMoney = 80 + delta * 2 + dur * 3;
+      c.title = TextFormat("Grow to %d residents", c.targetInt);
+      c.description = TextFormat("Increase population from %d to %d by Day %d.\nTip: keep Residential demand high and connect homes to jobs.",
+                                 c.startInt, c.targetInt, c.dayDeadline);
+    } break;
+    case CityChallengeKind::BuildParks: {
+      c.startInt = s.parks;
+      const int add = std::clamp(RngRangeI(rng, 2, 10) + (s.population / 200), 2, 18);
+      c.targetInt = c.startInt + add;
+      const int dur = RngRangeI(rng, 12, 45);
+      c.dayDeadline = day + dur;
+      c.rewardMoney = 60 + add * 40 + dur * 2;
+      c.title = TextFormat("Build %d parks", add);
+      c.description = TextFormat("Add %d park tiles by Day %d.\nParks boost happiness, land value, and help stabilize growth.",
+                                 add, c.dayDeadline);
+    } break;
+    case CityChallengeKind::ReduceCongestion: {
+      c.startF = std::clamp(s.trafficCongestion, 0.0f, 1.0f);
+      const float drop = rng.rangeFloat(0.15f, 0.45f);
+      c.targetF = std::clamp(c.startF - drop, 0.05f, 0.55f);
+      const int dur = RngRangeI(rng, 8, 30);
+      c.dayDeadline = day + dur;
+      c.rewardMoney = 110 + static_cast<int>(std::round(static_cast<double>((c.startF - c.targetF) * 520.0f))) + dur * 4;
+      c.title = TextFormat("Cut congestion below %d%%", static_cast<int>(std::round(c.targetF * 100.0f)));
+      c.description = TextFormat("Lower traffic congestion to <= %d%% by Day %d.\nTip: add bypass routes, upgrade key corridors, or build transit.",
+                                 static_cast<int>(std::round(c.targetF * 100.0f)), c.dayDeadline);
+    } break;
+    case CityChallengeKind::ImproveGoods: {
+      c.startF = std::clamp(s.goodsSatisfaction, 0.0f, 1.0f);
+      c.targetF = std::clamp(std::max(0.75f, c.startF + rng.rangeFloat(0.15f, 0.35f)), 0.0f, 1.0f);
+      const int dur = RngRangeI(rng, 8, 28);
+      c.dayDeadline = day + dur;
+      c.rewardMoney = 90 + static_cast<int>(std::round(static_cast<double>((c.targetF - c.startF) * 420.0f))) + dur * 3;
+      c.title = TextFormat("Deliver goods at %d%%", static_cast<int>(std::round(c.targetF * 100.0f)));
+      c.description = TextFormat("Raise goods satisfaction to >= %d%% by Day %d.\nTip: ensure industrial and commercial zones are connected to the road network.",
+                                 static_cast<int>(std::round(c.targetF * 100.0f)), c.dayDeadline);
+    } break;
+    case CityChallengeKind::ImproveServices: {
+      c.startF = std::clamp(s.servicesOverallSatisfaction, 0.0f, 1.0f);
+      c.targetF = std::clamp(std::max(0.55f, c.startF + rng.rangeFloat(0.15f, 0.35f)), 0.0f, 0.95f);
+      const int dur = RngRangeI(rng, 12, 40);
+      c.dayDeadline = day + dur;
+      c.rewardMoney = 100 + static_cast<int>(std::round(static_cast<double>((c.targetF - c.startF) * 520.0f))) + dur * 3;
+      c.title = TextFormat("Improve services to %d%%", static_cast<int>(std::round(c.targetF * 100.0f)));
+      c.description = TextFormat("Raise overall public services satisfaction to >= %d%% by Day %d.\nTip: place schools/hospitals/police/fire near residents.",
+                                 static_cast<int>(std::round(c.targetF * 100.0f)), c.dayDeadline);
+    } break;
+    case CityChallengeKind::BalanceBudget: {
+      c.stateInt = 0;
+      c.targetInt = std::clamp(RngRangeI(rng, 3, 5), 3, 7);
+      const int dur = RngRangeI(rng, 10, 42);
+      c.dayDeadline = day + dur;
+      c.rewardMoney = 120 + c.targetInt * 60 + dur * 3;
+      c.title = TextFormat("Run a surplus for %d days", c.targetInt);
+      c.description = TextFormat("Achieve %d consecutive days with Net >= 0 by Day %d.\nTip: adjust taxes/maintenance and watch demand.",
+                                 c.targetInt, c.dayDeadline);
+    } break;
+    case CityChallengeKind::RestoreOutsideConnection: {
+      const int unreachable = std::max(0, s.commutersUnreachable);
+      c.startInt = std::max(1, unreachable);
+      c.targetInt = 0;
+      const int dur = RngRangeI(rng, 7, 25);
+      c.dayDeadline = day + dur;
+      c.rewardMoney = 90 + std::min(500, unreachable * 2) + dur * 4;
+      c.title = "Restore outside access";
+      c.description = TextFormat("Reduce unreachable commuters to 0 by Day %d.\nTip: connect roads to the map edge and avoid isolated neighborhoods.",
+                                 c.dayDeadline);
+    } break;
+  }
+
+  // Ensure the title isn't empty in edge cases.
+  if (c.title.empty()) c.title = "City challenge";
+  if (c.dayDeadline < c.dayIssued) c.dayDeadline = c.dayIssued;
+  if (c.rewardMoney < 0) c.rewardMoney = 0;
+
+  (void)world;
+  return c;
+}
+
+static Color ChallengeProgressColor(const ui::Theme& th, float p, int daysLeft)
+{
+  if (p >= 0.999f) return th.accentOk;
+  if (daysLeft <= 3 && p < 0.4f) return th.accentBad;
+  return th.accent;
+}
+
+} // namespace
+
+void Game::clearCityChallenges()
+{
+  m_cityChallenges.clear();
+  m_challengeLog.clear();
+  m_cityNewsAddendum.clear();
+  m_challengeSelection = 0;
+  m_challengeFirst = 0;
+  m_challengeRerolls = 0;
+  m_challengeNextId = 1;
+  m_challengeLastProcessedDay = -1;
+}
+
+int Game::applyCityChallenges(Stats& ioStats)
+{
+  const int day = ioStats.day;
+  if (day == m_challengeLastProcessedDay) return 0;
+  m_challengeLastProcessedDay = day;
+
+  // Deterministic RNG: world seed + day.
+  const std::uint64_t seed = (static_cast<std::uint64_t>(m_world.seed()) ^ 0xBADC0FFEE0DDF00DULL) +
+                             (static_cast<std::uint64_t>(day) * 0x9E3779B97F4A7C15ULL);
+  RNG rng(seed);
+
+  auto addBullet = [&](std::string_view line) {
+    std::string& a = m_cityNewsAddendum[day];
+    if (a.empty()) {
+      a = "Council Dispatch:\n";
+    }
+    a += "- ";
+    a.append(line.data(), line.size());
+    a += "\n";
+  };
+
+  // Update active challenges.
+  int moneyAward = 0;
+  for (CityChallenge& c : m_cityChallenges) {
+    if (c.status != CityChallengeStatus::Active) continue;
+
+    // Stateful kinds.
+    if (c.kind == CityChallengeKind::BalanceBudget) {
+      const int net = ioStats.income - ioStats.expenses;
+      if (net >= 0) c.stateInt = std::max(0, c.stateInt) + 1;
+      else c.stateInt = 0;
+    }
+
+    const bool complete = ChallengeComplete(c, ioStats);
+    const bool expired = (day > c.dayDeadline);
+    if (complete) {
+      c.status = CityChallengeStatus::Completed;
+      moneyAward += std::max(0, c.rewardMoney);
+
+      addBullet(TextFormat("Challenge completed: %s (+$%d)", c.title.c_str(), std::max(0, c.rewardMoney)));
+      m_challengeLog.push_back(CityChallengeLogEntry{day, c.status, std::max(0, c.rewardMoney), c.title});
+    } else if (expired) {
+      c.status = CityChallengeStatus::Failed;
+      addBullet(TextFormat("Challenge failed: %s", c.title.c_str()));
+      m_challengeLog.push_back(CityChallengeLogEntry{day, c.status, 0, c.title});
+    }
+  }
+
+  // Prune logs.
+  while (static_cast<int>(m_challengeLog.size()) > std::max(8, m_challengeLogMax)) {
+    m_challengeLog.pop_front();
+  }
+
+  // Remove completed/failed challenges from the active list.
+  m_cityChallenges.erase(std::remove_if(m_cityChallenges.begin(), m_cityChallenges.end(), [](const CityChallenge& c) {
+                          return c.status != CityChallengeStatus::Active;
+                        }),
+                        m_cityChallenges.end());
+
+  // Keep a few active challenges available.
+  const int activeCount = static_cast<int>(m_cityChallenges.size());
+  const int target = std::clamp(m_challengeTargetActive, 1, 6);
+  if (activeCount < target) {
+    // Avoid duplicate kinds already active.
+    std::vector<CityChallengeKind> avoid;
+    avoid.reserve(static_cast<std::size_t>(target));
+    for (const CityChallenge& c : m_cityChallenges) {
+      avoid.push_back(c.kind);
+    }
+    const int toCreate = target - activeCount;
+    for (int i = 0; i < toCreate; ++i) {
+      const std::uint32_t id = m_challengeNextId++;
+      CityChallenge nc = MakeChallenge(m_world, ioStats, day, id, rng, avoid);
+      avoid.push_back(nc.kind);
+      m_cityChallenges.push_back(std::move(nc));
+    }
+  }
+
+  // Apply reward.
+  if (moneyAward > 0) {
+    ioStats.money += moneyAward;
+    showToast(TextFormat("Challenge reward: +$%d", moneyAward), 2.0f);
+  }
+
+  return moneyAward;
+}
+
+void Game::focusChallenge(const CityChallenge& c)
+{
+  switch (c.kind) {
+    case CityChallengeKind::BuildParks:
+      setTool(Tool::Park);
+      m_heatmapOverlay = HeatmapOverlay::ParkAmenity;
+      showToast("Focus: build parks (heatmap: Park amenity)", 2.0f);
+      break;
+    case CityChallengeKind::GrowPopulation:
+      setTool(Tool::Residential);
+      m_showReport = true;
+      showToast("Focus: grow population (tool: Residential)", 2.0f);
+      break;
+    case CityChallengeKind::ReduceCongestion:
+      m_showTrafficOverlay = true;
+      m_heatmapOverlay = HeatmapOverlay::TrafficSpill;
+      m_trafficDirty = true;
+      showToast("Focus: reduce congestion (heatmap: Traffic spill)", 2.0f);
+      break;
+    case CityChallengeKind::ImproveGoods:
+      m_showGoodsOverlay = true;
+      m_goodsDirty = true;
+      showToast("Focus: improve goods delivery (goods overlay)", 2.0f);
+      break;
+    case CityChallengeKind::ImproveServices:
+      m_showServicesPanel = true;
+      m_heatmapOverlay = HeatmapOverlay::ServicesOverall;
+      m_servicesHeatmapsDirty = true;
+      showToast("Focus: improve services (Services panel)", 2.0f);
+      break;
+    case CityChallengeKind::BalanceBudget:
+      m_showPolicy = true;
+      showToast("Focus: balance budget (Policy panel)", 2.0f);
+      break;
+    case CityChallengeKind::RestoreOutsideConnection:
+      m_showOutsideOverlay = true;
+      showToast("Focus: restore outside access (Outside overlay)", 2.0f);
+      break;
+  }
+}
+
+bool Game::rerollChallenge(std::size_t idx)
+{
+  if (idx >= m_cityChallenges.size()) return false;
+  CityChallenge& c = m_cityChallenges[idx];
+  if (c.status != CityChallengeStatus::Active) return false;
+
+  const int base = 25;
+  const int cost = base + 20 * std::clamp(m_challengeRerolls, 0, 20);
+  if (m_world.stats().money < cost) {
+    showToast(TextFormat("Reroll costs $%d (insufficient funds)", cost), 2.5f);
+    return false;
+  }
+
+  m_world.stats().money -= cost;
+  m_challengeRerolls += 1;
+
+  // Cancel and replace (avoid repeating the same kind immediately).
+  const int day = m_world.stats().day;
+  m_challengeLog.push_back(CityChallengeLogEntry{day, CityChallengeStatus::Canceled, 0, c.title});
+
+  std::vector<CityChallengeKind> avoid;
+  avoid.reserve(m_cityChallenges.size());
+  avoid.push_back(c.kind);
+  for (std::size_t i = 0; i < m_cityChallenges.size(); ++i) {
+    if (i == idx) continue;
+    avoid.push_back(m_cityChallenges[i].kind);
+  }
+
+  // Deterministic reroll seed: day + reroll count.
+  const std::uint64_t seed = (static_cast<std::uint64_t>(m_world.seed()) ^ 0xC0FFEE123456789ULL) +
+                             (static_cast<std::uint64_t>(day) * 0x9E3779B97F4A7C15ULL) +
+                             (static_cast<std::uint64_t>(m_challengeRerolls) * 0xD1B54A32D192ED03ULL);
+  RNG rng(seed);
+
+  CityChallenge nc = MakeChallenge(m_world, m_world.stats(), day, m_challengeNextId++, rng, avoid);
+  c = std::move(nc);
+  showToast(TextFormat("Challenge rerolled (-$%d)", cost), 2.0f);
+  return true;
+}
+
+void Game::drawChallengesPanel(const Rectangle& panelR)
+{
+  const float uiTime = static_cast<float>(GetTime());
+  const ui::Theme& uiTh = ui::GetTheme();
+  const Vector2 mouseUi = mouseUiPosition(m_uiScale);
+
+  ui::DrawPanel(panelR, uiTime, /*active=*/true);
+  ui::DrawPanelHeader(panelR, "City Challenges", uiTime, /*active=*/true, /*titleSizePx=*/22);
+
+  // Close.
+  {
+    const Rectangle br{panelR.x + panelR.width - 30.0f, panelR.y + 8.0f, 22.0f, 18.0f};
+    if (ui::Button(8800, br, "X", mouseUi, uiTime, true, false)) {
+      m_showChallengesPanel = false;
+      return;
+    }
+  }
+
+  const int pad = 10;
+  const int x0 = static_cast<int>(panelR.x) + pad;
+  int y = static_cast<int>(panelR.y) + 40;
+  const int w = static_cast<int>(panelR.width) - pad * 2;
+
+  const Stats& st = m_world.stats();
+  ui::Text(x0, y, 14,
+           TextFormat("Tab: select  |  Enter: focus  |  Del: reroll  |  Active: %d", static_cast<int>(m_cityChallenges.size())),
+           uiTh.textDim, false, true, 1);
+  y += 18;
+
+  const int listH = std::min(176, std::max(130, static_cast<int>(panelR.height) / 2 - 10));
+  const Rectangle listR{static_cast<float>(x0), static_cast<float>(y), static_cast<float>(w), static_cast<float>(listH)};
+  ui::DrawPanelInset(listR, uiTime, true);
+  const int detailY = y + listH + 10;
+  const Rectangle detailR{static_cast<float>(x0), static_cast<float>(detailY), static_cast<float>(w),
+                          std::max(0.0f, panelR.y + panelR.height - static_cast<float>(detailY) - 10.0f)};
+  ui::DrawPanelInset(detailR, uiTime * 0.9f, true);
+
+  const int count = static_cast<int>(m_cityChallenges.size());
+  if (count <= 0) {
+    ui::Text(x0 + 8, y + 8, 14, "No active challenges (unpause to generate).", uiTh.textDim, false, true, 1);
+    return;
+  }
+
+  m_challengeSelection = std::clamp(m_challengeSelection, 0, std::max(0, count - 1));
+
+  const int rowH = 24;
+  const Rectangle viewR{listR.x + 6.0f, listR.y + 6.0f, listR.width - 12.0f, listR.height - 12.0f};
+  constexpr float kSbW = 12.0f;
+  const Rectangle barR{viewR.x + viewR.width - kSbW, viewR.y, kSbW, viewR.height};
+  const Rectangle contentR = ui::ContentRectWithScrollbar(viewR, kSbW, 2.0f);
+  const int visibleRows = std::max(1, static_cast<int>(std::floor(contentR.height / static_cast<float>(rowH))));
+
+  int first = std::clamp(m_challengeFirst, 0, std::max(0, count - visibleRows));
+  const bool hoverList = CheckCollisionPointRec(mouseUi, viewR);
+  const float wheel = GetMouseWheelMove();
+  if (hoverList && wheel != 0.0f && count > 0) {
+    const int step = (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) ? 2 : 1;
+    const int delta = (wheel > 0.0f) ? -step : step;
+    const int newSel = std::clamp(m_challengeSelection + delta, 0, std::max(0, count - 1));
+    if (newSel != m_challengeSelection) m_challengeSelection = newSel;
+  }
+
+  if (m_challengeSelection < first) first = m_challengeSelection;
+  if (m_challengeSelection >= first + visibleRows) first = m_challengeSelection - visibleRows + 1;
+  first = std::clamp(first, 0, std::max(0, count - visibleRows));
+  m_challengeFirst = first;
+
+  const bool leftPressed = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+  for (int i = 0; i < visibleRows; ++i) {
+    const int idx = first + i;
+    if (idx >= count) break;
+    const CityChallenge& c = m_cityChallenges[static_cast<std::size_t>(idx)];
+    const int ry = static_cast<int>(contentR.y) + i * rowH;
+    const bool sel = (idx == m_challengeSelection);
+
+    const Rectangle rowR{contentR.x, static_cast<float>(ry), contentR.width, static_cast<float>(rowH)};
+    if (leftPressed && CheckCollisionPointRec(mouseUi, rowR)) {
+      m_challengeSelection = idx;
+    }
+    if (sel) {
+      ui::DrawSelectionHighlight(Rectangle{rowR.x - 2.0f, rowR.y + 1.0f, rowR.width + 4.0f, rowR.height - 2.0f},
+                                 uiTime, true);
+    }
+
+    const int dl = DaysLeftInclusive(st.day, c.dayDeadline);
+    const float p = ChallengeProgress(c, st);
+    const Color pc = ChallengeProgressColor(uiTh, p, dl);
+    ui::Text(static_cast<int>(contentR.x) + 6, ry + 5, 14,
+             TextFormat("D%3d  %2dd  $%d", c.dayDeadline, dl, std::max(0, c.rewardMoney)),
+             pc, sel, true, 1);
+    ui::Text(static_cast<int>(contentR.x) + 136, ry + 5, 14, c.title, sel ? uiTh.text : uiTh.textDim, sel, true, 1);
+  }
+
+  // Scrollbar.
+  int newFirst = first;
+  if (ui::ScrollbarV(8801, barR, count, visibleRows, newFirst, mouseUi, uiTime, true)) {
+    newFirst = std::clamp(newFirst, 0, std::max(0, count - visibleRows));
+    m_challengeFirst = newFirst;
+    if (m_challengeSelection < newFirst) m_challengeSelection = newFirst;
+    if (m_challengeSelection >= newFirst + visibleRows) m_challengeSelection = std::clamp(newFirst + visibleRows - 1, 0, count - 1);
+  }
+
+  // Detail.
+  {
+    const CityChallenge& c = m_cityChallenges[static_cast<std::size_t>(m_challengeSelection)];
+    const int dx = static_cast<int>(detailR.x) + 10;
+    int dy = static_cast<int>(detailR.y) + 8;
+
+    const int dl = DaysLeftInclusive(st.day, c.dayDeadline);
+    ui::Text(dx, dy, 16, c.title, uiTh.text, true, true, 1);
+    dy += 20;
+
+    ui::Text(dx, dy, 13, TextFormat("Due Day %d  (%d days left)   Reward: $%d", c.dayDeadline, dl, std::max(0, c.rewardMoney)),
+             uiTh.textDim, false, true, 1);
+    dy += 18;
+
+    const float p = ChallengeProgress(c, st);
+    const Color pc = ChallengeProgressColor(uiTh, p, dl);
+    const Rectangle pr{detailR.x + 10.0f, static_cast<float>(dy), detailR.width - 20.0f, 14.0f};
+    ui::ProgressBar(pr, p, pc, uiTime, true);
+    ui::Text(dx, dy - 1, 13, TextFormat("%.0f%%", static_cast<double>(p * 100.0f)), uiTh.text, true, true, 1);
+    dy += 22;
+
+    // Description.
+    const Rectangle bodyR{detailR.x + 10.0f, static_cast<float>(dy), detailR.width - 20.0f, detailR.height - (static_cast<float>(dy) - detailR.y) - 40.0f};
+    ui::TextBox(bodyR, 14, c.description, uiTh.textDim, false, true, 1, true, true);
+
+    // Buttons.
+    const Rectangle focusR{detailR.x + 10.0f, detailR.y + detailR.height - 28.0f, 120.0f, 20.0f};
+    const Rectangle rerollR{detailR.x + 140.0f, detailR.y + detailR.height - 28.0f, 120.0f, 20.0f};
+    const int cost = 25 + 20 * std::clamp(m_challengeRerolls, 0, 20);
+
+    if (ui::Button(8802, focusR, "Focus", mouseUi, uiTime, true, true)) {
+      focusChallenge(c);
+    }
+    if (ui::Button(8803, rerollR, TextFormat("Reroll ($%d)", cost), mouseUi, uiTime, true, false)) {
+      (void)rerollChallenge(static_cast<std::size_t>(m_challengeSelection));
+    }
+
+    // Recent log.
+    if (!m_challengeLog.empty()) {
+      const int lines = std::min(3, static_cast<int>(m_challengeLog.size()));
+      int ly = static_cast<int>(detailR.y + detailR.height) - 52 - 14 * lines;
+      ui::Text(dx, ly, 13, "Recent:", uiTh.textFaint, true, true, 1);
+      ly += 14;
+      for (int i = 0; i < lines; ++i) {
+        const CityChallengeLogEntry& e = m_challengeLog[m_challengeLog.size() - 1 - i];
+        const bool ok = (e.status == CityChallengeStatus::Completed);
+        const Color lc = ok ? uiTh.accentOk : (e.status == CityChallengeStatus::Failed) ? uiTh.accentBad : uiTh.textFaint;
+        std::string line = TextFormat("Day %d: %s", e.day, e.title.c_str());
+        if (ok && e.rewardMoney > 0) {
+          line += TextFormat(" (+$%d)", e.rewardMoney);
+        }
+        if (line.size() > 70) {
+          line.resize(67);
+          line += "...";
+        }
+        ui::Text(dx, ly, 13, line, lc, false, true, 1);
+        ly += 14;
+      }
+    }
+  }
+
+  ui::Text(x0, static_cast<int>(panelR.y + panelR.height) - 20, 13,
+           "Ctrl+O: toggle  |  Tab: cycle  |  Enter: focus  |  Del: reroll", uiTh.textFaint, false, true, 1);
+}
+
+
+void Game::issueBond(int principal, int termDays, int aprBasisPoints)
+{
+  principal = std::max(0, principal);
+  termDays = std::max(1, termDays);
+  aprBasisPoints = std::clamp(aprBasisPoints, 0, 50000);
+
+  if (principal == 0) return;
+
+  // Compute an amortized daily payment estimate. The sim will force a full payoff on the
+  // final day, so small rounding drift is OK.
+  int dailyPayment = 0;
+  if (aprBasisPoints <= 0) {
+    dailyPayment = (principal + termDays - 1) / termDays;
+  } else {
+    const double apr = static_cast<double>(aprBasisPoints) / 10000.0;
+    const double r = apr / 365.0;
+    if (r <= 0.0) {
+      dailyPayment = (principal + termDays - 1) / termDays;
+    } else {
+      const double n = static_cast<double>(termDays);
+      const double powv = std::pow(1.0 + r, n);
+      const double denom = (powv - 1.0);
+      const double pmt = (denom != 0.0) ? (static_cast<double>(principal) * r * powv) / denom : 0.0;
+      if (!std::isfinite(pmt) || pmt <= 0.0) {
+        dailyPayment = (principal + termDays - 1) / termDays;
+      } else {
+        dailyPayment = static_cast<int>(std::ceil(pmt));
+      }
+    }
+  }
+  dailyPayment = std::max(1, dailyPayment);
+
+  // Pick a stable id (max+1).
+  int nextId = 1;
+  for (const DebtItem& d : m_world.debts()) {
+    nextId = std::max(nextId, d.id + 1);
+  }
+
+  DebtItem debt{};
+  debt.id = nextId;
+  debt.principal = principal;
+  debt.balance = principal;
+  debt.termDays = termDays;
+  debt.daysLeft = termDays;
+  debt.aprBasisPoints = aprBasisPoints;
+  debt.dailyPayment = dailyPayment;
+  debt.issuedDay = m_world.stats().day;
+
+  m_world.debts().push_back(debt);
+
+  // Cash injection (kept separate from tax income so the graphs stay meaningful).
+  if (principal > 0 && m_world.stats().money > (std::numeric_limits<int>::max() - principal)) {
+    m_world.stats().money = std::numeric_limits<int>::max();
+  } else {
+    m_world.stats().money += principal;
+  }
+
+  showToast(TextFormat("Bond #%d issued: +$%d @ %.2f%%", debt.id, principal, aprBasisPoints / 100.0f));
+
+  // Add a lightweight news entry so players notice the extra expense line item.
+  CityNewsEntry e{};
+  e.day = m_world.stats().day;
+  e.tone = CityNewsTone::Neutral;
+  e.title = "City treasury: bond issued";
+  e.body = TextFormat("The city issued a $%d municipal bond to fund infrastructure. Debt service starts immediately.",
+                      principal);
+  e.tip = "Tip: bonds boost cash now, but increase daily expenses until paid off.";
+  e.mayorRating = std::clamp(static_cast<int>(m_world.stats().happiness * 100.0f), 0, 100);
+  m_cityNews.push_back(std::move(e));
+  if (m_cityNews.size() > 250) {
+    m_cityNews.erase(m_cityNews.begin(), m_cityNews.begin() + (m_cityNews.size() - 250));
+  }
+}
+
+void Game::payDownBond(std::size_t idx, int payment)
+{
+  auto& debts = m_world.debts();
+  if (idx >= debts.size()) return;
+
+  payment = std::max(0, payment);
+  if (payment == 0) return;
+
+  DebtItem& d = debts[idx];
+  if (d.balance <= 0) return;
+
+  if (m_world.stats().money <= 0) {
+    showToast("Not enough cash to pay down debt");
+    return;
+  }
+
+  const int pay = std::min({payment, d.balance, m_world.stats().money});
+  if (pay <= 0) return;
+
+  m_world.stats().money -= pay;
+  d.balance -= pay;
+
+  if (d.balance <= 0) {
+    const int id = d.id;
+    debts.erase(debts.begin() + static_cast<std::ptrdiff_t>(idx));
+    showToast(TextFormat("Bond #%d paid off (-$%d)", id, pay));
+  } else {
+    showToast(TextFormat("Paid $%d toward bond #%d", pay, d.id));
+  }
+
+  if (debts.empty()) {
+    m_bondsSelection = 0;
+    m_bondsFirst = 0;
+  } else {
+    m_bondsSelection = std::clamp(m_bondsSelection, 0, static_cast<int>(debts.size()) - 1);
+    m_bondsFirst = std::clamp(m_bondsFirst, 0, std::max(0, static_cast<int>(debts.size()) - 1));
+  }
+}
+
+
+void Game::drawBondsPanel(const Rectangle& rect)
+{
+  const float uiTime = GetTime();
+  const Vector2 mouseUi = mouseUiPosition(m_uiScale);
+  const ui::Theme& uiTh = ui::theme();
+
+  ui::DrawPanel(rect, uiTime, true);
+  ui::DrawPanelHeader(rect, "City Treasury", uiTime, true);
+
+  // Close button.
+  if (ui::Button(24100, {rect.x + rect.width - 28, rect.y + 6, 22, 20}, "x", mouseUi, uiTime, true, false)) {
+    m_showBondsPanel = false;
+    return;
+  }
+
+  const int pad = 10;
+  const int x0 = static_cast<int>(rect.x) + pad;
+  int y = static_cast<int>(rect.y) + 40;
+  const int w = static_cast<int>(rect.width) - pad * 2;
+
+  const Stats& st = m_world.stats();
+  const int pop = st.population;
+  const int net = st.income - st.expenses;
+  const int money = st.money;
+
+  int totalDebt = 0;
+  int totalDaily = 0;
+  for (const DebtItem& d : m_world.debts()) {
+    totalDebt += std::max(0, d.balance);
+    totalDaily += std::max(0, std::min(d.dailyPayment, d.balance));
+  }
+
+  // --- Market / credit scoring (lightweight, deterministic) ---
+  const float happiness01 = std::clamp(st.happiness, 0.0f, 1.0f);
+
+  const float netPerCap = (pop > 0) ? static_cast<float>(net) / static_cast<float>(pop) : static_cast<float>(net);
+  const float netScore01 = std::clamp(0.5f + 0.5f * (netPerCap / 5.0f), 0.0f, 1.0f);
+
+  const float cashScore01 = std::clamp(0.5f + 0.5f * (static_cast<float>(money) / 1000.0f), 0.0f, 1.0f);
+
+  const float debtScale = static_cast<float>(std::max(500, pop * 80 + 500));
+  const float debtScore01 = std::clamp(1.0f - (static_cast<float>(totalDebt) / debtScale), 0.0f, 1.0f);
+
+  float credit01 = 0.15f;
+  credit01 += 0.35f * happiness01;
+  credit01 += 0.25f * netScore01;
+  credit01 += 0.15f * cashScore01;
+  credit01 += 0.10f * debtScore01;
+  credit01 = std::clamp(credit01, 0.0f, 1.0f);
+
+  const char* rating = "B";
+  if (credit01 >= 0.85f)
+    rating = "AAA";
+  else if (credit01 >= 0.72f)
+    rating = "AA";
+  else if (credit01 >= 0.60f)
+    rating = "A";
+  else if (credit01 >= 0.48f)
+    rating = "BBB";
+  else if (credit01 >= 0.36f)
+    rating = "BB";
+
+  const int baseCap = 600 + pop * 35;
+  const float capMult = 0.60f + 0.90f * credit01;
+  const int maxOutstanding =
+      std::clamp(static_cast<int>(std::round(static_cast<float>(baseCap) * capMult)), 200, 200000);
+  const int available = std::max(0, maxOutstanding - totalDebt);
+
+  // --- Summary ---
+  ui::Text(x0, y, 14, TextFormat("Rating: %s   Credit: %.0f%%", rating, std::round(credit01 * 100.0f)), uiTh.text,
+           /*bold=*/true, /*shadow=*/true, 1);
+  y += 18;
+
+  ui::Text(x0, y, 14, TextFormat("Cash: $%d   Net/day: $%d   Pop: %d", money, net, pop), uiTh.textDim, false, true, 1);
+  y += 18;
+
+  ui::Text(x0, y, 14, TextFormat("Debt: $%d   Debt service: ~$%d/day", totalDebt, totalDaily), uiTh.textDim, false, true,
+           1);
+  y += 18;
+
+  ui::Text(x0, y, 14, TextFormat("Capacity: $%d   Available: $%d", maxOutstanding, available), uiTh.textDim, false, true,
+           1);
+  y += 10;
+
+  DrawRectangle(x0, y, w, 1, uiTh.panelBorder);
+  y += 10;
+
+  // --- Issuance ---
+  ui::Text(x0, y, 14, "Issue a bond", uiTh.text, true, true, 1);
+  y += 18;
+
+  constexpr int kBondTypeCount = 3;
+  const int termDays[kBondTypeCount] = {30, 90, 180};
+  const int baseAprBp[kBondTypeCount] = {450, 650, 850}; // 4.5%, 6.5%, 8.5%
+
+  m_bondsType = std::clamp(m_bondsType, 0, kBondTypeCount - 1);
+
+  // Type buttons (Short / Medium / Long).
+  const int gap = 6;
+  const float bw = static_cast<float>((w - gap * 2) / 3);
+
+  const char* typeLabel[kBondTypeCount] = {"Short", "Medium", "Long"};
+  for (int i = 0; i < kBondTypeCount; ++i) {
+    Rectangle br{static_cast<float>(x0 + (static_cast<int>(bw) + gap) * i), static_cast<float>(y), bw, 20.0f};
+    if (ui::Button(24110 + i, br, typeLabel[i], mouseUi, uiTime, true, (m_bondsType == i))) {
+      m_bondsType = i;
+    }
+  }
+  y += 26;
+
+  const int penaltyBp = static_cast<int>(std::round((1.0f - credit01) * 600.0f)); // up to +6%
+  const int offerAprBp = std::clamp(baseAprBp[m_bondsType] + penaltyBp, 200, 2500);
+
+  const int maxAmount = available;
+  const int minAmount = 100;
+  const bool canBorrow = (maxAmount >= minAmount);
+
+  if (canBorrow) {
+    m_bondsAmount = std::clamp(m_bondsAmount, minAmount, maxAmount);
+  } else {
+    m_bondsAmount = minAmount;
+  }
+
+  // Payment preview.
+  int previewPayment = 0;
+  {
+    const int principal = m_bondsAmount;
+    const int tdays = termDays[m_bondsType];
+
+    if (!canBorrow) {
+      previewPayment = 0;
+    } else if (offerAprBp <= 0) {
+      previewPayment = (principal + tdays - 1) / tdays;
+    } else {
+      const double apr = static_cast<double>(offerAprBp) / 10000.0;
+      const double r = apr / 365.0;
+      const double n = static_cast<double>(tdays);
+      const double powv = std::pow(1.0 + r, n);
+      const double denom = (powv - 1.0);
+      const double pmt = (denom != 0.0) ? (static_cast<double>(principal) * r * powv) / denom : 0.0;
+      previewPayment =
+          (!std::isfinite(pmt) || pmt <= 0.0) ? (principal + tdays - 1) / tdays : static_cast<int>(std::ceil(pmt));
+    }
+    previewPayment = std::max(1, previewPayment);
+  }
+
+  ui::Text(x0, y, 14,
+           TextFormat("Offer: %d days @ %.2f%% APR  |  Est. payment: ~$%d/day", termDays[m_bondsType],
+                      offerAprBp / 100.0f, previewPayment),
+           uiTh.textDim, false, true, 1);
+  y += 18;
+
+  // Amount slider.
+  {
+    Rectangle sliderR{static_cast<float>(x0), static_cast<float>(y), static_cast<float>(w), 20.0f};
+    const int maxSlider = std::max(minAmount, maxAmount);
+    ui::SliderInt(24130, sliderR, m_bondsAmount, minAmount, maxSlider, mouseUi, uiTime, canBorrow);
+    y += 24;
+  }
+
+  // Issue button.
+  {
+    Rectangle issueR{static_cast<float>(x0), static_cast<float>(y), static_cast<float>(w), 22.0f};
+    const bool enabled = canBorrow && (m_bondsAmount >= minAmount) && (m_bondsAmount <= maxAmount);
+    if (ui::Button(24140, issueR, enabled ? "Issue bond" : "Issue bond (unavailable)", mouseUi, uiTime, enabled,
+                   /*primary=*/true)) {
+      issueBond(m_bondsAmount, termDays[m_bondsType], offerAprBp);
+    }
+    y += 28;
+  }
+
+  DrawRectangle(x0, y, w, 1, uiTh.panelBorder);
+  y += 10;
+
+  // --- Debt list ---
+  ui::Text(x0, y, 14, "Outstanding bonds", uiTh.text, true, true, 1);
+  y += 18;
+
+  Rectangle listR{static_cast<float>(x0), static_cast<float>(y), static_cast<float>(w), 110.0f};
+  ui::DrawPanelInset(listR, uiTime, true);
+
+  const auto& debts = m_world.debts();
+  const int rowH = 18;
+  const int visibleRows = std::max(1, static_cast<int>((listR.height - 8.0f) / static_cast<float>(rowH)));
+
+  if (CheckCollisionPointRec(mouseUi, listR)) {
+    const float wheel = GetMouseWheelMove();
+    if (wheel != 0.0f) {
+      m_bondsFirst -= static_cast<int>(wheel);
+    }
+  }
+
+  m_bondsSelection = std::clamp(m_bondsSelection, 0, std::max(0, static_cast<int>(debts.size()) - 1));
+  m_bondsFirst = std::clamp(m_bondsFirst, 0, std::max(0, static_cast<int>(debts.size()) - visibleRows));
+
+  float ly = listR.y + 4.0f;
+  if (debts.empty()) {
+    ui::Text(x0 + 6, static_cast<int>(ly), 14, "No outstanding debt.", uiTh.textDim, false, false, 0);
+  } else {
+    const int start = m_bondsFirst;
+    const int end = std::min(static_cast<int>(debts.size()), start + visibleRows);
+
+    for (int i = start; i < end; ++i) {
+      const DebtItem& d = debts[static_cast<std::size_t>(i)];
+      Rectangle rr{listR.x + 4.0f, ly, listR.width - 8.0f, static_cast<float>(rowH - 2)};
+      const bool selected = (i == m_bondsSelection);
+
+      const int daily = std::max(0, std::min(d.dailyPayment, d.balance));
+      const char* label =
+          TextFormat("#%d  $%d  %dd  ~$%d/d  %.2f%%", d.id, d.balance, d.daysLeft, daily, d.aprBasisPoints / 100.0f);
+
+      if (ui::Button(24160 + i, rr, label, mouseUi, uiTime, true, selected)) {
+        m_bondsSelection = i;
+      }
+
+      ly += static_cast<float>(rowH);
+    }
+  }
+
+  y += static_cast<int>(listR.height) + 10;
+
+  // --- Actions ---
+  if (!debts.empty()) {
+    const int sel = std::clamp(m_bondsSelection, 0, static_cast<int>(debts.size()) - 1);
+    const DebtItem d = debts[static_cast<std::size_t>(sel)]; // copy (safe if buttons mutate the vector)
+
+    ui::Text(x0, y, 14, TextFormat("Selected: Bond #%d   Balance: $%d   Days left: %d", d.id, d.balance, d.daysLeft),
+             uiTh.textDim, false, true, 1);
+    y += 18;
+
+    Rectangle btn1{static_cast<float>(x0), static_cast<float>(y), static_cast<float>((w - gap * 2) / 3), 22.0f};
+    Rectangle btn2{btn1.x + btn1.width + static_cast<float>(gap), btn1.y, btn1.width, 22.0f};
+    Rectangle btn3{btn2.x + btn2.width + static_cast<float>(gap), btn1.y, btn1.width, 22.0f};
+
+    const bool canPay = (money > 0 && d.balance > 0);
+
+    if (ui::Button(24180, btn1, "$100", mouseUi, uiTime, canPay, false)) {
+      payDownBond(static_cast<std::size_t>(sel), 100);
+    }
+    if (ui::Button(24181, btn2, "$500", mouseUi, uiTime, canPay, false)) {
+      payDownBond(static_cast<std::size_t>(sel), 500);
+    }
+
+    const bool canPayOff = (money >= d.balance && d.balance > 0);
+    if (ui::Button(24182, btn3, "Pay off", mouseUi, uiTime, canPayOff, true)) {
+      payDownBond(static_cast<std::size_t>(sel), d.balance);
+    }
+
+    y += 28;
+  }
+
+  // Footnote.
+  ui::Text(x0, static_cast<int>(rect.y + rect.height) - 18, 12,
+           "Debt service is applied each sim-day as an expense (see the Report panel).", uiTh.textFaint, false, false, 0);
+}
+
+
 
 void Game::unloadSaveMenuThumbnails()
 {
@@ -15500,8 +16781,14 @@ m_policyOptTopFirst = 0;
   // Make HUD stats immediately correct (without waiting for the first sim tick).
   m_sim.refreshDerivedStats(m_world);
 
+  clearCityChallenges();
   clearHistory();
-  recordHistorySample(m_world.stats());
+  {
+    Stats s = m_world.stats();
+    const int grant = applyCityChallenges(s);
+    if (grant != 0) m_world.stats().money += grant;
+    recordHistorySample(s);
+  }
 
   // Update title with seed.
   SetWindowTitle(TextFormat("ProcIsoCity  |  seed: %llu", static_cast<unsigned long long>(newSeed)));
@@ -15514,16 +16801,105 @@ m_policyOptTopFirst = 0;
 
 void Game::run()
 {
-  while (!WindowShouldClose()) {
-    const float dt = GetFrameTime();
-    m_timeSec += dt;
+  using clock = std::chrono::steady_clock;
+  auto toMs = [](clock::duration d) -> double {
+    return std::chrono::duration<double, std::milli>(d).count();
+  };
 
-    handleInput(dt);
-    update(dt);
+  while (!WindowShouldClose()) {
+    const auto t0 = clock::now();
+
+    // Raw delta time as measured by raylib.
+    float dtRaw = GetFrameTime();
+    if (!(dtRaw >= 0.0f)) dtRaw = 0.0f;
+
+    m_loopStats.dtRaw = dtRaw;
+
+    // Pause the real-time clock when the window is not interactive (optional).
+    const bool focused = IsWindowFocused();
+    const bool minimized = IsWindowState(FLAG_WINDOW_MINIMIZED);
+    const bool focusPaused =
+        (m_loopCfg.pauseWhenMinimized && minimized) || (m_loopCfg.pauseWhenUnfocused && !focused);
+
+    m_loopStats.focused = focused;
+    m_loopStats.minimized = minimized;
+    m_loopStats.focusPaused = focusPaused;
+
+    // Treat focus/minimize pauses as an automatic simulation pause (separate from user pause).
+    m_simPausedAuto = focusPaused;
+
+
+    // Optionally throttle frame rate when unfocused/minimized to reduce CPU/GPU churn.
+    if (m_loopCfg.throttleFpsWhenUnfocused) {
+      int desired = m_targetFpsApplied;
+      if (focused && !minimized) desired = std::max(1, m_loopCfg.targetFpsFocused);
+      else desired = std::max(1, m_loopCfg.targetFpsUnfocused);
+
+      if (desired != m_targetFpsApplied) {
+        SetTargetFPS(desired);
+        m_targetFpsApplied = desired;
+      }
+    }
+    m_loopStats.targetFps = m_targetFpsApplied;
+
+    // Clamp dt used for input/camera/UI timers.
+    float dtFrame = dtRaw;
+    m_loopStats.dtClamped = false;
+    if (m_loopCfg.maxFrameDt > 0.0f && dtFrame > m_loopCfg.maxFrameDt) {
+      dtFrame = m_loopCfg.maxFrameDt;
+      m_loopStats.dtClamped = true;
+    }
+
+    // Clamp dt fed to the simulation clock separately.
+    float dtSimBase = dtRaw;
+    if (m_loopCfg.maxSimDt > 0.0f && dtSimBase > m_loopCfg.maxSimDt) {
+      dtSimBase = m_loopCfg.maxSimDt;
+    }
+
+    // If we paused due to focus/minimize, freeze clocks and avoid a catch-up burst on resume.
+    // (dtRaw can be huge when returning from alt-tab / breakpoint / window drag.)
+    if (focusPaused) {
+      dtFrame = 0.0f;
+      dtSimBase = 0.0f;
+
+      // Clear pending sim time on the first paused frame.
+      if (!m_focusPausePrev) {
+        m_sim.resetTimer();
+      }
+    } else if (m_focusPausePrev) {
+      // First frame after unpausing: swallow the resume hitch.
+      dtFrame = 0.0f;
+      dtSimBase = 0.0f;
+      m_sim.resetTimer();
+    }
+    m_focusPausePrev = focusPaused;
+
+    m_loopStats.dtFrame = dtFrame;
+
+    m_timeSec += dtFrame;
+
+    const auto t1 = clock::now();
+    handleInput(dtFrame);
+    const auto t2 = clock::now();
+
+    // Compute dt for the simulation after input, so speed hotkeys apply immediately.
+    const float simSpeed =
+        kSimSpeeds[static_cast<std::size_t>(std::clamp(m_simSpeedIndex, 0, kSimSpeedCount - 1))];
+    m_loopStats.dtSim = dtSimBase * simSpeed;
+
+    update(dtFrame);
+    const auto t3 = clock::now();
+
     draw();
+    const auto t4 = clock::now();
+
+    // CPU timing for the perf overlay (note: draw() may include vsync waits).
+    m_loopStats.cpuInputMs = toMs(t2 - t1);
+    m_loopStats.cpuUpdateMs = toMs(t3 - t2);
+    m_loopStats.cpuDrawMs = toMs(t4 - t3);
+    m_loopStats.cpuFrameMs = toMs(t4 - t0);
   }
 }
-
 void Game::floodFillDistrict(Point start, bool includeRoads)
 {
   if (!m_world.inBounds(start.x, start.y)) return;
@@ -16082,11 +17458,22 @@ void Game::runAutoBuild(int days, const AutoBuildConfig& cfg, const char* toastP
   // Restore and append simulation history samples.
   m_cityHistory = std::move(prevHistory);
   if (!tickStats.empty()) {
+    int moneyOffset = 0;
     for (const Stats& s : tickStats) {
-      recordHistorySample(s);
+      Stats ss = s;
+      ss.money += moneyOffset;
+      const int grant = applyCityChallenges(ss);
+      moneyOffset += grant;
+      recordHistorySample(ss);
+    }
+    if (moneyOffset != 0) {
+      m_world.stats().money += moneyOffset;
     }
   } else {
-    recordHistorySample(m_world.stats());
+    Stats s = m_world.stats();
+    const int grant = applyCityChallenges(s);
+    if (grant != 0) m_world.stats().money += grant;
+    recordHistorySample(s);
   }
 }
 
@@ -16834,12 +18221,15 @@ void Game::handleInput(float dt)
 
   if (IsKeyPressed(KEY_SPACE)) {
     endPaintStroke();
-    m_simPaused = !m_simPaused;
+    m_simPausedUser = !m_simPausedUser;
     m_sim.resetTimer();
-    showToast(m_simPaused ? "Sim paused" : "Sim running");
+    const bool paused = simPaused();
+    // If we're paused due to focus/minimize, keep messaging clear.
+    if (paused && !m_simPausedUser && m_simPausedAuto) showToast("Sim paused (unfocused)");
+    else showToast(paused ? "Sim paused" : "Sim running");
   }
 
-  if (m_simPaused && IsKeyPressed(KEY_N)) {
+  if (simPaused() && IsKeyPressed(KEY_N)) {
     endPaintStroke();
 
     if (m_replayCapture.active()) {
@@ -16925,7 +18315,15 @@ void Game::handleInput(float dt)
   }
 
   if (IsKeyPressed(KEY_F3)) {
-    if (shift) {
+    // Ctrl+F3: perf overlay. Ctrl+Shift+F3: sim tick limiter mode (auto vs fixed).
+    if (ctrl && shift) {
+      m_loopCfg.simTickLimiter = true;
+      m_loopCfg.simTickAuto = !m_loopCfg.simTickAuto;
+      showToast(std::string("Sim tick limiter: ") + (m_loopCfg.simTickAuto ? "AUTO" : "FIXED"));
+    } else if (ctrl) {
+      m_showPerfOverlay = !m_showPerfOverlay;
+      showToast(m_showPerfOverlay ? "Perf overlay: ON" : "Perf overlay: OFF");
+    } else if (shift) {
       auto s = m_renderer.weatherSettings();
       using M = Renderer::WeatherSettings::Mode;
 
@@ -17040,6 +18438,11 @@ void Game::handleInput(float dt)
       if (count > 0) {
         m_newsSelection = (m_newsSelection + delta + count) % count;
       }
+    } else if (m_showChallengesPanel) {
+      const int count = static_cast<int>(m_cityChallenges.size());
+      if (count > 0) {
+        m_challengeSelection = (m_challengeSelection + delta + count) % count;
+      }
     } else if (m_showTrafficModel) {
       const int count = 9;
       m_trafficModelSelection = (m_trafficModelSelection + delta + count) % count;
@@ -17068,6 +18471,26 @@ void Game::handleInput(float dt)
       else if (m_videoPage == 1) m_videoSelectionVisual = m_videoSelection;
       else if (m_videoPage == 2) m_videoSelectionAtmos = m_videoSelection;
       else m_videoSelectionUiTheme = m_videoSelection;
+    }
+  }
+
+  // City Challenges: keyboard shortcuts while the panel is open.
+  if (m_showChallengesPanel && m_blueprintMode == BlueprintMode::Off) {
+    // Avoid fighting with other "Enter" panels (transit/upgrades) when multiple docks are visible.
+    const bool enterOk = !(m_showTransitPanel || m_showRoadUpgradePanel);
+    if (enterOk && (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER))) {
+      endPaintStroke();
+      if (!m_cityChallenges.empty()) {
+        m_challengeSelection = std::clamp(m_challengeSelection, 0, std::max(0, static_cast<int>(m_cityChallenges.size()) - 1));
+        focusChallenge(m_cityChallenges[static_cast<std::size_t>(m_challengeSelection)]);
+      }
+    }
+    if (IsKeyPressed(KEY_DELETE)) {
+      endPaintStroke();
+      if (!m_cityChallenges.empty()) {
+        m_challengeSelection = std::clamp(m_challengeSelection, 0, std::max(0, static_cast<int>(m_cityChallenges.size()) - 1));
+        (void)rerollChallenge(static_cast<std::size_t>(m_challengeSelection));
+      }
     }
   }
 
@@ -17126,9 +18549,23 @@ void Game::handleInput(float dt)
     }
     m_renderer.setElevationSettings(m_elev);
   }
-  if (IsKeyPressed(KEY_O)) {
+  if (IsKeyPressed(KEY_O) && !ctrl) {
     m_showOutsideOverlay = !m_showOutsideOverlay;
     showToast(m_showOutsideOverlay ? "Outside overlay: ON" : "Outside overlay: OFF");
+  }
+
+  // City Challenges panel: Ctrl+O (keeps plain 'O' reserved for the outside overlay).
+  if (ctrl && IsKeyPressed(KEY_O)) {
+    endPaintStroke();
+    m_showChallengesPanel = !m_showChallengesPanel;
+    showToast(m_showChallengesPanel ? "City challenges: ON" : "City challenges: OFF");
+  }
+
+  // City Treasury panel (municipal bonds): Ctrl+B.
+  if (ctrl && IsKeyPressed(KEY_B)) {
+    endPaintStroke();
+    m_showBondsPanel = !m_showBondsPanel;
+    showToast(m_showBondsPanel ? "City treasury: ON" : "City treasury: OFF");
   }
 
   if (IsKeyPressed(KEY_T)) {
@@ -17274,7 +18711,7 @@ void Game::handleInput(float dt)
   }
 
 
-  if (IsKeyPressed(KEY_B)) {
+  if (!ctrl && !alt && IsKeyPressed(KEY_B)) {
     m_showGoodsOverlay = !m_showGoodsOverlay;
     m_goodsDirty = true;
 
@@ -18161,6 +19598,8 @@ void Game::handleInput(float dt)
       };
       if (checkDock(m_showPolicy, kPolicyPanelW, kPolicyPanelH)) return true;
       if (checkDock(m_showNewsPanel, kNewsPanelW, kNewsPanelH)) return true;
+      if (checkDock(m_showChallengesPanel, kChallengesPanelW, kChallengesPanelH)) return true;
+      if (checkDock(m_showBondsPanel, kBondsPanelW, kBondsPanelH)) return true;
       if (checkDock(m_showTrafficModel, kTrafficPanelW, kTrafficPanelH)) return true;
       if (checkDock(m_showResiliencePanel, kResiliencePanelW, kResiliencePanelH)) return true;
       if (checkDock(m_showDistrictPanel, kDistrictPanelW, kDistrictPanelH)) return true;
@@ -18703,18 +20142,56 @@ void Game::update(float dt)
 
   // Pause simulation while actively painting so an undoable "stroke" doesn't
   // accidentally include sim-driven money changes.
-  if (!m_painting && !m_simPaused) {
-    const int si = std::clamp(m_simSpeedIndex, 0, kSimSpeedCount - 1);
-    const float speed = kSimSpeeds[static_cast<std::size_t>(si)];
+  //
+  // Game loop note: the simulator maintains its own fixed-tick accumulator and can
+  // process multiple ticks back-to-back if dt spikes. For real-time play we cap the
+  // amount of catch-up work per frame to avoid "spiral of death" hitches.
+  m_loopStats.simTicks = 0;
+  m_loopStats.simCpuMs = 0.0;
+  m_loopStats.simMsPerTick = 0.0;
+  m_loopStats.simTickLimit = 0;
 
+  if (!m_painting && !simPaused()) {
     if (m_replayCapture.active()) {
       std::string err;
       (void)m_replayCapture.captureSettingsIfChanged(m_world, m_procCfg, m_sim, err);
     }
 
+    // Choose how many sim ticks we're willing to process this frame.
+    // (0 means "unlimited" when the limiter is disabled.)
+    int tickLimit = 0;
+    if (m_loopCfg.simTickLimiter) {
+      if (m_loopCfg.simTickAuto) {
+        if (m_loopStats.simMsPerTickEma > 0.0 && m_loopCfg.simBudgetMs > 0.0f) {
+          tickLimit = static_cast<int>(
+              std::floor(static_cast<double>(m_loopCfg.simBudgetMs) / m_loopStats.simMsPerTickEma));
+        } else {
+          tickLimit = m_loopCfg.simMaxTicksPerFrame;
+        }
+        tickLimit = std::clamp(tickLimit, m_loopCfg.simAutoMinTicks, m_loopCfg.simAutoMaxTicks);
+      } else {
+        tickLimit = std::max(0, m_loopCfg.simMaxTicksPerFrame);
+      }
+    }
+    m_loopStats.simTickLimit = tickLimit;
+
     std::vector<Stats> tickStats;
     tickStats.reserve(4);
-    const int ticks = m_sim.update(m_world, dt * speed, &tickStats);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const int ticks = m_sim.updateLimited(m_world, m_loopStats.dtSim, tickLimit, m_loopCfg.simMaxBacklogTicks,
+                                         &tickStats);
+    const auto t1 = std::chrono::steady_clock::now();
+
+    m_loopStats.simTicks = ticks;
+    m_loopStats.simCpuMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    if (ticks > 0) {
+      m_loopStats.simMsPerTick = m_loopStats.simCpuMs / static_cast<double>(ticks);
+      constexpr double kAlpha = 0.10;
+      if (m_loopStats.simMsPerTickEma <= 0.0) m_loopStats.simMsPerTickEma = m_loopStats.simMsPerTick;
+      else m_loopStats.simMsPerTickEma =
+          (1.0 - kAlpha) * m_loopStats.simMsPerTickEma + kAlpha * m_loopStats.simMsPerTick;
+    }
 
     if (ticks > 0) {
       if (m_replayCapture.active()) {
@@ -18757,11 +20234,26 @@ void Game::update(float dt)
       // Keep the software 3D preview in sync with sim-driven changes.
       m_3dPreviewDirty = true;
 
+      // Apply gameplay layer (challenges) and then record per-tick snapshots.
+      // When multiple ticks run in one frame, we apply challenge rewards deterministically
+      // in tick order so later snapshots reflect earlier grants.
+      int moneyOffset = 0;
       for (const Stats& s : tickStats) {
-        recordHistorySample(s);
+        Stats ss = s;
+        ss.money += moneyOffset;
+        const int grant = applyCityChallenges(ss);
+        moneyOffset += grant;
+        recordHistorySample(ss);
+      }
+      if (moneyOffset != 0) {
+        m_world.stats().money += moneyOffset;
       }
     }
   }
+
+  // Sim backlog stats for debug overlays.
+  m_loopStats.simBacklogSec = m_sim.accumulatedSeconds();
+  m_loopStats.simBacklogTicks = m_sim.accumulatedTicks();
 
   if (m_toastTimer > 0.0f) {
     m_toastTimer -= dt;
@@ -18769,7 +20261,7 @@ void Game::update(float dt)
   }
 
   // Update vehicle visualization (movement pauses when sim is paused or while painting).
-  const float vdt = (!m_painting && !m_simPaused) ? dt : 0.0f;
+  const float vdt = (!m_painting && !simPaused()) ? dt : 0.0f;
   updateVehicles(vdt);
 
   // Autosave uses wall-clock time (so it works regardless of sim speed).
@@ -19736,6 +21228,93 @@ static void DrawSpaceBackground(int screenW, int screenH, std::uint64_t seed, fl
     DrawRectangle(x, y, size, size, Color{rC, gC, bC, a});
   }
 }
+
+void Game::drawPerfOverlay(int uiW, int uiH, float uiTime)
+{
+  if (!m_showPerfOverlay) return;
+
+  // The console already provides a lot of diagnostic text; avoid stacking.
+  if (m_console.isOpen()) return;
+
+  const ui::Theme& th = ui::GetTheme();
+
+  const int padOuter = 10;
+  const int padInner = 10;
+  const int fontTitle = 16;
+  const int fontText = 13;
+  const int lineH = 16;
+
+  // Build lines.
+  std::vector<std::string> lines;
+  lines.reserve(6);
+
+  const float dtMs = m_loopStats.dtFrame * 1000.0f;
+  const float dtRawMs = m_loopStats.dtRaw * 1000.0f;
+  const float fps = (m_loopStats.dtFrame > 1.0e-6f) ? (1.0f / m_loopStats.dtFrame) : 0.0f;
+
+  lines.push_back(std::string(TextFormat("dt: %.2fms (raw %.2fms)%s | fps: %.1f",
+                                         static_cast<double>(dtMs), static_cast<double>(dtRawMs),
+                                         m_loopStats.dtClamped ? " CLAMP" : "", static_cast<double>(fps))));
+  lines.push_back(std::string(TextFormat("CPU ms: in %.2f  up %.2f  draw %.2f  tot %.2f",
+                                         m_loopStats.cpuInputMs, m_loopStats.cpuUpdateMs, m_loopStats.cpuDrawMs,
+                                         m_loopStats.cpuFrameMs)));
+
+  const char* mode = (!m_loopCfg.simTickLimiter) ? "UNLIM" : (m_loopCfg.simTickAuto ? "AUTO" : "FIX");
+  lines.push_back(std::string(TextFormat("Sim: dt %.1fms | ticks %d (limit %d, %s)",
+                                         static_cast<double>(m_loopStats.dtSim * 1000.0f), m_loopStats.simTicks,
+                                         m_loopStats.simTickLimit, mode)));
+  lines.push_back(std::string(TextFormat("Backlog: %d ticks (%.2fs)",
+                                         m_loopStats.simBacklogTicks, static_cast<double>(m_loopStats.simBacklogSec))));
+  lines.push_back(std::string(TextFormat("Sim CPU: %.2fms | tick %.2fms (ema %.2fms)",
+                                         m_loopStats.simCpuMs, m_loopStats.simMsPerTick, m_loopStats.simMsPerTickEma)));
+  std::string pauseStr = "no";
+  if (simPaused()) {
+    if (m_simPausedUser && m_simPausedAuto) pauseStr = "user+auto";
+    else if (m_simPausedUser) pauseStr = "user";
+    else if (m_simPausedAuto) pauseStr = "auto";
+    else pauseStr = "yes";
+  }
+
+  lines.push_back(std::string(TextFormat("Focus: %s%s%s | fps cap %d | pause %s  (Ctrl+F3)",
+                                         m_loopStats.focused ? "yes" : "no",
+                                         m_loopStats.minimized ? " minimized" : "",
+                                         m_loopStats.focusPaused ? " PAUSED" : "",
+                                         m_loopStats.targetFps, pauseStr.c_str())));
+
+  // Compute box size.
+  int maxLineW = ui::MeasureTextWidth("PERF", fontTitle, /*bold=*/true, 1);
+  for (const std::string& s : lines) {
+    maxLineW = std::max(maxLineW, ui::MeasureTextWidth(s, fontText, /*bold=*/false, 1));
+  }
+
+  const int boxW = maxLineW + padInner * 2;
+  const int boxH = 8 + 20 + static_cast<int>(lines.size()) * lineH + 8;
+
+  int x = padOuter;
+  int y = padOuter;
+
+  // Avoid overlapping the POV HUD when active.
+  if (m_pov.isActive()) y += 60;
+
+  // Keep within UI bounds.
+  if (x + boxW > uiW - padOuter) x = std::max(padOuter, uiW - padOuter - boxW);
+  if (y + boxH > uiH - padOuter) y = std::max(padOuter, uiH - padOuter - boxH);
+
+  Rectangle r{static_cast<float>(x), static_cast<float>(y), static_cast<float>(boxW),
+              static_cast<float>(boxH)};
+  ui::DrawPanel(r, uiTime, /*active=*/true);
+
+  int tx = x + padInner;
+  int ty = y + 8;
+  ui::Text(tx, ty, fontTitle, "PERF", th.text, /*bold=*/true, /*shadow=*/true, 1);
+  ty += 20;
+
+  for (const std::string& s : lines) {
+    ui::Text(tx, ty, fontText, s, th.textDim, /*bold=*/false, /*shadow=*/true, 1);
+    ty += lineH;
+  }
+}
+
 
 void Game::draw()
 {
@@ -21101,7 +22680,7 @@ void Game::draw()
 
   m_renderer.drawHUD(m_world, m_camera, m_tool, m_roadBuildLevel, m_hovered, uiW, uiH, m_showHelp,
                      m_brushRadius, static_cast<int>(m_history.undoSize()), static_cast<int>(m_history.redoSize()),
-                     m_simPaused, simSpeed, m_saveSlot, m_showMinimap, inspectInfo, heatmapInfoC);
+                     simPaused(), simSpeed, m_saveSlot, m_showMinimap, inspectInfo, heatmapInfoC);
 
   drawBlueprintPanel(uiW, uiH);
 
@@ -21465,6 +23044,20 @@ if (optHasBest) {
     const Rectangle rect = rightDock.alloc(kNewsPanelW, kNewsPanelH);
     const Rectangle panelR{rect.x, rect.y, static_cast<float>(kNewsPanelW), static_cast<float>(kNewsPanelH)};
     drawNewsPanel(panelR);
+  }
+
+  // City Challenges panel (optional "goals" board).
+  if (m_showChallengesPanel) {
+    const Rectangle rect = rightDock.alloc(kChallengesPanelW, kChallengesPanelH);
+    const Rectangle panelR{rect.x, rect.y, static_cast<float>(kChallengesPanelW), static_cast<float>(kChallengesPanelH)};
+    drawChallengesPanel(panelR);
+  }
+
+  // City Treasury panel (municipal bonds / debt management).
+  if (m_showBondsPanel) {
+    const Rectangle rect = rightDock.alloc(kBondsPanelW, kBondsPanelH);
+    const Rectangle panelR{rect.x, rect.y, static_cast<float>(kBondsPanelW), static_cast<float>(kBondsPanelH)};
+    drawBondsPanel(panelR);
   }
 
 
@@ -22404,6 +23997,8 @@ if (optHasBest) {
                /*bold=*/false, /*shadow=*/true, 1);
     }
   }
+
+  drawPerfOverlay(uiW, uiH, uiTime);
 
   // Developer console draws above the HUD/panels but below transient toasts.
   if (m_console.isOpen()) {

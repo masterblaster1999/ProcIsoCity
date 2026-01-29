@@ -118,6 +118,57 @@ struct CityNewsEntry {
   std::string body;
 };
 
+// Optional goal/challenge that nudges sandbox play toward short-term objectives.
+//
+// Challenges are intentionally game-layer only (not saved yet), similar to City News.
+enum class CityChallengeKind : std::uint8_t {
+  GrowPopulation = 0,
+  BuildParks,
+  ReduceCongestion,
+  ImproveGoods,
+  ImproveServices,
+  BalanceBudget,
+  RestoreOutsideConnection,
+};
+
+enum class CityChallengeStatus : std::uint8_t { Active = 0, Completed = 1, Failed = 2, Canceled = 3 };
+
+struct CityChallenge {
+  std::uint32_t id = 0;
+  CityChallengeKind kind = CityChallengeKind::GrowPopulation;
+  CityChallengeStatus status = CityChallengeStatus::Active;
+
+  int dayIssued = 0;
+  int dayDeadline = 0; // inclusive
+
+  int rewardMoney = 0;
+
+  // Generic parameters used by each kind.
+  //
+  // - GrowPopulation: startInt=popStart, targetInt=popTarget
+  // - BuildParks: startInt=parksBaseline, targetInt=parksTarget
+  // - ReduceCongestion: startF=congestionStart, targetF=congestionTarget
+  // - ImproveGoods: startF=goodsStart, targetF=goodsTarget
+  // - ImproveServices: startF=servicesStart, targetF=servicesTarget
+  // - BalanceBudget: targetInt=requiredStreak, stateInt=streak
+  // - RestoreOutsideConnection: startInt=unreachableStart, targetInt=0
+  int startInt = 0;
+  int targetInt = 0;
+  int stateInt = 0;
+  float startF = 0.0f;
+  float targetF = 0.0f;
+
+  std::string title;
+  std::string description;
+};
+
+struct CityChallengeLogEntry {
+  int day = 0;
+  CityChallengeStatus status = CityChallengeStatus::Completed;
+  int rewardMoney = 0;
+  std::string title;
+};
+
 
 
 struct GameStartupOptions {
@@ -152,6 +203,9 @@ private:
   void floodFillTool(Point start, bool includeRoads);
   void showToast(const std::string& msg, float seconds = 2.5f);
 
+  // Effective simulation pause state (user pause OR focus/minimize auto pause).
+  bool simPaused() const { return m_simPausedUser || m_simPausedAuto; }
+
   // City report (time-series graphs of key stats).
   void clearHistory();
   void recordHistorySample(const Stats& s);
@@ -162,6 +216,22 @@ private:
   void recordCityNews(const Stats& s);
   void drawNewsPanel(const Rectangle& rect);
   void exportCityNews();
+
+  // City challenges / goals (optional guidance for sandbox play).
+  void clearCityChallenges();
+  // Applies one day's worth of challenge progression.
+  // Returns money awarded this day. (ioStats.money is updated.)
+  int applyCityChallenges(Stats& ioStats);
+  void drawChallengesPanel(const Rectangle& rect);
+  void focusChallenge(const CityChallenge& c);
+  bool rerollChallenge(std::size_t idx);
+
+
+  // City treasury / municipal bonds (toggle with Ctrl+B).
+  void drawBondsPanel(const Rectangle& rect);
+  void issueBond(int principal, int termDays, int aprBasisPoints);
+  void payDownBond(std::size_t idx, int payment);
+
 
   // Visual micro-sim: moving vehicles along roads (commute + goods).
   void rebuildVehiclesRoutingCache();
@@ -244,6 +314,7 @@ private:
   void handleInput(float dt);
   void update(float dt);
   void draw();
+  void drawPerfOverlay(int uiW, int uiH, float uiTime);
 
   // Blueprint (copy/paste stamp) tool (toggle with J).
   void clearBlueprint();
@@ -486,6 +557,29 @@ private:
   // across multiple in-game days.
   double m_newsEnvLastComputeSec = -1.0;
   int m_newsEnvLastComputeDay = -1;
+
+  // City challenges panel (toggle with Ctrl+O).
+  bool m_showChallengesPanel = false;
+  int m_challengeSelection = 0;
+  int m_challengeFirst = 0;
+  int m_challengeTargetActive = 3;
+  int m_challengeRerolls = 0;
+  std::uint32_t m_challengeNextId = 1;
+  int m_challengeLastProcessedDay = -1;
+
+  std::vector<CityChallenge> m_cityChallenges;
+  std::deque<CityChallengeLogEntry> m_challengeLog;
+  int m_challengeLogMax = 40;
+
+// City treasury / municipal bonds panel (toggle with Ctrl+B).
+bool m_showBondsPanel = false;
+int m_bondsType = 1;       // 0=short, 1=medium, 2=long
+int m_bondsAmount = 250;   // desired principal for issuance UI
+int m_bondsSelection = 0;  // selected outstanding bond in the list
+int m_bondsFirst = 0;      // scroll offset for the bond list
+
+  // Daily addendum injected into City News (used to publish challenge completions/failures).
+  std::map<int, std::string> m_cityNewsAddendum;
 
   // UI minimap overlay (toggle with M). Clicking the minimap recenters the camera.
   bool m_showMinimap = false;
@@ -986,8 +1080,86 @@ private:
   RoadFlowField m_goodsEdgeField;
 
   // Simulation controls (pause/step/speed) are handled at the game layer so the simulator stays simple.
-  bool m_simPaused = false;
+  //
+  // We track user pause separately from focus/minimize auto-pause so alt-tabbing doesn't
+  // accidentally change the user's intended pause state.
+  bool m_simPausedUser = false;
+  bool m_simPausedAuto = false;
   int m_simSpeedIndex = 2; // 0.25x, 0.5x, 1x, 2x, ... (default = 1x)
+
+
+  // Game loop pacing / hitch protection.
+  //
+  // The simulator already runs at a fixed tick interval internally, but a long frame can
+  // still cause multiple ticks to be processed back-to-back. To keep the interactive app
+  // responsive, we optionally cap catch-up work per frame and clamp extreme dt spikes.
+  struct LoopConfig {
+    // Clamp the per-frame dt used for input/camera/UI timers (seconds).
+    // 0 disables clamping.
+    float maxFrameDt = 0.25f;
+
+    // Clamp the dt fed into the simulation clock (seconds, before sim speed multiplier).
+    // 0 disables clamping.
+    float maxSimDt = 0.50f;
+
+    // Pause the real-time clock when the window isn't interactive.
+    bool pauseWhenUnfocused = true;
+    bool pauseWhenMinimized = true;
+
+    // When the window is not interactive, optionally reduce the target FPS to save CPU/GPU.
+    bool throttleFpsWhenUnfocused = true;
+    int targetFpsFocused = 60;
+    int targetFpsUnfocused = 15;
+
+    // Simulation catch-up limiter.
+    bool simTickLimiter = true;
+
+    // If enabled, compute max ticks per frame from a CPU budget estimate.
+    bool simTickAuto = true;
+    float simBudgetMs = 6.0f;
+    int simAutoMinTicks = 1;
+    int simAutoMaxTicks = 32;
+
+    // Fixed tick limit used when simTickAuto is false.
+    int simMaxTicksPerFrame = 8;
+
+    // Clamp how far the sim accumulator is allowed to fall behind (in ticks).
+    // Prevents huge dt spikes (breakpoints, alt-tab) from queuing unbounded work.
+    int simMaxBacklogTicks = 240; // 240 * 0.5s = 120s by default
+  };
+
+  struct LoopStats {
+    float dtRaw = 0.0f;
+    float dtFrame = 0.0f;
+    float dtSim = 0.0f;
+    bool dtClamped = false;
+
+    bool focused = true;
+    bool minimized = false;
+    bool focusPaused = false;
+
+    int targetFps = 60;
+
+    int simTicks = 0;
+    int simTickLimit = 0;
+    int simBacklogTicks = 0;
+    float simBacklogSec = 0.0f;
+
+    double cpuInputMs = 0.0;
+    double cpuUpdateMs = 0.0;
+    double cpuDrawMs = 0.0;
+    double cpuFrameMs = 0.0;
+
+    double simCpuMs = 0.0;
+    double simMsPerTick = 0.0;
+    double simMsPerTickEma = 0.0;
+  };
+
+  LoopConfig m_loopCfg{};
+  LoopStats m_loopStats{};
+  bool m_showPerfOverlay = false;
+  bool m_focusPausePrev = false;
+  int m_targetFpsApplied = 60;
 
   float m_timeSec = 0.0f;
   std::string m_toast;

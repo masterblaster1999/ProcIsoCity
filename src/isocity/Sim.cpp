@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cmath>
 #include <vector>
+#include <limits>
 
 namespace isocity {
 
@@ -38,6 +39,78 @@ inline int JobsForTile(const Tile& t)
 }
 
 inline float Clamp01(float v) { return std::clamp(v, 0.0f, 1.0f); }
+
+// ---------------------------------------------------------------------------
+// Municipal bonds / debt service
+//
+// The simulator treats debt service as a daily expense that reduces cash and
+// slowly amortizes outstanding balances. This lives in the simulation layer so
+// the budget graphs and economy metrics naturally include it.
+// ---------------------------------------------------------------------------
+
+inline int ComputeDailyDebtInterest(int balance, int aprBasisPoints)
+{
+  if (balance <= 0 || aprBasisPoints <= 0) return 0;
+
+  // APR basis points (1bp = 0.01%) converted to a per-day rate.
+  // interest = balance * (apr / 365)
+  //          = balance * (bp / 10000) / 365
+  //          = balance * bp / (10000*365)
+  constexpr std::int64_t kDenom = 10000LL * 365LL;
+  const std::int64_t num = static_cast<std::int64_t>(balance) * static_cast<std::int64_t>(aprBasisPoints);
+
+  // Round up so small balances still accrue at least 1 when appropriate.
+  std::int64_t interest = (num + kDenom - 1) / kDenom;
+  if (interest < 0) interest = 0;
+  if (interest > static_cast<std::int64_t>(std::numeric_limits<int>::max())) {
+    interest = static_cast<std::int64_t>(std::numeric_limits<int>::max());
+  }
+  return static_cast<int>(interest);
+}
+
+inline int ApplyDebtService(World& world)
+{
+  auto& debts = world.debts();
+  if (debts.empty()) return 0;
+
+  std::int64_t totalPaid = 0;
+
+  for (DebtItem& d : debts) {
+    if (d.balance <= 0 || d.daysLeft <= 0) continue;
+
+    const int interest = ComputeDailyDebtInterest(d.balance, d.aprBasisPoints);
+
+    // Avoid overflow.
+    if (interest > 0 && d.balance > (std::numeric_limits<int>::max() - interest)) {
+      d.balance = std::numeric_limits<int>::max();
+    } else {
+      d.balance += interest;
+    }
+
+    int pay = d.dailyPayment;
+    // Force full payoff on the final day to avoid rounding drift.
+    if (d.daysLeft <= 1) pay = d.balance;
+
+    pay = std::clamp(pay, 0, d.balance);
+    d.balance -= pay;
+    totalPaid += pay;
+
+    d.daysLeft -= 1;
+    if (d.daysLeft < 0) d.daysLeft = 0;
+  }
+
+  // Remove repaid / expired entries.
+  debts.erase(std::remove_if(debts.begin(), debts.end(),
+                             [](const DebtItem& d) { return d.balance <= 0 || d.daysLeft <= 0; }),
+              debts.end());
+
+  if (totalPaid <= 0) return 0;
+  if (totalPaid > static_cast<std::int64_t>(std::numeric_limits<int>::max())) {
+    return std::numeric_limits<int>::max();
+  }
+  return static_cast<int>(totalPaid);
+}
+
 
 float ResidentialDemand(float jobPressure, float happiness, float avgLandValue)
 {
@@ -325,16 +398,46 @@ void Simulator::stepOnce(World& world)
 
 void Simulator::update(World& world, float dt)
 {
-  (void)update(world, dt, nullptr);
+  (void)updateLimited(world, dt, /*maxTicks=*/0, /*maxBacklogTicks=*/0, nullptr);
 }
 
 int Simulator::update(World& world, float dt, std::vector<Stats>* outTickStats)
 {
+  return updateLimited(world, dt, /*maxTicks=*/0, /*maxBacklogTicks=*/0, outTickStats);
+}
+
+int Simulator::updateLimited(World& world, float dt, int maxTicks, int maxBacklogTicks,
+                             std::vector<Stats>* outTickStats)
+{
+  // Reject negative or NaN dt (NaN fails all comparisons).
+  if (!(dt > 0.0f)) return 0;
+
+  const float tickSec = m_cfg.tickSeconds;
+  if (!(tickSec > 1.0e-6f)) {
+    // Degenerate tick size; avoid infinite loops.
+    m_accum = 0.0f;
+    return 0;
+  }
+
   m_accum += dt;
+  if (!(m_accum >= 0.0f)) {
+    // Handles NaN and negative accumulation.
+    m_accum = 0.0f;
+    return 0;
+  }
+
+  if (maxBacklogTicks > 0) {
+    const float maxBacklogSec = tickSec * static_cast<float>(maxBacklogTicks);
+    if (m_accum > maxBacklogSec) m_accum = maxBacklogSec;
+  }
+
+  const bool limitTicks = (maxTicks > 0);
   int ticks = 0;
 
-  while (m_accum >= m_cfg.tickSeconds) {
-    m_accum -= m_cfg.tickSeconds;
+  while (m_accum >= tickSec) {
+    if (limitTicks && ticks >= maxTicks) break;
+
+    m_accum -= tickSec;
     step(world);
     ++ticks;
 
@@ -343,7 +446,6 @@ int Simulator::update(World& world, float dt, std::vector<Stats>* outTickStats)
 
   return ticks;
 }
-
 void Simulator::refreshDerivedStats(World& world) const
 {
   refreshDerivedStatsInternal(world, nullptr, nullptr);
@@ -1294,6 +1396,12 @@ void Simulator::step(World& world)
   // Include upgrade spending in the budget and apply the net change to money.
   s.upgradeCost = upgradeCost;
   s.expenses += upgradeCost;
+
+  // Debt service (municipal bonds) behaves like an additional daily expense.
+  const int debtService = ApplyDebtService(world);
+  if (debtService > 0) {
+    s.expenses += debtService;
+  }
 
   s.money += (s.income - s.expenses);
 }

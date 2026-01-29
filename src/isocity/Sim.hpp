@@ -168,12 +168,64 @@ public:
   // Returns the number of ticks processed.
   int update(World& world, float dt, std::vector<Stats>* outTickStats);
 
+  // Like update(), but clamps how many simulation ticks can be processed in a single call.
+  //
+  // This is useful to keep the interactive loop responsive if the app hitches (e.g. when dragging
+  // panels, resizing, or when the OS stalls the process). Any remaining accumulated time is kept
+  // in the internal accumulator and will be processed in subsequent frames.
+  //
+  // Parameters:
+  //   tickLimit          - maximum ticks to process this call (<=0 means unlimited).
+  //   backlogLimitTicks  - clamps the accumulator to at most this many ticks worth of time
+  //                        (<=0 means no clamp).
+  //   outTickStats       - optional: collect Stats after each processed tick.
+  //
+  // Returns number of ticks processed.
+  int updateLimited(World& world, float dt, int tickLimit, int backlogLimitTicks, std::vector<Stats>* outTickStats);
+
+
+  // Update the simulation while limiting the number of ticks processed in one call.
+  //
+  // This is useful for real-time game loops: if a frame stalls (e.g., breakpoint, alt-tab, hitch),
+  // an unbounded catch-up can cause a "spiral of death" where one long frame triggers many
+  // expensive ticks, causing the next frame to be even longer.
+  //
+  // - maxTicks <= 0 disables the per-call tick limit (behaves like update()).
+  // - maxBacklogTicks > 0 clamps the internal accumulator so extremely large dt spikes do not
+  //   queue an unbounded amount of work.
+  //
+  // Returns the number of ticks processed.
+  int updateLimited(World& world, float dt, int maxTicks, int maxBacklogTicks,
+                    std::vector<Stats>* outTickStats = nullptr);
+
+  // Inspect the internal tick accumulator (useful for debugging/perf overlays).
+  float accumulatedSeconds() const { return m_accum; }
+  int accumulatedTicks() const
+  {
+    const float ts = m_cfg.tickSeconds;
+    if (!(ts > 1.0e-6f)) return 0;
+    if (!(m_accum > 0.0f)) return 0;
+    return static_cast<int>(m_accum / ts);
+  }
+
+
   // Advance the simulation by exactly one tick (increments day, updates economy, etc.).
   // Resets the internal timer accumulator so stepping is deterministic.
   void stepOnce(World& world);
 
   // Clears the internal tick accumulator (useful when pausing/unpausing or changing sim speed).
   void resetTimer() { m_accum = 0.0f; }
+
+
+  // Expose the accumulator for diagnostics / HUD widgets.
+  float accumulatedSeconds() const { return m_accum; }
+  int accumulatedTicks() const
+  {
+    const float t = m_cfg.tickSeconds;
+    if (t <= 0.0f) return 0;
+    return static_cast<int>(m_accum / t);
+  }
+
 
   const SimConfig& config() const { return m_cfg; }
 
