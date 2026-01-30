@@ -59,6 +59,37 @@ void ReconstructPath(int goalIdx, int startIdx, int w, const std::vector<int>& c
   std::reverse(out.begin(), out.end());
 }
 
+inline int DirFromDelta(int dx, int dy)
+{
+  if (dx == 1 && dy == 0) return 0;
+  if (dx == -1 && dy == 0) return 1;
+  if (dx == 0 && dy == 1) return 2;
+  if (dx == 0 && dy == -1) return 3;
+  return -1;
+}
+
+inline int MinRoadTravelTimeMilli()
+{
+  // Highway is the fastest class. Use the global minimum to keep the A* heuristic admissible.
+  return std::min({RoadTravelTimeMilliForLevel(1), RoadTravelTimeMilliForLevel(2), RoadTravelTimeMilliForLevel(3)});
+}
+
+inline int RoadTileTravelTimeMilli(const World& world, int x, int y)
+{
+  const Tile& t = world.at(x, y);
+  const int lvl = static_cast<int>(t.level);
+  if (t.terrain == Terrain::Water && t.overlay == Overlay::Road) {
+    return RoadBridgeTravelTimeMilliForLevel(lvl);
+  }
+  return RoadTravelTimeMilliForLevel(lvl);
+}
+
+inline int ExtraCostMilliAt(const std::vector<int>* extra, std::size_t idx)
+{
+  if (!extra || idx >= extra->size()) return 0;
+  return std::max(0, (*extra)[idx]);
+}
+
 } // namespace
 
 bool FindRoadPathAStar(const World& world, Point start, Point goal, std::vector<Point>& outPath, int* outCost)
@@ -137,6 +168,236 @@ bool FindRoadPathAStar(const World& world, Point start, Point goal, std::vector<
         const int f = tentativeG + Manhattan(Point{nx, ny}, goal);
         open.push(Node{nidx, f, tentativeG});
       }
+    }
+  }
+
+  return false;
+}
+
+RoadPathCostBreakdown ComputeRoadPathCostMilli(const World& world, const std::vector<Point>& path,
+                                               const std::vector<int>* extraTileCostMilli,
+                                               int turnPenaltyMilli)
+{
+  RoadPathCostBreakdown out{};
+
+  if (path.size() < 2u) return out;
+
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return out;
+
+  const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+  const std::vector<int>* extra = (extraTileCostMilli && extraTileCostMilli->size() == n) ? extraTileCostMilli : nullptr;
+
+  const int turnPenalty = std::max(0, turnPenaltyMilli);
+
+  int prevDir = -1;
+
+  for (std::size_t i = 1; i < path.size(); ++i) {
+    const Point a = path[i - 1u];
+    const Point b = path[i];
+
+    const int dir = DirFromDelta(b.x - a.x, b.y - a.y);
+    if (prevDir >= 0 && dir >= 0 && dir != prevDir) {
+      out.turnPenaltyMilli += turnPenalty;
+    }
+    prevDir = dir;
+
+    if (!world.inBounds(b.x, b.y)) continue;
+    const int idx = Idx(b.x, b.y, w);
+    if (idx < 0) continue;
+    const std::size_t uidx = static_cast<std::size_t>(idx);
+    if (uidx >= n) continue;
+
+    out.travelTimeMilli += RoadTileTravelTimeMilli(world, b.x, b.y);
+    out.extraCostMilli += ExtraCostMilliAt(extra, uidx);
+  }
+
+  return out;
+}
+
+bool FindRoadPathAStarEx(const World& world, Point start, Point goal, std::vector<Point>& outPath,
+                         int* outSteps, int* outCostMilli, RoadPathCostBreakdown* outBreakdown,
+                         const RoadPathAStarConfig& cfg)
+{
+  outPath.clear();
+  if (outSteps) *outSteps = 0;
+  if (outCostMilli) *outCostMilli = 0;
+  if (outBreakdown) *outBreakdown = RoadPathCostBreakdown{};
+
+  if (!IsRoad(world, start.x, start.y)) return false;
+  if (!IsRoad(world, goal.x, goal.y)) return false;
+
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return false;
+
+  const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+  const std::vector<int>* extra = (cfg.extraTileCostMilli && cfg.extraTileCostMilli->size() == n) ? cfg.extraTileCostMilli : nullptr;
+
+  const int startIdx = Idx(start.x, start.y, w);
+  const int goalIdx = Idx(goal.x, goal.y, w);
+
+  // Trivial.
+  if (startIdx == goalIdx) {
+    outPath.push_back(start);
+    if (outSteps) *outSteps = 0;
+    if (outCostMilli || outBreakdown) {
+      const RoadPathCostBreakdown bd = ComputeRoadPathCostMilli(world, outPath, extra, cfg.turnPenaltyMilli);
+      if (outCostMilli) *outCostMilli = bd.totalCostMilli();
+      if (outBreakdown) *outBreakdown = bd;
+    }
+    return true;
+  }
+
+  // Classic step-count path; we reuse the existing implementation to preserve historical
+  // tie-breaking behavior.
+  if (cfg.metric == RoadPathMetric::Steps) {
+    int steps = 0;
+    if (!FindRoadPathAStar(world, start, goal, outPath, &steps) || outPath.size() < 2u) return false;
+
+    if (outSteps) *outSteps = steps;
+
+    if (cfg.computeTravelTimeCost || outCostMilli || outBreakdown) {
+      const RoadPathCostBreakdown bd = ComputeRoadPathCostMilli(world, outPath, extra, cfg.turnPenaltyMilli);
+      if (outCostMilli) *outCostMilli = bd.totalCostMilli();
+      if (outBreakdown) *outBreakdown = bd;
+    }
+
+    return true;
+  }
+
+  // Travel-time weighted A* with direction state (for turn penalties).
+  constexpr int kInf = std::numeric_limits<int>::max() / 4;
+
+  constexpr int kDirs = 4;
+  constexpr int kDirNone = 4;
+  constexpr int kStatesPerTile = 5; // 4 dirs + none
+
+  const std::size_t nStates = n * static_cast<std::size_t>(kStatesPerTile);
+  std::vector<int> bestP(nStates, kInf);
+  std::vector<int> bestS(nStates, kInf);
+  std::vector<int> cameFrom(nStates, -1);
+
+  auto stateOf = [&](int idx, int dir) -> int { return idx * kStatesPerTile + dir; };
+
+  struct Node {
+    int state = 0;
+    int f = 0;
+    int p = 0;
+    int s = 0;
+  };
+  struct Cmp {
+    bool operator()(const Node& a, const Node& b) const
+    {
+      if (a.f != b.f) return a.f > b.f;
+      if (a.p != b.p) return a.p > b.p;
+      if (a.s != b.s) return a.s > b.s;
+      return a.state > b.state;
+    }
+  };
+
+  std::priority_queue<Node, std::vector<Node>, Cmp> open;
+
+  const int minStepTime = std::max(1, MinRoadTravelTimeMilli());
+
+  const int startState = stateOf(startIdx, kDirNone);
+  bestP[static_cast<std::size_t>(startState)] = 0;
+  bestS[static_cast<std::size_t>(startState)] = 0;
+  open.push(Node{startState, Manhattan(start, goal) * minStepTime, 0, 0});
+
+  constexpr int dirs[kDirs][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+
+  while (!open.empty()) {
+    const Node cur = open.top();
+    open.pop();
+
+    const std::size_t curU = static_cast<std::size_t>(cur.state);
+    if (curU >= nStates) continue;
+
+    // Ignore stale heap entries.
+    if (cur.p != bestP[curU] || cur.s != bestS[curU]) continue;
+
+    const int curIdx = cur.state / kStatesPerTile;
+    const int curDir = cur.state % kStatesPerTile;
+
+    if (curIdx == goalIdx) {
+      // Reconstruct.
+      std::vector<Point> rev;
+      rev.reserve(256);
+      int st = cur.state;
+      while (st != -1) {
+        const int tidx = st / kStatesPerTile;
+        const int x = tidx % w;
+        const int y = tidx / w;
+        rev.push_back(Point{x, y});
+        st = cameFrom[static_cast<std::size_t>(st)];
+      }
+      std::reverse(rev.begin(), rev.end());
+      outPath = std::move(rev);
+
+      const int steps = static_cast<int>(outPath.size()) - 1;
+      if (outSteps) *outSteps = std::max(0, steps);
+
+      const RoadPathCostBreakdown bd = ComputeRoadPathCostMilli(world, outPath, extra, cfg.turnPenaltyMilli);
+      if (outCostMilli) *outCostMilli = bd.totalCostMilli();
+      if (outBreakdown) *outBreakdown = bd;
+
+      return outPath.size() >= 1u;
+    }
+
+    const int cx = curIdx % w;
+    const int cy = curIdx / w;
+
+    for (int d = 0; d < kDirs; ++d) {
+      const int nx = cx + dirs[d][0];
+      const int ny = cy + dirs[d][1];
+      if (!IsRoad(world, nx, ny)) continue;
+
+      const int nidx = Idx(nx, ny, w);
+      if (nidx < 0) continue;
+
+      const int ns = stateOf(nidx, d);
+      const std::size_t nsU = static_cast<std::size_t>(ns);
+      if (nsU >= nStates) continue;
+
+      const int base = RoadTileTravelTimeMilli(world, nx, ny);
+      const int extraC = ExtraCostMilliAt(extra, static_cast<std::size_t>(nidx));
+      const int turnC = (curDir != kDirNone && curDir != d) ? std::max(0, cfg.turnPenaltyMilli) : 0;
+
+      const int stepCost = base + extraC + turnC;
+      if (stepCost < 0 || stepCost >= kInf) continue;
+
+      const int newP = cur.p + stepCost;
+      if (newP >= kInf) continue;
+
+      const int newS = cur.s + 1;
+
+      const int bestPrevP = bestP[nsU];
+      const int bestPrevS = bestS[nsU];
+
+      bool improve = false;
+      if (newP < bestPrevP) {
+        improve = true;
+      } else if (newP == bestPrevP) {
+        if (newS < bestPrevS) {
+          improve = true;
+        } else if (newS == bestPrevS) {
+          // Deterministic tie-break: prefer smaller predecessor state id.
+          const int prevSt = cameFrom[nsU];
+          if (prevSt == -1 || cur.state < prevSt) improve = true;
+        }
+      }
+
+      if (!improve) continue;
+
+      bestP[nsU] = newP;
+      bestS[nsU] = newS;
+      cameFrom[nsU] = cur.state;
+
+      const int h = Manhattan(Point{nx, ny}, goal) * minStepTime;
+      const int f = (newP >= kInf - h) ? kInf : (newP + h);
+      open.push(Node{ns, f, newP, newS});
     }
   }
 

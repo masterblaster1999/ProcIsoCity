@@ -10177,6 +10177,78 @@ static void TestRoadHealthCrossHasVulnerability()
   EXPECT_TRUE(r.vulnerability01[center] >= (cfg.articulationVulnerabilityBase - 1e-6f));
 }
 
+void TestRoadPathfindingAStarExAvoidsHighPenaltyTiles()
+{
+  using namespace isocity;
+
+  World world(7, 3, 123u);
+
+  // Two parallel road corridors from (0,1) -> (6,1):
+  //   - Direct: along y=1 (6 steps)
+  //   - Detour: up to y=0, across, then back down (8 steps)
+  for (int x = 0; x < 7; ++x) {
+    world.setRoad(x, 1);
+    world.setRoad(x, 0);
+  }
+
+  const Point start{0, 1};
+  const Point goal{6, 1};
+
+  // Baseline (travel-time) should take the direct corridor.
+  std::vector<Point> basePath;
+  int baseSteps = 0;
+  int baseCostMilli = 0;
+  RoadPathCostBreakdown baseBreakdown{};
+  {
+    RoadPathAStarConfig cfg;
+    cfg.metric = RoadPathMetric::TravelTime;
+    EXPECT_TRUE(FindRoadPathAStarEx(world, start, goal, basePath, &baseSteps, &baseCostMilli, &baseBreakdown, cfg));
+  }
+
+  EXPECT_EQ(baseSteps, 6);
+  EXPECT_EQ(basePath.front().x, start.x);
+  EXPECT_EQ(basePath.front().y, start.y);
+  EXPECT_EQ(basePath.back().x, goal.x);
+  EXPECT_EQ(basePath.back().y, goal.y);
+
+  // Add a large penalty to the direct corridor (excluding the goal tile).
+  const int w = world.width();
+  const int h = world.height();
+  std::vector<int> extra(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), 0);
+  for (int x = 1; x <= 5; ++x) {
+    const std::size_t idx = static_cast<std::size_t>(1) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+    extra[idx] = 5000; // 5 street-steps per tile of penalty
+  }
+
+  std::vector<Point> safePath;
+  int safeSteps = 0;
+  int safeCostMilli = 0;
+  RoadPathCostBreakdown safeBreakdown{};
+  {
+    RoadPathAStarConfig cfg;
+    cfg.metric = RoadPathMetric::TravelTime;
+    cfg.extraTileCostMilli = &extra;
+    EXPECT_TRUE(FindRoadPathAStarEx(world, start, goal, safePath, &safeSteps, &safeCostMilli, &safeBreakdown, cfg));
+  }
+
+  // The cheaper (penalty-free) detour should be selected.
+  EXPECT_EQ(safeSteps, 8);
+  EXPECT_TRUE(safePath.size() >= 2u);
+  EXPECT_EQ(safePath[1].x, 0);
+  EXPECT_EQ(safePath[1].y, 0);
+
+  // Ensure we never traverse the penalized tiles on y=1 (x=1..5).
+  for (const Point& p : safePath) {
+    EXPECT_TRUE(!(p.y == 1 && p.x >= 1 && p.x <= 5));
+  }
+
+  EXPECT_EQ(safeBreakdown.extraCostMilli, 0);
+  EXPECT_EQ(safeBreakdown.turnPenaltyMilli, 0);
+  EXPECT_TRUE(safeBreakdown.travelTimeMilli > baseBreakdown.travelTimeMilli); // detour is longer in pure travel time
+
+}
+
+
 int main()
 {
   TestRoadAutoTilingMasks();
@@ -10342,6 +10414,7 @@ int main()
 
 
   TestRoadPathfindingAStar();
+  TestRoadPathfindingAStarExAvoidsHighPenaltyTiles();
   TestRoadGraphRoutingInteriorToInterior();
   TestRoadGraphRoutingTravelTimeVsSteps();
   TestLandPathfindingAStarAvoidsWater();
@@ -10362,3 +10435,5 @@ int main()
   std::cerr << "proc_isocity_tests: FAILED (" << g_failures << ")\n";
   return 1;
 }
+
+

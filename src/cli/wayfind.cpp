@@ -72,6 +72,21 @@ bool ParseBool01(const std::string& s, bool* out)
   return true;
 }
 
+bool ParseRouteMetric(const std::string& s, isocity::WayfindingRouteMetric* out)
+{
+  using namespace isocity;
+  if (!out) return false;
+  if (s == "steps" || s == "step") {
+    *out = WayfindingRouteMetric::Steps;
+    return true;
+  }
+  if (s == "time" || s == "travel_time" || s == "traveltime") {
+    *out = WayfindingRouteMetric::TravelTime;
+    return true;
+  }
+  return false;
+}
+
 void PrintHelp()
 {
   std::cout
@@ -94,6 +109,14 @@ void PrintHelp()
       << "  --out-image <path.(png|ppm)>  Write a tile-map snapshot with route overlay\n"
       << "  --image-layer <name>       Base layer for the snapshot (default: overlay)\n"
       << "  --image-scale <N>          Nearest-neighbor upscale factor (default: 6)\n\n"
+      << "Routing metric knobs:\n"
+      << "  --metric <steps|time>       (default: steps; auto-switches to time if weights are set)\n"
+      << "  --turn-penalty-milli <N>    Turn penalty (milli-steps) when metric=time (default: 0)\n"
+      << "  --w-traffic-milli <N>       Avoid high-traffic tiles (default: 0)\n"
+      << "  --w-crash-milli <N>         Avoid high crash-risk tiles (default: 0)\n"
+      << "  --w-crime-milli <N>         Avoid high crime-risk tiles (default: 0)\n"
+      << "  --w-noise-milli <N>         Avoid high noise tiles (default: 0)\n"
+      << "  --hazards-require-outside <0|1>  Only penalize roads connected to edge (default: 0)\n\n"
       << "Street naming knobs (must match what you used for exports if you want exact strings):\n"
       << "  --merge-intersections <0|1>  (default: 1)\n"
       << "  --merge-corners <0|1>        (default: 1)\n"
@@ -173,6 +196,39 @@ static bool WriteRouteJson(const std::string& path, const isocity::RouteResult& 
   jw.key("path_cost");
   jw.intValue(r.pathCost);
 
+  jw.key("metric");
+  jw.stringValue(r.routeCfg.metric == WayfindingRouteMetric::Steps ? "steps" : "time");
+
+  jw.key("path_cost_milli");
+  jw.intValue(r.pathCostMilli);
+
+  jw.key("path_travel_time_milli");
+  jw.intValue(r.pathTravelTimeMilli);
+
+  jw.key("path_hazard_penalty_milli");
+  jw.intValue(r.pathHazardPenaltyMilli);
+
+  jw.key("path_turn_penalty_milli");
+  jw.intValue(r.pathTurnPenaltyMilli);
+
+  jw.key("route_config");
+  jw.beginObject();
+  jw.key("metric");
+  jw.stringValue(r.routeCfg.metric == WayfindingRouteMetric::Steps ? "steps" : "time");
+  jw.key("turn_penalty_milli");
+  jw.intValue(r.routeCfg.turnPenaltyMilli);
+  jw.key("w_traffic_milli");
+  jw.intValue(r.routeCfg.wTrafficMilli);
+  jw.key("w_crash_milli");
+  jw.intValue(r.routeCfg.wCrashMilli);
+  jw.key("w_crime_milli");
+  jw.intValue(r.routeCfg.wCrimeMilli);
+  jw.key("w_noise_milli");
+  jw.intValue(r.routeCfg.wNoiseMilli);
+  jw.key("hazards_require_outside");
+  jw.boolValue(r.routeCfg.requireOutsideConnectionForHazards);
+  jw.endObject();
+
   jw.key("path");
   jw.beginArray();
   for (const Point& p : r.pathTiles) {
@@ -243,6 +299,9 @@ int main(int argc, char** argv)
   AddressConfig addrCfg;
   AddressIndexConfig indexCfg;
 
+  WayfindingRouteConfig routeCfg;
+  bool metricSpecified = false;
+
   auto requireValue = [&](int& i, std::string& out) -> bool {
     if (i + 1 >= argc) return false;
     out = argv[++i];
@@ -306,6 +365,42 @@ int main(int argc, char** argv)
         std::cerr << "--image-scale requires a positive integer\n";
         return 2;
       }
+    } else if (arg == "--metric") {
+      if (!requireValue(i, val) || !ParseRouteMetric(val, &routeCfg.metric)) {
+        std::cerr << "--metric requires steps or time\n";
+        return 2;
+      }
+      metricSpecified = true;
+    } else if (arg == "--turn-penalty-milli") {
+      if (!requireValue(i, val) || !ParseI32(val, &routeCfg.turnPenaltyMilli) || routeCfg.turnPenaltyMilli < 0) {
+        std::cerr << "--turn-penalty-milli requires a non-negative integer\n";
+        return 2;
+      }
+    } else if (arg == "--w-traffic-milli") {
+      if (!requireValue(i, val) || !ParseI32(val, &routeCfg.wTrafficMilli) || routeCfg.wTrafficMilli < 0) {
+        std::cerr << "--w-traffic-milli requires a non-negative integer\n";
+        return 2;
+      }
+    } else if (arg == "--w-crash-milli") {
+      if (!requireValue(i, val) || !ParseI32(val, &routeCfg.wCrashMilli) || routeCfg.wCrashMilli < 0) {
+        std::cerr << "--w-crash-milli requires a non-negative integer\n";
+        return 2;
+      }
+    } else if (arg == "--w-crime-milli") {
+      if (!requireValue(i, val) || !ParseI32(val, &routeCfg.wCrimeMilli) || routeCfg.wCrimeMilli < 0) {
+        std::cerr << "--w-crime-milli requires a non-negative integer\n";
+        return 2;
+      }
+    } else if (arg == "--w-noise-milli") {
+      if (!requireValue(i, val) || !ParseI32(val, &routeCfg.wNoiseMilli) || routeCfg.wNoiseMilli < 0) {
+        std::cerr << "--w-noise-milli requires a non-negative integer\n";
+        return 2;
+      }
+    } else if (arg == "--hazards-require-outside") {
+      if (!requireValue(i, val) || !ParseBool01(val, &routeCfg.requireOutsideConnectionForHazards)) {
+        std::cerr << "--hazards-require-outside requires 0 or 1\n";
+        return 2;
+      }
     } else if (arg == "--merge-intersections") {
       if (!requireValue(i, val) || !ParseBool01(val, &streetCfg.mergeThroughIntersections)) {
         std::cerr << "--merge-intersections requires 0 or 1\n";
@@ -345,6 +440,15 @@ int main(int argc, char** argv)
       std::cerr << "Unknown arg: " << arg << "\n";
       PrintHelp();
       return 2;
+    }
+  }
+
+  // Convenience: if the user didn't specify --metric, but they did specify any
+  // avoidance weights or turn penalties, automatically switch to travel-time routing.
+  if (!metricSpecified) {
+    if (routeCfg.turnPenaltyMilli > 0 || routeCfg.wTrafficMilli > 0 || routeCfg.wCrashMilli > 0 ||
+        routeCfg.wCrimeMilli > 0 || routeCfg.wNoiseMilli > 0) {
+      routeCfg.metric = WayfindingRouteMetric::TravelTime;
     }
   }
 
@@ -391,16 +495,21 @@ int main(int argc, char** argv)
     return 2;
   }
 
-  const RouteResult r = RouteBetweenEndpoints(world, streets, a.endpoint, b.endpoint);
+  const RouteResult r = RouteBetweenEndpoints(world, streets, a.endpoint, b.endpoint, routeCfg);
   if (!r.ok) {
     std::cerr << "Route failed: " << r.error << "\n";
     return 2;
   }
 
   std::cout << "Wayfind\n";
-  std::cout << "  from: " << r.from.full << "\n";
-  std::cout << "  to:   " << r.to.full << "\n";
-  std::cout << "  cost: " << r.pathCost << " steps\n";
+  std::cout << "  from:   " << r.from.full << "\n";
+  std::cout << "  to:     " << r.to.full << "\n";
+  std::cout << "  metric: " << (r.routeCfg.metric == WayfindingRouteMetric::Steps ? "steps" : "time") << "\n";
+  std::cout << "  steps:  " << r.pathCost << "\n";
+  std::cout << "  cost:   " << r.pathCostMilli << " milli\n";
+  std::cout << "    travel: " << r.pathTravelTimeMilli << "\n";
+  std::cout << "    hazard: " << r.pathHazardPenaltyMilli << "\n";
+  std::cout << "    turns:  " << r.pathTurnPenaltyMilli << "\n";
   std::cout << "  maneuvers: " << r.maneuvers.size() << "\n\n";
 
   for (std::size_t i = 0; i < r.maneuvers.size(); ++i) {

@@ -1,6 +1,10 @@
 #include "isocity/Wayfinding.hpp"
 
 #include "isocity/Pathfinding.hpp"
+#include "isocity/CrimeModel.hpp"
+#include "isocity/NoisePollution.hpp"
+#include "isocity/Traffic.hpp"
+#include "isocity/TrafficSafety.hpp"
 #include "isocity/Random.hpp"
 #include "isocity/World.hpp"
 
@@ -439,6 +443,158 @@ static bool ComputeDestinationSide(const ParcelAddress& to, const Point& goalRoa
   return false;
 }
 
+static void BuildRouteManeuvers(const StreetNamingResult& streets, const ParcelAddress& to,
+                                const Point& goalRoad, const std::vector<Point>& path,
+                                std::vector<RouteManeuver>& outManeuvers)
+{
+  outManeuvers.clear();
+  if (path.size() < 2u) return;
+
+  const int w = streets.w;
+  const int h = streets.h;
+
+  auto sidAt = [&](const Point& p) -> int {
+    if (p.x < 0 || p.y < 0 || p.x >= w || p.y >= h) return -1;
+    const std::size_t idx = static_cast<std::size_t>(p.y) * static_cast<std::size_t>(w) +
+                            static_cast<std::size_t>(p.x);
+    if (idx >= streets.roadTileToStreetId.size()) return -1;
+    return streets.roadTileToStreetId[idx];
+  };
+
+  // Edge-based street ids.
+  const int edges = static_cast<int>(path.size()) - 1;
+  if (edges <= 0) return;
+
+  std::vector<int> edgeStreetId(static_cast<std::size_t>(edges), -1);
+  for (int i = 0; i < edges; ++i) {
+    int sid = sidAt(path[static_cast<std::size_t>(i)]);
+    if (sid < 0) sid = sidAt(path[static_cast<std::size_t>(i + 1)]);
+    edgeStreetId[static_cast<std::size_t>(i)] = sid;
+  }
+
+  // Group contiguous edges by street id.
+  struct Seg {
+    int streetId = -1;
+    int startEdge = 0;
+    int endEdge = 0; // inclusive
+    int bearing = 0;
+  };
+
+  std::vector<Seg> segs;
+  segs.reserve(32);
+
+  int curSid = edgeStreetId[0];
+  int startE = 0;
+
+  for (int i = 1; i <= edges; ++i) {
+    const int sid = (i < edges) ? edgeStreetId[static_cast<std::size_t>(i)]
+                                : std::numeric_limits<int>::min();
+    if (i == edges || sid != curSid) {
+      Seg s;
+      s.streetId = curSid;
+      s.startEdge = startE;
+      s.endEdge = i - 1;
+
+      // Bearing from first edge.
+      const Point p0 = path[static_cast<std::size_t>(s.startEdge)];
+      const Point p1 = path[static_cast<std::size_t>(s.startEdge + 1)];
+      s.bearing = BearingFromDelta(p1.x - p0.x, p1.y - p0.y);
+
+      segs.push_back(s);
+      startE = i;
+      curSid = sid;
+    }
+  }
+
+  // Convert segments to maneuvers.
+  outManeuvers.reserve(segs.size() + 1);
+
+  int prevBearing = segs.empty() ? 0 : segs.front().bearing;
+
+  for (std::size_t si = 0; si < segs.size(); ++si) {
+    const Seg& s = segs[si];
+
+    RouteManeuver m;
+
+    const int steps = s.endEdge - s.startEdge + 1;
+    m.steps = std::max(0, steps);
+    m.streetId = s.streetId;
+    m.streetName = StreetNameForId(streets, s.streetId);
+    m.pathStart = s.startEdge;
+    m.pathEnd = s.endEdge + 1;
+
+    const int curBearing = s.bearing;
+
+    if (si == 0) {
+      m.type = "depart";
+      m.modifier = "";
+      m.bearingBefore = curBearing;
+      m.bearingAfter = curBearing;
+
+      std::ostringstream oss;
+      oss << "Head " << CardinalNameFromBearing(curBearing) << " on " << m.streetName;
+      if (m.steps == 1) oss << " for 1 block.";
+      else oss << " for " << m.steps << " blocks.";
+      m.instruction = oss.str();
+    } else {
+      m.bearingBefore = prevBearing;
+      m.bearingAfter = curBearing;
+      m.modifier = TurnModifier(prevBearing, curBearing);
+
+      if (m.modifier == "straight") {
+        m.type = "continue";
+        std::ostringstream oss;
+        oss << "Continue straight on " << m.streetName;
+        if (m.steps == 1) oss << " for 1 block.";
+        else oss << " for " << m.steps << " blocks.";
+        m.instruction = oss.str();
+      } else if (m.modifier == "uturn") {
+        m.type = "turn";
+        std::ostringstream oss;
+        oss << "Make a U-turn onto " << m.streetName;
+        if (m.steps == 1) oss << " for 1 block.";
+        else oss << " for " << m.steps << " blocks.";
+        m.instruction = oss.str();
+      } else {
+        m.type = "turn";
+        std::ostringstream oss;
+        oss << "Turn " << m.modifier << " onto " << m.streetName;
+        if (m.steps == 1) oss << " for 1 block.";
+        else oss << " for " << m.steps << " blocks.";
+        m.instruction = oss.str();
+      }
+    }
+
+    outManeuvers.push_back(m);
+    prevBearing = curBearing;
+  }
+
+  // Final arrive maneuver.
+  {
+    RouteManeuver a;
+    a.type = "arrive";
+    a.modifier = "";
+    a.bearingBefore = prevBearing;
+    a.bearingAfter = prevBearing;
+    a.steps = 0;
+    a.streetId = -1;
+    a.streetName = "";
+    a.pathStart = static_cast<int>(path.size()) - 1;
+    a.pathEnd = a.pathStart;
+
+    std::ostringstream oss;
+    oss << "Arrive at " << (to.full.empty() ? "destination" : to.full) << ".";
+
+    std::string side;
+    if (ComputeDestinationSide(to, goalRoad, prevBearing, side)) {
+      oss << " Destination will be on your " << side << ".";
+    }
+
+    a.instruction = oss.str();
+    outManeuvers.push_back(a);
+  }
+}
+
 } // namespace
 
 AddressIndex BuildAddressIndex(const std::vector<ParcelAddress>& addresses, const AddressIndexConfig& cfg)
@@ -652,9 +808,19 @@ GeocodeMatch GeocodeEndpoint(const World& world, const StreetNamingResult& stree
 RouteResult RouteBetweenEndpoints(const World& world, const StreetNamingResult& streets,
                                   const ParcelAddress& from, const ParcelAddress& to)
 {
+  WayfindingRouteConfig cfg;
+  cfg.metric = WayfindingRouteMetric::Steps;
+  return RouteBetweenEndpoints(world, streets, from, to, cfg);
+}
+
+RouteResult RouteBetweenEndpoints(const World& world, const StreetNamingResult& streets,
+                                  const ParcelAddress& from, const ParcelAddress& to,
+                                  const WayfindingRouteConfig& cfg)
+{
   RouteResult rr;
   rr.from = from;
   rr.to = to;
+  rr.routeCfg = cfg;
 
   rr.startRoad = from.roadTile;
   rr.goalRoad = to.roadTile;
@@ -672,161 +838,172 @@ RouteResult RouteBetweenEndpoints(const World& world, const StreetNamingResult& 
     return rr;
   }
 
-  std::vector<Point> path;
-  int cost = 0;
-  if (!FindRoadPathAStar(world, rr.startRoad, rr.goalRoad, path, &cost) || path.size() < 2) {
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) {
     rr.ok = false;
-    rr.error = "No road path found";
+    rr.error = "World has invalid dimensions";
     return rr;
   }
 
-  rr.pathTiles = path;
-  rr.pathCost = cost;
+  const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
 
-  const int w = streets.w;
-  const int h = streets.h;
+  // Build optional per-tile hazard penalties (milli-steps) to support "avoidance" routes.
+  std::vector<int> extraCost;
+  const std::vector<int>* extraPtr = nullptr;
 
-  auto sidAt = [&](const Point& p) -> int {
-    if (p.x < 0 || p.y < 0 || p.x >= w || p.y >= h) return -1;
-    const std::size_t idx = static_cast<std::size_t>(p.y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(p.x);
-    if (idx >= streets.roadTileToStreetId.size()) return -1;
-    return streets.roadTileToStreetId[idx];
-  };
+  const bool needTraffic = (cfg.wTrafficMilli > 0) || (cfg.wCrashMilli > 0) || (cfg.wNoiseMilli > 0) || (cfg.wCrimeMilli > 0);
+  const bool needNoise = (cfg.wNoiseMilli > 0) || (cfg.wCrimeMilli > 0);
+  const bool needCrime = (cfg.wCrimeMilli > 0);
 
-  // Edge-based street ids.
-  const int edges = static_cast<int>(path.size()) - 1;
-  std::vector<int> edgeStreetId(static_cast<std::size_t>(edges), -1);
-  for (int i = 0; i < edges; ++i) {
-    int sid = sidAt(path[static_cast<std::size_t>(i)]);
-    if (sid < 0) sid = sidAt(path[static_cast<std::size_t>(i + 1)]);
-    edgeStreetId[static_cast<std::size_t>(i)] = sid;
-  }
+  if (cfg.wTrafficMilli > 0 || cfg.wCrashMilli > 0 || cfg.wCrimeMilli > 0 || cfg.wNoiseMilli > 0) {
+    extraCost.assign(n, 0);
 
-  // Group contiguous edges by street id.
-  struct Seg {
-    int streetId = -1;
-    int startEdge = 0;
-    int endEdge = 0; // inclusive
-    int bearing = 0;
-  };
-
-  std::vector<Seg> segs;
-  segs.reserve(32);
-
-  int curSid = edgeStreetId[0];
-  int startE = 0;
-
-  for (int i = 1; i <= edges; ++i) {
-    const int sid = (i < edges) ? edgeStreetId[static_cast<std::size_t>(i)] : std::numeric_limits<int>::min();
-    if (i == edges || sid != curSid) {
-      Seg s;
-      s.streetId = curSid;
-      s.startEdge = startE;
-      s.endEdge = i - 1;
-
-      // Bearing from first edge.
-      const Point p0 = path[static_cast<std::size_t>(s.startEdge)];
-      const Point p1 = path[static_cast<std::size_t>(s.startEdge + 1)];
-      s.bearing = BearingFromDelta(p1.x - p0.x, p1.y - p0.y);
-
-      segs.push_back(s);
-      startE = i;
-      curSid = sid;
+    // Optionally precompute road-to-edge mask for hazard models that respect the outside-connection rule.
+    std::vector<std::uint8_t> roadToEdge;
+    const std::vector<std::uint8_t>* roadToEdgeP = nullptr;
+    if (cfg.requireOutsideConnectionForHazards) {
+      roadToEdge.assign(n, 0);
+      ComputeRoadsConnectedToEdge(world, roadToEdge);
+      roadToEdgeP = &roadToEdge;
     }
-  }
 
-  // Convert segments to maneuvers.
-  rr.maneuvers.clear();
-  rr.maneuvers.reserve(segs.size() + 1);
+    TrafficResult traffic;
+    bool haveTraffic = false;
+    if (needTraffic) {
+      TrafficConfig tcfg{};
+      tcfg.requireOutsideConnection = cfg.requireOutsideConnectionForHazards;
+      traffic = ComputeCommuteTraffic(world, tcfg, 1.0f, roadToEdgeP, nullptr);
+      haveTraffic = (traffic.roadTraffic.size() == n);
+    }
 
-  int prevBearing = segs.empty() ? 0 : segs.front().bearing;
+    // Helper: robust percentile for uint16 samples.
+    auto percentileU16 = [&](std::vector<std::uint16_t>& samples, float q) -> float {
+      if (samples.empty()) return 0.0f;
+      q = std::clamp(q, 0.0f, 1.0f);
+      const std::size_t k = static_cast<std::size_t>(q * static_cast<float>(samples.size() - 1));
+      std::nth_element(samples.begin(), samples.begin() + k, samples.end());
+      return static_cast<float>(samples[k]);
+    };
 
-  for (std::size_t si = 0; si < segs.size(); ++si) {
-    const Seg& s = segs[si];
+    // Traffic avoidance penalty (normalized by p95 traffic).
+    if (cfg.wTrafficMilli > 0 && haveTraffic) {
+      std::vector<std::uint16_t> samples;
+      samples.reserve(n / 4);
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::uint16_t v = traffic.roadTraffic[i];
+        if (v > 0) samples.push_back(v);
+      }
 
-    RouteManeuver m;
+      float pctl = percentileU16(samples, 0.95f);
+      if (pctl < 1.0f) pctl = 1.0f;
 
-    const int steps = s.endEdge - s.startEdge + 1;
-    m.steps = std::max(0, steps);
-    m.streetId = s.streetId;
-    m.streetName = StreetNameForId(streets, s.streetId);
-    m.pathStart = s.startEdge;
-    m.pathEnd = s.endEdge + 1;
-
-    const int curBearing = s.bearing;
-
-    if (si == 0) {
-      m.type = "depart";
-      m.modifier = "";
-      m.bearingBefore = curBearing;
-      m.bearingAfter = curBearing;
-
-      std::ostringstream oss;
-      oss << "Head " << CardinalNameFromBearing(curBearing) << " on " << m.streetName;
-      if (m.steps == 1) oss << " for 1 block.";
-      else oss << " for " << m.steps << " blocks.";
-      m.instruction = oss.str();
-    } else {
-      m.bearingBefore = prevBearing;
-      m.bearingAfter = curBearing;
-      m.modifier = TurnModifier(prevBearing, curBearing);
-
-      if (m.modifier == "straight") {
-        m.type = "continue";
-        std::ostringstream oss;
-        oss << "Continue straight on " << m.streetName;
-        if (m.steps == 1) oss << " for 1 block.";
-        else oss << " for " << m.steps << " blocks.";
-        m.instruction = oss.str();
-      } else if (m.modifier == "uturn") {
-        m.type = "turn";
-        std::ostringstream oss;
-        oss << "Make a U-turn onto " << m.streetName;
-        if (m.steps == 1) oss << " for 1 block.";
-        else oss << " for " << m.steps << " blocks.";
-        m.instruction = oss.str();
-      } else {
-        m.type = "turn";
-        std::ostringstream oss;
-        oss << "Turn " << m.modifier << " onto " << m.streetName;
-        if (m.steps == 1) oss << " for 1 block.";
-        else oss << " for " << m.steps << " blocks.";
-        m.instruction = oss.str();
+      for (std::size_t i = 0; i < n; ++i) {
+        const std::uint16_t v = traffic.roadTraffic[i];
+        if (v == 0) continue;
+        const float t01 = std::min(1.0f, static_cast<float>(v) / pctl);
+        extraCost[i] += static_cast<int>(t01 * static_cast<float>(cfg.wTrafficMilli) + 0.5f);
       }
     }
 
-    rr.maneuvers.push_back(m);
-    prevBearing = curBearing;
-  }
+    // Crash-risk avoidance penalty.
+    if (cfg.wCrashMilli > 0) {
+      TrafficSafetyConfig scfg{};
+      scfg.requireOutsideConnection = cfg.requireOutsideConnectionForHazards;
+      scfg.canyonWeight = 0.0f; // keep routing lightweight (no sky-view dependency)
 
-  // Final arrive maneuver.
-  {
-    RouteManeuver a;
-    a.type = "arrive";
-    a.modifier = "";
-    a.bearingBefore = prevBearing;
-    a.bearingAfter = prevBearing;
-    a.steps = 0;
-    a.streetId = -1;
-    a.streetName = "";
-    a.pathStart = static_cast<int>(path.size()) - 1;
-    a.pathEnd = a.pathStart;
-
-    std::ostringstream oss;
-    oss << "Arrive at " << (to.full.empty() ? "destination" : to.full) << ".";
-
-    std::string side;
-    if (ComputeDestinationSide(to, rr.goalRoad, prevBearing, side)) {
-      oss << " Destination will be on your " << side << ".";
+      const TrafficSafetyResult safety = ComputeTrafficSafety(world, scfg, haveTraffic ? &traffic : nullptr,
+                                                             nullptr, roadToEdgeP);
+      if (safety.risk01.size() == n) {
+        for (std::size_t i = 0; i < n; ++i) {
+          const float r01 = std::clamp(safety.risk01[i], 0.0f, 1.0f);
+          if (r01 <= 0.0f) continue;
+          extraCost[i] += static_cast<int>(r01 * static_cast<float>(cfg.wCrashMilli) + 0.5f);
+        }
+      }
     }
 
-    a.instruction = oss.str();
-    rr.maneuvers.push_back(a);
+    NoiseResult noise;
+    bool haveNoise = false;
+    if (needNoise) {
+      NoiseConfig ncfg{};
+      noise = ComputeNoisePollution(world, ncfg, haveTraffic ? &traffic : nullptr, nullptr);
+      haveNoise = (noise.noise01.size() == n);
+    }
+
+    // Noise avoidance penalty.
+    if (cfg.wNoiseMilli > 0 && haveNoise) {
+      for (std::size_t i = 0; i < n; ++i) {
+        const float n01 = std::clamp(noise.noise01[i], 0.0f, 1.0f);
+        if (n01 <= 0.0f) continue;
+        extraCost[i] += static_cast<int>(n01 * static_cast<float>(cfg.wNoiseMilli) + 0.5f);
+      }
+    }
+
+    // Crime-risk avoidance penalty.
+    if (cfg.wCrimeMilli > 0 && needCrime) {
+      CrimeModelConfig ccfg{};
+      ccfg.requireOutsideConnection = cfg.requireOutsideConnectionForHazards;
+      ccfg.congestionCosts = false; // keep routing lightweight/deterministic
+      const CrimeModelResult crime = ComputeCrimeModel(world, ccfg,
+                                                      haveTraffic ? &traffic : nullptr,
+                                                      nullptr, nullptr,
+                                                      haveNoise ? &noise : nullptr,
+                                                      roadToEdgeP, nullptr);
+      if (crime.risk01.size() == n) {
+        for (std::size_t i = 0; i < n; ++i) {
+          const float c01 = std::clamp(crime.risk01[i], 0.0f, 1.0f);
+          if (c01 <= 0.0f) continue;
+          extraCost[i] += static_cast<int>(c01 * static_cast<float>(cfg.wCrimeMilli) + 0.5f);
+        }
+      }
+    }
+
+    extraPtr = &extraCost;
   }
+
+  std::vector<Point> path;
+  int steps = 0;
+  int costMilli = 0;
+  RoadPathCostBreakdown breakdown{};
+
+  if (cfg.metric == WayfindingRouteMetric::TravelTime) {
+    RoadPathAStarConfig pcfg{};
+    pcfg.metric = RoadPathMetric::TravelTime;
+    pcfg.extraTileCostMilli = extraPtr;
+    pcfg.turnPenaltyMilli = cfg.turnPenaltyMilli;
+
+    if (!FindRoadPathAStarEx(world, rr.startRoad, rr.goalRoad, path, &steps, &costMilli, &breakdown, pcfg) ||
+        path.size() < 2) {
+      rr.ok = false;
+      rr.error = "No road path found";
+      return rr;
+    }
+  } else {
+    if (!FindRoadPathAStar(world, rr.startRoad, rr.goalRoad, path, &steps) || path.size() < 2) {
+      rr.ok = false;
+      rr.error = "No road path found";
+      return rr;
+    }
+
+    breakdown = ComputeRoadPathCostMilli(world, path, extraPtr, cfg.turnPenaltyMilli);
+    costMilli = breakdown.totalCostMilli();
+  }
+
+  rr.pathTiles = path;
+  rr.pathCost = steps;
+
+  rr.pathTravelTimeMilli = breakdown.travelTimeMilli;
+  rr.pathHazardPenaltyMilli = breakdown.extraCostMilli;
+  rr.pathTurnPenaltyMilli = breakdown.turnPenaltyMilli;
+  rr.pathCostMilli = breakdown.totalCostMilli();
+
+  BuildRouteManeuvers(streets, to, rr.goalRoad, rr.pathTiles, rr.maneuvers);
 
   rr.ok = true;
   rr.error.clear();
   return rr;
 }
+
 
 } // namespace isocity

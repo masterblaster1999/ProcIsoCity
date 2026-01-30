@@ -39,6 +39,75 @@ bool PickAdjacentRoadTile(const World& world, const std::vector<std::uint8_t>* r
 // outCost (if non-null) is the number of steps (edges), i.e. outPath.size()-1.
 bool FindRoadPathAStar(const World& world, Point start, Point goal, std::vector<Point>& outPath, int* outCost = nullptr);
 
+// Extended road A* with travel-time weights and optional per-tile penalties.
+//
+// This is useful for:
+//  - vehicle routing that prefers faster road classes (Street/Avenue/Highway)
+//  - "avoidance" routing (safety, noise, etc.) by supplying extra per-tile costs
+//  - turn-penalized routes that prefer fewer turns for clearer navigation
+//
+// Costs are expressed in "milli-steps" where 1000 ~= one Street step.
+enum class RoadPathMetric : std::uint8_t {
+  Steps = 0,      // Optimize number of road-tile steps (classic behavior)
+  TravelTime = 1, // Optimize weighted travel time (road class speed + penalties)
+};
+
+struct RoadPathAStarConfig {
+  // Which metric to optimize.
+  RoadPathMetric metric = RoadPathMetric::Steps;
+
+  // Optional additional per-tile cost in milli-steps, added when ENTERING a road tile.
+  // If provided, the vector must have size world.width()*world.height().
+  // Non-road tiles are ignored (but the vector must still cover the full grid).
+  const std::vector<int>* extraTileCostMilli = nullptr;
+
+  // Turn penalty in milli-steps, added when the direction changes between consecutive moves.
+  // Only applied when metric == TravelTime (it is still reported in the cost breakdown).
+  int turnPenaltyMilli = 0;
+
+  // When metric==Steps, FindRoadPathAStarEx() will still compute travel-time costs for reporting.
+  bool computeTravelTimeCost = true;
+};
+
+struct RoadPathCostBreakdown {
+  // Base road travel-time cost (includes bridge penalties and road class speeds).
+  int travelTimeMilli = 0;
+
+  // Sum of extraTileCostMilli values along the path (excluding the start tile).
+  int extraCostMilli = 0;
+
+  // Total turn penalties along the path.
+  int turnPenaltyMilli = 0;
+
+  int totalCostMilli() const { return travelTimeMilli + extraCostMilli + turnPenaltyMilli; }
+};
+
+// Compute the travel-time cost of a road-tile path, including optional penalties.
+//
+// Path is expected to be a valid road-tile polyline (inclusive of start and goal).
+RoadPathCostBreakdown ComputeRoadPathCostMilli(const World& world, const std::vector<Point>& path,
+                                               const std::vector<int>* extraTileCostMilli = nullptr,
+                                               int turnPenaltyMilli = 0);
+
+// Find a road route using either classic step-count A* or travel-time weighted A*.
+//
+// Always outputs:
+//  - outPath: inclusive start..goal polyline
+//  - outSteps: step count (outPath.size()-1)
+//
+// When outCostMilli or outBreakdown are provided, the function also computes:
+//  - weighted travel time (milli-steps), optionally including extraTileCostMilli and turn penalties.
+//
+// Notes:
+//  - If cfg.metric==Steps, the chosen path matches FindRoadPathAStar() (hazards/turn penalties do NOT affect
+//    the chosen path), but costs are still reported when requested.
+//  - If cfg.metric==TravelTime, the path is optimized by weighted time + penalties.
+bool FindRoadPathAStarEx(const World& world, Point start, Point goal, std::vector<Point>& outPath,
+                         int* outSteps = nullptr, int* outCostMilli = nullptr,
+                         RoadPathCostBreakdown* outBreakdown = nullptr,
+                         const RoadPathAStarConfig& cfg = {});
+
+
 // Find the shortest path from a road tile to *any* road tile on the map edge.
 // Useful for debugging "outside connection" road networks.
 bool FindRoadPathToEdge(const World& world, Point start, std::vector<Point>& outPath, int* outCost = nullptr);
