@@ -158,6 +158,55 @@ struct TransitModelSettings {
   TransitPlannerConfig plannerCfg{};
 };
 
+// Non-persistent runtime tuning for emergent "incident" gameplay.
+//
+// This is not part of SimConfig (and therefore not saved) so the system can
+// evolve without save-version churn.
+struct FireIncidentSettings {
+  // Master enable.
+  bool enabled = true;
+
+  // Do not trigger fires in very small towns.
+  int minPopulation = 40;
+  int minZoneTiles = 12;
+
+  // Base chance per simulation day (after minPopulation/minZoneTiles).
+  // Typical mid-sized cities will see a few incidents per in-game year.
+  float baseChancePerDay = 0.0070f;
+
+  // Additional chance per 100 residents.
+  float chancePer100Population = 0.0015f;
+
+  // If the city has no Fire Stations at all, multiply the chance.
+  float noStationMultiplier = 1.65f;
+
+  // Per-station reduction applied to the chance, clamped by minChanceFactor.
+  float stationChanceMitigation = 0.18f;
+  float minChanceFactor = 0.45f;
+
+  // How many tiles are affected when a fire happens.
+  int minAffectedTiles = 4;
+  int maxAffectedTiles = 28;
+
+  // Fire spread tuning.
+  float spreadBase = 0.68f; // base probability of propagating to a neighbor
+
+  // Damage tuning (per affected tile).
+  float destroyBase = 0.22f; // chance to clear the building
+
+  // Citywide happiness penalty applied when a fire happens.
+  float happinessPenaltyBase = 0.03f;
+  float happinessPenaltyPerTile = 0.0020f;
+  float happinessPenaltyPer100Displaced = 0.0060f;
+  float maxHappinessPenalty = 0.20f;
+
+  // Response cost (added to expenses on the day of the incident).
+  int costPerDamagedTile = 6;
+  int costPerDestroyedTile = 12;
+  int costPer10Displaced = 1;
+  int costPer10JobsCapLost = 1;
+};
+
 class Simulator {
 public:
   explicit Simulator(SimConfig cfg = {}) : m_cfg(cfg) {}
@@ -170,22 +219,6 @@ public:
 
   // Like update(), but clamps how many simulation ticks can be processed in a single call.
   //
-  // This is useful to keep the interactive loop responsive if the app hitches (e.g. when dragging
-  // panels, resizing, or when the OS stalls the process). Any remaining accumulated time is kept
-  // in the internal accumulator and will be processed in subsequent frames.
-  //
-  // Parameters:
-  //   tickLimit          - maximum ticks to process this call (<=0 means unlimited).
-  //   backlogLimitTicks  - clamps the accumulator to at most this many ticks worth of time
-  //                        (<=0 means no clamp).
-  //   outTickStats       - optional: collect Stats after each processed tick.
-  //
-  // Returns number of ticks processed.
-  int updateLimited(World& world, float dt, int tickLimit, int backlogLimitTicks, std::vector<Stats>* outTickStats);
-
-
-  // Update the simulation while limiting the number of ticks processed in one call.
-  //
   // This is useful for real-time game loops: if a frame stalls (e.g., breakpoint, alt-tab, hitch),
   // an unbounded catch-up can cause a "spiral of death" where one long frame triggers many
   // expensive ticks, causing the next frame to be even longer.
@@ -193,6 +226,7 @@ public:
   // - maxTicks <= 0 disables the per-call tick limit (behaves like update()).
   // - maxBacklogTicks > 0 clamps the internal accumulator so extremely large dt spikes do not
   //   queue an unbounded amount of work.
+  // - outTickStats optionally collects a Stats snapshot after each processed tick.
   //
   // Returns the number of ticks processed.
   int updateLimited(World& world, float dt, int maxTicks, int maxBacklogTicks,
@@ -208,24 +242,12 @@ public:
     return static_cast<int>(m_accum / ts);
   }
 
-
   // Advance the simulation by exactly one tick (increments day, updates economy, etc.).
   // Resets the internal timer accumulator so stepping is deterministic.
   void stepOnce(World& world);
 
   // Clears the internal tick accumulator (useful when pausing/unpausing or changing sim speed).
   void resetTimer() { m_accum = 0.0f; }
-
-
-  // Expose the accumulator for diagnostics / HUD widgets.
-  float accumulatedSeconds() const { return m_accum; }
-  int accumulatedTicks() const
-  {
-    const float t = m_cfg.tickSeconds;
-    if (t <= 0.0f) return 0;
-    return static_cast<int>(m_accum / t);
-  }
-
 
   const SimConfig& config() const { return m_cfg; }
 
@@ -247,6 +269,9 @@ public:
   const EconomyModelSettings& economyModel() const { return m_economyModel; }
   EconomyModelSettings& economyModel() { return m_economyModel; }
 
+  const FireIncidentSettings& fireIncidents() const { return m_fireIncidents; }
+  FireIncidentSettings& fireIncidents() { return m_fireIncidents; }
+
   // Recompute derived HUD stats (population/capacities/roads/parks/employment/happiness)
   // without advancing time or modifying tiles.
   void refreshDerivedStats(World& world) const;
@@ -265,6 +290,7 @@ private:
   ServicesModelSettings m_servicesModel{};
   TradeModelSettings m_tradeModel{};
   EconomyModelSettings m_economyModel{};
+  FireIncidentSettings m_fireIncidents{};
   float m_accum = 0.0f;
 };
 

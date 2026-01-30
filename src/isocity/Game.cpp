@@ -8762,6 +8762,7 @@ enum class NewsKind : std::uint8_t {
   Traffic,
   Services,
   FireRisk,
+  FireIncident,
   AirPollution,
   RunoffPollution,
   Goods,
@@ -9036,6 +9037,13 @@ void Game::recordCityNews(const Stats& s)
 
   const int popDelta = s.population - prev->population;
   const int net = s.income - s.expenses;
+
+  // A real disaster should dominate the day's headline.
+  const int fireIncidentTotal = s.fireIncidentDamaged + s.fireIncidentDestroyed;
+  if (fireIncidentTotal > 0) {
+    // Score is intentionally much larger than other stories.
+    add(NewsKind::FireIncident, 12.0f + 0.04f * static_cast<float>(fireIncidentTotal));
+  }
 
   const float traffic = Clamp01(s.trafficCongestion);
   const float services = Clamp01(s.servicesOverallSatisfaction);
@@ -9407,6 +9415,44 @@ void Game::recordCityNews(const Stats& s)
         "Tip: press L until 'Fire risk' appears, then add/upgrade Fire Stations near dense industrial/commercial blocks. "
         "Roads and parks can act as simple firebreaks.",
         avgPct, m_fireRisk.highRiskZones, stations, fireWorstDistrict, worstPct);
+      appendMayorLine();
+    } break;
+
+    case NewsKind::FireIncident: {
+      e.tone = CityNewsTone::Alert;
+
+      const int damaged = s.fireIncidentDamaged;
+      const int destroyed = s.fireIncidentDestroyed;
+      const int total = damaged + destroyed;
+      const int displaced = s.fireIncidentDisplaced;
+      const int cost = s.fireIncidentCost;
+      const int d = s.fireIncidentDistrict;
+
+      const int pick = static_cast<int>(rng.rangeU32(3));
+      if (d >= 0) {
+        if (pick == 0) e.headline = TextFormat("Fire breaks out in District %d", d);
+        else if (pick == 1) e.headline = TextFormat("Major fire damages %d buildings (District %d)", total, d);
+        else e.headline = TextFormat("Fire response teams deployed to District %d", d);
+      } else {
+        if (pick == 0) e.headline = "Major fire reported";
+        else if (pick == 1) e.headline = TextFormat("Fire damages %d buildings", total);
+        else e.headline = "Fire crews respond to city incident";
+      }
+
+      // Context: how prepared are we?
+      int stations = 0;
+      for (int y = 0; y < m_world.height(); ++y) {
+        for (int x = 0; x < m_world.width(); ++x) {
+          if (m_world.getTile(x, y).overlay == Overlay::FireStation) ++stations;
+        }
+      }
+
+      e.body = TextFormat(
+        "Buildings damaged: %d | Destroyed: %d | Displaced residents: %d\n"
+        "Estimated response cost: %d | Fire stations: %d\n"
+        "Tip: press L until 'Fire risk' appears, then strengthen coverage near dense industrial/commercial blocks. "
+        "Upgrading/adding Fire Stations and improving road connectivity can reduce future losses.",
+        damaged, destroyed, displaced, cost, stations);
       appendMayorLine();
     } break;
 
@@ -10463,11 +10509,12 @@ void Game::issueBond(int principal, int termDays, int aprBasisPoints)
   CityNewsEntry e{};
   e.day = m_world.stats().day;
   e.tone = CityNewsTone::Neutral;
-  e.title = "City treasury: bond issued";
-  e.body = TextFormat("The city issued a $%d municipal bond to fund infrastructure. Debt service starts immediately.",
-                      principal);
-  e.tip = "Tip: bonds boost cash now, but increase daily expenses until paid off.";
-  e.mayorRating = std::clamp(static_cast<int>(m_world.stats().happiness * 100.0f), 0, 100);
+  e.headline = "City treasury: bond issued";
+  e.body = TextFormat(
+      "The city issued a $%d municipal bond to fund infrastructure. Debt service starts immediately.\n\n"
+      "Tip: bonds boost cash now, but increase daily expenses until paid off.",
+      principal);
+  e.mayorRating = static_cast<float>(std::clamp(static_cast<int>(m_world.stats().happiness * 100.0f), 0, 100));
   m_cityNews.push_back(std::move(e));
   if (m_cityNews.size() > 250) {
     m_cityNews.erase(m_cityNews.begin(), m_cityNews.begin() + (m_cityNews.size() - 250));
@@ -22883,9 +22930,14 @@ void Game::draw()
     ui::Text(x, y, 18, TextFormat("Net: %+d   Income: %d   Expenses: %d", net, st.income, st.expenses), uiTh.text,
              /*bold=*/false, /*shadow=*/true, 1);
     y += 20;
-    ui::Text(x, y, 16, TextFormat("Tax %d  Maint %d  Upg %d  Trade %+d", st.taxRevenue, st.maintenanceCost,
-                                  st.upgradeCost, tradeNet),
-             uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
+    {
+      std::string breakdown = TextFormat("Tax %d  Maint %d  Upg %d  Trade %+d", st.taxRevenue, st.maintenanceCost,
+                                         st.upgradeCost, tradeNet);
+      if (st.fireIncidentCost > 0) {
+        breakdown += TextFormat("  Fire %d", st.fireIncidentCost);
+      }
+      ui::Text(x, y, 16, breakdown.c_str(), uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
+    }
     y += 18;
     ui::Text(x, y, 16,
              TextFormat("Land %.0f%%  Demand R/C/I %.0f%%/%.0f%%/%.0f%%  Tax/cap %.2f",

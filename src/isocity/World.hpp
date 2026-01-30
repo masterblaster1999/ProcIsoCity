@@ -190,6 +190,22 @@ struct Stats {
   float demandCommercial = 0.0f;  // 0..1 (global)
   float demandIndustrial = 0.0f;  // 0..1 (global)
   float avgLandValue = 0.0f;      // mean land value across non-water tiles
+
+  // --- Incidents / disasters (derived; not persisted in saves) ---
+  // These fields are reset each simulation day by the simulator.
+  //
+  // Fire incident summary (0 when no fire occurred today).
+  int fireIncidentDamaged = 0;       // buildings damaged (R/C/I)
+  int fireIncidentDestroyed = 0;     // buildings destroyed/cleared
+  int fireIncidentDisplaced = 0;     // residents displaced (net drop in occupancy)
+  int fireIncidentJobsLostCap = 0;   // lost job capacity (approx)
+  int fireIncidentCost = 0;          // added to daily expenses
+  float fireIncidentHappinessPenalty = 0.0f; // subtracted from computed happiness
+
+  // Origin of the last fire (tile coordinates) for UI/news (-1 when none).
+  int fireIncidentOriginX = -1;
+  int fireIncidentOriginY = -1;
+  int fireIncidentDistrict = -1; // 0..kDistrictCount-1
 };
 
 
@@ -296,6 +312,7 @@ private:
   std::uint64_t m_seed = 0;
   std::vector<Tile> m_tiles;
   Stats m_stats;
+  std::vector<DebtItem> m_debts;
 };
 
 } // namespace isocity

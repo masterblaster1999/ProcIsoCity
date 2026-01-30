@@ -21,6 +21,7 @@
 
 #include "isocity/ZoneMetrics.hpp"
 #include "isocity/ZoneAccess.hpp"
+#include "isocity/FireRisk.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -265,6 +266,288 @@ void ComputeEdgeConnectedRoads(const World& world, std::vector<std::uint8_t>& ou
 bool HasAdjacentEdgeConnectedRoad(const World& world, const std::vector<std::uint8_t>& roadToEdge, int x, int y)
 {
   return HasAdjacentRoadConnectedToEdge(world, roadToEdge, x, y);
+}
+
+// ---------------------------------------------------------------------------
+// Fire incidents (emergent gameplay)
+// ---------------------------------------------------------------------------
+
+inline bool IsZoneFlammable(Overlay o)
+{
+  return (o == Overlay::Residential || o == Overlay::Commercial || o == Overlay::Industrial);
+}
+
+struct FireIncidentOutcome {
+  bool happened = false;
+  bool zoneLayoutChanged = false; // true if any tile overlay was cleared
+
+  int damaged = 0;
+  int destroyed = 0;
+  int displaced = 0;
+  int jobsLostCap = 0;
+
+  int originX = -1;
+  int originY = -1;
+  int originDistrict = -1;
+
+  int cost = 0;
+  float happinessPenalty = 0.0f;
+};
+
+FireIncidentOutcome TryApplyFireIncident(World& world,
+                                        const FireIncidentSettings& settings,
+                                        bool requireOutsideConnection,
+                                        const ZoneAccessMap& zoneAccess,
+                                        const std::vector<std::uint8_t>* roadToEdge,
+                                        int population,
+                                        int zoneTiles,
+                                        RNG& rng)
+{
+  FireIncidentOutcome out;
+  if (!settings.enabled) return out;
+  if (population < settings.minPopulation) return out;
+  if (zoneTiles < settings.minZoneTiles) return out;
+
+  // Count fire stations (cheap; used to scale frequency).
+  int fireStations = 0;
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      if (world.at(x, y).overlay == Overlay::FireStation) fireStations++;
+    }
+  }
+
+  float p = settings.baseChancePerDay;
+  p += settings.chancePer100Population * (static_cast<float>(population) / 100.0f);
+
+  // Scale gently with the amount of built city.
+  const float zoneScale = std::clamp(static_cast<float>(zoneTiles) / 120.0f, 0.35f, 1.75f);
+  p *= zoneScale;
+
+  // Fire stations reduce incidents.
+  if (fireStations <= 0) {
+    p *= settings.noStationMultiplier;
+  } else {
+    const float fac = std::clamp(1.0f - settings.stationChanceMitigation * static_cast<float>(fireStations),
+                                 settings.minChanceFactor, 1.0f);
+    p *= fac;
+  }
+  p = std::clamp(p, 0.0f, 0.12f);
+
+  if (!rng.chance(p)) return out;
+
+  // Build a fire risk field to choose plausible origins and to modulate severity.
+  FireRiskConfig frc{};
+  frc.requireOutsideConnection = requireOutsideConnection;
+  FireRiskResult fr = ComputeFireRisk(world, frc, &zoneAccess, roadToEdge);
+
+  const int w = world.width();
+  const int h = world.height();
+  const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+  if (fr.risk01.size() != n || fr.coverage01.size() != n) return out;
+
+  // Weighted pick of a flammable zone tile.
+  double totalW = 0.0;
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const Tile& t = world.at(x, y);
+      if (!IsZoneFlammable(t.overlay)) continue;
+      const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+      const float risk = fr.risk01[idx];
+      if (!(risk > 0.01f)) continue;
+
+      // Favor higher-risk, higher-intensity tiles.
+      const float levelFactor = std::clamp(static_cast<float>(t.level) / 5.0f, 0.35f, 1.25f);
+      float occFactor = 0.65f;
+      if (t.overlay == Overlay::Residential) {
+        const int cap = std::max(1, HousingForLevel(t.level));
+        occFactor = std::clamp(static_cast<float>(t.occupants) / static_cast<float>(cap), 0.05f, 1.0f);
+      }
+      const double wgt = static_cast<double>(risk) * static_cast<double>(risk) *
+                         static_cast<double>(levelFactor) * (0.35 + 0.65 * static_cast<double>(occFactor));
+      totalW += wgt;
+    }
+  }
+  if (!(totalW > 0.0)) return out;
+
+  const double pick = static_cast<double>(rng.nextF01()) * totalW;
+  double acc = 0.0;
+  int ox = -1;
+  int oy = -1;
+  for (int y = 0; y < h && ox < 0; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const Tile& t = world.at(x, y);
+      if (!IsZoneFlammable(t.overlay)) continue;
+      const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+      const float risk = fr.risk01[idx];
+      if (!(risk > 0.01f)) continue;
+
+      const float levelFactor = std::clamp(static_cast<float>(t.level) / 5.0f, 0.35f, 1.25f);
+      float occFactor = 0.65f;
+      if (t.overlay == Overlay::Residential) {
+        const int cap = std::max(1, HousingForLevel(t.level));
+        occFactor = std::clamp(static_cast<float>(t.occupants) / static_cast<float>(cap), 0.05f, 1.0f);
+      }
+      const double wgt = static_cast<double>(risk) * static_cast<double>(risk) *
+                         static_cast<double>(levelFactor) * (0.35 + 0.65 * static_cast<double>(occFactor));
+      acc += wgt;
+      if (acc >= pick) {
+        ox = x;
+        oy = y;
+        break;
+      }
+    }
+  }
+  if (ox < 0 || oy < 0) return out;
+
+  const std::size_t oIdx = static_cast<std::size_t>(oy) * static_cast<std::size_t>(w) + static_cast<std::size_t>(ox);
+  const float originRisk = fr.risk01[oIdx];
+  const float originCov = fr.coverage01[oIdx];
+
+  // Determine fire size/intensity.
+  int maxTiles = rng.rangeInt(settings.minAffectedTiles, settings.maxAffectedTiles);
+  float intensity = 0.55f + 0.85f * Clamp01(originRisk);
+  intensity *= (1.10f - 0.70f * Clamp01(originCov));
+  maxTiles = std::clamp(static_cast<int>(std::lround(static_cast<float>(maxTiles) * intensity)),
+                        settings.minAffectedTiles, settings.maxAffectedTiles);
+
+  // Grow the affected set via BFS with probabilistic spread.
+  std::vector<std::uint8_t> visited;
+  visited.assign(n, 0);
+  std::vector<int> queue;
+  queue.reserve(static_cast<std::size_t>(maxTiles) * 2u);
+  std::vector<int> affected;
+  affected.reserve(static_cast<std::size_t>(maxTiles));
+
+  auto pushIf = [&](int nx, int ny, float spreadP) {
+    if (nx < 0 || ny < 0 || nx >= w || ny >= h) return;
+    const std::size_t nidx = static_cast<std::size_t>(ny) * static_cast<std::size_t>(w) + static_cast<std::size_t>(nx);
+    if (visited[nidx]) return;
+    const Tile& nt = world.at(nx, ny);
+    if (!IsZoneFlammable(nt.overlay)) return;
+    if (!rng.chance(spreadP)) return;
+    visited[nidx] = 1;
+    queue.push_back(static_cast<int>(nidx));
+  };
+
+  visited[oIdx] = 1;
+  queue.push_back(static_cast<int>(oIdx));
+  std::size_t qh = 0;
+  while (qh < queue.size() && affected.size() < static_cast<std::size_t>(maxTiles)) {
+    const int idxI = queue[qh++];
+    const int x = idxI % w;
+    const int y = idxI / w;
+    const Tile& t = world.at(x, y);
+    if (!IsZoneFlammable(t.overlay)) continue;
+    affected.push_back(idxI);
+
+    // Spread is influenced by local risk and mitigated by fire coverage.
+    const std::size_t idx = static_cast<std::size_t>(idxI);
+    const float nRisk = fr.risk01[idx];
+    const float nCov = fr.coverage01[idx];
+    float sp = settings.spreadBase;
+    sp *= (0.65f + 0.85f * Clamp01(nRisk));
+    sp *= (1.05f - 0.65f * Clamp01(nCov));
+    sp = std::clamp(sp, 0.05f, 0.92f);
+
+    pushIf(x + 1, y, sp);
+    pushIf(x - 1, y, sp);
+    pushIf(x, y + 1, sp);
+    pushIf(x, y - 1, sp);
+  }
+
+  // Apply damage.
+  for (int idxI : affected) {
+    const int x = idxI % w;
+    const int y = idxI / w;
+    Tile& t = world.at(x, y);
+    if (!IsZoneFlammable(t.overlay)) continue;
+
+    const std::size_t idx = static_cast<std::size_t>(idxI);
+    const float risk = fr.risk01[idx];
+    const float cov = fr.coverage01[idx];
+
+    const int prevLevel = static_cast<int>(t.level);
+    const Overlay prevOverlay = t.overlay;
+    const int prevOcc = static_cast<int>(t.occupants);
+    const int prevJobsCap = JobsForTile(t);
+    const int prevHousingCap = (t.overlay == Overlay::Residential) ? HousingForLevel(t.level) : 0;
+
+    // Severity: higher risk and lower coverage => more destruction.
+    const float sev = Clamp01(0.30f + 0.85f * risk + 0.25f * rng.nextF01());
+    float destroyP = settings.destroyBase * (0.55f + sev) * (1.10f - 0.70f * Clamp01(cov));
+    destroyP = std::clamp(destroyP, 0.05f, 0.85f);
+
+    const bool destroyed = rng.chance(destroyP);
+    if (destroyed) {
+      out.destroyed++;
+      if (prevOverlay == Overlay::Residential) {
+        out.displaced += prevOcc;
+      }
+      if (prevJobsCap > 0) {
+        out.jobsLostCap += prevJobsCap;
+      }
+
+      // Clear the tile.
+      t.overlay = Overlay::None;
+      t.level = 1;
+      t.occupants = 0;
+      out.zoneLayoutChanged = true;
+      continue;
+    }
+
+    out.damaged++;
+
+    // Downgrade the building more often when severity is high.
+    if (t.level > 1) {
+      const float downP = std::clamp(0.55f + 0.35f * sev, 0.0f, 0.95f);
+      if (rng.chance(downP)) {
+        t.level = static_cast<std::uint8_t>(std::max(1, prevLevel - 1));
+      }
+    }
+
+    // Evacuation / reduced occupancy.
+    if (prevOverlay == Overlay::Residential) {
+      const int cap = std::max(0, HousingForLevel(t.level));
+      const float keepFrac = std::clamp(0.15f + 0.55f * Clamp01(cov) - 0.35f * sev, 0.0f, 1.0f);
+      const int newOcc = std::clamp(static_cast<int>(std::lround(static_cast<float>(prevOcc) * keepFrac)), 0, cap);
+      out.displaced += (prevOcc - newOcc);
+      t.occupants = static_cast<std::uint16_t>(newOcc);
+    } else {
+      // Businesses shut down for the day (capacity is modeled by level/overlay).
+      t.occupants = 0;
+    }
+
+    // Track lost job capacity caused by downgrade.
+    if (prevJobsCap > 0) {
+      const int afterCap = JobsForTile(t);
+      out.jobsLostCap += std::max(0, prevJobsCap - afterCap);
+    }
+    // Track displaced residents due to downgrade cap reduction (even if occupants were already low).
+    if (prevHousingCap > 0) {
+      const int afterCap = HousingForLevel(t.level);
+      // If cap shrank below current occupancy, the clamp above already handled it.
+      (void)afterCap;
+    }
+  }
+
+  const int totalTiles = out.damaged + out.destroyed;
+  if (totalTiles <= 0) return FireIncidentOutcome{};
+
+  // Costs and citywide penalty.
+  out.cost = out.damaged * settings.costPerDamagedTile + out.destroyed * settings.costPerDestroyedTile;
+  out.cost += ((out.displaced + 9) / 10) * settings.costPer10Displaced;
+  out.cost += ((out.jobsLostCap + 9) / 10) * settings.costPer10JobsCapLost;
+
+  float pen = settings.happinessPenaltyBase;
+  pen += static_cast<float>(totalTiles) * settings.happinessPenaltyPerTile;
+  pen += (static_cast<float>(out.displaced) / 100.0f) * settings.happinessPenaltyPer100Displaced;
+  out.happinessPenalty = std::clamp(pen, 0.0f, settings.maxHappinessPenalty);
+
+  out.happened = true;
+  out.originX = ox;
+  out.originY = oy;
+  out.originDistrict = world.at(ox, oy).district;
+  return out;
 }
 
 // Parks are modeled as an *area of influence* rather than a global ratio.
@@ -1144,6 +1427,8 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
   const float inflationPenalty = std::min(0.06f, std::max(0.0f, s.economyInflation) * 1.25f);
   const float lvBonus = std::clamp((s.avgLandValue - 0.50f) * 0.10f, -0.05f, 0.05f);
 
+  const float firePenalty = std::clamp(s.fireIncidentHappinessPenalty, 0.0f, 0.35f);
+
   float servicesBonus = 0.0f;
   if (servicesActive && scan.population > 0) {
     const float sat = std::clamp(servicesOverallSat, 0.0f, 1.0f);
@@ -1151,7 +1436,7 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
     servicesBonus = std::clamp((sat - 0.5f) * 0.20f, -0.10f, 0.10f);
   }
 
-  s.happiness = Clamp01(0.45f + parkBonus + lvBonus + servicesBonus - unemployment * 0.35f - commutePenalty - congestionPenalty - goodsPenalty - taxPenalty - inflationPenalty);
+  s.happiness = Clamp01(0.45f + parkBonus + lvBonus + servicesBonus - unemployment * 0.35f - commutePenalty - congestionPenalty - goodsPenalty - taxPenalty - inflationPenalty - firePenalty);
 
   // Demand meter (for UI/debug): recompute using the newly derived happiness.
   const float jobPressure = (scan.housingCap > 0)
@@ -1177,6 +1462,17 @@ void Simulator::step(World& world)
 {
   Stats& s = world.stats();
   s.day++;
+
+  // Reset per-day incident fields (derived).
+  s.fireIncidentDamaged = 0;
+  s.fireIncidentDestroyed = 0;
+  s.fireIncidentDisplaced = 0;
+  s.fireIncidentJobsLostCap = 0;
+  s.fireIncidentCost = 0;
+  s.fireIncidentOriginX = -1;
+  s.fireIncidentOriginY = -1;
+  s.fireIncidentDistrict = -1;
+  s.fireIncidentHappinessPenalty = 0.0f;
 
   // Precompute which roads are connected to the map border ("outside connection").
   // When requireOutsideConnection is enabled, zones only function if they touch a road
@@ -1390,8 +1686,42 @@ void Simulator::step(World& world)
     }
   }
 
+  // Fire incident system (rare, deterministic per-day RNG stream).
+  const ZoneAccessMap* zoneAccessPtr = &zoneAccess;
+  ZoneAccessMap zoneAccessAfter;
+  {
+    RNG fireRng(world.seed() ^ (static_cast<std::uint64_t>(s.day) * 0xD1B54A32D192ED03ULL));
+    const FireIncidentOutcome fire = TryApplyFireIncident(world, m_fireIncidents,
+                                                         m_cfg.requireOutsideConnection,
+                                                         zoneAccess, edgeMask,
+                                                         population, scan.zoneTiles,
+                                                         fireRng);
+    if (fire.happened) {
+      s.fireIncidentDamaged = fire.damaged;
+      s.fireIncidentDestroyed = fire.destroyed;
+      s.fireIncidentDisplaced = fire.displaced;
+      s.fireIncidentJobsLostCap = fire.jobsLostCap;
+      s.fireIncidentCost = fire.cost;
+      s.fireIncidentOriginX = fire.originX;
+      s.fireIncidentOriginY = fire.originY;
+      s.fireIncidentDistrict = fire.originDistrict;
+      s.fireIncidentHappinessPenalty = fire.happinessPenalty;
+
+      // If we cleared any zone tiles, recompute zone-access for accurate derived stats.
+      if (fire.zoneLayoutChanged) {
+        zoneAccessAfter = BuildZoneAccessMap(world, edgeMask);
+        zoneAccessPtr = &zoneAccessAfter;
+      }
+    }
+  }
+
   // Recompute derived stats (traffic, goods, happiness, budget metrics) for the new state.
-  refreshDerivedStatsInternal(world, edgeMask, &zoneAccess);
+  refreshDerivedStatsInternal(world, edgeMask, zoneAccessPtr);
+
+  // Add incident response costs after refresh (refresh recomputes the base expense breakdown).
+  if (s.fireIncidentCost > 0) {
+    s.expenses += s.fireIncidentCost;
+  }
 
   // Include upgrade spending in the budget and apply the net change to money.
   s.upgradeCost = upgradeCost;
