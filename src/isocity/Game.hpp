@@ -53,6 +53,8 @@
 #include "isocity/Sim.hpp"
 #include "isocity/World.hpp"
 
+#include "isocity/CityMeta.hpp"
+
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -73,104 +75,6 @@ struct RaylibContext {
   RaylibContext(const RaylibContext&) = delete;
   RaylibContext& operator=(const RaylibContext&) = delete;
 };
-
-// Small time-series sample used by the in-game City Report panel.
-// Stored in the game layer (not saved yet), derived from World::Stats after each sim tick.
-struct CityHistorySample {
-  int day = 0;
-
-  int population = 0;
-  int money = 0;
-
-  float happiness = 0.0f;          // 0..1
-  float demandResidential = 0.0f;  // 0..1
-  float demandCommercial = 0.0f;   // 0..1
-  float demandIndustrial = 0.0f;   // 0..1
-
-  float avgLandValue = 0.0f;       // 0..1
-  float avgTaxPerCapita = 0.0f;
-
-  int income = 0;
-  int expenses = 0;
-  int taxRevenue = 0;
-  int maintenanceCost = 0;
-
-  int commuters = 0;
-  float avgCommute = 0.0f;      // road steps
-  float avgCommuteTime = 0.0f;  // street-step equivalent travel time
-  float trafficCongestion = 0.0f;  // 0..1
-
-  float goodsSatisfaction = 1.0f;  // 0..1
-};
-
-// SimCity-style city news / advisor feed entry.
-// Stored in the game layer (not saved yet), derived from World::Stats after each sim day.
-enum class CityNewsTone : std::uint8_t { Good = 0, Neutral = 1, Bad = 2, Alert = 3 };
-
-struct CityNewsEntry {
-  int day = 0;
-  CityNewsTone tone = CityNewsTone::Neutral;
-
-  // Mayor rating (0..100), exponentially smoothed so it doesn't jitter day-to-day.
-  float mayorRating = 50.0f;
-
-  std::string headline;
-  std::string body;
-};
-
-// Optional goal/challenge that nudges sandbox play toward short-term objectives.
-//
-// Challenges are intentionally game-layer only (not saved yet), similar to City News.
-enum class CityChallengeKind : std::uint8_t {
-  GrowPopulation = 0,
-  BuildParks,
-  ReduceCongestion,
-  ImproveGoods,
-  ImproveServices,
-  BalanceBudget,
-  RestoreOutsideConnection,
-};
-
-enum class CityChallengeStatus : std::uint8_t { Active = 0, Completed = 1, Failed = 2, Canceled = 3 };
-
-struct CityChallenge {
-  std::uint32_t id = 0;
-  CityChallengeKind kind = CityChallengeKind::GrowPopulation;
-  CityChallengeStatus status = CityChallengeStatus::Active;
-
-  int dayIssued = 0;
-  int dayDeadline = 0; // inclusive
-
-  int rewardMoney = 0;
-
-  // Generic parameters used by each kind.
-  //
-  // - GrowPopulation: startInt=popStart, targetInt=popTarget
-  // - BuildParks: startInt=parksBaseline, targetInt=parksTarget
-  // - ReduceCongestion: startF=congestionStart, targetF=congestionTarget
-  // - ImproveGoods: startF=goodsStart, targetF=goodsTarget
-  // - ImproveServices: startF=servicesStart, targetF=servicesTarget
-  // - BalanceBudget: targetInt=requiredStreak, stateInt=streak
-  // - RestoreOutsideConnection: startInt=unreachableStart, targetInt=0
-  int startInt = 0;
-  int targetInt = 0;
-  int stateInt = 0;
-  float startF = 0.0f;
-  float targetF = 0.0f;
-
-  std::string title;
-  std::string description;
-};
-
-struct CityChallengeLogEntry {
-  int day = 0;
-  CityChallengeStatus status = CityChallengeStatus::Completed;
-  int rewardMoney = 0;
-  std::string title;
-};
-
-
-
 struct GameStartupOptions {
   // Visual preferences JSON file to load/save (relative or absolute).
   //
@@ -210,6 +114,7 @@ private:
   void clearHistory();
   void recordHistorySample(const Stats& s);
   void drawReportPanel(int screenW, int screenH);
+  void exportCityReport(int startIndex, int count);
 
   // City news / advisor feed (SimCity-style newspaper headlines).
   void clearCityNews();
@@ -254,12 +159,21 @@ private:
   // If tickStats is provided, it is used to seed the City Report history (useful
   // when applying a replay that contains many ticks).
   void adoptLoadedWorld(World&& loaded, const ProcGenConfig& loadedProcCfg, const SimConfig& loadedSimCfg,
-                        const std::string& toastMessage, const std::vector<Stats>* tickStats = nullptr);
+                        const std::string& toastMessage, const CityMeta* meta = nullptr,
+                        const std::vector<Stats>* tickStats = nullptr);
 
   // Save slot browser / manager UI (toggle with F10).
   void refreshSaveMenu();
   void unloadSaveMenuThumbnails();
   void drawSaveMenuPanel(int screenW, int screenH);
+
+  // Support bundle / bug report helper (accessible from the Save Manager and dev console).
+  bool createSupportBundleZip(const std::string& outDirOverride, bool includeSaveSnapshot, bool includeMinimap,
+                              std::string& outZipPath, std::vector<std::string>& outWarnings,
+                              std::string& outError);
+  bool createSupportBundleDir(const std::string& outDirOverride, bool includeSaveSnapshot, bool includeMinimap,
+                              std::string& outBundleDir, std::vector<std::string>& outWarnings,
+                              std::string& outError);
 
   void updateAutosave(float dt);
 
@@ -394,6 +308,7 @@ private:
   void updateWorldRenderFilter();
   void ensureWorldRenderTarget(int screenW, int screenH);
   void unloadWorldRenderTarget();
+  Rectangle videoSettingsPanelRect(int uiW, int uiH) const;
   void drawVideoSettingsPanel(int uiW, int uiH);
   void adjustVideoSettings(int dir);
   void toggleFullscreen();
@@ -536,13 +451,16 @@ private:
   // City report panel (toggle with F1): time-series graphs of key stats.
   bool m_showReport = false;
   int m_reportPage = 0;
+  int m_reportRangeDays = 120;  // 30/60/120/0=all (UI)
+  bool m_reportCursorPinned = false;
+  int m_reportCursorAbs = -1;  // absolute index into m_cityHistory
   std::vector<CityHistorySample> m_cityHistory;
   // Full Stats history for headless exports (dossier / analysis tooling).
   // This mirrors m_cityHistory but stores the complete Stats struct for each sampled day.
   std::vector<Stats> m_tickStatsHistory;
   int m_cityHistoryMax = 240; // max stored days
 
-  // City news (SimCity-style newspaper/advisor feed). Not saved yet; derived from daily Stats.
+  // City news (SimCity-style newspaper/advisor feed). Saved/loaded via CityMeta sidecar.
   bool m_showNewsPanel = false;
   std::deque<CityNewsEntry> m_cityNews;
   int m_cityNewsMax = 120;
@@ -1213,6 +1131,12 @@ int m_bondsFirst = 0;      // scroll offset for the bond list
   int m_videoSelectionVisual = 0;
   int m_videoSelectionAtmos = 0;
   int m_videoSelectionUiTheme = 0;
+
+  // Per-page scroll position for the Video Settings list (row index).
+  int m_videoScrollDisplay = 0;
+  int m_videoScrollVisual = 0;
+  int m_videoScrollAtmos = 0;
+  int m_videoScrollUiTheme = 0;
 
   // Visual prefs persistence (autosave throttled).
   std::string m_visualPrefsPath = "isocity_visual.json";

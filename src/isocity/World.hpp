@@ -120,6 +120,25 @@ struct Stats {
   int congestedRoadTiles = 0;
   int maxRoadTraffic = 0; // max commuters on any road tile (for heatmap scaling)
 
+  // --- Derived traffic safety stats (recomputed by the simulator; not persisted in saves) ---
+  // These summarize the street-safety proxy model (TrafficSafety).
+  //
+  // residentMeanExposure: neighborhood exposure to crash risk (0..1)
+  // residentMeanPriority: intervention priority considering exposure + population (0..1)
+  int trafficSafetyRoadTilesConsidered = 0;
+  int trafficSafetyResidentPopulation = 0;
+  float trafficSafetyResidentMeanExposure = 0.0f;
+  float trafficSafetyResidentMeanPriority = 0.0f;
+
+  // Continuous citywide happiness penalty derived from exposure (0..~0.2).
+  float trafficSafetyHappinessPenalty = 0.0f;
+
+  // A deterministic high-risk road tile used as a hotspot/candidate for incident events.
+  int trafficSafetyHotspotX = -1;
+  int trafficSafetyHotspotY = -1;
+  int trafficSafetyHotspotDistrict = -1;
+  float trafficSafetyHotspotRisk01 = 0.0f;
+
   // --- Derived transit stats (recomputed by the simulator; not persisted in saves) ---
   int transitLines = 0;
   int transitStops = 0;
@@ -191,6 +210,14 @@ struct Stats {
   float demandIndustrial = 0.0f;  // 0..1 (global)
   float avgLandValue = 0.0f;      // mean land value across non-water tiles
 
+  // --- Derived air quality / air pollution stats (not persisted in saves) ---
+  // These summarize a headless air pollution transport heuristic.
+  // Values are resident-weighted using residential tiles with occupants > 0.
+  int airPollutionResidentPopulation = 0;
+  float airPollutionResidentAvg01 = 0.0f;
+  float airPollutionResidentHighExposureFrac = 0.0f;
+  float airPollutionHappinessPenalty = 0.0f;
+
   // --- Incidents / disasters (derived; not persisted in saves) ---
   // These fields are reset each simulation day by the simulator.
   //
@@ -206,6 +233,16 @@ struct Stats {
   int fireIncidentOriginX = -1;
   int fireIncidentOriginY = -1;
   int fireIncidentDistrict = -1; // 0..kDistrictCount-1
+
+  // Traffic incident summary (0 when none occurred today).
+  int trafficIncidentInjuries = 0;     // estimated injuries
+  int trafficIncidentCost = 0;         // added to daily expenses
+  float trafficIncidentHappinessPenalty = 0.0f; // subtracted from computed happiness
+
+  // Origin of the last traffic incident (tile coordinates) for UI/news (-1 when none).
+  int trafficIncidentOriginX = -1;
+  int trafficIncidentOriginY = -1;
+  int trafficIncidentDistrict = -1; // 0..kDistrictCount-1
 };
 
 

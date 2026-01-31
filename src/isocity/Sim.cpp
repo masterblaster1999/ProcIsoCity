@@ -550,6 +550,76 @@ FireIncidentOutcome TryApplyFireIncident(World& world,
   return out;
 }
 
+struct TrafficIncidentOutcome {
+  bool happened = false;
+
+  int injuries = 0;
+  int cost = 0;
+  float happinessPenalty = 0.0f;
+
+  int originX = -1;
+  int originY = -1;
+  int originDistrict = -1;
+};
+
+TrafficIncidentOutcome TryApplyTrafficIncident(const World& world, const TrafficIncidentSettings& settings,
+                                               const Stats& prevStats, int population, int zoneTileCount, RNG& rng)
+{
+  if (!settings.enabled) return TrafficIncidentOutcome{};
+  if (population < settings.minPopulation) return TrafficIncidentOutcome{};
+  if (zoneTileCount < settings.minZoneTiles) return TrafficIncidentOutcome{};
+
+  int ox = prevStats.trafficSafetyHotspotX;
+  int oy = prevStats.trafficSafetyHotspotY;
+  if (!world.inBounds(ox, oy) || world.at(ox, oy).overlay != Overlay::Road) return TrafficIncidentOutcome{};
+
+  const float exposure = std::clamp(prevStats.trafficSafetyResidentMeanExposure, 0.0f, 1.0f);
+  const float hotspotRisk = std::clamp(prevStats.trafficSafetyHotspotRisk01, 0.0f, 1.0f);
+
+  float chance = settings.baseChancePerDay;
+  chance += settings.chancePer100Population * (static_cast<float>(population) / 100.0f);
+  chance *= (1.0f + settings.exposureChanceBoost * exposure);
+  chance *= (1.0f + settings.hotspotRiskChanceBoost * hotspotRisk);
+  chance = std::clamp(chance, 0.0f, settings.maxChancePerDay);
+
+  if (!rng.chance(chance)) return TrafficIncidentOutcome{};
+
+  // Severity scaled by hotspot risk (0..1) with some randomness.
+  const float bonusF = hotspotRisk * std::max(0.0f, settings.injuriesRiskBonus);
+  const int extra = std::max(0, static_cast<int>(std::lround(bonusF)));
+  const int baseMax = std::max(settings.minInjuries, settings.maxInjuries);
+  const int injuriesCap = baseMax + std::max(0, static_cast<int>(std::ceil(std::max(0.0f, settings.injuriesRiskBonus))));
+
+  const int base = settings.minInjuries + static_cast<int>(rng.rangeU32(static_cast<std::uint32_t>(baseMax - settings.minInjuries + 1)));
+  const int injuries = std::clamp(base + extra, settings.minInjuries, injuriesCap);
+
+  // Emergency response mitigation: strong safety services reduce injuries/cost/penalty.
+  float responseFactor = 1.0f;
+  if (prevStats.servicesSafetyFacilities <= 0) {
+    responseFactor *= settings.noSafetyServicesMultiplier;
+  } else {
+    const float sat = std::clamp(prevStats.servicesSafetySatisfaction, 0.0f, 1.0f);
+    responseFactor *= std::clamp(1.0f - settings.safetySatisfactionMitigation * sat, settings.minSafetyMitigation, 1.0f);
+  }
+
+  TrafficIncidentOutcome out{};
+  out.happened = true;
+  out.originX = ox;
+  out.originY = oy;
+  out.originDistrict = world.at(ox, oy).district;
+
+  const int adjInjuries = std::clamp(static_cast<int>(std::lround(static_cast<float>(injuries) * responseFactor)), settings.minInjuries,
+                                    injuriesCap);
+  out.injuries = adjInjuries;
+
+  const float rawPenalty = (settings.happinessPenaltyBase + static_cast<float>(adjInjuries) * settings.happinessPenaltyPerInjury);
+  out.happinessPenalty = std::clamp(rawPenalty, 0.0f, settings.maxHappinessPenalty);
+
+  const float rawCost = static_cast<float>(settings.costBase + adjInjuries * settings.costPerInjury);
+  out.cost = std::max(0, static_cast<int>(std::lround(rawCost)));
+  return out;
+}
+
 // Parks are modeled as an *area of influence* rather than a global ratio.
 // We compute a simple "coverage" ratio: what fraction of zone tiles can reach
 // any park (via their access road) within a travel-time threshold.
@@ -1234,12 +1304,127 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
   s.congestedRoadTiles = trafficRoad.congestedRoadTiles;
   s.maxRoadTraffic = trafficRoad.maxTraffic;
 
+  // Traffic safety (derived; does not require the app/UI).
+  //
+  // We compute a resident-weighted exposure/priority metric and a deterministic
+  // high-risk road "hotspot" for use by the (optional) traffic incident system.
+  s.trafficSafetyRoadTilesConsidered = 0;
+  s.trafficSafetyResidentPopulation = 0;
+  s.trafficSafetyResidentMeanExposure = 0.0f;
+  s.trafficSafetyResidentMeanPriority = 0.0f;
+  s.trafficSafetyHappinessPenalty = 0.0f;
+  s.trafficSafetyHotspotX = -1;
+  s.trafficSafetyHotspotY = -1;
+  s.trafficSafetyHotspotDistrict = -1;
+  s.trafficSafetyHotspotRisk01 = 0.0f;
+
+  if (m_trafficSafetyModel.enabled) {
+    TrafficSafetyConfig tscfg = m_trafficSafetyModel.cfg;
+    tscfg.enabled = true;
+    tscfg.requireOutsideConnection = m_cfg.requireOutsideConnection;
+    // Keep the simulator headless/cheap: avoid SkyView (canyon) unless explicitly precomputed.
+    tscfg.canyonWeight = 0.0f;
+
+    const TrafficSafetyResult ts = ComputeTrafficSafety(world, tscfg, &trafficRoad, /*skyView=*/nullptr,
+                                                        tscfg.requireOutsideConnection ? roadToEdge : nullptr);
+
+    s.trafficSafetyResidentPopulation = std::max(0, ts.residentPopulation);
+    s.trafficSafetyResidentMeanExposure = std::clamp(ts.residentMeanExposure, 0.0f, 1.0f);
+    s.trafficSafetyResidentMeanPriority = std::clamp(ts.residentMeanPriority, 0.0f, 1.0f);
+    s.trafficSafetyRoadTilesConsidered = std::max(0, ts.roadTilesConsidered);
+
+    // Continuous, citywide happiness penalty (mild by default).
+    const float pen = s.trafficSafetyResidentMeanExposure * std::max(0.0f, m_trafficSafetyModel.happinessPenaltyScale);
+    s.trafficSafetyHappinessPenalty = std::min(std::max(0.0f, m_trafficSafetyModel.maxHappinessPenalty),
+                                               std::max(0.0f, pen));
+
+    // Pick a deterministic high-risk road tile for UI/news/incident location.
+    // Use integer weights for stability.
+    const int w = world.width();
+    const int h = world.height();
+    const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+    if (w > 0 && h > 0 && ts.risk01.size() == n) {
+      uint64_t totalW = 0;
+      for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+          const Tile& t = world.at(x, y);
+          if (t.overlay != Overlay::Road) continue;
+          const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+          const float r = ts.risk01[idx];
+          const int rq = Float01ToQ16(std::clamp(r, 0.0f, 1.0f));
+          if (rq <= 0) continue;
+          const uint64_t wgt = static_cast<uint64_t>(rq) * static_cast<uint64_t>(rq);
+          if (wgt == 0) continue;
+          totalW += wgt;
+        }
+      }
+
+      if (totalW > 0) {
+        // Separate RNG stream from other subsystems.
+        const uint64_t seed = world.seed() ^ (static_cast<uint64_t>(s.day) * 0xD6E8FEB86659FD93ULL) ^ 0xA1C1D7E5BADC0FFELL;
+        RNG rng(seed);
+        const uint64_t pick = rng.nextU64() % totalW;
+        uint64_t acc = 0;
+        bool chosen = false;
+
+        for (int y = 0; y < h && !chosen; ++y) {
+          for (int x = 0; x < w && !chosen; ++x) {
+            const Tile& t = world.at(x, y);
+            if (t.overlay != Overlay::Road) continue;
+            const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+            const float r = ts.risk01[idx];
+            const int rq = Float01ToQ16(std::clamp(r, 0.0f, 1.0f));
+            if (rq <= 0) continue;
+            const uint64_t wgt = static_cast<uint64_t>(rq) * static_cast<uint64_t>(rq);
+            if (wgt == 0) continue;
+            acc += wgt;
+            if (acc > pick) {
+              s.trafficSafetyHotspotX = x;
+              s.trafficSafetyHotspotY = y;
+              s.trafficSafetyHotspotDistrict = t.district;
+              s.trafficSafetyHotspotRisk01 = std::clamp(r, 0.0f, 1.0f);
+              chosen = true;
+            }
+          }
+        }
+      }
+    }
+  }
+
   // Land value (amenities + pollution + optional traffic spill). Used both for
   // display and for the simple tax model.
   LandValueConfig lvc;
   lvc.requireOutsideConnection = m_cfg.requireOutsideConnection;
   const LandValueResult lv = ComputeLandValue(world, lvc, &trafficRoad, roadToEdge);
   s.avgLandValue = AvgLandValueNonWater(world, lv);
+
+  // Air quality (derived; headless).
+  //
+  // Uses the AirPollution model to estimate resident-weighted exposure based on
+  // land use + traffic + goods movement. This feeds into a mild citywide
+  // happiness penalty to encourage zoning buffers, parks, and congestion reduction.
+  s.airPollutionResidentPopulation = 0;
+  s.airPollutionResidentAvg01 = 0.0f;
+  s.airPollutionResidentHighExposureFrac = 0.0f;
+  s.airPollutionHappinessPenalty = 0.0f;
+
+  if (m_airPollutionModel.enabled) {
+    AirPollutionConfig apcfg = m_airPollutionModel.cfg;
+    // Ensure deterministic wind if requested.
+    // (ComputeAirPollution uses world.seed() when windFromSeed is enabled.)
+    const AirPollutionResult ap = ComputeAirPollution(world, apcfg, &trafficRoad, &goods);
+
+    s.airPollutionResidentPopulation = std::max(0, ap.residentPopulation);
+    s.airPollutionResidentAvg01 = std::clamp(ap.residentAvgPollution01, 0.0f, 1.0f);
+    s.airPollutionResidentHighExposureFrac = std::clamp(ap.residentHighExposureFrac, 0.0f, 1.0f);
+
+    const float avgScale = std::max(0.0f, m_airPollutionModel.happinessPenaltyScale);
+    const float highScale = std::max(0.0f, m_airPollutionModel.highExposurePenaltyScale);
+    const float maxPen = std::max(0.0f, m_airPollutionModel.maxHappinessPenalty);
+
+    const float raw = s.airPollutionResidentAvg01 * avgScale + s.airPollutionResidentHighExposureFrac * highScale;
+    s.airPollutionHappinessPenalty = std::clamp(raw, 0.0f, maxPen);
+  }
 
   // Public services / civic accessibility (optional).
   //
@@ -1429,6 +1614,15 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
 
   const float firePenalty = std::clamp(s.fireIncidentHappinessPenalty, 0.0f, 0.35f);
 
+  const float trafficSafetyPenalty =
+      std::clamp(s.trafficSafetyHappinessPenalty, 0.0f, std::max(0.0f, m_trafficSafetyModel.maxHappinessPenalty));
+
+  const float trafficIncidentPenalty =
+      std::clamp(s.trafficIncidentHappinessPenalty, 0.0f, std::max(0.0f, m_trafficIncidents.maxHappinessPenalty));
+
+  const float airPollutionPenalty =
+      std::clamp(s.airPollutionHappinessPenalty, 0.0f, std::max(0.0f, m_airPollutionModel.maxHappinessPenalty));
+
   float servicesBonus = 0.0f;
   if (servicesActive && scan.population > 0) {
     const float sat = std::clamp(servicesOverallSat, 0.0f, 1.0f);
@@ -1436,7 +1630,7 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
     servicesBonus = std::clamp((sat - 0.5f) * 0.20f, -0.10f, 0.10f);
   }
 
-  s.happiness = Clamp01(0.45f + parkBonus + lvBonus + servicesBonus - unemployment * 0.35f - commutePenalty - congestionPenalty - goodsPenalty - taxPenalty - inflationPenalty - firePenalty);
+  s.happiness = Clamp01(0.45f + parkBonus + lvBonus + servicesBonus - unemployment * 0.35f - commutePenalty - congestionPenalty - goodsPenalty - taxPenalty - inflationPenalty - firePenalty - trafficSafetyPenalty - trafficIncidentPenalty - airPollutionPenalty);
 
   // Demand meter (for UI/debug): recompute using the newly derived happiness.
   const float jobPressure = (scan.housingCap > 0)
@@ -1473,6 +1667,13 @@ void Simulator::step(World& world)
   s.fireIncidentOriginY = -1;
   s.fireIncidentDistrict = -1;
   s.fireIncidentHappinessPenalty = 0.0f;
+
+  s.trafficIncidentInjuries = 0;
+  s.trafficIncidentCost = 0;
+  s.trafficIncidentOriginX = -1;
+  s.trafficIncidentOriginY = -1;
+  s.trafficIncidentDistrict = -1;
+  s.trafficIncidentHappinessPenalty = 0.0f;
 
   // Precompute which roads are connected to the map border ("outside connection").
   // When requireOutsideConnection is enabled, zones only function if they touch a road
@@ -1686,6 +1887,22 @@ void Simulator::step(World& world)
     }
   }
 
+  // Traffic incident system (rare, deterministic per-day RNG stream).
+  {
+    RNG crashRng(world.seed() ^ (static_cast<std::uint64_t>(s.day) * 0xA0761D6478BD642FULL));
+    const TrafficIncidentOutcome crash = TryApplyTrafficIncident(world, m_trafficIncidents, s,
+                                                                 population, scan.zoneTiles,
+                                                                 crashRng);
+    if (crash.happened) {
+      s.trafficIncidentInjuries = crash.injuries;
+      s.trafficIncidentCost = crash.cost;
+      s.trafficIncidentOriginX = crash.originX;
+      s.trafficIncidentOriginY = crash.originY;
+      s.trafficIncidentDistrict = crash.originDistrict;
+      s.trafficIncidentHappinessPenalty = crash.happinessPenalty;
+    }
+  }
+
   // Fire incident system (rare, deterministic per-day RNG stream).
   const ZoneAccessMap* zoneAccessPtr = &zoneAccess;
   ZoneAccessMap zoneAccessAfter;
@@ -1721,6 +1938,9 @@ void Simulator::step(World& world)
   // Add incident response costs after refresh (refresh recomputes the base expense breakdown).
   if (s.fireIncidentCost > 0) {
     s.expenses += s.fireIncidentCost;
+  }
+  if (s.trafficIncidentCost > 0) {
+    s.expenses += s.trafficIncidentCost;
   }
 
   // Include upgrade spending in the budget and apply the net change to money.

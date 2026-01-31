@@ -5,6 +5,8 @@
 #include "isocity/TradeMarket.hpp"
 #include "isocity/Economy.hpp"
 #include "isocity/Services.hpp"
+#include "isocity/TrafficSafety.hpp"
+#include "isocity/AirPollution.hpp"
 
 #include <array>
 #include <vector>
@@ -158,6 +160,92 @@ struct TransitModelSettings {
   TransitPlannerConfig plannerCfg{};
 };
 
+// Non-persistent runtime tuning for traffic safety gameplay.
+//
+// This is intentionally not part of SimConfig (and therefore not saved) so the
+// model can evolve without forcing save-version churn.
+struct TrafficSafetyModelSettings {
+  // Master enable for simulation impacts (happiness penalties, hotspot stats).
+  // The heatmap overlay remains available regardless.
+  bool enabled = true;
+
+  // TrafficSafety model configuration used for derived stats.
+  //
+  // Notes:
+  // - requireOutsideConnection is overridden by SimConfig::requireOutsideConnection.
+  // - canyonWeight is forced to 0 in the simulator to avoid expensive SkyView computation.
+  TrafficSafetyConfig cfg{};
+
+  // Continuous citywide happiness penalty derived from residentMeanExposure.
+  // penalty = clamp(residentMeanExposure * happinessPenaltyScale, 0, maxHappinessPenalty)
+  float happinessPenaltyScale = 0.07f;
+  float maxHappinessPenalty = 0.10f;
+};
+
+// Non-persistent runtime tuning for air quality gameplay.
+//
+// This is intentionally not part of SimConfig (and therefore not saved) so the
+// model can evolve without save-version churn.
+struct AirPollutionModelSettings {
+  // Master enable for simulation impacts (happiness penalties).
+  // The app's heatmap overlay remains available regardless.
+  bool enabled = true;
+
+  // Air pollution transport + emission configuration.
+  AirPollutionConfig cfg{};
+
+  // Happiness penalty derived from resident-weighted exposure summary:
+  //   penalty = clamp(residentAvgPollution01 * happinessPenaltyScale +
+  //                  residentHighExposureFrac * highExposurePenaltyScale,
+  //                  0, maxHappinessPenalty)
+  float happinessPenaltyScale = 0.06f;
+  float highExposurePenaltyScale = 0.04f;
+  float maxHappinessPenalty = 0.12f;
+};
+
+// Non-persistent runtime tuning for emergent traffic incident gameplay.
+//
+// This system uses the TrafficSafety hotspot (a deterministic high-risk road
+// tile) as an "incident candidate" signal from the previous day.
+struct TrafficIncidentSettings {
+  // Master enable.
+  bool enabled = true;
+
+  // Do not trigger incidents in very small towns.
+  int minPopulation = 60;
+  int minZoneTiles = 12;
+
+  // Base chance per simulation day (after minPopulation/minZoneTiles).
+  float baseChancePerDay = 0.0060f;
+
+  // Additional chance per 100 residents.
+  float chancePer100Population = 0.0010f;
+
+  // Multiplicative chance boosts based on the previous-day safety stats.
+  float exposureChanceBoost = 0.75f;   // scales with residentMeanExposure (0..1)
+  float hotspotRiskChanceBoost = 0.50f; // scales with hotspotRisk01 (0..1)
+  float maxChancePerDay = 0.18f;
+
+  // Severity / budget effects.
+  int minInjuries = 1;
+  int maxInjuries = 12;
+  float injuriesRiskBonus = 8.0f; // additional injuries when risk01 ~ 1.0
+
+  float happinessPenaltyBase = 0.012f;
+  float happinessPenaltyPerInjury = 0.0018f;
+  float maxHappinessPenalty = 0.18f;
+
+  int costBase = 6;
+  int costPerInjury = 2;
+
+  // If the city has no safety facilities (police/fire), incidents are harsher.
+  float noSafetyServicesMultiplier = 1.25f;
+
+  // If safety services exist, high safety satisfaction mitigates severity.
+  float safetySatisfactionMitigation = 0.35f;
+  float minSafetyMitigation = 0.65f;
+};
+
 // Non-persistent runtime tuning for emergent "incident" gameplay.
 //
 // This is not part of SimConfig (and therefore not saved) so the system can
@@ -257,6 +345,15 @@ public:
   const TrafficModelSettings& trafficModel() const { return m_trafficModel; }
   TrafficModelSettings& trafficModel() { return m_trafficModel; }
 
+  const TrafficSafetyModelSettings& trafficSafetyModel() const { return m_trafficSafetyModel; }
+  TrafficSafetyModelSettings& trafficSafetyModel() { return m_trafficSafetyModel; }
+
+  const AirPollutionModelSettings& airPollutionModel() const { return m_airPollutionModel; }
+  AirPollutionModelSettings& airPollutionModel() { return m_airPollutionModel; }
+
+  const TrafficIncidentSettings& trafficIncidents() const { return m_trafficIncidents; }
+  TrafficIncidentSettings& trafficIncidents() { return m_trafficIncidents; }
+
   const TransitModelSettings& transitModel() const { return m_transitModel; }
   TransitModelSettings& transitModel() { return m_transitModel; }
 
@@ -286,6 +383,9 @@ private:
 
   SimConfig m_cfg;
   TrafficModelSettings m_trafficModel{};
+  TrafficSafetyModelSettings m_trafficSafetyModel{};
+  AirPollutionModelSettings m_airPollutionModel{};
+  TrafficIncidentSettings m_trafficIncidents{};
   TransitModelSettings m_transitModel{};
   ServicesModelSettings m_servicesModel{};
   TradeModelSettings m_tradeModel{};

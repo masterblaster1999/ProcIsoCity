@@ -17,6 +17,8 @@
 #include "isocity/RoadGraphTraffic.hpp"
 #include "isocity/RoadUpgradePlannerExport.hpp"
 #include "isocity/SaveLoad.hpp"
+#include "isocity/SupportBundle.hpp"
+#include "isocity/Version.hpp"
 #include "isocity/FileSync.hpp"
 #include "isocity/Script.hpp"
 #include "isocity/TransitPlannerExport.hpp"
@@ -39,6 +41,8 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
+#include <span>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -510,6 +514,43 @@ bool Game::saveToPath(const std::string& path, bool makeThumbnail, const char* t
     return false;
   }
 
+  // Best effort: persist game-layer meta (city report history / city news / challenges)
+  // alongside the save.
+  {
+    CityMeta meta{};
+    meta.version = kCityMetaVersion;
+    meta.seed = m_world.seed();
+    meta.width = m_world.width();
+    meta.height = m_world.height();
+    meta.day = m_world.stats().day;
+
+    meta.historyMax = m_cityHistoryMax;
+    meta.history = m_cityHistory;
+
+    meta.newsMax = m_cityNewsMax;
+    meta.newsSelection = m_newsSelection;
+    meta.newsFirst = m_newsFirst;
+    meta.mayorRatingEma = m_mayorRatingEma;
+    meta.mayorRatingPrev = m_mayorRatingPrev;
+    meta.news = m_cityNews;
+
+    meta.challengeTargetActive = m_challengeTargetActive;
+    meta.challengeRerolls = m_challengeRerolls;
+    meta.challengeNextId = m_challengeNextId;
+    meta.challengeLastProcessedDay = m_challengeLastProcessedDay;
+    meta.challengeSelection = m_challengeSelection;
+    meta.challengeFirst = m_challengeFirst;
+    meta.challenges = m_cityChallenges;
+    meta.challengeLog = m_challengeLog;
+
+    meta.newsAddendum = m_cityNewsAddendum;
+
+    std::string metaErr;
+    if (!SaveCityMetaForSavePath(path, meta, metaErr)) {
+      m_console.print(std::string("save: warning: failed to write meta: ") + metaErr);
+    }
+  }
+
   if (makeThumbnail) {
     const std::string thumb = thumbPathForSavePath(path);
     // Best effort: do not fail the save if thumbnail export fails.
@@ -679,7 +720,51 @@ bool Game::loadFromPath(const std::string& path, const char* toastLabel)
     m_console.print(TextFormat("save: recovered load from %s", usedPath.string().c_str()));
   }
 
-  adoptLoadedWorld(std::move(loaded), loadedProcCfg, loadedSimCfg, toast, nullptr);
+  // Best effort: load game-layer meta (city report history / city news / challenges).
+  CityMeta meta{};
+  bool haveMeta = false;
+  {
+    const fs::path metaBase = fs::path(CityMetaPathForSavePath(basePath.string()));
+    fs::path metaTmp = metaBase;
+    metaTmp += ".tmp";
+    fs::path metaBak = metaBase;
+    metaBak += ".bak";
+
+    std::vector<fs::path> candidates;
+    if (usedSrc == Source::Temp) {
+      candidates = {metaTmp, metaBase, metaBak};
+    } else if (usedSrc == Source::Backup) {
+      candidates = {metaBak, metaBase, metaTmp};
+    } else {
+      candidates = {metaBase, metaTmp, metaBak};
+    }
+
+    std::string metaErr;
+    for (const fs::path& p : candidates) {
+      std::error_code ec;
+      if (!fs::exists(p, ec) || ec || !fs::is_regular_file(p, ec) || ec) continue;
+      CityMeta tmp{};
+      if (LoadCityMetaJsonFile(p.string(), tmp, metaErr)) {
+        meta = std::move(tmp);
+        haveMeta = true;
+        break;
+      }
+    }
+
+    if (haveMeta) {
+      const bool matches = (meta.version == kCityMetaVersion) &&
+                           (meta.seed == loaded.seed()) &&
+                           (meta.width == loaded.width()) &&
+                           (meta.height == loaded.height()) &&
+                           (meta.day == loaded.stats().day);
+      if (!matches) {
+        m_console.print("save: meta file does not match loaded world; ignoring");
+        haveMeta = false;
+      }
+    }
+  }
+
+  adoptLoadedWorld(std::move(loaded), loadedProcCfg, loadedSimCfg, toast, haveMeta ? &meta : nullptr);
 
   // --- Best-effort on-disk healing ---
   // If we successfully loaded from a temp/backup, try to promote it back to the canonical slot file.
@@ -795,7 +880,7 @@ bool Game::loadFromPath(const std::string& path, const char* toastLabel)
 }
 
 void Game::adoptLoadedWorld(World&& loaded, const ProcGenConfig& loadedProcCfg, const SimConfig& loadedSimCfg,
-                            const std::string& toastMessage, const std::vector<Stats>* tickStats)
+                            const std::string& toastMessage, const CityMeta* meta, const std::vector<Stats>* tickStats)
 {
   const std::uint64_t prevSeed = m_world.seed();
 
@@ -904,7 +989,13 @@ m_policyOptTopFirst = 0;
 
   // Make HUD stats immediately correct (without waiting for the next sim tick).
   m_sim.refreshDerivedStats(m_world);
+
+  const bool useMeta = (meta != nullptr) && (!tickStats || tickStats->empty()) && (meta->version == kCityMetaVersion) &&
+                       (meta->seed == m_world.seed()) && (meta->width == m_world.width()) &&
+                       (meta->height == m_world.height()) && (meta->day == m_world.stats().day);
+
   clearHistory();
+
   if (tickStats && !tickStats->empty()) {
     int moneyOffset = 0;
     for (const Stats& s : *tickStats) {
@@ -918,10 +1009,83 @@ m_policyOptTopFirst = 0;
       m_world.stats().money += moneyOffset;
     }
   } else {
-    {
-      Stats s = m_world.stats();
-      const int grant = applyCityChallenges(s);
-      if (grant != 0) m_world.stats().money += grant;
+    if (useMeta) {
+      // Restore persisted game-layer state (bounded and validated on deserialize, but
+      // still clamp defensively).
+      m_cityHistoryMax = std::clamp(meta->historyMax, 16, 2048);
+      m_cityNewsMax = std::clamp(meta->newsMax, 16, 2048);
+
+      m_cityHistory = meta->history;
+      if (static_cast<int>(m_cityHistory.size()) > m_cityHistoryMax) {
+        const std::size_t keep = static_cast<std::size_t>(m_cityHistoryMax);
+        m_cityHistory.erase(m_cityHistory.begin(), m_cityHistory.end() - keep);
+      }
+
+      m_cityNews = meta->news;
+      while (static_cast<int>(m_cityNews.size()) > m_cityNewsMax) {
+        m_cityNews.pop_front();
+      }
+
+      m_newsSelection = std::max(0, meta->newsSelection);
+      m_newsFirst = std::max(0, meta->newsFirst);
+      if (!m_cityNews.empty()) {
+        const int n = static_cast<int>(m_cityNews.size());
+        m_newsSelection = std::clamp(m_newsSelection, 0, n - 1);
+        m_newsFirst = std::clamp(m_newsFirst, 0, m_newsSelection);
+      } else {
+        m_newsSelection = 0;
+        m_newsFirst = 0;
+      }
+
+      m_mayorRatingEma = std::clamp(meta->mayorRatingEma, 0.0f, 100.0f);
+      m_mayorRatingPrev = std::clamp(meta->mayorRatingPrev, 0.0f, 100.0f);
+      m_cityNewsAddendum = meta->newsAddendum;
+
+      m_challengeTargetActive = std::clamp(meta->challengeTargetActive, 1, 8);
+      m_challengeRerolls = std::max(0, meta->challengeRerolls);
+      m_challengeNextId = std::max<std::uint32_t>(1u, meta->challengeNextId);
+      m_challengeLastProcessedDay = meta->challengeLastProcessedDay;
+
+      m_cityChallenges = meta->challenges;
+      m_challengeLog = meta->challengeLog;
+      while (static_cast<int>(m_challengeLog.size()) > m_challengeLogMax) {
+        m_challengeLog.pop_front();
+      }
+
+      std::uint32_t maxId = 0;
+      for (const CityChallenge& c : m_cityChallenges) {
+        maxId = std::max(maxId, c.id);
+      }
+      m_challengeNextId = std::max(m_challengeNextId, maxId + 1);
+
+      m_challengeSelection = std::max(0, meta->challengeSelection);
+      m_challengeFirst = std::max(0, meta->challengeFirst);
+      if (!m_cityChallenges.empty()) {
+        const int n = static_cast<int>(m_cityChallenges.size());
+        m_challengeSelection = std::clamp(m_challengeSelection, 0, n - 1);
+        m_challengeFirst = std::clamp(m_challengeFirst, 0, m_challengeSelection);
+      } else {
+        m_challengeSelection = 0;
+        m_challengeFirst = 0;
+      }
+    }
+
+    Stats s = m_world.stats();
+    const int grant = applyCityChallenges(s);
+    if (grant != 0) {
+      m_world.stats().money += grant;
+    }
+    s = m_world.stats();
+
+    if (useMeta && !m_cityHistory.empty() && m_cityHistory.back().day == s.day) {
+      // Avoid duplicating the last persisted day, but seed tick-stats history so that
+      // the next day's news has a previous-day baseline.
+      m_tickStatsHistory.clear();
+      m_tickStatsHistory.push_back(s);
+      if (m_cityNews.empty() || m_cityNews.back().day != s.day) {
+        recordCityNews(s);
+      }
+    } else {
       recordHistorySample(s);
     }
   }
@@ -1317,6 +1481,90 @@ void Game::setupDevConsole()
       "echo", "echo <text...>  - print text", [joinArgs](DevConsole& c, const DevConsole::Args& args) {
         if (args.empty()) return;
         c.print(joinArgs(args, 0));
+      });
+
+  m_console.registerCommand(
+      "support",
+      "support [zip|dir] [out=<dir>] [save=0|1] [map=0|1]  - create a support bundle (diagnostics+logs+prefs+crash+snapshot)",
+      [this, toLower, parseI32](DevConsole& c, const DevConsole::Args& args) {
+        bool zip = true;
+        bool includeSave = true;
+        bool includeMap = true;
+        std::string outDir;
+
+        auto parseBool01 = [&](const std::string& s, bool& out) -> bool {
+          int v = 0;
+          if (!parseI32(s, v)) return false;
+          if (v == 0 || v == 1) {
+            out = (v == 1);
+            return true;
+          }
+          return false;
+        };
+
+        for (std::size_t i = 0; i < args.size(); ++i) {
+          const std::string a = toLower(args[i]);
+          if (a == "zip") {
+            zip = true;
+            continue;
+          }
+          if (a == "dir" || a == "folder") {
+            zip = false;
+            continue;
+          }
+
+          const std::size_t eq = args[i].find('=');
+          if (eq != std::string::npos) {
+            const std::string key = toLower(args[i].substr(0, eq));
+            const std::string val = args[i].substr(eq + 1);
+
+            if (key == "out" || key == "dir" || key == "base") {
+              outDir = val;
+              continue;
+            }
+            if (key == "save") {
+              if (!parseBool01(val, includeSave)) {
+                c.print("support: invalid save= (use 0/1)");
+                return;
+              }
+              continue;
+            }
+            if (key == "map" || key == "minimap") {
+              if (!parseBool01(val, includeMap)) {
+                c.print("support: invalid map= (use 0/1)");
+                return;
+              }
+              continue;
+            }
+          }
+
+          c.print("support: unknown arg: " + args[i]);
+          c.print("Usage: support [zip|dir] [out=<dir>] [save=0|1] [map=0|1]");
+          return;
+        }
+
+        std::string path;
+        std::vector<std::string> warnings;
+        std::string err;
+
+        const bool ok = zip
+                            ? createSupportBundleZip(outDir, includeSave, includeMap, path, warnings, err)
+                            : createSupportBundleDir(outDir, includeSave, includeMap, path, warnings, err);
+
+        if (!ok) {
+          c.print("support: failed: " + err);
+          showToast("Support bundle failed", 2.5f);
+          return;
+        }
+
+        c.print(std::string("support: created: ") + path);
+        if (!warnings.empty()) {
+          c.print(TextFormat("support: %d warning(s):", static_cast<int>(warnings.size())));
+          for (const std::string& w : warnings) {
+            c.print("  " + w);
+          }
+        }
+        showToast(std::string("Support bundle: ") + path, 3.5f);
       });
 
   m_console.registerCommand(
@@ -2247,7 +2495,7 @@ void Game::setupDevConsole()
           const std::uint64_t finalHash = HashWorld(w, true);
 
           const std::string toast = std::string(TextFormat("Replay applied: %s", path.c_str()));
-          adoptLoadedWorld(std::move(w), proc, sim, toast, outStats);
+          adoptLoadedWorld(std::move(w), proc, sim, toast, nullptr, outStats);
 
           c.print(TextFormat("replay: applied (%zu events) final_hash=0x%llx", replay.events.size(),
                              static_cast<unsigned long long>(finalHash)));
@@ -2613,7 +2861,7 @@ void Game::setupDevConsole()
                                                          st.roadTilesPainted, st.waterTilesPainted,
                                                          st.zoneTilesPainted, st.parkTilesPainted));
 
-        adoptLoadedWorld(std::move(imported), m_procCfg, m_sim.config(), toast,
+        adoptLoadedWorld(std::move(imported), m_procCfg, m_sim.config(), toast, nullptr,
                          (autobuildDays > 0 ? &tickStats : nullptr));
 
         c.print(TextFormat("osm stats: nodes=%zu ways=%zu rel=%zu  highway=%zu water=%zu landuse=%zu parks=%zu buildings=%zu",
@@ -8705,12 +8953,17 @@ void Game::clearHistory()
   m_cityHistory.clear();
   m_tickStatsHistory.clear();
   clearCityNews();
+  m_reportCursorPinned = false;
+  m_reportCursorAbs = -1;
 }
 
 void Game::recordHistorySample(const Stats& s)
 {
   // Avoid recording duplicate days (can happen when resetting/loading).
-  if (!m_tickStatsHistory.empty() && m_tickStatsHistory.back().day == s.day) return;
+  if ((!m_tickStatsHistory.empty() && m_tickStatsHistory.back().day == s.day) ||
+      (!m_cityHistory.empty() && m_cityHistory.back().day == s.day)) {
+    return;
+  }
 
   CityHistorySample hs{};
   hs.day = s.day;
@@ -8760,6 +9013,7 @@ enum class NewsKind : std::uint8_t {
   BudgetSurplus,
   BudgetDeficit,
   Traffic,
+  TrafficIncident,
   Services,
   FireRisk,
   FireIncident,
@@ -9043,6 +9297,11 @@ void Game::recordCityNews(const Stats& s)
   if (fireIncidentTotal > 0) {
     // Score is intentionally much larger than other stories.
     add(NewsKind::FireIncident, 12.0f + 0.04f * static_cast<float>(fireIncidentTotal));
+  }
+
+  if (s.trafficIncidentInjuries > 0) {
+    const float injuriesScore = std::min(4.0f, 0.15f * static_cast<float>(s.trafficIncidentInjuries));
+    add(NewsKind::TrafficIncident, 8.0f + injuriesScore);
   }
 
   const float traffic = Clamp01(s.trafficCongestion);
@@ -9362,6 +9621,27 @@ void Game::recordCityNews(const Stats& s)
       appendMayorLine();
     } break;
 
+    case NewsKind::TrafficIncident: {
+      const int injuries = s.trafficIncidentInjuries;
+      e.tone = (injuries >= 8 || s.trafficIncidentCost >= 30) ? CityNewsTone::Alert : CityNewsTone::Bad;
+
+      const int pick = static_cast<int>(rng.rangeU32(3));
+      if (pick == 0) e.headline = TextFormat("Traffic collision injures %d", injuries);
+      else if (pick == 1) e.headline = "Major crash rattles commuters";
+      else e.headline = TextFormat("Road safety incident: %d injured", injuries);
+
+      const std::string districtStr = (s.trafficIncidentDistrict >= 0)
+        ? TextFormat("District %d", s.trafficIncidentDistrict)
+        : "Unknown district";
+
+      e.body = TextFormat(
+        "Injuries: %d | Response cost: %d\n"
+        "Location: %s\n"
+        "Tip: check the Traffic Safety heatmap to find risky intersections. Space junctions, add parallel routes, and reduce bottlenecks.",
+        injuries, s.trafficIncidentCost, districtStr.c_str());
+      appendMayorLine();
+    } break;
+
     case NewsKind::Services: {
       const int svcPct = Pct100(s.servicesOverallSatisfaction);
       e.tone = (svcPct < 35) ? CityNewsTone::Alert : CityNewsTone::Bad;
@@ -9645,6 +9925,106 @@ void Game::recordCityNews(const Stats& s)
   if (m_cityNews.back().tone == CityNewsTone::Alert || newEventToast) {
     showToast(m_cityNews.back().headline, 3.5f);
   }
+}
+
+void Game::exportCityReport(int startIndex, int count)
+{
+  namespace fs = std::filesystem;
+
+  const int total = static_cast<int>(m_cityHistory.size());
+  if (total <= 0) {
+    showToast("Report: no data to export");
+    return;
+  }
+
+  startIndex = std::clamp(startIndex, 0, std::max(0, total - 1));
+  count = std::clamp(count, 1, total - startIndex);
+
+  const int endIndex = startIndex + count - 1;
+  const int day0 = m_cityHistory[static_cast<std::size_t>(startIndex)].day;
+  const int day1 = m_cityHistory[static_cast<std::size_t>(endIndex)].day;
+
+  std::error_code ec;
+  fs::create_directories(fs::path("captures"), ec);
+
+  const std::string stamp = FileTimestamp();
+  const std::string base = TextFormat("captures/city_report_seed%llu_d%d-%d_%s",
+                                      static_cast<unsigned long long>(m_world.seed()), day0, day1, stamp.c_str());
+
+  const std::string cityName = GenerateCityName(m_world.seed());
+
+  // JSON export
+  {
+    const std::string path = base + ".json";
+    std::ofstream f(path, std::ios::out | std::ios::trunc);
+    if (!f) {
+      showToast("Report export failed (json)");
+    } else {
+      f << "{\n";
+      f << "  \"seed\": " << static_cast<unsigned long long>(m_world.seed()) << ",\n";
+      f << "  \"city\": \"" << JsonEscape(cityName) << "\",\n";
+      f << "  \"exported_at\": \"" << JsonEscape(stamp) << "\",\n";
+      f << "  \"range\": {\"day_start\": " << day0 << ", \"day_end\": " << day1 << "},\n";
+      f << "  \"samples\": [\n";
+      for (int i = 0; i < count; ++i) {
+        const CityHistorySample& s = m_cityHistory[static_cast<std::size_t>(startIndex + i)];
+        f << "    {\"day\": " << s.day
+          << ", \"population\": " << s.population
+          << ", \"money\": " << s.money
+          << ", \"happiness\": " << static_cast<double>(s.happiness)
+          << ", \"demand_residential\": " << static_cast<double>(s.demandResidential)
+          << ", \"demand_commercial\": " << static_cast<double>(s.demandCommercial)
+          << ", \"demand_industrial\": " << static_cast<double>(s.demandIndustrial)
+          << ", \"avg_land_value\": " << static_cast<double>(s.avgLandValue)
+          << ", \"avg_tax_per_capita\": " << static_cast<double>(s.avgTaxPerCapita)
+          << ", \"income\": " << s.income
+          << ", \"expenses\": " << s.expenses
+          << ", \"tax_revenue\": " << s.taxRevenue
+          << ", \"maintenance_cost\": " << s.maintenanceCost
+          << ", \"commuters\": " << s.commuters
+          << ", \"avg_commute\": " << static_cast<double>(s.avgCommute)
+          << ", \"avg_commute_time\": " << static_cast<double>(s.avgCommuteTime)
+          << ", \"traffic_congestion\": " << static_cast<double>(s.trafficCongestion)
+          << ", \"goods_satisfaction\": " << static_cast<double>(s.goodsSatisfaction)
+          << "}";
+        if (i + 1 < count) f << ",";
+        f << "\n";
+      }
+      f << "  ]\n";
+      f << "}\n";
+    }
+  }
+
+  // CSV export
+  {
+    const std::string path = base + ".csv";
+    std::ofstream f(path, std::ios::out | std::ios::trunc);
+    if (!f) {
+      showToast("Report export failed (csv)");
+    } else {
+      f << "day,population,money,happiness,demand_residential,demand_commercial,demand_industrial,"
+           "avg_land_value,avg_tax_per_capita,income,expenses,tax_revenue,maintenance_cost,commuters,"
+           "avg_commute,avg_commute_time,traffic_congestion,goods_satisfaction\n";
+      for (int i = 0; i < count; ++i) {
+        const CityHistorySample& s = m_cityHistory[static_cast<std::size_t>(startIndex + i)];
+        f << s.day << "," << s.population << "," << s.money << ","
+          << static_cast<double>(s.happiness) << ","
+          << static_cast<double>(s.demandResidential) << ","
+          << static_cast<double>(s.demandCommercial) << ","
+          << static_cast<double>(s.demandIndustrial) << ","
+          << static_cast<double>(s.avgLandValue) << ","
+          << static_cast<double>(s.avgTaxPerCapita) << ","
+          << s.income << "," << s.expenses << "," << s.taxRevenue << "," << s.maintenanceCost << ","
+          << s.commuters << ","
+          << static_cast<double>(s.avgCommute) << ","
+          << static_cast<double>(s.avgCommuteTime) << ","
+          << static_cast<double>(s.trafficCongestion) << ","
+          << static_cast<double>(s.goodsSatisfaction) << "\n";
+      }
+    }
+  }
+
+  showToast(TextFormat("Report exported (%d day%s)", count, (count == 1) ? "" : "s"), 3.0f);
 }
 
 void Game::exportCityNews()
@@ -10919,6 +11299,7 @@ void Game::drawSaveMenuPanel(int screenW, int screenH)
 
   const float uiTime = static_cast<float>(GetTime());
   const ui::Theme& uiTh = ui::GetTheme();
+  const Vector2 mouseUi = mouseUiPosition(m_uiScale);
 
   const int panelW = 760;
   const int panelH = 420;
@@ -10937,7 +11318,7 @@ void Game::drawSaveMenuPanel(int screenW, int screenH)
   const char* tabName = (m_saveMenuGroup == 0) ? "Manual" : "Autosaves";
   ui::Text(
       x, y, 15,
-      TextFormat("Tab: switch  |  Up/Down: select  |  Enter/F9: load  |  F5: save  |  Del: delete  |  Group: %s",
+      TextFormat("Tab: switch  |  Up/Down: select  |  Enter/F9: load  |  F5: save  |  F2: bundle  |  Del: delete  |  Group: %s",
                  tabName),
       uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
   y += 22;
@@ -10946,9 +11327,10 @@ void Game::drawSaveMenuPanel(int screenW, int screenH)
   const int previewX = x0 + listW + 24;
   const int previewY = y;
   const int previewW = panelW - listW - 36;
-  const int previewH = panelH - (previewY - y0) - 14;
+  const int footerH = 36;
+  const int previewH = panelH - (previewY - y0) - 14 - footerH;
 
-  const int listH = panelH - (y - y0) - 14;
+  const int listH = panelH - (y - y0) - 14 - footerH;
   const Rectangle listR{static_cast<float>(x0 + 12), static_cast<float>(y), static_cast<float>(listW),
                         static_cast<float>(listH)};
   ui::DrawPanelInset(listR, uiTime, /*active=*/true);
@@ -11046,7 +11428,275 @@ void Game::drawSaveMenuPanel(int screenW, int screenH)
                /*shadow=*/true, 1);
     }
   }
+
+  // Footer actions.
+  {
+    const int footerTop = y0 + panelH - 14 - footerH;
+    const Rectangle btnR{static_cast<float>(x0 + 12), static_cast<float>(footerTop + 7),
+                         static_cast<float>(panelW - 24), 22.0f};
+
+    if (ui::Button(24601, btnR, "Create Support Bundle Zip", mouseUi, uiTime, /*enabled=*/true,
+                   /*primary=*/true)) {
+      std::string path;
+      std::vector<std::string> warnings;
+      std::string err;
+      if (createSupportBundleZip(std::string{}, /*includeSaveSnapshot=*/true, /*includeMinimap=*/true, path,
+                                 warnings, err)) {
+        showToast(std::string("Support bundle: ") + path, 3.5f);
+        if (!warnings.empty()) {
+          showToast(TextFormat("Support bundle created with %d warning(s)", static_cast<int>(warnings.size())), 3.0f);
+        }
+      } else {
+        showToast(std::string("Support bundle failed: ") + err, 4.0f);
+      }
+    }
+  }
 }
+
+
+
+bool Game::createSupportBundleZip(const std::string& outDirOverride, bool includeSaveSnapshot, bool includeMinimap,
+                                std::string& outZipPath, std::vector<std::string>& outWarnings,
+                                std::string& outError)
+{
+  outZipPath.clear();
+  outWarnings.clear();
+  outError.clear();
+
+  namespace fs = std::filesystem;
+
+  std::error_code ec;
+  fs::path dataDir = fs::current_path(ec);
+  if (ec) {
+    outError = std::string("Unable to resolve current directory: ") + ec.message();
+    return false;
+  }
+
+  fs::path baseDir = outDirOverride.empty() ? fs::path("captures") : fs::path(outDirOverride);
+  if (baseDir.empty()) baseDir = dataDir;
+
+  fs::create_directories(baseDir, ec);
+  if (ec) {
+    outError = std::string("Unable to create output directory: ") + baseDir.string() + " (" + ec.message() + ")";
+    return false;
+  }
+
+  const Stats& s = m_world.stats();
+  const unsigned long long seed = static_cast<unsigned long long>(m_world.seed());
+  const int day = s.day;
+
+  SupportBundleOptions opt;
+  opt.baseDir = baseDir;
+  opt.dataDir = dataDir;
+
+  {
+    char prefix[128]{};
+    std::snprintf(prefix, sizeof(prefix), "support_seed%llu_day%d", seed, day);
+    opt.namePrefix = prefix;
+  }
+
+  // Diagnostics text.
+  {
+    std::ostringstream ss;
+    ss << "ProcIsoCity support bundle (in-game)\n";
+    ss << "version: " << ProcIsoCityFullVersionString() << "\n";
+    ss << "build: " << ProcIsoCityBuildStamp() << "\n";
+    ss << "cwd: " << dataDir.string() << "\n";
+    ss << "seed: " << seed << "\n";
+    ss << "map: " << m_world.width() << "x" << m_world.height() << "\n";
+    ss << "day: " << day << "\n";
+    ss << "population: " << s.population << "\n";
+    ss << "employed: " << s.employed << "\n";
+    ss << "money: " << s.money << "\n";
+    ss << "happiness: " << s.happiness << "\n";
+    ss << "demand: R " << s.demandResidential << " C " << s.demandCommercial << " I " << s.demandIndustrial << "\n";
+    ss << "income: " << s.income << " expenses: " << s.expenses << "\n";
+    ss << "trafficCongestion: " << s.trafficCongestion << "\n";
+    ss << "goodsSatisfaction: " << s.goodsSatisfaction << "\n";
+    ss << "requireOutsideConnection: " << (m_sim.config().requireOutsideConnection ? "true" : "false") << "\n";
+    opt.diagnosticsText = ss.str();
+  }
+
+  // Try to mirror the interactive app defaults (and respect the env override used by main.cpp).
+  if (const char* envLog = std::getenv("PROCISOCITY_LOG_FILE"); envLog && envLog[0] != '\0') {
+    opt.logPath = fs::path(envLog);
+  } else {
+    opt.logPath = fs::path("proc_isocity.log");
+  }
+  opt.logKeepFiles = 3;
+
+  if (!m_visualPrefsPath.empty()) {
+    opt.visualPrefsPath = fs::path(m_visualPrefsPath);
+  }
+
+  opt.crashReportsMax = 5;
+
+  // Extra files: optional world snapshot + minimap thumbnail.
+  std::vector<fs::path> tempFiles;
+  const std::string stamp = FileTimestamp();
+
+  if (includeSaveSnapshot) {
+    char fname[256]{};
+    std::snprintf(fname, sizeof(fname), "support_snapshot_seed%llu_day%d_%s.bin", seed, day, stamp.c_str());
+    fs::path snapshot = baseDir / fname;
+
+    std::string saveErr;
+    if (!SaveWorldBinary(m_world, m_procCfg, m_sim.config(), snapshot.string(), saveErr)) {
+      outWarnings.push_back(std::string("Snapshot save failed: ") + saveErr);
+    } else {
+      opt.extraFiles.push_back(snapshot);
+      tempFiles.push_back(snapshot);
+    }
+  }
+
+  if (includeMinimap) {
+    char fname[256]{};
+    std::snprintf(fname, sizeof(fname), "support_minimap_seed%llu_day%d_%s.png", seed, day, stamp.c_str());
+    fs::path thumb = baseDir / fname;
+
+    if (!m_renderer.exportMinimapThumbnail(m_world, thumb.string().c_str(), 512)) {
+      outWarnings.push_back("Minimap thumbnail export failed");
+    } else {
+      opt.extraFiles.push_back(thumb);
+      tempFiles.push_back(thumb);
+    }
+  }
+
+  SupportBundleArchiveResult res;
+  if (!CreateSupportBundleZip(opt, res, outError)) return false;
+
+  outZipPath = res.archivePath.string();
+  outWarnings.insert(outWarnings.end(), res.warnings.begin(), res.warnings.end());
+
+  // Cleanup our temporary snapshot/thumbnail files (best-effort). The archive contains copies.
+  for (const fs::path& p : tempFiles) {
+    std::error_code rmec;
+    fs::remove(p, rmec);
+  }
+
+  return true;
+}
+
+bool Game::createSupportBundleDir(const std::string& outDirOverride, bool includeSaveSnapshot, bool includeMinimap,
+                                std::string& outBundleDir, std::vector<std::string>& outWarnings,
+                                std::string& outError)
+{
+  outBundleDir.clear();
+  outWarnings.clear();
+  outError.clear();
+
+  namespace fs = std::filesystem;
+
+  std::error_code ec;
+  fs::path dataDir = fs::current_path(ec);
+  if (ec) {
+    outError = std::string("Unable to resolve current directory: ") + ec.message();
+    return false;
+  }
+
+  fs::path baseDir = outDirOverride.empty() ? fs::path("captures") : fs::path(outDirOverride);
+  if (baseDir.empty()) baseDir = dataDir;
+
+  fs::create_directories(baseDir, ec);
+  if (ec) {
+    outError = std::string("Unable to create output directory: ") + baseDir.string() + " (" + ec.message() + ")";
+    return false;
+  }
+
+  const Stats& s = m_world.stats();
+  const unsigned long long seed = static_cast<unsigned long long>(m_world.seed());
+  const int day = s.day;
+
+  SupportBundleOptions opt;
+  opt.baseDir = baseDir;
+  opt.dataDir = dataDir;
+
+  {
+    char prefix[128]{};
+    std::snprintf(prefix, sizeof(prefix), "support_seed%llu_day%d", seed, day);
+    opt.namePrefix = prefix;
+  }
+
+  // Diagnostics text.
+  {
+    std::ostringstream ss;
+    ss << "ProcIsoCity support bundle (in-game)\n";
+    ss << "version: " << ProcIsoCityFullVersionString() << "\n";
+    ss << "build: " << ProcIsoCityBuildStamp() << "\n";
+    ss << "cwd: " << dataDir.string() << "\n";
+    ss << "seed: " << seed << "\n";
+    ss << "map: " << m_world.width() << "x" << m_world.height() << "\n";
+    ss << "day: " << day << "\n";
+    ss << "population: " << s.population << "\n";
+    ss << "employed: " << s.employed << "\n";
+    ss << "money: " << s.money << "\n";
+    ss << "happiness: " << s.happiness << "\n";
+    ss << "demand: R " << s.demandResidential << " C " << s.demandCommercial << " I " << s.demandIndustrial << "\n";
+    ss << "income: " << s.income << " expenses: " << s.expenses << "\n";
+    ss << "trafficCongestion: " << s.trafficCongestion << "\n";
+    ss << "goodsSatisfaction: " << s.goodsSatisfaction << "\n";
+    ss << "requireOutsideConnection: " << (m_sim.config().requireOutsideConnection ? "true" : "false") << "\n";
+    opt.diagnosticsText = ss.str();
+  }
+
+  if (const char* envLog = std::getenv("PROCISOCITY_LOG_FILE"); envLog && envLog[0] != '\0') {
+    opt.logPath = fs::path(envLog);
+  } else {
+    opt.logPath = fs::path("proc_isocity.log");
+  }
+  opt.logKeepFiles = 3;
+
+  if (!m_visualPrefsPath.empty()) {
+    opt.visualPrefsPath = fs::path(m_visualPrefsPath);
+  }
+
+  opt.crashReportsMax = 5;
+
+  std::vector<fs::path> tempFiles;
+  const std::string stamp = FileTimestamp();
+
+  if (includeSaveSnapshot) {
+    char fname[256]{};
+    std::snprintf(fname, sizeof(fname), "support_snapshot_seed%llu_day%d_%s.bin", seed, day, stamp.c_str());
+    fs::path snapshot = baseDir / fname;
+
+    std::string saveErr;
+    if (!SaveWorldBinary(m_world, m_procCfg, m_sim.config(), snapshot.string(), saveErr)) {
+      outWarnings.push_back(std::string("Snapshot save failed: ") + saveErr);
+    } else {
+      opt.extraFiles.push_back(snapshot);
+      tempFiles.push_back(snapshot);
+    }
+  }
+
+  if (includeMinimap) {
+    char fname[256]{};
+    std::snprintf(fname, sizeof(fname), "support_minimap_seed%llu_day%d_%s.png", seed, day, stamp.c_str());
+    fs::path thumb = baseDir / fname;
+
+    if (!m_renderer.exportMinimapThumbnail(m_world, thumb.string().c_str(), 512)) {
+      outWarnings.push_back("Minimap thumbnail export failed");
+    } else {
+      opt.extraFiles.push_back(thumb);
+      tempFiles.push_back(thumb);
+    }
+  }
+
+  SupportBundleResult res;
+  if (!CreateSupportBundle(opt, res, outError)) return false;
+
+  outBundleDir = res.bundleDir.string();
+  outWarnings.insert(outWarnings.end(), res.warnings.begin(), res.warnings.end());
+
+  for (const fs::path& p : tempFiles) {
+    std::error_code rmec;
+    fs::remove(p, rmec);
+  }
+
+  return true;
+}
+
+
 
 
 namespace {
@@ -18198,6 +18848,23 @@ void Game::handleInput(float dt)
   }
 
   if (m_showSaveMenu) {
+    // Support bundle helper (F2).
+    if (IsKeyPressed(KEY_F2)) {
+      endPaintStroke();
+      std::string path;
+      std::vector<std::string> warnings;
+      std::string err;
+      if (createSupportBundleZip(std::string{}, /*includeSaveSnapshot=*/true, /*includeMinimap=*/true, path,
+                                 warnings, err)) {
+        showToast(std::string("Support bundle: ") + path, 3.5f);
+        if (!warnings.empty()) {
+          showToast(TextFormat("Support bundle created with %d warning(s)", static_cast<int>(warnings.size())), 3.0f);
+        }
+      } else {
+        showToast(std::string("Support bundle failed: ") + err, 4.0f);
+      }
+    }
+
     // Group switch.
     if (IsKeyPressed(KEY_TAB)) {
       m_saveMenuGroup = (m_saveMenuGroup == 0) ? 1 : 0;
@@ -18249,6 +18916,19 @@ void Game::handleInput(float dt)
           fs::remove(fs::path(e.path), ec);
           const std::string tp = thumbPathForSavePath(e.path);
           fs::remove(fs::path(tp), ec);
+
+          // Remove companion city meta files (if present).
+          {
+            fs::path mp = fs::path(CityMetaPathForSavePath(e.path));
+            fs::path mpTmp = mp;
+            mpTmp += ".tmp";
+            fs::path mpBak = mp;
+            mpBak += ".bak";
+            fs::remove(mpTmp, ec);
+            fs::remove(mpBak, ec);
+            fs::remove(mp, ec);
+          }
+
           m_saveMenuDeleteArmed = false;
           refreshSaveMenu();
           showToast("Deleted save", 1.5f);
@@ -19614,24 +20294,9 @@ void Game::handleInput(float dt)
 
     // Video settings panel (below report if visible).
     if (m_showVideoSettings) {
-      int w = 432;
-      int h = 276;
-      const int x0 = kUiPanelMargin;
-      int y0 = kUiPanelTopY;
-      if (m_showReport) {
-        y0 += 420 + kUiPanelMargin;
-      }
-      if (uiW > 0) {
-        w = std::min(w, uiW - x0 - kUiPanelMargin);
-      }
-      if (uiH > 0) {
-        h = std::min(h, uiH - y0 - kUiPanelMargin);
-      }
-      if (w > 0 && h > 0) {
-        const Rectangle r{static_cast<float>(x0), static_cast<float>(y0), static_cast<float>(w), static_cast<float>(h)};
-        if (CheckCollisionPointRec(mouseUi, r)) {
-          return true;
-        }
+      const Rectangle r = videoSettingsPanelRect(uiW, uiH);
+      if (CheckCollisionPointRec(mouseUi, r)) {
+        return true;
       }
     }
 
@@ -20363,9 +21028,21 @@ void Game::update(float dt)
 
 namespace {
 
+Rectangle HistoryGraphPlotRect(Rectangle r)
+{
+  const float pad = 10.0f;
+  Rectangle gr = r;
+  gr.x += pad;
+  gr.width -= pad * 2.0f;
+  gr.y += 34.0f;
+  gr.height -= 52.0f;
+  return gr;
+}
+
 template <typename F>
-void DrawHistoryGraph(const std::vector<CityHistorySample>& samples, Rectangle r, const char* title, F getValue,
-                      float fixedMin, float fixedMax, bool fixedRange, const char* valueFmt, bool percent = false)
+void DrawHistoryGraph(std::span<const CityHistorySample> samples, Rectangle r, const char* title, F getValue,
+                      float fixedMin, float fixedMax, bool fixedRange, const char* valueFmt, bool percent = false,
+                      int cursorIndex = -1)
 {
   const float uiTime = static_cast<float>(GetTime());
   const ui::Theme& th = ui::GetTheme();
@@ -20411,11 +21088,7 @@ void DrawHistoryGraph(const std::vector<CityHistorySample>& samples, Rectangle r
   }
 
   // Graph area.
-  Rectangle gr = r;
-  gr.x += static_cast<float>(pad);
-  gr.width -= static_cast<float>(pad * 2);
-  gr.y += 34.0f;
-  gr.height -= 52.0f;
+  Rectangle gr = HistoryGraphPlotRect(r);
 
   // Grid lines.
   const int gridLines = 3;
@@ -20443,9 +21116,20 @@ void DrawHistoryGraph(const std::vector<CityHistorySample>& samples, Rectangle r
     DrawLineEx(Vector2{x0, y0}, Vector2{x1, y1}, 2.0f, th.accent);
   }
 
+  // Cursor marker.
+  if (cursorIndex >= 0 && cursorIndex < static_cast<int>(n)) {
+    const float cx = mapX(static_cast<std::size_t>(cursorIndex));
+    DrawLineEx(Vector2{cx, gr.y}, Vector2{cx, gr.y + gr.height}, 1.0f, Fade(th.text, 0.35f));
+
+    const float cy = mapY(getValue(samples[static_cast<std::size_t>(cursorIndex)]));
+    DrawCircleV(Vector2{cx, cy}, 3.5f, th.accent);
+    DrawCircleLines(static_cast<int>(cx), static_cast<int>(cy), 3.5f, Fade(th.text, 0.35f));
+  }
+
+
   // Latest label.
   char buf[96];
-  const float latest = getValue(samples.back());
+  const float latest = getValue(samples[n - 1]);
   if (percent) {
     std::snprintf(buf, sizeof(buf), valueFmt, static_cast<double>(latest * 100.0f));
   } else {
@@ -20455,7 +21139,7 @@ void DrawHistoryGraph(const std::vector<CityHistorySample>& samples, Rectangle r
            /*bold=*/false, /*shadow=*/true, 1);
 }
 
-void DrawHistoryGraphRCI(const std::vector<CityHistorySample>& samples, Rectangle r)
+void DrawHistoryGraphRCI(std::span<const CityHistorySample> samples, Rectangle r, int cursorIndex = -1)
 {
   const float uiTime = static_cast<float>(GetTime());
   const ui::Theme& th = ui::GetTheme();
@@ -20480,11 +21164,7 @@ void DrawHistoryGraphRCI(const std::vector<CityHistorySample>& samples, Rectangl
   const float vmin = 0.0f;
   const float vmax = 1.0f;
 
-  Rectangle gr = r;
-  gr.x += static_cast<float>(pad);
-  gr.width -= static_cast<float>(pad * 2);
-  gr.y += 34.0f;
-  gr.height -= 52.0f;
+  Rectangle gr = HistoryGraphPlotRect(r);
 
   const int gridLines = 3;
   for (int i = 0; i <= gridLines; ++i) {
@@ -20521,6 +21201,24 @@ void DrawHistoryGraphRCI(const std::vector<CityHistorySample>& samples, Rectangl
   drawSeries([](const CityHistorySample& s) { return s.demandCommercial; }, cC);
   drawSeries([](const CityHistorySample& s) { return s.demandIndustrial; }, cI);
 
+  // Cursor marker.
+  if (cursorIndex >= 0 && cursorIndex < static_cast<int>(n)) {
+    const float cx = mapX(static_cast<std::size_t>(cursorIndex));
+    DrawLineEx(Vector2{cx, gr.y}, Vector2{cx, gr.y + gr.height}, 1.0f, Fade(th.text, 0.35f));
+
+    auto dot = [&](float v, Color c) {
+      const float cy = mapY(v);
+      DrawCircleV(Vector2{cx, cy}, 3.3f, c);
+      DrawCircleLines(static_cast<int>(cx), static_cast<int>(cy), 3.3f, Fade(th.text, 0.35f));
+    };
+
+    const CityHistorySample& s = samples[static_cast<std::size_t>(cursorIndex)];
+    dot(s.demandResidential, cR);
+    dot(s.demandCommercial, cC);
+    dot(s.demandIndustrial, cI);
+  }
+
+
   // Legend.
   const int lx = static_cast<int>(r.x + r.width) - pad - 92;
   const int ly = static_cast<int>(r.y) + 10;
@@ -20532,7 +21230,7 @@ void DrawHistoryGraphRCI(const std::vector<CityHistorySample>& samples, Rectangl
   ui::Text(lx + 70, ly, 14, "I", th.textDim, /*bold=*/true, /*shadow=*/true, 1);
 
   // Latest label.
-  const CityHistorySample& last = samples.back();
+  const CityHistorySample& last = samples[n - 1];
   char buf[128];
   std::snprintf(buf, sizeof(buf), "Latest: R %.0f%%  C %.0f%%  I %.0f%%",
                 static_cast<double>(last.demandResidential * 100.0f),
@@ -20603,44 +21301,169 @@ void Game::drawReportPanel(int /*screenW*/, int /*screenH*/)
     }
   }
 
-  // Display a fixed window: last N days (bounded by stored history).
-  const int maxPoints = 120;
-  const int count = static_cast<int>(m_cityHistory.size());
-  const int start = (count > maxPoints) ? (count - maxPoints) : 0;
-  const std::vector<CityHistorySample> view(m_cityHistory.begin() + start, m_cityHistory.end());
+  // Controls row: range + export.
+  const int controlsY = tabY + tabH + 6;
+  const int btnH = 18;
+  const int btnGap = 6;
+  const int fontSmall = 13;
 
-  const int graphY = tabY + tabH + 6;
+  {
+    int rx = x0 + 12;
+    ui::Text(rx, controlsY + 2, fontSmall, "Range:", uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
+    rx += ui::MeasureTextWidth("Range:", fontSmall, /*bold=*/false, 1) + 8;
+
+    struct RangeOpt {
+      const char* label;
+      int days; // 0 = all
+    };
+    const RangeOpt opts[] = {{"30d", 30}, {"60d", 60}, {"120d", 120}, {"All", 0}};
+
+    const int btnW = 52;
+    for (int i = 0; i < 4; ++i) {
+      const bool sel = (m_reportRangeDays == opts[i].days);
+      const Rectangle br{static_cast<float>(rx + i * (btnW + btnGap)),
+                         static_cast<float>(controlsY),
+                         static_cast<float>(btnW),
+                         static_cast<float>(btnH)};
+      if (ui::Button(8020 + i, br, opts[i].label, mouseUi, uiTime, /*enabled=*/true, /*primary=*/sel)) {
+        m_reportRangeDays = opts[i].days;
+        // Clear hover state when switching ranges to avoid confusing snaps.
+        if (!m_reportCursorPinned) {
+          m_reportCursorAbs = -1;
+        }
+      }
+    }
+  }
+
+  const int total = static_cast<int>(m_cityHistory.size());
+  if (total <= 0) {
+    m_reportCursorPinned = false;
+    m_reportCursorAbs = -1;
+
+    ui::Text(x0 + 16, controlsY + 32, 14, "(run the sim to collect data)", uiTh.textDim,
+             /*bold=*/false, /*shadow=*/true, 1);
+    ui::Text(x0 + 12, y0 + panelH - 22, fontSmall, "Tab: cycle   F1: toggle", uiTh.textDim,
+             /*bold=*/false, /*shadow=*/true, 1);
+    return;
+  }
+
+  // Determine how many points to show.
+  int viewCount = total;
+  if (m_reportRangeDays > 0) {
+    viewCount = std::min(viewCount, m_reportRangeDays);
+  }
+  viewCount = std::clamp(viewCount, 1, total);
+
+  // Default: tail window.
+  int startIndex = (total > viewCount) ? (total - viewCount) : 0;
+
+  // Clamp pinned cursor into available history.
+  if (m_reportCursorAbs >= total) m_reportCursorAbs = total - 1;
+  if (m_reportCursorAbs < 0) {
+    m_reportCursorAbs = -1;
+    m_reportCursorPinned = false;
+  }
+
+  // If pinned, start with a window centered around the pinned day so hover maps correctly.
+  if (m_reportCursorPinned && m_reportCursorAbs >= 0 && viewCount < total) {
+    startIndex = std::clamp(m_reportCursorAbs - viewCount / 2, 0, total - viewCount);
+  }
+
+  bool exportPressed = false;
+
+  // Export button (exports the currently displayed window).
+  {
+    const int exportW = 84;
+    const Rectangle br{panelR.x + panelR.width - 12.0f - static_cast<float>(exportW),
+                       static_cast<float>(controlsY),
+                       static_cast<float>(exportW),
+                       static_cast<float>(btnH)};
+    exportPressed = ui::Button(8030, br, "Export", mouseUi, uiTime, /*enabled=*/(viewCount > 0), /*primary=*/false);
+  }
+
+  // Graph layout.
+  const int graphY = controlsY + btnH + 6;
   Rectangle r1{static_cast<float>(x0 + 12), static_cast<float>(graphY), static_cast<float>(panelW - 24), 96};
   Rectangle r2{static_cast<float>(x0 + 12), static_cast<float>(graphY + 104), static_cast<float>(panelW - 24), 96};
   Rectangle r3{static_cast<float>(x0 + 12), static_cast<float>(graphY + 208), static_cast<float>(panelW - 24), 96};
 
+  // Hover + pin cursor: hover to scrub, click to pin/unpin.
+  int hoverAbs = -1;
+  if (m_reportPage != 4 && viewCount >= 2) {
+    auto hoverIndexFor = [&](Rectangle rr) -> int {
+      const Rectangle gr = HistoryGraphPlotRect(rr);
+      if (!CheckCollisionPointRec(mouseUi, gr)) return -1;
+      if (!(gr.width > 1.0f)) return -1;
+      const float t = (mouseUi.x - gr.x) / gr.width;
+      const int idx = static_cast<int>(std::round(t * static_cast<float>(viewCount - 1)));
+      return std::clamp(idx, 0, viewCount - 1);
+    };
+
+    int hv = hoverIndexFor(r1);
+    if (hv < 0) hv = hoverIndexFor(r2);
+    if (hv < 0) hv = hoverIndexFor(r3);
+    if (hv >= 0) hoverAbs = startIndex + hv;
+
+    if (hoverAbs >= 0 && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+      if (m_reportCursorPinned && m_reportCursorAbs == hoverAbs) {
+        m_reportCursorPinned = false;
+      } else {
+        m_reportCursorPinned = true;
+        m_reportCursorAbs = hoverAbs;
+      }
+    }
+  }
+
+  if (!m_reportCursorPinned) {
+    m_reportCursorAbs = hoverAbs;
+  }
+
+  // If pinned, center the view window around the pinned day when possible.
+  if (m_reportCursorPinned && m_reportCursorAbs >= 0 && viewCount < total) {
+    startIndex = std::clamp(m_reportCursorAbs - viewCount / 2, 0, total - viewCount);
+  } else {
+    startIndex = (total > viewCount) ? (total - viewCount) : 0;
+  }
+
+  std::span<const CityHistorySample> view(m_cityHistory.data() + startIndex, static_cast<std::size_t>(viewCount));
+
+
+  if (exportPressed) {
+    exportCityReport(startIndex, viewCount);
+  }
+
+  int cursorIndexView = -1;
+  if (m_reportCursorAbs >= startIndex && m_reportCursorAbs < startIndex + viewCount) {
+    cursorIndexView = m_reportCursorAbs - startIndex;
+  }
+
   if (m_reportPage == 0) {
     DrawHistoryGraph(view, r1, "Population", [](const CityHistorySample& s) { return static_cast<float>(s.population); },
-                     0.0f, 0.0f, false, "Latest: %.0f");
+                     0.0f, 0.0f, false, "Latest: %.0f", /*percent=*/false, cursorIndexView);
     DrawHistoryGraph(view, r2, "Happiness", [](const CityHistorySample& s) { return s.happiness; }, 0.0f, 1.0f, true,
-                     "Latest: %.0f%%", true);
-    DrawHistoryGraphRCI(view, r3);
+                     "Latest: %.0f%%", /*percent=*/true, cursorIndexView);
+    DrawHistoryGraphRCI(view, r3, cursorIndexView);
   } else if (m_reportPage == 1) {
     DrawHistoryGraph(view, r1, "Money", [](const CityHistorySample& s) { return static_cast<float>(s.money); }, 0.0f, 0.0f,
-                     false, "Latest: %.0f");
+                     false, "Latest: %.0f", /*percent=*/false, cursorIndexView);
     DrawHistoryGraph(view, r2, "Income", [](const CityHistorySample& s) { return static_cast<float>(s.income); }, 0.0f, 0.0f,
-                     false, "Latest: %.0f");
+                     false, "Latest: %.0f", /*percent=*/false, cursorIndexView);
     DrawHistoryGraph(view, r3, "Expenses", [](const CityHistorySample& s) { return static_cast<float>(s.expenses); }, 0.0f, 0.0f,
-                     false, "Latest: %.0f");
+                     false, "Latest: %.0f", /*percent=*/false, cursorIndexView);
   } else if (m_reportPage == 2) {
     DrawHistoryGraph(view, r1, "Commuters", [](const CityHistorySample& s) { return static_cast<float>(s.commuters); }, 0.0f, 0.0f,
-                     false, "Latest: %.0f");
+                     false, "Latest: %.0f", /*percent=*/false, cursorIndexView);
     DrawHistoryGraph(view, r2, "Avg commute (time)", [](const CityHistorySample& s) { return s.avgCommuteTime; }, 0.0f, 0.0f,
-                     false, "Latest: %.1f");
+                     false, "Latest: %.1f", /*percent=*/false, cursorIndexView);
     DrawHistoryGraph(view, r3, "Congestion", [](const CityHistorySample& s) { return s.trafficCongestion; }, 0.0f, 1.0f, true,
-                     "Latest: %.0f%%", true);
+                     "Latest: %.0f%%", /*percent=*/true, cursorIndexView);
   } else if (m_reportPage == 3) {
     DrawHistoryGraph(view, r1, "Avg land value", [](const CityHistorySample& s) { return s.avgLandValue; }, 0.0f, 1.0f, true,
-                     "Latest: %.0f%%", true);
+                     "Latest: %.0f%%", /*percent=*/true, cursorIndexView);
     DrawHistoryGraph(view, r2, "Tax per capita", [](const CityHistorySample& s) { return s.avgTaxPerCapita; }, 0.0f, 0.0f, false,
-                     "Latest: %.2f");
+                     "Latest: %.2f", /*percent=*/false, cursorIndexView);
     DrawHistoryGraph(view, r3, "Goods satisfaction", [](const CityHistorySample& s) { return s.goodsSatisfaction; }, 0.0f, 1.0f, true,
-                     "Latest: %.0f%%", true);
+                     "Latest: %.0f%%", /*percent=*/true, cursorIndexView);
   } else {
     // Districts table
     const SimConfig& cfg = m_sim.config();
@@ -20673,10 +21496,15 @@ void Game::drawReportPanel(int /*screenW*/, int /*screenH*/)
       const DistrictSummary& s = ds.districts[static_cast<std::size_t>(d)];
       const int rowY = rowStartY + d * rowH;
 
-      if (d == std::clamp(m_activeDistrict, 0, kDistrictCount - 1)) {
-        const Rectangle rr{static_cast<float>(x0 + 8), static_cast<float>(rowY - 2),
+      const Rectangle rowR{static_cast<float>(x0 + 8), static_cast<float>(rowY - 2),
                            static_cast<float>(panelW - 16), static_cast<float>(rowH)};
-        ui::DrawSelectionHighlight(rr, uiTime, /*strong=*/false);
+
+      if (d == std::clamp(m_activeDistrict, 0, kDistrictCount - 1)) {
+        ui::DrawSelectionHighlight(rowR, uiTime, /*strong=*/false);
+      }
+
+      if (CheckCollisionPointRec(mouseUi, rowR) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        m_activeDistrict = d;
       }
 
       ui::Text(tableX, rowY, font, TextFormat("%d", d), uiTh.text, /*bold=*/false, /*shadow=*/true, 1);
@@ -20713,15 +21541,167 @@ void Game::drawReportPanel(int /*screenW*/, int /*screenH*/)
              uiTh.textFaint, /*bold=*/false, /*shadow=*/true, 1);
   }
 
-  // Footer: day range / help
-  if (!view.empty()) {
-    const int d0 = view.front().day;
-    const int d1 = view.back().day;
-    ui::Text(x0 + 12, y0 + panelH - 22, 13,
-             TextFormat("Days: %d..%d  (showing %d / stored %d)   Tab: cycle   F1: toggle",
-                        d0, d1, static_cast<int>(view.size()), static_cast<int>(m_cityHistory.size())),
-             uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
+  // Tooltip with exact values for the current cursor.
+  if (m_reportPage != 4 && m_reportCursorAbs >= 0 && m_reportCursorAbs < total) {
+    const CityHistorySample& s = m_cityHistory[static_cast<std::size_t>(m_reportCursorAbs)];
+
+    std::vector<std::string> lines;
+    lines.emplace_back(TextFormat("Day %d%s", s.day, m_reportCursorPinned ? " (pinned)" : ""));
+
+    if (m_reportPage == 0) {
+      lines.emplace_back(TextFormat("Pop: %d", s.population));
+      lines.emplace_back(TextFormat("Happiness: %.0f%%", static_cast<double>(s.happiness) * 100.0));
+      lines.emplace_back(TextFormat("Demand: R %.0f%%  C %.0f%%  I %.0f%%",
+                                    static_cast<double>(s.demandResidential) * 100.0,
+                                    static_cast<double>(s.demandCommercial) * 100.0,
+                                    static_cast<double>(s.demandIndustrial) * 100.0));
+    } else if (m_reportPage == 1) {
+      lines.emplace_back(TextFormat("Money: %d", s.money));
+      lines.emplace_back(TextFormat("Income: %d", s.income));
+      lines.emplace_back(TextFormat("Expenses: %d", s.expenses));
+    } else if (m_reportPage == 2) {
+      lines.emplace_back(TextFormat("Commuters: %d", s.commuters));
+      lines.emplace_back(TextFormat("Avg commute: %.1f", static_cast<double>(s.avgCommuteTime)));
+      lines.emplace_back(TextFormat("Congestion: %.0f%%", static_cast<double>(s.trafficCongestion) * 100.0));
+    } else if (m_reportPage == 3) {
+      lines.emplace_back(TextFormat("Land value: %.0f%%", static_cast<double>(s.avgLandValue) * 100.0));
+      lines.emplace_back(TextFormat("Tax/capita: %.2f", static_cast<double>(s.avgTaxPerCapita)));
+      lines.emplace_back(TextFormat("Goods: %.0f%%", static_cast<double>(s.goodsSatisfaction) * 100.0));
+    }
+
+    const int font = 14;
+    const int pad = 8;
+    int w = 0;
+    for (const std::string& line : lines) {
+      w = std::max(w, ui::MeasureTextWidth(line, font, /*bold=*/false, 1));
+    }
+    const int lineH = ui::MeasureTextHeight(font) + 2;
+    const float tipW = static_cast<float>(w + pad * 2);
+    const float tipH = static_cast<float>(pad * 2 + static_cast<int>(lines.size()) * lineH);
+
+    float tx = m_reportCursorPinned ? (panelR.x + panelR.width - 12.0f - tipW) : (mouseUi.x + 14.0f);
+    float ty = m_reportCursorPinned ? (r1.y + 6.0f) : (mouseUi.y + 14.0f);
+
+    tx = std::clamp(tx, panelR.x + 8.0f, panelR.x + panelR.width - tipW - 8.0f);
+    ty = std::clamp(ty, panelR.y + 60.0f, panelR.y + panelR.height - tipH - 30.0f);
+
+    const Rectangle tipR{tx, ty, tipW, tipH};
+    ui::DrawPanelInset(tipR, uiTime, /*active=*/true);
+
+    float yy = ty + static_cast<float>(pad);
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+      const Color c = (i == 0) ? uiTh.accent : uiTh.text;
+      ui::Text(static_cast<int>(tx) + pad, static_cast<int>(yy), font, lines[i], c,
+               /*bold=*/(i == 0), /*shadow=*/true, 1);
+      yy += static_cast<float>(lineH);
+    }
   }
+
+  // Footer.
+  const int d0 = view[0].day;
+  const int d1 = view[static_cast<std::size_t>(viewCount - 1)].day;
+
+  std::string rangeLabel;
+  if (m_reportRangeDays == 0) {
+    rangeLabel = "All";
+  } else if (m_reportRangeDays == 30) {
+    rangeLabel = "30d";
+  } else if (m_reportRangeDays == 60) {
+    rangeLabel = "60d";
+  } else if (m_reportRangeDays == 120) {
+    rangeLabel = "120d";
+  } else {
+    rangeLabel = std::to_string(m_reportRangeDays) + "d";
+  }
+
+  ui::Text(x0 + 12, y0 + panelH - 22, fontSmall,
+           TextFormat("Days: %d..%d  (showing %d / stored %d)   Range: %s   Hover graph for values; click to pin   Tab: cycle   F1: toggle",
+                      d0, d1, viewCount, total, rangeLabel.c_str()),
+           uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
+}
+
+
+
+
+Rectangle Game::videoSettingsPanelRect(int uiW, int uiH) const
+{
+  const int rowH = 22;
+
+  auto rowsForPage = [](int page) -> int {
+    if (page == 0) return 11;
+    if (page == 1) return 57;
+    if (page == 2) return 19;
+    return 11; // UI Theme
+  };
+
+  const int rows = rowsForPage(m_videoPage);
+
+  const int margin = kUiPanelMargin;
+
+  // Width clamps: prefer a comfortable min, but never exceed the available screen width.
+  const int panelMinW = 360;
+  const int panelMaxW = 640;
+
+  int availW = (uiW > 0) ? (uiW - margin * 2) : panelMaxW;
+  availW = std::max(0, availW);
+
+  int panelW = std::min(panelMaxW, availW);
+  if (availW >= panelMinW) panelW = std::max(panelW, panelMinW);
+
+  // Desired height: header + tabs + help + list + footer.
+  const int tabH = 18;
+  const int gapAfterTabs = 6;
+  const int helpH = 22;
+  const int listPadH = 12; // view padding top+bottom inside inset
+  const int footerH = 28;
+
+  const int baseH = 42 + tabH + gapAfterTabs + helpH + listPadH + footerH;
+  const int desiredH = baseH + rows * rowH;
+
+  int x0 = margin;
+  int y0 = kUiPanelTopY;
+
+  // Avoid overlapping the report panel (top-left) when possible; match its clamped height.
+  if (m_showReport) {
+    int reportH = 420;
+    if (uiH > 0) {
+      reportH = std::min(reportH, std::max(0, uiH - y0 - margin));
+    }
+    y0 += reportH + margin;
+  }
+
+  int panelH = desiredH;
+
+  if (uiH > 0) {
+    const int maxHScreen = std::max(0, uiH - margin * 2);
+    const int maxHBelow = std::max(0, uiH - y0 - margin);
+
+    // Minimum height that can still show header/tabs/help + a single row.
+    const int minListH = rowH + listPadH;
+    const int minUsefulH = 42 + tabH + gapAfterTabs + helpH + minListH + footerH;
+
+    if (maxHBelow >= minUsefulH) {
+      // If we can fit below the report panel, stay below it (scrollbar handles the rest).
+      panelH = std::min(desiredH, maxHBelow);
+      panelH = std::max(panelH, minUsefulH);
+    } else {
+      // Otherwise, grow as much as possible and slide up (may overlap report if necessary).
+      panelH = std::min(desiredH, maxHScreen);
+      panelH = std::max(panelH, std::min(minUsefulH, maxHScreen));
+
+      if (y0 + panelH > uiH - margin) {
+        y0 = std::max(margin, uiH - panelH - margin);
+      }
+    }
+
+    // Final clamp to keep on-screen.
+    if (y0 + panelH > uiH - margin) {
+      y0 = std::max(margin, uiH - panelH - margin);
+    }
+  }
+
+  return Rectangle{static_cast<float>(x0), static_cast<float>(y0), static_cast<float>(panelW),
+                   static_cast<float>(panelH)};
 }
 
 void Game::drawVideoSettingsPanel(int uiW, int uiH)
@@ -20730,33 +21710,19 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
 
   const float uiTime = static_cast<float>(GetTime());
   const ui::Theme& uiTh = ui::GetTheme();
+  const Vector2 mouseUi = mouseUiPosition(m_uiScale);
 
-  const int panelMaxW = 620;
-  const int panelMinW = 420;
-  const int availW = std::max(0, uiW - 24);
-  const int panelW = std::max(std::min(panelMaxW, availW), std::min(panelMinW, availW));
   const int rowH = 22;
-  const int rows = (m_videoPage == 0)   ? 11
-                   : (m_videoPage == 1) ? 57
-                   : (m_videoPage == 2) ? 19
-                                        : 11;
-  const int panelH = 64 + rows * rowH + 28;
+  auto rowsForPage = [](int page) -> int {
+    if (page == 0) return 11;
+    if (page == 1) return 57;
+    if (page == 2) return 19;
+    return 11;
+  };
 
-  const int x0 = 12;
-  int y0 = 96;
+  const int rows = rowsForPage(m_videoPage);
 
-  // Avoid overlapping the report panel (which also lives on the left).
-  if (m_showReport) {
-    y0 += 420 + 12;
-  }
-
-  // Clamp to screen height.
-  if (y0 + panelH > uiH - 12) {
-    y0 = std::max(12, uiH - panelH - 12);
-  }
-
-  const Rectangle panelR{static_cast<float>(x0), static_cast<float>(y0), static_cast<float>(panelW),
-                         static_cast<float>(panelH)};
+  const Rectangle panelR = videoSettingsPanelRect(uiW, uiH);
   ui::DrawPanel(panelR, uiTime, /*active=*/true);
 
   const char* title = (m_videoPage == 0)   ? "Video / Display"
@@ -20765,52 +21731,173 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
                                            : "Video / UI Theme";
   ui::DrawPanelHeader(panelR, title, uiTime, /*active=*/true, /*titleSizePx=*/22);
 
-  const int x = x0 + 12;
-  int y = y0 + 42;
+  // Close button.
+  {
+    const Rectangle br{panelR.x + panelR.width - 30.0f, panelR.y + 8.0f, 22.0f, 18.0f};
+    if (ui::Button(9300, br, "X", mouseUi, uiTime, /*enabled=*/true, /*primary=*/false)) {
+      m_showVideoSettings = false;
+      ui::ClearActiveWidget();
+      return;
+    }
+  }
 
-  ui::Text(x, y, 15,
-           "Tab: select  |  [ / ]: adjust/toggle  |  Shift: coarse  |  F8: close  |  Shift+F8: next page  |  Ctrl+F8: UI Theme  |  Ctrl+Shift+F8: Atmosphere",
+  auto setPage = [&](int newPage) {
+    newPage = std::clamp(newPage, 0, 3);
+    if (newPage == m_videoPage) return;
+
+    // Store selection for current page.
+    if (m_videoPage == 0) m_videoSelectionDisplay = m_videoSelection;
+    if (m_videoPage == 1) m_videoSelectionVisual = m_videoSelection;
+    if (m_videoPage == 2) m_videoSelectionAtmos = m_videoSelection;
+    if (m_videoPage == 3) m_videoSelectionUiTheme = m_videoSelection;
+
+    m_videoPage = newPage;
+
+    // Restore selection for new page.
+    if (m_videoPage == 0) m_videoSelection = m_videoSelectionDisplay;
+    if (m_videoPage == 1) m_videoSelection = m_videoSelectionVisual;
+    if (m_videoPage == 2) m_videoSelection = m_videoSelectionAtmos;
+    if (m_videoPage == 3) m_videoSelection = m_videoSelectionUiTheme;
+
+    ui::ClearActiveWidget();
+  };
+
+  const int x0 = static_cast<int>(panelR.x);
+  const int y0 = static_cast<int>(panelR.y);
+  const int panelW = static_cast<int>(panelR.width);
+  const int panelH = static_cast<int>(panelR.height);
+
+  // Tabs (mouse-friendly page switcher).
+  const int tabH = 18;
+  const int tabGap = 6;
+  const int tabCount = 4;
+  const int tabAreaW = std::max(0, panelW - 24);
+  int tabW = (tabAreaW - tabGap * (tabCount - 1)) / tabCount;
+  tabW = std::max(1, tabW);
+  const int tabX0 = x0 + 12;
+  const int tabY = y0 + 42;
+
+  struct Tab { const char* label; int page; };
+  const Tab tabs[4] = {
+    {"Display", 0},
+    {"Visual FX", 1},
+    {"Atmos", 2},
+    {"UI Theme", 3},
+  };
+
+  for (int i = 0; i < tabCount; ++i) {
+    const int tx = tabX0 + i * (tabW + tabGap);
+    const Rectangle br{static_cast<float>(tx), static_cast<float>(tabY), static_cast<float>(tabW),
+                       static_cast<float>(tabH)};
+    const bool active = (m_videoPage == tabs[i].page);
+    if (ui::Button(9310 + i, br, tabs[i].label, mouseUi, uiTime, /*enabled=*/true, /*primary=*/active)) {
+      setPage(tabs[i].page);
+      return; // re-layout next frame
+    }
+  }
+
+  int y = tabY + tabH + 6;
+
+  ui::Text(x0 + 12, y, 15,
+           "Wheel: select  |  Click: select  |  Tab: cycle  |  [ / ]: adjust/toggle  |  Shift: coarse  |  F8: close",
            uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
   y += 22;
 
-  // List inset
+  // Scrollable list inset.
+  const int footerH = 28;
+  const int listHAvail = panelH - (y - y0) - footerH;
+  const int listH = std::max(0, listHAvail);
+
+  if (listH < 20) {
+    // Not enough vertical space to draw a usable list.
+    const float fps = 1.0f / std::max(0.0001f, m_frameTimeSmoothed);
+    const char* rtStr =
+      wantsWorldRenderTarget() ? TextFormat("%dx%d", m_worldRenderRTWidth, m_worldRenderRTHeight) : "native";
+    ui::Text(x0 + 12, y0 + panelH - 22, 14, TextFormat("Smoothed FPS: %.1f    World RT: %s", fps, rtStr),
+             uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
+    return;
+  }
+
   const Rectangle listR{static_cast<float>(x0 + 12), static_cast<float>(y), static_cast<float>(panelW - 24),
-                        static_cast<float>(rows * rowH + 8)};
+                        static_cast<float>(listH)};
   ui::DrawPanelInset(listR, uiTime, /*active=*/true);
 
-  const Vector2 mouseUi = mouseUiPosition(m_uiScale);
-  int rowY = y + 4;
+  const Rectangle viewR{listR.x + 6.0f, listR.y + 6.0f, listR.width - 12.0f, listR.height - 12.0f};
+  constexpr float kSbW = 12.0f;
+  const Rectangle barR{viewR.x + viewR.width - kSbW, viewR.y, kSbW, viewR.height};
+  const Rectangle contentR = ui::ContentRectWithScrollbar(viewR, kSbW, 2.0f);
 
-  auto rowRectFor = [&](int yRow) -> Rectangle {
-    return Rectangle{static_cast<float>(x0 + 14), static_cast<float>(yRow - 2), static_cast<float>(panelW - 28),
-                     static_cast<float>(rowH)};
+  const int visibleRows = std::max(1, static_cast<int>(std::floor(contentR.height / static_cast<float>(rowH))));
+
+  // Select scroll state for current page.
+  int* scrollPtr = nullptr;
+  if (m_videoPage == 0) scrollPtr = &m_videoScrollDisplay;
+  else if (m_videoPage == 1) scrollPtr = &m_videoScrollVisual;
+  else if (m_videoPage == 2) scrollPtr = &m_videoScrollAtmos;
+  else scrollPtr = &m_videoScrollUiTheme;
+
+  int& first = *scrollPtr;
+  const int maxFirst = std::max(0, rows - visibleRows);
+  first = std::clamp(first, 0, maxFirst);
+
+  auto setSelection = [&](int idx) {
+    idx = std::clamp(idx, 0, std::max(0, rows - 1));
+    m_videoSelection = idx;
+    if (m_videoPage == 0) m_videoSelectionDisplay = idx;
+    if (m_videoPage == 1) m_videoSelectionVisual = idx;
+    if (m_videoPage == 2) m_videoSelectionAtmos = idx;
+    if (m_videoPage == 3) m_videoSelectionUiTheme = idx;
   };
 
-  auto drawRow = [&](int idx, std::string_view label, std::string_view value, bool dim = false) {
-    const bool selected = (m_videoSelection == idx);
-    const Rectangle rr = rowRectFor(rowY);
+  // Mouse wheel selection, only when hovering the list.
+  const bool hoverList = CheckCollisionPointRec(mouseUi, viewR);
+  const float wheel = GetMouseWheelMove();
+  if (hoverList && wheel != 0.0f && rows > 0) {
+    const int step = (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) ? 3 : 1;
+    const int delta = (wheel > 0.0f) ? -step : step;
+    setSelection(m_videoSelection + delta);
+  }
 
-    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouseUi, rr)) {
-      m_videoSelection = idx;
-      if (m_videoPage == 0) m_videoSelectionDisplay = idx;
-      if (m_videoPage == 1) m_videoSelectionVisual = idx;
-      if (m_videoPage == 2) m_videoSelectionAtmos = idx;
-      if (m_videoPage == 3) m_videoSelectionUiTheme = idx;
+  // Ensure selection stays in range and visible.
+  m_videoSelection = std::clamp(m_videoSelection, 0, std::max(0, rows - 1));
+  if (m_videoSelection < first) first = m_videoSelection;
+  if (m_videoSelection >= first + visibleRows) first = m_videoSelection - visibleRows + 1;
+  first = std::clamp(first, 0, maxFirst);
+
+  auto rowVisible = [&](int idx) -> bool { return idx >= first && idx < first + visibleRows; };
+  auto rowRectFor = [&](int idx) -> Rectangle {
+    const int ry = static_cast<int>(contentR.y) + (idx - first) * rowH;
+    return Rectangle{contentR.x, static_cast<float>(ry), contentR.width, static_cast<float>(rowH)};
+  };
+
+  const int xLabel = static_cast<int>(contentR.x) + 6;
+  const int xValueRight = static_cast<int>(contentR.x + contentR.width) - 6;
+
+  const bool leftPressed = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+
+  auto drawRow = [&](int idx, std::string_view label, std::string_view value, bool dim = false) {
+    if (!rowVisible(idx)) return;
+    const Rectangle rr = rowRectFor(idx);
+    const bool selected = (m_videoSelection == idx);
+
+    if (leftPressed && CheckCollisionPointRec(mouseUi, rr)) {
+      setSelection(idx);
     }
 
     if (selected) {
-      ui::DrawSelectionHighlight(rr, uiTime, /*strong=*/true);
+      ui::DrawSelectionHighlight(Rectangle{rr.x - 2.0f, rr.y + 1.0f, rr.width + 4.0f, rr.height - 2.0f}, uiTime,
+                                 /*strong=*/true);
     }
 
     Color c = dim ? uiTh.textFaint : uiTh.textDim;
     if (selected) {
-      c = uiTh.text;
+      c = dim ? uiTh.textFaint : uiTh.text;
     }
 
-    ui::Text(x, rowY, 16, label, c, /*bold=*/false, /*shadow=*/true, 1);
+    const int ry = static_cast<int>(rr.y) + 3;
+    ui::Text(xLabel, ry, 16, label, c, /*bold=*/false, /*shadow=*/true, 1);
     const int valW = ui::MeasureTextWidth(value, 16, /*bold=*/false, 1);
-    ui::Text(x0 + panelW - 12 - valW, rowY, 16, value, c, /*bold=*/false, /*shadow=*/true, 1);
-    rowY += rowH;
+    ui::Text(xValueRight - valW, ry, 16, value, c, /*bold=*/false, /*shadow=*/true, 1);
   };
 
   if (m_videoPage == 0) {
@@ -20819,7 +21906,7 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
     drawRow(1, "Borderless windowed", m_borderlessWindowed ? "On" : "Off");
     drawRow(2, "VSync", m_cfg.vsync ? "On" : "Off");
     drawRow(3, "UI scale mode", m_uiScaleAuto ? "Auto" : "Manual");
-    drawRow(4, "UI scale", TextFormat("%.2fx", m_uiScale), !m_uiScaleAuto);
+    drawRow(4, "UI scale", TextFormat("%.2fx", m_uiScale), m_uiScaleAuto);
 
     drawRow(5, "World render mode", m_worldRenderScaleAuto ? "Auto" : "Manual");
     drawRow(6, "World render scale", TextFormat("%.0f%%", m_worldRenderScale * 100.0f), m_worldRenderScaleAuto);
@@ -20875,30 +21962,34 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
     drawRow(10, "Shadow direction", TextFormat("%.0f°", sh.azimuthDeg), !sh.enabled);
 
     drawRow(11, "Day/night cycle", onOff(dn.enabled));
-    drawRow(12, "Day length", TextFormat("%.0f s", dn.dayLengthSec), !dn.enabled);
-    drawRow(13, "Time offset", TextFormat("%.0f s", dn.timeOffsetSec), !dn.enabled);
-    drawRow(14, "Night darken", TextFormat("%.0f%%", dn.nightDarken * 100.0f), !dn.enabled);
-    drawRow(15, "Dusk tint", TextFormat("%.0f%%", dn.duskTint * 100.0f), !dn.enabled);
-    drawRow(16, "Night lights", onOff(dn.drawLights), !dn.enabled);
+    drawRow(12, "Time of day", TextFormat("%.1f h", dn.timeOfDayHours), !dn.enabled);
+    drawRow(13, "Day length", TextFormat("%.1f min", dn.dayLengthMinutes), !dn.enabled);
 
-    drawRow(17, "Weather mode", weatherModeStr(wx.mode));
-    drawRow(18, "Intensity", TextFormat("%.0f%%", wx.intensity * 100.0f), wx.mode == Renderer::WeatherSettings::Mode::Clear);
-    drawRow(19, "Wind dir", TextFormat("%.0f°", wx.windAngleDeg), wx.mode == Renderer::WeatherSettings::Mode::Clear);
-    drawRow(20, "Wind speed", TextFormat("%.2fx", wx.windSpeed), wx.mode == Renderer::WeatherSettings::Mode::Clear);
-    drawRow(21, "Overcast", TextFormat("%.0f%%", wx.overcast * 100.0f), wx.mode == Renderer::WeatherSettings::Mode::Clear);
-    drawRow(22, "Fog", TextFormat("%.0f%%", wx.fog * 100.0f), wx.mode == Renderer::WeatherSettings::Mode::Clear);
-    drawRow(23, "Particles", onOff(wx.drawParticles), wx.mode == Renderer::WeatherSettings::Mode::Clear);
-    drawRow(24, "Ground effects", onOff(wx.affectGround), wx.mode == Renderer::WeatherSettings::Mode::Clear);
-    drawRow(25, "Reflect lights", onOff(wx.reflectLights),
-            (wx.mode != Renderer::WeatherSettings::Mode::Rain) || (wx.mode == Renderer::WeatherSettings::Mode::Clear));
+    drawRow(14, "Weather mode", weatherModeStr(wx.mode));
+    drawRow(15, "Weather intensity", TextFormat("%.0f%%", wx.intensity * 100.0f),
+            (wx.mode == Renderer::WeatherSettings::Mode::Clear));
+    drawRow(16, "Weather speed", TextFormat("%.1fx", wx.speed), (wx.mode == Renderer::WeatherSettings::Mode::Clear));
 
-    // Post FX (stylized)
-    const char* postFxStatus =
-      (!m_postFx.enabled) ? "Off" : (m_postFxPipeline.isReady() ? "On" : "On (fallback)");
-    drawRow(26, "Post FX", postFxStatus);
-    drawRow(27, "Color bits", TextFormat("%d", m_postFx.colorBits), !m_postFx.enabled);
-    drawRow(28, "Dither strength", TextFormat("%.0f%%", m_postFx.ditherStrength * 100.0f), !m_postFx.enabled);
-    drawRow(29, "Film grain", TextFormat("%.0f%%", m_postFx.grain * 100.0f), !m_postFx.enabled);
+    drawRow(17, "Post FX", onOff(m_postFx.enabled));
+    drawRow(18, "Pixelate", TextFormat("%.0f%%", m_postFx.pixelate * 100.0f), !m_postFx.enabled);
+    drawRow(19, "Pixel size", TextFormat("%.1f px", m_postFx.pixelSize),
+            (!m_postFx.enabled || m_postFx.pixelate < 0.001f));
+    drawRow(20, "Dither", TextFormat("%.0f%%", m_postFx.dither * 100.0f), !m_postFx.enabled);
+    drawRow(21, "Dither size", TextFormat("%.1f px", m_postFx.ditherSize),
+            (!m_postFx.enabled || m_postFx.dither < 0.001f));
+    drawRow(22, "CRT curvature", TextFormat("%.0f%%", m_postFx.crtCurve * 100.0f), !m_postFx.enabled);
+    drawRow(23, "CRT vignette", TextFormat("%.0f%%", m_postFx.crtVignette * 100.0f), !m_postFx.enabled);
+    drawRow(24, "Scan flicker", TextFormat("%.0f%%", m_postFx.scanFlicker * 100.0f), !m_postFx.enabled);
+    drawRow(25, "Noise", TextFormat("%.0f%%", m_postFx.noise * 100.0f), !m_postFx.enabled);
+    drawRow(26, "Noise speed", TextFormat("%.1fx", m_postFx.noiseSpeed),
+            (!m_postFx.enabled || m_postFx.noise < 0.001f));
+
+    drawRow(27, "Distortion", TextFormat("%.0f%%", m_postFx.distort * 100.0f), !m_postFx.enabled);
+    drawRow(28, "Distort freq", TextFormat("%.1fx", m_postFx.distortFreq),
+            (!m_postFx.enabled || m_postFx.distort < 0.001f));
+    drawRow(29, "Distort speed", TextFormat("%.1fx", m_postFx.distortSpeed),
+            (!m_postFx.enabled || m_postFx.distort < 0.001f));
+
     drawRow(30, "Vignette", TextFormat("%.0f%%", m_postFx.vignette * 100.0f), !m_postFx.enabled);
     drawRow(31, "Chroma aberration", TextFormat("%.0f%%", m_postFx.chroma * 100.0f), !m_postFx.enabled);
     drawRow(32, "Scanlines", TextFormat("%.0f%%", m_postFx.scanlines * 100.0f), !m_postFx.enabled);
@@ -20921,7 +22012,7 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
     drawRow(42, "Bloom radius", TextFormat("%.2fx", m_postFx.bloomRadius), !m_postFx.enabled);
     drawRow(43, "Bloom downsample", TextFormat("%dx", m_postFx.bloomDownsample), !m_postFx.enabled);
 
-    // Filmic tonemap + grade
+    // Filmic tonemap + grade.
     drawRow(44, "Filmic tonemap", onOff(m_postFx.tonemapEnabled), !m_postFx.enabled);
     drawRow(45, "Exposure", TextFormat("%.2fx", m_postFx.exposure),
             (!m_postFx.enabled || !m_postFx.tonemapEnabled));
@@ -20930,14 +22021,14 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
     drawRow(47, "Saturation", TextFormat("%.2fx", m_postFx.saturation),
             (!m_postFx.enabled || !m_postFx.tonemapEnabled));
 
-    // Screen-space outlines
+    // Screen-space outlines.
     drawRow(48, "Outlines", TextFormat("%.0f%%", m_postFx.outline * 100.0f), !m_postFx.enabled);
     drawRow(49, "Outline threshold", TextFormat("%.0f%%", m_postFx.outlineThreshold * 100.0f),
             (!m_postFx.enabled || m_postFx.outline < 0.001f));
     drawRow(50, "Outline thickness", TextFormat("%.2f px", m_postFx.outlineThickness),
             (!m_postFx.enabled || m_postFx.outline < 0.001f));
 
-    // Lens precipitation (rain on lens / wet camera)
+    // Lens precipitation (rain on lens / wet camera).
     drawRow(51, "Lens rain", TextFormat("%.0f%%", m_postFx.lensWeather * 100.0f), !m_postFx.enabled);
     drawRow(52, "Lens distort", TextFormat("%.0f%%", m_postFx.lensDistort * 100.0f),
             (!m_postFx.enabled || m_postFx.lensWeather < 0.001f));
@@ -20959,124 +22050,140 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
 
     auto onOff = [](bool v) -> const char* { return v ? "On" : "Off"; };
 
-    const int xLabel = x;
-    const int xValueRight = x0 + panelW - 12;
-    const int xSlider = x0 + 270;
-    const int sliderW = std::max(80, (xValueRight - 90) - xSlider);
     const int sliderH = 12;
+    const int sliderMinW = 80;
+
+    int xSlider = x0 + 270;
+    xSlider = std::min(xSlider, xValueRight - 90 - sliderMinW);
+    xSlider = std::max(xSlider, xLabel + 160);
+
+    const int sliderW = std::max(sliderMinW, (xValueRight - 90) - xSlider);
+
+    auto rowSelect = [&](int idx, const Rectangle& rr) {
+      if (leftPressed && CheckCollisionPointRec(mouseUi, rr)) {
+        setSelection(idx);
+      }
+    };
 
     auto drawSliderRow = [&](int idx, std::string_view label, float& v, float vMin, float vMax,
                              std::string_view valueText, bool enabled = true) {
+      if (!rowVisible(idx)) return;
+      const Rectangle rr = rowRectFor(idx);
+      rowSelect(idx, rr);
+
       const bool selected = (m_videoSelection == idx);
-      const Rectangle rr = rowRectFor(rowY);
-
-      if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouseUi, rr)) {
-        m_videoSelection = idx;
-        m_videoSelectionAtmos = idx;
-      }
-
       if (selected) {
-        ui::DrawSelectionHighlight(rr, uiTime, /*strong=*/true);
+        ui::DrawSelectionHighlight(Rectangle{rr.x - 2.0f, rr.y + 1.0f, rr.width + 4.0f, rr.height - 2.0f}, uiTime,
+                                   /*strong=*/true);
       }
 
       Color c = enabled ? uiTh.textDim : uiTh.textFaint;
       if (selected) c = enabled ? uiTh.text : uiTh.textFaint;
 
-      ui::Text(xLabel, rowY, 16, label, c, /*bold=*/false, /*shadow=*/true, 1);
+      const int ry = static_cast<int>(rr.y) + 3;
+      ui::Text(xLabel, ry, 16, label, c, /*bold=*/false, /*shadow=*/true, 1);
 
-      const Rectangle sr{static_cast<float>(xSlider), static_cast<float>(rowY + (rowH - sliderH) / 2),
+      const Rectangle sr{static_cast<float>(xSlider), rr.y + (rr.height - static_cast<float>(sliderH)) * 0.5f,
                          static_cast<float>(sliderW), static_cast<float>(sliderH)};
       if (ui::SliderFloat(4200 + idx, sr, v, vMin, vMax, mouseUi, uiTime, enabled)) {
         changed = true;
       }
 
       const int valW = ui::MeasureTextWidth(valueText, 16, /*bold=*/false, 1);
-      ui::Text(xValueRight - valW, rowY, 16, valueText, c, /*bold=*/false, /*shadow=*/true, 1);
-      rowY += rowH;
+      ui::Text(xValueRight - valW, ry, 16, valueText, c, /*bold=*/false, /*shadow=*/true, 1);
     };
 
     auto drawToggleRow = [&](int idx, std::string_view label, bool& v, std::string_view valueText,
                              bool enabled = true) {
+      if (!rowVisible(idx)) return;
+      const Rectangle rr = rowRectFor(idx);
+      rowSelect(idx, rr);
+
       const bool selected = (m_videoSelection == idx);
-      const Rectangle rr = rowRectFor(rowY);
-
-      if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouseUi, rr)) {
-        m_videoSelection = idx;
-        m_videoSelectionAtmos = idx;
-      }
-
       if (selected) {
-        ui::DrawSelectionHighlight(rr, uiTime, /*strong=*/true);
+        ui::DrawSelectionHighlight(Rectangle{rr.x - 2.0f, rr.y + 1.0f, rr.width + 4.0f, rr.height - 2.0f}, uiTime,
+                                   /*strong=*/true);
       }
 
       Color c = enabled ? uiTh.textDim : uiTh.textFaint;
       if (selected) c = enabled ? uiTh.text : uiTh.textFaint;
 
-      ui::Text(xLabel, rowY, 16, label, c, /*bold=*/false, /*shadow=*/true, 1);
+      const int ry = static_cast<int>(rr.y) + 3;
+      ui::Text(xLabel, ry, 16, label, c, /*bold=*/false, /*shadow=*/true, 1);
 
-      const Rectangle tr{static_cast<float>(xValueRight - 44), static_cast<float>(rowY + 3), 44.0f,
-                         static_cast<float>(rowH - 6)};
+      const Rectangle tr{static_cast<float>(xValueRight - 44), rr.y + 3.0f, 44.0f, rr.height - 6.0f};
       if (ui::Toggle(4000 + idx, tr, v, mouseUi, uiTime, enabled)) {
         changed = true;
       }
 
       const int valW = ui::MeasureTextWidth(valueText, 16, /*bold=*/false, 1);
-      ui::Text(xValueRight - 52 - valW, rowY, 16, valueText, c, /*bold=*/false, /*shadow=*/true, 1);
-      rowY += rowH;
+      ui::Text(xValueRight - 52 - valW, ry, 16, valueText, c, /*bold=*/false, /*shadow=*/true, 1);
     };
 
     // Row indices must match adjustVideoSettings() Atmosphere page cases (0..18).
     drawToggleRow(0, "Cloud shadows", cs.enabled, onOff(cs.enabled));
-    drawSliderRow(1, "Shadow strength", cs.strength, 0.0f, 1.0f, TextFormat("%.0f%%", cs.strength * 100.0f), cs.enabled);
+    drawSliderRow(1, "Shadow strength", cs.strength, 0.0f, 1.0f, TextFormat("%.0f%%", cs.strength * 100.0f),
+                  cs.enabled);
     drawSliderRow(2, "Shadow scale", cs.scale, 0.25f, 8.0f, TextFormat("%.2fx", cs.scale), cs.enabled);
     drawSliderRow(3, "Shadow speed", cs.speed, 0.0f, 5.0f, TextFormat("%.2fx", cs.speed), cs.enabled);
     drawSliderRow(4, "Shadow evolve", cs.evolve, 0.0f, 1.0f, TextFormat("%.0f%%", cs.evolve * 100.0f), cs.enabled);
-    drawSliderRow(5, "Shadow coverage", cs.coverage, 0.0f, 1.0f, TextFormat("%.0f%%", cs.coverage * 100.0f), cs.enabled);
-    drawSliderRow(6, "Shadow softness", cs.softness, 0.0f, 1.0f, TextFormat("%.0f%%", cs.softness * 100.0f), cs.enabled);
-    drawSliderRow(7, "Clear sky", cs.clearAmount, 0.0f, 1.0f, TextFormat("%.0f%%", cs.clearAmount * 100.0f), cs.enabled);
+    drawSliderRow(5, "Shadow coverage", cs.coverage, 0.0f, 1.0f, TextFormat("%.0f%%", cs.coverage * 100.0f),
+                  cs.enabled);
+    drawSliderRow(6, "Shadow softness", cs.softness, 0.0f, 1.0f, TextFormat("%.0f%%", cs.softness * 100.0f),
+                  cs.enabled);
+    drawSliderRow(7, "Clear sky", cs.clearAmount, 0.0f, 1.0f, TextFormat("%.0f%%", cs.clearAmount * 100.0f),
+                  cs.enabled);
 
     drawToggleRow(8, "Volumetric clouds", vc.enabled, onOff(vc.enabled));
     drawSliderRow(9, "Cloud opacity", vc.opacity, 0.0f, 1.0f, TextFormat("%.0f%%", vc.opacity * 100.0f), vc.enabled);
-    drawSliderRow(10, "Cloud coverage", vc.coverage, 0.0f, 1.0f, TextFormat("%.0f%%", vc.coverage * 100.0f), vc.enabled);
+    drawSliderRow(10, "Cloud coverage", vc.coverage, 0.0f, 1.0f, TextFormat("%.0f%%", vc.coverage * 100.0f),
+                  vc.enabled);
     drawSliderRow(11, "Cloud density", vc.density, 0.0f, 2.0f, TextFormat("%.2fx", vc.density), vc.enabled);
     drawSliderRow(12, "Cloud scale", vc.scale, 0.25f, 8.0f, TextFormat("%.2fx", vc.scale), vc.enabled);
     drawSliderRow(13, "Cloud speed", vc.speed, 0.0f, 5.0f, TextFormat("%.2fx", vc.speed), vc.enabled);
-    drawSliderRow(14, "Cloud softness", vc.softness, 0.0f, 1.0f, TextFormat("%.0f%%", vc.softness * 100.0f), vc.enabled);
+    drawSliderRow(14, "Cloud softness", vc.softness, 0.0f, 1.0f, TextFormat("%.0f%%", vc.softness * 100.0f),
+                  vc.enabled);
     {
       float stepsF = static_cast<float>(vc.steps);
       drawSliderRow(15, "Cloud steps", stepsF, 8.0f, 64.0f, TextFormat("%d", vc.steps), vc.enabled);
       vc.steps = std::clamp(static_cast<int>(std::lround(stepsF)), 8, 64);
     }
-    drawSliderRow(16, "Bottom fade", vc.bottomFade, 0.0f, 1.0f, TextFormat("%.0f%%", vc.bottomFade * 100.0f), vc.enabled);
-    drawSliderRow(17, "Clear sky", vc.clearAmount, 0.0f, 1.0f, TextFormat("%.0f%%", vc.clearAmount * 100.0f), vc.enabled);
+    drawSliderRow(16, "Bottom fade", vc.bottomFade, 0.0f, 1.0f, TextFormat("%.0f%%", vc.bottomFade * 100.0f),
+                  vc.enabled);
+    drawSliderRow(17, "Clear sky", vc.clearAmount, 0.0f, 1.0f, TextFormat("%.0f%%", vc.clearAmount * 100.0f),
+                  vc.enabled);
 
     // Reset row (clickable).
     {
       const int idx = 18;
-      const bool selected = (m_videoSelection == idx);
-      const Rectangle rr = rowRectFor(rowY);
-      if (selected) {
-        ui::DrawSelectionHighlight(rr, uiTime, /*strong=*/true);
-      }
+      if (rowVisible(idx)) {
+        const Rectangle rr = rowRectFor(idx);
+        rowSelect(idx, rr);
 
-      const bool hovered = CheckCollisionPointRec(mouseUi, rr);
-      const bool click = hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
-      if (click) {
-        cs = Renderer::CloudShadowSettings{};
-        vc = Renderer::VolumetricCloudSettings{};
-        m_renderer.setCloudShadowSettings(cs);
-        m_renderer.setVolumetricCloudSettings(vc);
-        changed = false;
-        m_videoSelection = idx;
-        m_videoSelectionAtmos = idx;
-      }
+        const bool selected = (m_videoSelection == idx);
+        if (selected) {
+          ui::DrawSelectionHighlight(Rectangle{rr.x - 2.0f, rr.y + 1.0f, rr.width + 4.0f, rr.height - 2.0f}, uiTime,
+                                     /*strong=*/true);
+        }
 
-      const Color c = selected ? uiTh.text : uiTh.textDim;
-      ui::Text(xLabel, rowY, 16, "Reset atmosphere", c, /*bold=*/false, /*shadow=*/true, 1);
-      const char* val = "Click / ]";
-      const int valW = ui::MeasureTextWidth(val, 16, /*bold=*/false, 1);
-      ui::Text(xValueRight - valW, rowY, 16, val, c, /*bold=*/false, /*shadow=*/true, 1);
-      rowY += rowH;
+        const bool hovered = CheckCollisionPointRec(mouseUi, rr);
+        const bool click = hovered && leftPressed;
+        if (click) {
+          cs = Renderer::CloudShadowSettings{};
+          vc = Renderer::VolumetricCloudSettings{};
+          m_renderer.setCloudShadowSettings(cs);
+          m_renderer.setVolumetricCloudSettings(vc);
+          changed = false;
+          setSelection(idx);
+        }
+
+        const Color c = selected ? uiTh.text : uiTh.textDim;
+        const int ry = static_cast<int>(rr.y) + 3;
+        ui::Text(xLabel, ry, 16, "Reset atmosphere", c, /*bold=*/false, /*shadow=*/true, 1);
+        const char* val = "Click / ]";
+        const int valW = ui::MeasureTextWidth(val, 16, /*bold=*/false, 1);
+        ui::Text(xValueRight - valW, ry, 16, val, c, /*bold=*/false, /*shadow=*/true, 1);
+      }
     }
 
     if (changed) {
@@ -21090,68 +22197,71 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
     ui::Settings s = ui::GetSettings();
     bool changed = false;
 
-    const int xLabel = x;
-    const int xValueRight = x0 + panelW - 12;
-    const int xSlider = x0 + 260;
-    const int sliderW = std::max(80, (xValueRight - 90) - xSlider);
     const int sliderH = 12;
+    const int sliderMinW = 80;
 
-    auto drawSliderRow = [&](int idx, std::string_view label, float& v, float vMin, float vMax, std::string_view valueText,
-                             bool enabled = true) {
-      const bool selected = (m_videoSelection == idx);
-      const Rectangle rr = rowRectFor(rowY);
+    int xSlider = x0 + 260;
+    xSlider = std::min(xSlider, xValueRight - 90 - sliderMinW);
+    xSlider = std::max(xSlider, xLabel + 150);
 
-      if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouseUi, rr)) {
-        m_videoSelection = idx;
-        m_videoSelectionUiTheme = idx;
+    const int sliderW = std::max(sliderMinW, (xValueRight - 90) - xSlider);
+
+    auto rowSelect = [&](int idx, const Rectangle& rr) {
+      if (leftPressed && CheckCollisionPointRec(mouseUi, rr)) {
+        setSelection(idx);
       }
+    };
 
+    auto drawSliderRow = [&](int idx, std::string_view label, float& v, float vMin, float vMax,
+                             std::string_view valueText, bool enabled = true) {
+      if (!rowVisible(idx)) return;
+      const Rectangle rr = rowRectFor(idx);
+      rowSelect(idx, rr);
+
+      const bool selected = (m_videoSelection == idx);
       if (selected) {
-        ui::DrawSelectionHighlight(rr, uiTime, /*strong=*/true);
+        ui::DrawSelectionHighlight(Rectangle{rr.x - 2.0f, rr.y + 1.0f, rr.width + 4.0f, rr.height - 2.0f}, uiTime,
+                                   /*strong=*/true);
       }
 
       Color c = enabled ? uiTh.textDim : uiTh.textFaint;
       if (selected) c = enabled ? uiTh.text : uiTh.textFaint;
 
-      ui::Text(xLabel, rowY, 16, label, c, /*bold=*/false, /*shadow=*/true, 1);
+      const int ry = static_cast<int>(rr.y) + 3;
+      ui::Text(xLabel, ry, 16, label, c, /*bold=*/false, /*shadow=*/true, 1);
 
-      const Rectangle sr{static_cast<float>(xSlider), static_cast<float>(rowY + (rowH - sliderH) / 2),
+      const Rectangle sr{static_cast<float>(xSlider), rr.y + (rr.height - static_cast<float>(sliderH)) * 0.5f,
                          static_cast<float>(sliderW), static_cast<float>(sliderH)};
       if (ui::SliderFloat(3100 + idx, sr, v, vMin, vMax, mouseUi, uiTime, enabled)) {
         changed = true;
       }
 
       const int valW = ui::MeasureTextWidth(valueText, 16, /*bold=*/false, 1);
-      ui::Text(xValueRight - valW, rowY, 16, valueText, c, /*bold=*/false, /*shadow=*/true, 1);
-      rowY += rowH;
+      ui::Text(xValueRight - valW, ry, 16, valueText, c, /*bold=*/false, /*shadow=*/true, 1);
     };
 
     auto drawToggleRow = [&](int idx, std::string_view label, bool& v, std::string_view valueText) {
+      if (!rowVisible(idx)) return;
+      const Rectangle rr = rowRectFor(idx);
+      rowSelect(idx, rr);
+
       const bool selected = (m_videoSelection == idx);
-      const Rectangle rr = rowRectFor(rowY);
-
-      if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouseUi, rr)) {
-        m_videoSelection = idx;
-        m_videoSelectionUiTheme = idx;
-      }
-
       if (selected) {
-        ui::DrawSelectionHighlight(rr, uiTime, /*strong=*/true);
+        ui::DrawSelectionHighlight(Rectangle{rr.x - 2.0f, rr.y + 1.0f, rr.width + 4.0f, rr.height - 2.0f}, uiTime,
+                                   /*strong=*/true);
       }
 
       Color c = selected ? uiTh.text : uiTh.textDim;
-      ui::Text(xLabel, rowY, 16, label, c, /*bold=*/false, /*shadow=*/true, 1);
+      const int ry = static_cast<int>(rr.y) + 3;
+      ui::Text(xLabel, ry, 16, label, c, /*bold=*/false, /*shadow=*/true, 1);
 
-      const Rectangle tr{static_cast<float>(xValueRight - 44), static_cast<float>(rowY + 3), 44.0f,
-                         static_cast<float>(rowH - 6)};
+      const Rectangle tr{static_cast<float>(xValueRight - 44), rr.y + 3.0f, 44.0f, rr.height - 6.0f};
       if (ui::Toggle(3000 + idx, tr, v, mouseUi, uiTime, /*enabled=*/true)) {
         changed = true;
       }
 
       const int valW = ui::MeasureTextWidth(valueText, 16, /*bold=*/false, 1);
-      ui::Text(xValueRight - 52 - valW, rowY, 16, valueText, c, /*bold=*/false, /*shadow=*/true, 1);
-
-      rowY += rowH;
+      ui::Text(xValueRight - 52 - valW, ry, 16, valueText, c, /*bold=*/false, /*shadow=*/true, 1);
     };
 
     // Row indices must match adjustVideoSettings() cases (0..10).
@@ -21198,31 +22308,35 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
     // Reset row (clickable).
     {
       const int idx = 10;
-      const bool selected = (m_videoSelection == idx);
-      const Rectangle rr = rowRectFor(rowY);
-      if (selected) {
-        ui::DrawSelectionHighlight(rr, uiTime, /*strong=*/true);
-      }
+      if (rowVisible(idx)) {
+        const Rectangle rr = rowRectFor(idx);
+        rowSelect(idx, rr);
 
-      const bool hovered = CheckCollisionPointRec(mouseUi, rr);
-      const bool click = hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
-      if (click) {
-        ui::ResetSettings();
-        s = ui::GetSettings();
-        changed = false;
-      }
+        const bool selected = (m_videoSelection == idx);
+        if (selected) {
+          ui::DrawSelectionHighlight(Rectangle{rr.x - 2.0f, rr.y + 1.0f, rr.width + 4.0f, rr.height - 2.0f}, uiTime,
+                                     /*strong=*/true);
+        }
 
-      if (click) {
-        m_videoSelection = idx;
-        m_videoSelectionUiTheme = idx;
-      }
+        const bool hovered = CheckCollisionPointRec(mouseUi, rr);
+        const bool click = hovered && leftPressed;
+        if (click) {
+          ui::ResetSettings();
+          s = ui::GetSettings();
+          changed = false;
+        }
 
-      const Color c = selected ? uiTh.text : uiTh.textDim;
-      ui::Text(xLabel, rowY, 16, "Reset UI theme", c, /*bold=*/false, /*shadow=*/true, 1);
-      const char* val = "Click / ]";
-      const int valW = ui::MeasureTextWidth(val, 16, /*bold=*/false, 1);
-      ui::Text(xValueRight - valW, rowY, 16, val, c, /*bold=*/false, /*shadow=*/true, 1);
-      rowY += rowH;
+        if (click) {
+          setSelection(idx);
+        }
+
+        const Color c = selected ? uiTh.text : uiTh.textDim;
+        const int ry = static_cast<int>(rr.y) + 3;
+        ui::Text(xLabel, ry, 16, "Reset UI theme", c, /*bold=*/false, /*shadow=*/true, 1);
+        const char* val = "Click / ]";
+        const int valW = ui::MeasureTextWidth(val, 16, /*bold=*/false, 1);
+        ui::Text(xValueRight - valW, ry, 16, val, c, /*bold=*/false, /*shadow=*/true, 1);
+      }
     }
 
     if (changed) {
@@ -21230,13 +22344,23 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
     }
   }
 
+  // Scrollbar.
+  int newFirst = first;
+  if (ui::ScrollbarV(9350 + m_videoPage, barR, rows, visibleRows, newFirst, mouseUi, uiTime, /*enabled=*/true)) {
+    newFirst = std::clamp(newFirst, 0, maxFirst);
+    first = newFirst;
+
+    if (m_videoSelection < first) setSelection(first);
+    if (m_videoSelection >= first + visibleRows) setSelection(std::min(rows - 1, first + visibleRows - 1));
+  }
+
   // Footer: show current effective world RT size and smoothed FPS.
   const float fps = 1.0f / std::max(0.0001f, m_frameTimeSmoothed);
-  const char* rtStr = wantsWorldRenderTarget() ? TextFormat("%dx%d", m_worldRenderRTWidth, m_worldRenderRTHeight) : "native";
+  const char* rtStr =
+    wantsWorldRenderTarget() ? TextFormat("%dx%d", m_worldRenderRTWidth, m_worldRenderRTHeight) : "native";
   ui::Text(x0 + 12, y0 + panelH - 22, 14, TextFormat("Smoothed FPS: %.1f    World RT: %s", fps, rtStr), uiTh.textDim,
            /*bold=*/false, /*shadow=*/true, 1);
 }
-
 
 
 static void DrawSpaceBackground(int screenW, int screenH, std::uint64_t seed, float t)
@@ -22935,6 +24059,9 @@ void Game::draw()
                                          st.upgradeCost, tradeNet);
       if (st.fireIncidentCost > 0) {
         breakdown += TextFormat("  Fire %d", st.fireIncidentCost);
+      }
+      if (st.trafficIncidentCost > 0) {
+        breakdown += TextFormat("  Crash %d", st.trafficIncidentCost);
       }
       ui::Text(x, y, 16, breakdown.c_str(), uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
     }

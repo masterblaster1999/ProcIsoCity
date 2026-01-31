@@ -149,6 +149,7 @@ add_library(isocity_core
   src/isocity/ZoneAccess.cpp
   src/isocity/SaveLoad.cpp
   src/isocity/SaveDiscovery.cpp
+  src/isocity/CityMeta.cpp
   src/isocity/Export.cpp
   src/isocity/Export3D.cpp
   src/isocity/ImageIO.cpp

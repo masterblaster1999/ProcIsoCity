@@ -23,6 +23,7 @@
 #include "isocity/Hash.hpp"
 #include "isocity/Json.hpp"
 #include "isocity/Compression.hpp"
+#include "isocity/SupportBundle.hpp"
 #include "isocity/Export.hpp"
 #include "isocity/GfxCanvas.hpp"
 #include "isocity/GfxPalette.hpp"
@@ -67,6 +68,7 @@
 #include "isocity/World.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -7840,6 +7842,108 @@ void TestGfxCanvasAffineAndSampling()
 
 
 
+static void TestSupportBundleZip()
+{
+  namespace fs = std::filesystem;
+
+  std::error_code ec;
+  fs::path base = fs::temp_directory_path(ec);
+  if (ec) {
+    base = fs::current_path(ec);
+  }
+
+  // Unique-ish temp folder name.
+  const auto tick = static_cast<unsigned long long>(
+      std::chrono::high_resolution_clock::now().time_since_epoch().count());
+  const fs::path root = base / ("proc_isocity_test_supportbundle_" + std::to_string(tick));
+  const fs::path dataDir = root / "data";
+  const fs::path outDir = root / "out";
+  fs::create_directories(dataDir, ec);
+  fs::create_directories(outDir, ec);
+
+  auto writeFile = [&](const fs::path& p, const std::string& content) {
+    fs::create_directories(p.parent_path(), ec);
+    std::ofstream ofs(p, std::ios::binary);
+    ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
+  };
+
+  // Logs (including rotated files).
+  writeFile(dataDir / "proc_isocity.log", "log0\n");
+  writeFile(dataDir / "proc_isocity.log.1", "log1\n");
+  writeFile(dataDir / "proc_isocity.log.2", "log2\n");
+
+  // Visual prefs (and transactional artifacts).
+  writeFile(dataDir / "isocity_visual.json", "{\"v\":1}\n");
+  writeFile(dataDir / "isocity_visual.json.bak", "bak\n");
+  writeFile(dataDir / "isocity_visual.json.tmp", "tmp\n");
+
+  // Crash reports: newest two should be included, oldest should be excluded.
+  const fs::path crashOld = dataDir / "crash_old.txt";
+  const fs::path crashMid = dataDir / "crash_mid.txt";
+  const fs::path crashNew = dataDir / "crash_new.txt";
+  writeFile(crashOld, "old\n");
+  writeFile(crashMid, "mid\n");
+  writeFile(crashNew, "new\n");
+
+  const auto now = fs::file_time_type::clock::now();
+  fs::last_write_time(crashOld, now - std::chrono::hours(48), ec);
+  fs::last_write_time(crashMid, now - std::chrono::hours(24), ec);
+  fs::last_write_time(crashNew, now, ec);
+
+  // Extra file.
+  const fs::path extra = dataDir / "extra_note.txt";
+  writeFile(extra, "extra\n");
+
+  SupportBundleOptions opt;
+  opt.baseDir = outDir;
+  opt.dataDir = dataDir;
+  opt.namePrefix = "testbundle";
+  const std::string diag = "support-bundle diagnostics marker";
+  opt.diagnosticsText = diag;
+  opt.logPath = dataDir / "proc_isocity.log";
+  opt.logKeepFiles = 2;
+  opt.visualPrefsPath = dataDir / "isocity_visual.json";
+  opt.crashReportsMax = 2;
+  opt.extraFiles.push_back(extra);
+  opt.includeManifest = true;
+
+  SupportBundleArchiveResult out;
+  std::string err;
+  const bool ok = CreateSupportBundleZip(opt, out, err);
+  EXPECT_TRUE(ok);
+  EXPECT_TRUE(err.empty());
+  EXPECT_TRUE(!out.archivePath.empty());
+  EXPECT_TRUE(fs::exists(out.archivePath));
+
+  // ZipWriter uses "store" (no compression), so both filenames and file contents
+  // appear plainly in the archive bytes.
+  std::ifstream ifs(out.archivePath, std::ios::binary);
+  std::string bytes((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+
+  EXPECT_TRUE(bytes.find("diagnostics.txt") != std::string::npos);
+  EXPECT_TRUE(bytes.find(diag) != std::string::npos);
+  EXPECT_TRUE(bytes.find("manifest.txt") != std::string::npos);
+
+  EXPECT_TRUE(bytes.find("files/proc_isocity.log") != std::string::npos);
+  EXPECT_TRUE(bytes.find("files/proc_isocity.log.1") != std::string::npos);
+  EXPECT_TRUE(bytes.find("files/proc_isocity.log.2") != std::string::npos);
+
+  EXPECT_TRUE(bytes.find("files/isocity_visual.json") != std::string::npos);
+  EXPECT_TRUE(bytes.find("files/isocity_visual.json.bak") != std::string::npos);
+  EXPECT_TRUE(bytes.find("files/isocity_visual.json.tmp") != std::string::npos);
+
+  EXPECT_TRUE(bytes.find("files/crash_new.txt") != std::string::npos);
+  EXPECT_TRUE(bytes.find("files/crash_mid.txt") != std::string::npos);
+  EXPECT_TRUE(bytes.find("files/crash_old.txt") == std::string::npos);
+
+  EXPECT_TRUE(bytes.find("files/extra_note.txt") != std::string::npos);
+
+  fs::remove_all(root, ec);
+}
+
+
+
+
 int main()
 {
   TestRoadAutoTilingMasks();
@@ -7983,6 +8087,8 @@ int main()
   TestRoadBuildPathAvoidsBridgesWhenLandAlternativeExists();
   TestRoadBuildPathMoneyAvoidsExpensiveBridge();
   TestRoadBuildPathMoneyAvoidsExpensiveUpgrades();
+
+  TestSupportBundleZip();
 
   if (g_failures == 0) {
     std::cout << "proc_isocity_tests: OK\n";

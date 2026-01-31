@@ -32,6 +32,7 @@
 #include "isocity/FileHash.hpp"
 #include "isocity/DeterministicMath.hpp"
 #include "isocity/Json.hpp"
+#include "isocity/CityMeta.hpp"
 #include "isocity/Compression.hpp"
 #include "isocity/Export.hpp"
 #include "isocity/AirPollution.hpp"
@@ -1362,6 +1363,55 @@ void TestEmploymentCountsOnlyAccessibleJobs()
   EXPECT_EQ(w.stats().jobsCapacity, 8);
   EXPECT_EQ(w.stats().jobsCapacityAccessible, 0);
   EXPECT_EQ(w.stats().employed, 0);
+}
+
+void TestSimulatorTrafficSafetyIntegration()
+{
+  using namespace isocity;
+
+  World w(12, 12, 1234u);
+  w.stats().money = 100000;
+
+  // Cross intersection (connects to edge) with a small resident/job pair.
+  for (int x = 0; x < w.width(); ++x) {
+    EXPECT_EQ(w.applyTool(Tool::Road, x, 6), ToolApplyResult::Applied);
+  }
+  for (int y = 0; y < w.height(); ++y) {
+    EXPECT_EQ(w.applyTool(Tool::Road, 6, y), ToolApplyResult::Applied);
+  }
+
+  EXPECT_EQ(w.applyTool(Tool::Residential, 5, 5), ToolApplyResult::Applied);
+  EXPECT_EQ(w.applyTool(Tool::Commercial, 7, 5), ToolApplyResult::Applied);
+
+  // Manually seed residents/jobs so the traffic and safety models have signal.
+  w.at(5, 5).occupants = 8;
+  w.at(7, 5).occupants = 8;
+
+  Simulator sim;
+  sim.refreshDerivedStats(w);
+
+  const auto& s = w.stats();
+  EXPECT_TRUE(s.trafficSafetyRoadTilesConsidered > 0);
+  EXPECT_TRUE(s.trafficSafetyResidentMeanExposure >= 0.0f && s.trafficSafetyResidentMeanExposure <= 1.0f);
+  EXPECT_TRUE(s.trafficSafetyHotspotX >= 0 && s.trafficSafetyHotspotX < w.width());
+  EXPECT_TRUE(s.trafficSafetyHotspotY >= 0 && s.trafficSafetyHotspotY < w.height());
+  EXPECT_TRUE(s.trafficSafetyHotspotRisk01 >= 0.0f && s.trafficSafetyHotspotRisk01 <= 1.0f);
+
+  // Force an incident to ensure the gameplay wiring is intact (deterministic).
+  sim.trafficIncidents().enabled = true;
+  sim.trafficIncidents().minPopulation = 0;
+  sim.trafficIncidents().minZoneTiles = 0;
+  sim.trafficIncidents().baseChancePerDay = 1.0f;
+  sim.trafficIncidents().chancePer100Population = 0.0f;
+  sim.trafficIncidents().maxChancePerDay = 1.0f;
+
+  sim.stepOnce(w);
+
+  EXPECT_TRUE(w.stats().trafficIncidentInjuries > 0);
+  EXPECT_TRUE(w.stats().trafficIncidentCost > 0);
+  EXPECT_TRUE(w.stats().trafficIncidentHappinessPenalty > 0.0f);
+  EXPECT_TRUE(w.stats().trafficIncidentOriginX >= 0 && w.stats().trafficIncidentOriginX < w.width());
+  EXPECT_TRUE(w.stats().trafficIncidentOriginY >= 0 && w.stats().trafficIncidentOriginY < w.height());
 }
 
 
@@ -8072,6 +8122,106 @@ void TestJsonWriterStreaming()
 }
 
 
+void TestCityMetaJsonRoundTrip()
+{
+  using namespace isocity;
+
+  CityMeta meta;
+  meta.version = kCityMetaVersion;
+  meta.seed = 12345678901234567890ull;
+  meta.width = 96;
+  meta.height = 64;
+  meta.day = 42;
+
+  meta.historyMax = 256;
+  meta.history = {
+    CityHistorySample{.day = 41, .population = 1200, .money = 5000, .happiness = 0.55f, .demandResidential = 0.2f, .demandCommercial = -0.1f, .demandIndustrial = 0.0f, .avgLandValue = 1.25f, .avgTaxPerCapita = 0.15f, .income = 120, .expenses = 100, .taxRevenue = 150, .maintenanceCost = 80, .commuters = 340, .avgCommute = 8.0f, .avgCommuteTime = 11.0f, .trafficCongestion = 0.12f, .goodsSatisfaction = 0.9f},
+    CityHistorySample{.day = 42, .population = 1234, .money = 5100, .happiness = 0.57f, .demandResidential = 0.25f, .demandCommercial = -0.05f, .demandIndustrial = 0.02f, .avgLandValue = 1.30f, .avgTaxPerCapita = 0.155f, .income = 125, .expenses = 102, .taxRevenue = 151, .maintenanceCost = 81, .commuters = 360, .avgCommute = 8.25f, .avgCommuteTime = 11.25f, .trafficCongestion = 0.13f, .goodsSatisfaction = 0.92f},
+  };
+
+  meta.newsMax = 120;
+  meta.newsSelection = 1;
+  meta.newsFirst = 0;
+  meta.mayorRatingEma = 61.25f;
+  meta.mayorRatingPrev = 60.0f;
+  meta.news = {
+    CityNewsEntry{.day = 41, .tone = CityNewsTone::Neutral, .mayorRating = 60.0f, .headline = "Steady Progress", .body = "The city continues to grow steadily."},
+    CityNewsEntry{.day = 42, .tone = CityNewsTone::Good, .mayorRating = 62.0f, .headline = "New Businesses Open", .body = "Local shops are reporting strong demand."},
+  };
+  meta.newsAddendum[43] = "(Bulletin) Water main repairs scheduled.";
+
+  meta.challengeTargetActive = 3;
+  meta.challengeRerolls = 1;
+  meta.challengeNextId = 100;
+  meta.challengeLastProcessedDay = 42;
+  meta.challengeSelection = 0;
+  meta.challengeFirst = 0;
+  {
+    CityChallenge c;
+    c.id = 99;
+    c.kind = CityChallengeKind::GrowPopulation;
+    c.status = CityChallengeStatus::Active;
+    c.dayIssued = 40;
+    c.dayDeadline = 50;
+    c.rewardMoney = 750;
+    c.startInt = 1000;
+    c.targetInt = 1500;
+    c.stateInt = 1234;
+    c.startF = 0.0f;
+    c.targetF = 0.0f;
+    c.title = "Welcoming New Residents";
+    c.description = "Reach a population of 1,500.";
+    meta.challenges.push_back(c);
+  }
+  meta.challengeLog.push_back(CityChallengeLogEntry{.day = 39, .status = CityChallengeStatus::Completed, .rewardMoney = 500, .title = "Balanced Budget"});
+
+  std::string json;
+  std::string err;
+  EXPECT_TRUE(SerializeCityMetaJson(meta, json, err));
+  EXPECT_TRUE(err.empty());
+  EXPECT_TRUE(!json.empty());
+
+  CityMeta parsed;
+  std::string err2;
+  EXPECT_TRUE(DeserializeCityMetaJson(parsed, json, err2));
+  EXPECT_TRUE(err2.empty());
+
+  EXPECT_EQ(parsed.version, meta.version);
+  EXPECT_EQ(parsed.seed, meta.seed);
+  EXPECT_EQ(parsed.width, meta.width);
+  EXPECT_EQ(parsed.height, meta.height);
+  EXPECT_EQ(parsed.day, meta.day);
+
+  EXPECT_EQ(parsed.historyMax, meta.historyMax);
+  EXPECT_EQ(parsed.history.size(), meta.history.size());
+  EXPECT_EQ(parsed.history[0].day, meta.history[0].day);
+  EXPECT_EQ(parsed.history[1].population, meta.history[1].population);
+  EXPECT_NEAR(parsed.history[1].happiness, meta.history[1].happiness, 1e-6f);
+
+  EXPECT_EQ(parsed.newsMax, meta.newsMax);
+  EXPECT_EQ(parsed.newsSelection, meta.newsSelection);
+  EXPECT_EQ(parsed.newsFirst, meta.newsFirst);
+  EXPECT_NEAR(parsed.mayorRatingEma, meta.mayorRatingEma, 1e-6f);
+  EXPECT_NEAR(parsed.mayorRatingPrev, meta.mayorRatingPrev, 1e-6f);
+  EXPECT_EQ(parsed.news.size(), meta.news.size());
+  EXPECT_EQ(parsed.news[0].headline, meta.news[0].headline);
+  EXPECT_EQ(static_cast<int>(parsed.news[1].tone), static_cast<int>(meta.news[1].tone));
+  EXPECT_EQ(parsed.newsAddendum.size(), 1u);
+  EXPECT_EQ(parsed.newsAddendum.begin()->first, 43);
+
+  EXPECT_EQ(parsed.challengeTargetActive, meta.challengeTargetActive);
+  EXPECT_EQ(parsed.challengeRerolls, meta.challengeRerolls);
+  EXPECT_EQ(parsed.challengeNextId, meta.challengeNextId);
+  EXPECT_EQ(parsed.challengeLastProcessedDay, meta.challengeLastProcessedDay);
+  EXPECT_EQ(parsed.challenges.size(), meta.challenges.size());
+  EXPECT_EQ(parsed.challenges[0].id, meta.challenges[0].id);
+  EXPECT_EQ(static_cast<int>(parsed.challenges[0].kind), static_cast<int>(meta.challenges[0].kind));
+  EXPECT_EQ(parsed.challenges[0].title, meta.challenges[0].title);
+  EXPECT_EQ(parsed.challengeLog.size(), meta.challengeLog.size());
+  EXPECT_EQ(parsed.challengeLog[0].rewardMoney, meta.challengeLog[0].rewardMoney);
+}
+
+
 void TestGfxCanvasAffineAndSampling()
 {
   using namespace isocity;
@@ -9316,6 +9466,116 @@ static void TestAirPollutionBasic()
   EXPECT_TRUE(park <= parkNeighbor);
 }
 
+static void TestSimulatorAirPollutionIntegration()
+{
+  // Integration smoke test: air pollution exposure computed by the simulator
+  // produces a consistent happiness penalty, and disabling the model removes
+  // that penalty without affecting other stats.
+
+  World world(24, 9, 424242);
+
+  for (int y = 0; y < world.height(); ++y) {
+    for (int x = 0; x < world.width(); ++x) {
+      Tile& t = world.at(x, y);
+      t.terrain = Terrain::Grass;
+      t.overlay = Overlay::None;
+      t.height = 0.0f;
+      t.level = 1;
+      t.variation = 0;
+      t.occupants = 0;
+      t.district = 0;
+    }
+  }
+
+  // Simple east-west arterial.
+  for (int x = 0; x < world.width(); ++x) {
+    world.setRoad(x, 4);
+  }
+
+  // Downwind residential block (population).
+  for (int x = 16; x <= 18; ++x) {
+    Tile& r = world.at(x, 3);
+    r.overlay = Overlay::Residential;
+    r.level = 2;
+    r.occupants = 40;
+  }
+
+  // Upwind industrial emitters + jobs.
+  for (int x = 2; x <= 5; ++x) {
+    Tile& i = world.at(x, 3);
+    i.overlay = Overlay::Industrial;
+    i.level = 3;
+  }
+
+  Simulator sim;
+  sim.config().requireOutsideConnection = false;
+  sim.config().taxResidential = 0;
+  sim.config().taxCommercial = 0;
+  sim.config().taxIndustrial = 0;
+  sim.config().taxHappinessPerCapita = 0.0f;
+
+  // Disable other optional penalties/side-systems to isolate the effect.
+  sim.tradeModel().enabled = false;
+  sim.economyModel().enabled = false;
+  sim.servicesModel().enabled = false;
+  sim.transitModel().enabled = false;
+  sim.trafficSafetyModel().enabled = false;
+  sim.trafficIncidents().enabled = false;
+  sim.fireIncidents().enabled = false;
+
+  // Configure deterministic wind carrying pollution eastward.
+  sim.airPollutionModel().enabled = true;
+  {
+    AirPollutionConfig& cfg = sim.airPollutionModel().cfg;
+    cfg.iterations = 140;
+    cfg.diffusion = 0.06f;
+    cfg.advection = 0.70f;
+    cfg.windSpeed = 1.0f;
+    cfg.decayPerIteration = 0.0f;
+    cfg.eightConnected = true;
+
+    cfg.windFromSeed = false;
+    cfg.fixedWindDir = WindDir::E;
+
+    // Isolate the industrial source for determinism.
+    cfg.roadBase = 0.0f;
+    cfg.roadClassBoost = 0.0f;
+    cfg.commuteTrafficBoost = 0.0f;
+    cfg.goodsTrafficBoost = 0.0f;
+
+    cfg.residentialSource = 0.0f;
+    cfg.commercialSource = 0.0f;
+    cfg.civicSource = 0.0f;
+    cfg.occupantBoost = 0.0f;
+
+    cfg.industrialSource = 1.0f;
+
+    cfg.parkSink = 0.0f;
+    cfg.waterSink = 0.0f;
+    cfg.elevationVentilation = 0.0f;
+
+    cfg.depositionPark = 0.0f;
+    cfg.depositionWater = 0.0f;
+  }
+
+  sim.refreshDerivedStats(world);
+  const float happyWith = world.stats().happiness;
+  const float pen = world.stats().airPollutionHappinessPenalty;
+
+  EXPECT_TRUE(world.stats().airPollutionResidentPopulation > 0);
+  EXPECT_TRUE(world.stats().airPollutionResidentAvg01 > 0.0f);
+  EXPECT_TRUE(pen > 0.0f);
+
+  sim.airPollutionModel().enabled = false;
+  sim.refreshDerivedStats(world);
+  const float happyWithout = world.stats().happiness;
+
+  EXPECT_TRUE(happyWithout >= happyWith);
+  EXPECT_NEAR(happyWithout - happyWith, pen, 1.0e-4f);
+}
+
+
+
 static void TestRunoffPollutionBasic()
 {
   // Deterministic routing smoke test:
@@ -10267,6 +10527,7 @@ int main()
   TestSLLZCompressionRoundTrip();
   TestJsonUnicodeEscapesAndStringify();
   TestJsonWriterStreaming();
+  TestCityMetaJsonRoundTrip();
   TestGfxCanvasAffineAndSampling();
   TestFileHashFNV1a64();
   TestPerceptualHashBasics();
@@ -10290,6 +10551,7 @@ int main()
   TestIsochroneTileAccessCostsRespectInteriorZoneAccess();
   TestWalkabilityBasic();
   TestAirPollutionBasic();
+  TestSimulatorAirPollutionIntegration();
   TestRunoffPollutionBasic();
   TestRunoffMitigationBasic();
   TestSolarPotentialBasic();
@@ -10304,6 +10566,7 @@ int main()
   TestRoadHealthCrossHasVulnerability();
   TestSimulatorStepInvariants();
   TestEmploymentCountsOnlyAccessibleJobs();
+  TestSimulatorTrafficSafetyIntegration();
   TestRoadPathfindingToEdge();
   TestRoadBuildPathSlopePenaltyAvoidsSteepRidge();
   TestRoadToEdgeMask();
