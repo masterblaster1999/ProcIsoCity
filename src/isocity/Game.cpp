@@ -2913,6 +2913,10 @@ void Game::setupDevConsole()
           c.print("  organic");
           c.print("  grid");
           c.print("  radial");
+          c.print("  tensor_field");
+          c.print("  physarum");
+          c.print("  medial_axis");
+          c.print("  voronoi_cells");
           c.print("  space_colonization");
         };
 
@@ -2921,6 +2925,7 @@ void Game::setupDevConsole()
           c.print("  voronoi");
           c.print("  road_flow");
           c.print("  block_graph");
+          c.print("  watershed");
         };
 
         auto listAll = [&]() {
@@ -2936,6 +2941,7 @@ void Game::setupDevConsole()
           c.print("  proc strength 1.5");
           c.print("  proc road_layout grid");
           c.print("  proc districting_mode block_graph");
+          c.print("  proc districting_mode watershed");
           c.print("  proc rivers 1");
           c.print("  regen same");
         };

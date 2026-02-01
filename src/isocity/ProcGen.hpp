@@ -29,6 +29,9 @@ enum class ProcGenTerrainPreset : std::uint8_t {
   Volcano = 8, // Central volcanic cone with a caldera (optionally lake-filled).
   Delta = 9,   // Low coastal river delta with branching distributaries.
   Tectonic = 10, // Plate-driven mountain ranges and rift valleys.
+
+  // Sentinel for bounds checks / iteration (must be last; keep enum values contiguous).
+  Count
 };
 
 // Human-readable name (stable for saves/CLI).
@@ -46,7 +49,17 @@ bool ParseProcGenTerrainPreset(const std::string& s, ProcGenTerrainPreset& out);
 enum class ProcGenDistrictingMode : std::uint8_t {
   Voronoi = 0,   // Legacy: hub-anchored Voronoi over the tile grid.
   RoadFlow = 1,  // Road-based travel-time districts (AutoAssignDistricts).
-  BlockGraph = 2 // Neighborhood-style districts based on CityBlocks adjacency.
+  BlockGraph = 2, // Neighborhood-style districts based on CityBlocks adjacency.
+
+  // Hydrology-based watershed districts.
+  //
+  // District boundaries tend to follow natural ridgelines and river valleys.
+  // This can produce "regional" city structure on rugged terrain (uplands vs.
+  // lowlands, river basins, coastal plains) while staying fully deterministic.
+  Watershed = 3,
+
+  // Sentinel for bounds checks / iteration (must be last; keep enum values contiguous).
+  Count
 };
 
 // Human-readable name (stable for saves/CLI).
@@ -64,6 +77,41 @@ enum class ProcGenRoadLayout : std::uint8_t {
   Grid = 1,              // Manhattan-like arterial grid with hubs snapped onto it.
   Radial = 2,            // Hub-and-spoke with an outer ring / beltway bias.
   SpaceColonization = 3, // Branching arterial growth guided by attractor points ("space colonization" style).
+  VoronoiCells = 4,      // Voronoi-cell boundary arterials (ring-road neighborhoods / superblocks).
+
+  // Physarum / slime-mold inspired pheromone routing.
+  //
+  // A set of lightweight agents performs biased random walks between hubs while depositing
+  // pheromone. Pheromone evaporates/diffuses over time, and a pheromone-biased A* pass
+  // extracts an arterial network that often resembles organic, redundancy-aware transport
+  // graphs.
+  Physarum = 5,
+
+  // Medial-axis / skeleton road layout.
+  //
+  // We approximate the medial axis of the buildable landmass by computing a
+  // boundary Voronoi diagram (via multi-source BFS) and carving arterials
+  // along the Voronoi edges (where distance-fronts from different boundary
+  // sources meet).
+  //
+  // The result tends to create central spines on islands, ridge-like
+  // backbones through narrow land corridors, and organic super-arterials that
+  // "thread" through the middle of districts.
+  MedialAxis = 6,
+
+  // Tensor-field guided routing.
+  //
+  // Inspired by classic procedural city work (Parish & Müller) and later tensor-field
+  // approaches, this layout builds a smooth *orientation field* from terrain
+  // (contour-following on steep slopes) and low-frequency noise, then routes
+  // hub-to-hub arterials using A* with a strong alignment bias to that field.
+  //
+  // The resulting macro network often exhibits "district grain" and sweeping
+  // boulevard-like curves, while still respecting topography.
+  TensorField = 7,
+
+  // Sentinel for bounds checks / iteration (must be last; keep enum values contiguous).
+  Count
 };
 
 // Human-readable name (stable for saves/CLI).
@@ -71,6 +119,55 @@ const char* ToString(ProcGenRoadLayout m);
 
 // Parse layout from a string (case-insensitive). Accepts common aliases.
 bool ParseProcGenRoadLayout(const std::string& s, ProcGenRoadLayout& out);
+
+// -----------------------------------------------------------------------------
+// Enum validation helpers (for serialized / user-provided values)
+// -----------------------------------------------------------------------------
+
+inline constexpr std::uint8_t ProcGenTerrainPresetCountU8()
+{
+  return static_cast<std::uint8_t>(ProcGenTerrainPreset::Count);
+}
+
+inline constexpr std::uint8_t ProcGenDistrictingModeCountU8()
+{
+  return static_cast<std::uint8_t>(ProcGenDistrictingMode::Count);
+}
+
+inline constexpr std::uint8_t ProcGenRoadLayoutCountU8()
+{
+  return static_cast<std::uint8_t>(ProcGenRoadLayout::Count);
+}
+
+inline constexpr bool IsValidProcGenTerrainPresetU8(std::uint8_t v)
+{
+  return v < ProcGenTerrainPresetCountU8();
+}
+
+inline constexpr bool IsValidProcGenDistrictingModeU8(std::uint8_t v)
+{
+  return v < ProcGenDistrictingModeCountU8();
+}
+
+inline constexpr bool IsValidProcGenRoadLayoutU8(std::uint8_t v)
+{
+  return v < ProcGenRoadLayoutCountU8();
+}
+
+inline constexpr std::uint8_t ClampProcGenTerrainPresetU8(std::uint8_t v)
+{
+  return IsValidProcGenTerrainPresetU8(v) ? v : static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
+}
+
+inline constexpr std::uint8_t ClampProcGenDistrictingModeU8(std::uint8_t v)
+{
+  return IsValidProcGenDistrictingModeU8(v) ? v : static_cast<std::uint8_t>(ProcGenDistrictingMode::Voronoi);
+}
+
+inline constexpr std::uint8_t ClampProcGenRoadLayoutU8(std::uint8_t v)
+{
+  return IsValidProcGenRoadLayoutU8(v) ? v : static_cast<std::uint8_t>(ProcGenRoadLayout::Organic);
+}
 
 struct ProcGenConfig {
   float terrainScale = 0.08f;     // noise scale

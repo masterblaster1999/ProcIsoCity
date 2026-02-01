@@ -31,9 +31,11 @@ endif()
 # ---- Options ----
 # NOTE: Default OFF to keep the default build fully offline-capable.
 # The interactive app requires raylib; enable explicitly when you have raylib available.
-option(PROCISOCITY_BUILD_APP "Build the interactive raylib application (requires raylib)" ON)
+option(PROCISOCITY_BUILD_APP "Build the interactive raylib application (requires raylib)" OFF)
 option(PROCISOCITY_BUILD_TESTS "Build headless tests (no raylib required)" OFF)
 option(PROCISOCITY_BUILD_CLI "Build headless command-line tools" ON)
+option(PROCISOCITY_ENABLE_GLTF_EXPORT "Enable glTF/glb export (can increase build time)" ON)
+
 
 # Only relevant when PROCISOCITY_BUILD_APP=ON
 option(PROCISOCITY_USE_SYSTEM_RAYLIB "Use system-installed raylib instead of FetchContent" OFF)
@@ -80,7 +82,6 @@ add_library(isocity_core
   src/isocity/StackTrace.cpp
   src/isocity/Checksum.cpp
   src/isocity/Compression.cpp
-  src/isocity/GltfExport.cpp
   src/isocity/GeoJsonExport.cpp
   src/isocity/OsmImport.cpp
   src/isocity/Suite.cpp
@@ -202,8 +203,20 @@ add_library(isocity_core
   src/isocity/MineEmbedding.cpp
   src/isocity/MineNeighbors.cpp
   src/isocity/MineTraces.cpp
+  src/isocity/Chronicle.cpp
   src/isocity/Dossier.cpp
 )
+
+# Optional: allow disabling glTF export to reduce build times / memory usage.
+# When disabled, a small stub is compiled so the API remains link-compatible.
+if (PROCISOCITY_ENABLE_GLTF_EXPORT)
+  target_sources(isocity_core PRIVATE src/isocity/GltfExport.cpp)
+  target_compile_definitions(isocity_core PUBLIC PROCISOCITY_ENABLE_GLTF_EXPORT=1)
+else()
+  target_sources(isocity_core PRIVATE src/isocity/GltfExportStub.cpp)
+  target_compile_definitions(isocity_core PUBLIC PROCISOCITY_ENABLE_GLTF_EXPORT=0)
+endif()
+
 
 target_include_directories(isocity_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
@@ -501,6 +514,17 @@ if (PROCISOCITY_BUILD_CLI)
   target_link_libraries(proc_isocity_autobuild PRIVATE isocity_core)
 
   procisocity_set_strict_warnings(proc_isocity_autobuild)
+
+  # Evolution tool (headless): search the procedural parameter space for "great" cities.
+  # Uses a deterministic cross-entropy style sampler + seed mutation.
+  add_executable(proc_isocity_evolve
+    src/cli/evolve.cpp
+  )
+
+  target_include_directories(proc_isocity_evolve PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_evolve PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_evolve)
 
   # Binary patch tool (headless): create/apply compact diffs between saves.
   add_executable(proc_isocity_patch
@@ -916,6 +940,16 @@ if (PROCISOCITY_BUILD_CLI)
   target_link_libraries(proc_isocity_dossier PRIVATE isocity_core)
 
   procisocity_set_strict_warnings(proc_isocity_dossier)
+
+  # Chronicle tool (headless): generate a deterministic city newspaper feed.
+  add_executable(proc_isocity_chronicle
+    src/cli/chronicle.cpp
+  )
+
+  target_include_directories(proc_isocity_chronicle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_chronicle PRIVATE isocity_core)
+
+  procisocity_set_strict_warnings(proc_isocity_chronicle)
 
   # Seed miner tool (headless): batch-generate/simulate seeds, compute KPIs, and rank by objective.
   add_executable(proc_isocity_mine

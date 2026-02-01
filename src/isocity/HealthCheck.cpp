@@ -5,7 +5,6 @@
 #include "isocity/Version.hpp"
 
 #include <chrono>
-#include <cstdio>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
@@ -28,15 +27,17 @@ static std::string UtcTimestampForFolder()
   gmtime_r(&tt, &tm);
 #endif
 
-  char buf[32] = {};
-  std::snprintf(buf, sizeof(buf), "%04d%02d%02d_%02d%02d%02dZ",
-                tm.tm_year + 1900,
-                tm.tm_mon + 1,
-                tm.tm_mday,
-                tm.tm_hour,
-                tm.tm_min,
-                tm.tm_sec);
-  return std::string(buf);
+  std::ostringstream oss;
+  oss << std::setfill('0')
+      << std::setw(4) << (tm.tm_year + 1900)
+      << std::setw(2) << (tm.tm_mon + 1)
+      << std::setw(2) << tm.tm_mday
+      << '_'
+      << std::setw(2) << tm.tm_hour
+      << std::setw(2) << tm.tm_min
+      << std::setw(2) << tm.tm_sec
+      << 'Z';
+  return oss.str();
 }
 
 static std::string FormatMs(double ms)

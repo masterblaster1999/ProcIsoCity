@@ -2,6 +2,9 @@
 
 #include "isocity/Hash.hpp"
 #include "isocity/Json.hpp"
+#include "isocity/StatsCsv.hpp"
+
+#include "cli/CliParse.hpp"
 
 #include <cctype>
 #include <cstdint>
@@ -85,33 +88,12 @@ static void PrintHelp()
 
 static bool ParseU64(const std::string& s, std::uint64_t* out)
 {
-  if (!out) return false;
-  if (s.empty()) return false;
-
-  int base = 10;
-  const char* p = s.c_str();
-  if (s.rfind("0x", 0) == 0 || s.rfind("0X", 0) == 0) {
-    base = 16;
-    p += 2;
-  }
-
-  char* end = nullptr;
-  const unsigned long long v = std::strtoull(p, &end, base);
-  if (!end || *end != '\0') return false;
-  *out = static_cast<std::uint64_t>(v);
-  return true;
+  return isocity::cli::ParseU64(s, out);
 }
 
 static bool ParseI32(const std::string& s, int* out)
 {
-  if (!out) return false;
-  if (s.empty()) return false;
-  char* end = nullptr;
-  const long v = std::strtol(s.c_str(), &end, 10);
-  if (!end || *end != '\0') return false;
-  if (v < std::numeric_limits<int>::min() || v > std::numeric_limits<int>::max()) return false;
-  *out = static_cast<int>(v);
-  return true;
+  return isocity::cli::ParseI32(s, out);
 }
 
 static bool WriteCsvTrace(const std::string& outPath, const std::vector<isocity::Stats>& ticks)
@@ -121,27 +103,9 @@ static bool WriteCsvTrace(const std::string& outPath, const std::vector<isocity:
   std::ofstream f(outPath, std::ios::binary);
   if (!f) return false;
 
-  f << "day,population,money,housingCapacity,jobsCapacity,jobsCapacityAccessible,employed,happiness,roads,parks,avgCommuteTime,trafficCongestion,goodsDemand,goodsDelivered,goodsSatisfaction,avgLandValue,demandResidential\n";
-
+  if (!isocity::WriteStatsCsvHeader(f)) return false;
   for (const isocity::Stats& s : ticks) {
-    f << s.day << ','
-      << s.population << ','
-      << s.money << ','
-      << s.housingCapacity << ','
-      << s.jobsCapacity << ','
-      << s.jobsCapacityAccessible << ','
-      << s.employed << ','
-      << s.happiness << ','
-      << s.roads << ','
-      << s.parks << ','
-      << s.avgCommuteTime << ','
-      << s.trafficCongestion << ','
-      << s.goodsDemand << ','
-      << s.goodsDelivered << ','
-      << s.goodsSatisfaction << ','
-      << s.avgLandValue << ','
-      << s.demandResidential
-      << '\n';
+    if (!isocity::WriteStatsCsvRow(f, s)) return false;
   }
 
   return static_cast<bool>(f);

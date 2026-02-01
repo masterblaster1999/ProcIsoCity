@@ -1,5 +1,7 @@
 #include "isocity/Dossier.hpp"
 
+#include "isocity/Chronicle.hpp"
+
 #include "isocity/ConfigIO.hpp"
 #include "isocity/DepressionFill.hpp"
 #include "isocity/FloodRisk.hpp"
@@ -28,6 +30,7 @@
 #include "isocity/JobOpportunity.hpp"
 #include "isocity/Pathfinding.hpp"
 #include "isocity/SaveLoad.hpp"
+#include "isocity/StatsCsv.hpp"
 #include "isocity/Traffic.hpp"
 
 #include <algorithm>
@@ -186,33 +189,12 @@ void BuildHeightFieldAndDrainMask(const World& world, std::vector<float>& height
 
 bool WriteCsvHeader(std::ostream& os)
 {
-  os << "day,population,money,housingCapacity,jobsCapacity,jobsCapacityAccessible,employed,happiness,roads,parks,avgCommuteTime,trafficCongestion,goodsDemand,goodsDelivered,goodsSatisfaction,avgLandValue,demandResidential,demandCommercial,demandIndustrial\n";
-  return static_cast<bool>(os);
+  return WriteStatsCsvHeader(os);
 }
 
 bool WriteCsvRow(std::ostream& os, const Stats& s)
 {
-  os << s.day << ','
-     << s.population << ','
-     << s.money << ','
-     << s.housingCapacity << ','
-     << s.jobsCapacity << ','
-     << s.jobsCapacityAccessible << ','
-     << s.employed << ','
-     << s.happiness << ','
-     << s.roads << ','
-     << s.parks << ','
-     << s.avgCommuteTime << ','
-     << s.trafficCongestion << ','
-     << s.goodsDemand << ','
-     << s.goodsDelivered << ','
-     << s.goodsSatisfaction << ','
-     << s.avgLandValue << ','
-     << s.demandResidential << ','
-     << s.demandCommercial << ','
-     << s.demandIndustrial
-     << '\n';
-  return static_cast<bool>(os);
+  return WriteStatsCsvRow(os, s);
 }
 
 bool WriteSummaryJson(const std::filesystem::path& outPath, const World& world,
@@ -361,6 +343,18 @@ bool WriteHtmlReport(const std::filesystem::path& outPath,
   f << ".thumbs a{text-decoration:none; color:inherit;}\n";
   f << ".thumbs img{width:100%; height:auto; image-rendering:pixelated; border:1px solid #eee; border-radius:8px;}\n";
   f << ".small{font-size:13px; color:#444;}\n";
+  f << "button{padding:4px 10px; border:1px solid #ccc; border-radius:8px; background:#f8f8f8; cursor:pointer;}\n";
+  f << "button:hover{background:#f0f0f0;}\n";
+  f << "select{padding:4px;}\n";
+  f << "input[type=text]{padding:4px; border:1px solid #ccc; border-radius:8px;}\n";
+  f << ".pill{display:inline-block; padding:2px 8px; border:1px solid #ddd; border-radius:999px; font-size:12px; margin:0 6px 6px 0;}\n";
+  f << ".chronEntry{border-top:1px solid #eee; padding-top:10px; margin-top:10px;}\n";
+  f << ".chronBody{white-space:pre-line;}\n";
+  f << ".tone{font-weight:600;}\n";
+  f << ".tone-good{color:#1b7f2a;}\n";
+  f << ".tone-neutral{color:#444;}\n";
+  f << ".tone-bad{color:#b00020;}\n";
+  f << ".tone-alert{color:#b00020;}\n";
   f << "</style>\n";
   f << "</head>\n<body>\n";
 
@@ -405,7 +399,49 @@ bool WriteHtmlReport(const std::filesystem::path& outPath,
   f << "      Optional: load <code>tile_metrics.csv</code> for per-tile inspection (works even when opened as file://).\n";
   f << "      <div style=\"margin-top:6px\"><input type=\"file\" id=\"metricsFile\" accept=\".csv\"></div>\n";
   f << "      <div id=\"metricsStatus\"></div>\n";
+  f << "      <div style=\"margin-top:10px\">\n";
+  f << "        <div><b>Hover metrics</b> (numeric columns from <code>tile_metrics.csv</code>)</div>\n";
+  f << "        <div style=\"display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:6px\">\n";
+  f << "          <input type=\"text\" id=\"metricFilter\" placeholder=\"filter columns\" style=\"flex:1; min-width:200px\">\n";
+  f << "          <button id=\"metricDefault\" type=\"button\">Default</button>\n";
+  f << "          <button id=\"metricAll\" type=\"button\">All</button>\n";
+  f << "          <button id=\"metricNone\" type=\"button\">None</button>\n";
+  f << "        </div>\n";
+  f << "        <div style=\"margin-top:6px\">\n";
+  f << "          <select id=\"metricSel\" multiple size=\"10\" style=\"width:100%\"></select>\n";
+  f << "        </div>\n";
+  f << "      </div>\n";
   f << "    </div>\n";
+  f << "  </div>\n";
+  f << "</div>\n";
+
+  f << "<h2 style=\"margin-top:28px\">Time series</h2>\n";
+  f << "<div class=\"row\">\n";
+  f << "  <div class=\"card\" style=\"flex:1; min-width:420px\">\n";
+  f << "    <div class=\"small\">Optional: load <code>ticks.csv</code> to plot a metric over time (works even when opened as file://).\n";
+  f << "      <div style=\"margin-top:6px\"><input type=\"file\" id=\"ticksFile\" accept=\".csv\"></div>\n";
+  f << "      <div id=\"ticksStatus\"></div>\n";
+  f << "    </div>\n";
+  f << "    <div style=\"margin-top:10px\">Metric: <select id=\"tickMetric\"></select>\n";
+  f << "      <label style=\"margin-left:12px\"><input type=\"checkbox\" id=\"tickNormalize\"> normalize</label>\n";
+  f << "    </div>\n";
+  f << "    <canvas id=\"tickChart\" style=\"margin-top:10px; width:100%; height:260px; border:1px solid #eee; border-radius:8px;\"></canvas>\n";
+  f << "    <div class=\"small\" id=\"tickHint\" style=\"margin-top:6px\"></div>\n";
+  f << "  </div>\n";
+  f << "</div>\n";
+
+  f << "<h2 style=\"margin-top:28px\">Chronicle</h2>\n";
+  f << "<div class=\"row\">\n";
+  f << "  <div class=\"card\" style=\"flex:1; min-width:420px\">\n";
+  f << "    <div class=\"small\">Optional: load <code>chronicle.json</code> for a procedural daily newspaper/advisor feed (works even when opened as file://).\n";
+  f << "      <div style=\"margin-top:6px\"><input type=\"file\" id=\"chronFile\" accept=\".json\"></div>\n";
+  f << "      <div id=\"chronStatus\"></div>\n";
+  f << "    </div>\n";
+  f << "    <div style=\"margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; align-items:center\">\n";
+  f << "      <input type=\"text\" id=\"chronFilter\" placeholder=\"filter headlines / tags\" style=\"flex:1; min-width:200px\">\n";
+  f << "      <select id=\"chronTone\"></select>\n";
+  f << "    </div>\n";
+  f << "    <div id=\"chronList\" style=\"margin-top:10px\"></div>\n";
   f << "  </div>\n";
   f << "</div>\n";
 
@@ -438,6 +474,8 @@ bool WriteHtmlReport(const std::filesystem::path& outPath,
   f << "<ul>\n";
   f << "  <li><a href=\"summary.json\">summary.json</a></li>\n";
   f << "  <li><a href=\"ticks.csv\">ticks.csv</a></li>\n";
+  f << "  <li><a href=\"chronicle.json\">chronicle.json</a></li>\n";
+  f << "  <li><a href=\"chronicle.md\">chronicle.md</a></li>\n";
   f << "  <li><a href=\"tile_metrics.csv\">tile_metrics.csv</a></li>\n";
   f << "  <li><a href=\"world.bin\">world.bin</a></li>\n";
   f << "</ul>\n";
@@ -462,9 +500,34 @@ const layerSel = document.getElementById('layerSel');
 const mainImg = document.getElementById('mainImg');
 const tileCoord = document.getElementById('tileCoord');
 const tileInfo = document.getElementById('tileInfo');
+
+// --- Tile metrics UI ---
 const metricsFile = document.getElementById('metricsFile');
 const metricsStatus = document.getElementById('metricsStatus');
+const metricSel = document.getElementById('metricSel');
+const metricFilter = document.getElementById('metricFilter');
+const metricDefaultBtn = document.getElementById('metricDefault');
+const metricAllBtn = document.getElementById('metricAll');
+const metricNoneBtn = document.getElementById('metricNone');
 
+// --- Ticks chart UI ---
+const ticksFile = document.getElementById('ticksFile');
+const ticksStatus = document.getElementById('ticksStatus');
+const tickMetric = document.getElementById('tickMetric');
+const tickNormalize = document.getElementById('tickNormalize');
+const tickChart = document.getElementById('tickChart');
+const tickHint = document.getElementById('tickHint');
+
+// --- Chronicle UI ---
+const chronFile = document.getElementById('chronFile');
+const chronStatus = document.getElementById('chronStatus');
+const chronFilter = document.getElementById('chronFilter');
+const chronTone = document.getElementById('chronTone');
+const chronList = document.getElementById('chronList');
+
+// -----------------------------
+// Layer selector
+// -----------------------------
 for (const l of LAYERS_2D) {
   const opt = document.createElement('option');
   opt.value = l.file;
@@ -476,66 +539,110 @@ layerSel.addEventListener('change', () => {
   mainImg.src = layerSel.value;
 });
 
-// --- Tile metrics ---
-let metrics = null; // {terrain,overlay,level,district,height,occupants,land_value,commute_traffic,goods_fill,flood_depth,ponding_depth,heat_island,heat_island_raw,fire_risk,fire_coverage,fire_response_cost}
+// -----------------------------
+// CSV parsing helpers (simple, no quotes)
+// -----------------------------
+function splitNonEmptyLines(text) {
+  return text.split(/\r?\n/).filter(l => l.length > 0);
+}
 
-function parseCsv(text) {
-  const lines = text.split(/\r?\n/).filter(l => l.length > 0);
+function tryParseNumber(s) {
+  if (s == null) return null;
+  const t = String(s).trim();
+  if (t === '' || t.toLowerCase() === 'nan' || t.toLowerCase() === 'null') return null;
+  const v = parseFloat(t);
+  return Number.isFinite(v) ? v : null;
+}
+
+function clamp(x, lo, hi) {
+  return x < lo ? lo : x > hi ? hi : x;
+}
+
+// -----------------------------
+// Tile metrics loader (generic)
+// -----------------------------
+let metrics = null; // {header, cols, types, numericKeys, stringKeys}
+let metricFilterValue = '';
+
+const DEFAULT_HOVER_METRICS = [
+  'land_value', 'livability', 'intervention_priority',
+  'traffic_crash_risk', 'crime_risk', 'noise', 'air_pollution',
+  'heat_island', 'runoff_pollution', 'flood_depth', 'ponding_depth',
+  'goods_fill', 'commute_traffic', 'road_centrality', 'road_vulnerability',
+  'job_opportunity', 'job_access', 'transit_access', 'walkability'
+];
+
+const ALWAYS_INFO_FIELDS = ['terrain', 'overlay', 'level', 'district', 'height', 'occupants'];
+
+function classifyColumns(header, sampleRows) {
+  const types = {};
+  for (let ci = 0; ci < header.length; ++ci) {
+    const name = header[ci];
+    if (name === 'x' || name === 'y') continue;
+    if (name === 'terrain' || name === 'overlay') {
+      types[name] = 'string';
+      continue;
+    }
+
+    let seen = 0;
+    let numeric = 0;
+    for (const row of sampleRows) {
+      if (ci >= row.length) continue;
+      const s = row[ci];
+      if (s == null) continue;
+      const t = String(s).trim();
+      if (t === '') continue;
+      seen += 1;
+      if (tryParseNumber(t) != null) numeric += 1;
+    }
+
+    // If the column looks mostly numeric, treat as numeric.
+    if (seen > 0 && (numeric / seen) >= 0.80) {
+      types[name] = 'number';
+    } else {
+      types[name] = 'string';
+    }
+  }
+  return types;
+}
+
+function parseTileMetricsCsv(text) {
+  const lines = splitNonEmptyLines(text);
   if (lines.length < 2) throw new Error('CSV has no data');
-  const header = lines[0].split(',');
-  const idx = (name) => header.indexOf(name);
-  const ix = idx('x');
-  const iy = idx('y');
-  if (ix < 0 || iy < 0) throw new Error('CSV missing x/y');
 
-  const take = {
-    terrain: idx('terrain'),
-    overlay: idx('overlay'),
-    level: idx('level'),
-    district: idx('district'),
-    height: idx('height'),
-    occupants: idx('occupants'),
-    land_value: idx('land_value'),
-    commute_traffic: idx('commute_traffic'),
-    goods_fill: idx('goods_fill'),
-    flood_depth: idx('flood_depth'),
-    ponding_depth: idx('ponding_depth'),
-    heat_island: idx('heat_island'),
-    heat_island_raw: idx('heat_island_raw'),
-    fire_risk: idx('fire_risk'),
-    fire_coverage: idx('fire_coverage'),
-    fire_response_cost: idx('fire_response_cost'),
-  };
+  const header = lines[0].split(',');
+  const ix = header.indexOf('x');
+  const iy = header.indexOf('y');
+  if (ix < 0 || iy < 0) throw new Error('CSV missing x/y columns');
 
   const n = MAP_W * MAP_H;
-  const out = {
-    terrain: new Array(n).fill(''),
-    overlay: new Array(n).fill(''),
-    level: new Int16Array(n),
-    district: new Int16Array(n),
-    height: new Float32Array(n),
-    occupants: new Int32Array(n),
-    land_value: new Float32Array(n),
-    commute_traffic: new Int32Array(n),
-    goods_fill: new Int32Array(n),
-    flood_depth: new Float32Array(n),
-    ponding_depth: new Float32Array(n),
-    heat_island: new Float32Array(n),
-    heat_island_raw: new Float32Array(n),
-    fire_risk: new Float32Array(n),
-    fire_coverage: new Float32Array(n),
-    fire_response_cost: new Int32Array(n),
-  };
 
-  // Initialize optional numeric channels to NaN so we can detect missing.
-  out.land_value.fill(NaN);
-  out.flood_depth.fill(NaN);
-  out.ponding_depth.fill(NaN);
-  out.heat_island.fill(NaN);
-  out.heat_island_raw.fill(NaN);
-  out.fire_risk.fill(NaN);
-  out.fire_coverage.fill(NaN);
-  out.fire_response_cost.fill(-1);
+  // Sample a few rows to classify columns.
+  const sampleRows = [];
+  const sampleCount = Math.min(200, lines.length - 1);
+  for (let li = 1; li <= sampleCount; ++li) {
+    sampleRows.push(lines[li].split(','));
+  }
+
+  const types = classifyColumns(header, sampleRows);
+
+  const cols = {};
+  const numericKeys = [];
+  const stringKeys = [];
+
+  for (const name of header) {
+    if (name === 'x' || name === 'y') continue;
+    const ty = types[name] || 'string';
+    if (ty === 'number') {
+      const arr = new Float32Array(n);
+      arr.fill(NaN);
+      cols[name] = arr;
+      numericKeys.push(name);
+    } else {
+      cols[name] = new Array(n).fill('');
+      stringKeys.push(name);
+    }
+  }
 
   for (let li = 1; li < lines.length; ++li) {
     const parts = lines[li].split(',');
@@ -546,39 +653,113 @@ function parseCsv(text) {
     if (x < 0 || y < 0 || x >= MAP_W || y >= MAP_H) continue;
     const i = y * MAP_W + x;
 
-    if (take.terrain >= 0) out.terrain[i] = parts[take.terrain];
-    if (take.overlay >= 0) out.overlay[i] = parts[take.overlay];
-    if (take.level >= 0) out.level[i] = parseInt(parts[take.level], 10) || 0;
-    if (take.district >= 0) out.district[i] = parseInt(parts[take.district], 10) || 0;
-    if (take.height >= 0) out.height[i] = parseFloat(parts[take.height]) || 0;
-    if (take.occupants >= 0) out.occupants[i] = parseInt(parts[take.occupants], 10) || 0;
-
-    if (take.land_value >= 0) out.land_value[i] = parseFloat(parts[take.land_value]);
-    if (take.commute_traffic >= 0) out.commute_traffic[i] = parseInt(parts[take.commute_traffic], 10) || 0;
-    if (take.goods_fill >= 0) out.goods_fill[i] = parseInt(parts[take.goods_fill], 10) || 0;
-    if (take.flood_depth >= 0) out.flood_depth[i] = parseFloat(parts[take.flood_depth]);
-    if (take.ponding_depth >= 0) out.ponding_depth[i] = parseFloat(parts[take.ponding_depth]);
-    if (take.heat_island >= 0) out.heat_island[i] = parseFloat(parts[take.heat_island]);
-    if (take.heat_island_raw >= 0) out.heat_island_raw[i] = parseFloat(parts[take.heat_island_raw]);
-    if (take.fire_risk >= 0) out.fire_risk[i] = parseFloat(parts[take.fire_risk]);
-    if (take.fire_coverage >= 0) out.fire_coverage[i] = parseFloat(parts[take.fire_coverage]);
-    if (take.fire_response_cost >= 0) out.fire_response_cost[i] = parseInt(parts[take.fire_response_cost], 10) || -1;
+    for (let ci = 0; ci < header.length; ++ci) {
+      if (ci === ix || ci === iy) continue;
+      const name = header[ci];
+      const arr = cols[name];
+      if (!arr) continue;
+      const s = (ci < parts.length) ? parts[ci] : '';
+      if (types[name] === 'number') {
+        const v = tryParseNumber(s);
+        arr[i] = (v == null) ? NaN : v;
+      } else {
+        arr[i] = s;
+      }
+    }
   }
 
-  return out;
+  return { header, cols, types, numericKeys, stringKeys };
 }
 
 function setMetrics(m) {
   metrics = m;
-  metricsStatus.textContent = 'Loaded tile_metrics.csv (' + (MAP_W*MAP_H) + ' tiles)';
+  if (metricsStatus) {
+    metricsStatus.textContent = 'Loaded tile_metrics.csv (' + (MAP_W * MAP_H) + ' tiles, ' + metrics.numericKeys.length + ' numeric cols)';
+  }
+  rebuildMetricSelector();
+}
+
+function getSelectedMetrics() {
+  if (!metricSel) return [];
+  const out = [];
+  for (const opt of metricSel.selectedOptions) out.push(opt.value);
+  return out;
+}
+
+function rebuildMetricSelector() {
+  if (!metricSel) return;
+
+  const prev = new Set(getSelectedMetrics());
+
+  metricSel.innerHTML = '';
+  if (!metrics) return;
+
+  const filter = metricFilterValue.trim().toLowerCase();
+  const keys = metrics.numericKeys.slice().sort();
+
+  for (const k of keys) {
+    if (filter && !k.toLowerCase().includes(filter)) continue;
+    const opt = document.createElement('option');
+    opt.value = k;
+    opt.textContent = k;
+    if (prev.has(k)) opt.selected = true;
+    metricSel.appendChild(opt);
+  }
+
+  // If nothing was selected (fresh load), apply a sane default.
+  if (metricSel.selectedOptions.length === 0) {
+    applyDefaultHoverMetrics();
+  }
+}
+
+function applyDefaultHoverMetrics() {
+  if (!metricSel || !metrics) return;
+  const want = new Set(DEFAULT_HOVER_METRICS);
+  for (const opt of metricSel.options) {
+    opt.selected = want.has(opt.value);
+  }
+  // If none matched, select the first few columns.
+  if (metricSel.selectedOptions.length === 0) {
+    for (let i = 0; i < metricSel.options.length && i < 8; ++i) {
+      metricSel.options[i].selected = true;
+    }
+  }
+}
+
+function applyAllHoverMetrics() {
+  if (!metricSel) return;
+  for (const opt of metricSel.options) opt.selected = true;
+}
+
+function applyNoneHoverMetrics() {
+  if (!metricSel) return;
+  for (const opt of metricSel.options) opt.selected = false;
+}
+
+if (metricFilter) {
+  metricFilter.addEventListener('input', () => {
+    metricFilterValue = metricFilter.value || '';
+    rebuildMetricSelector();
+  });
+}
+
+if (metricDefaultBtn) {
+  metricDefaultBtn.addEventListener('click', () => applyDefaultHoverMetrics());
+}
+if (metricAllBtn) {
+  metricAllBtn.addEventListener('click', () => applyAllHoverMetrics());
+}
+if (metricNoneBtn) {
+  metricNoneBtn.addEventListener('click', () => applyNoneHoverMetrics());
 }
 
 async function tryAutoLoadMetrics() {
+  if (!metricsStatus) return;
   try {
     const resp = await fetch('tile_metrics.csv');
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const txt = await resp.text();
-    setMetrics(parseCsv(txt));
+    setMetrics(parseTileMetricsCsv(txt));
   } catch (e) {
     metricsStatus.textContent = 'Not loaded. Use the file picker above to load tile_metrics.csv.';
   }
@@ -586,20 +767,45 @@ async function tryAutoLoadMetrics() {
 
 tryAutoLoadMetrics();
 
-metricsFile.addEventListener('change', () => {
-  const file = metricsFile.files && metricsFile.files[0];
-  if (!file) return;
-  const r = new FileReader();
-  r.onload = () => {
-    try {
-      setMetrics(parseCsv(String(r.result)));
-    } catch (e) {
-      metricsStatus.textContent = 'Failed to parse: ' + e;
-    }
-  };
-  r.readAsText(file);
-});
+if (metricsFile) {
+  metricsFile.addEventListener('change', () => {
+    const file = metricsFile.files && metricsFile.files[0];
+    if (!file) return;
+    const r = new FileReader();
+    r.onload = () => {
+      try {
+        setMetrics(parseTileMetricsCsv(String(r.result)));
+      } catch (e) {
+        if (metricsStatus) metricsStatus.textContent = 'Failed to parse: ' + e;
+      }
+    };
+    r.readAsText(file);
+  });
+}
 
+function formatTileMetric(name, v) {
+  if (v == null || !Number.isFinite(v)) return null;
+
+  // Heuristic: costs are often stored in "milli-steps".
+  if (name && name.includes('cost') && Math.abs(v) >= 1000) {
+    const steps = v / 1000.0;
+    return steps.toFixed(1);
+  }
+
+  // Integer-ish values: print without decimals.
+  if (Math.abs(v - Math.round(v)) < 1e-6 && Math.abs(v) < 1e9) {
+    return String(Math.round(v));
+  }
+
+  const a = Math.abs(v);
+  if (a >= 1000) return v.toFixed(1);
+  if (a >= 10) return v.toFixed(2);
+  return v.toFixed(3);
+}
+
+// -----------------------------
+// Map hover inspector
+// -----------------------------
 function updateHover(ev) {
   const rect = mainImg.getBoundingClientRect();
   const u = (ev.clientX - rect.left) / rect.width;
@@ -615,44 +821,499 @@ function updateHover(ev) {
 
   tileCoord.textContent = tx + ',' + ty;
 
-  if (metrics) {
-    const i = ty * MAP_W + tx;
-    const lv = metrics.land_value[i];
-    const fd = metrics.flood_depth[i];
-    const pd = metrics.ponding_depth[i];
-    const hi = metrics.heat_island[i];
-    const hir = metrics.heat_island_raw[i];
-    const fr = metrics.fire_risk[i];
-    const fc = metrics.fire_coverage[i];
-    const frc = metrics.fire_response_cost[i];
-
-    const parts = [];
-    parts.push(' terrain=' + metrics.terrain[i]);
-    parts.push(' overlay=' + metrics.overlay[i]);
-    parts.push(' lvl=' + metrics.level[i]);
-    parts.push(' dist=' + metrics.district[i]);
-    parts.push(' h=' + metrics.height[i].toFixed(3));
-    parts.push(' occ=' + metrics.occupants[i]);
-
-    if (!Number.isNaN(lv)) parts.push(' lv=' + lv.toFixed(3));
-    parts.push(' commute=' + metrics.commute_traffic[i]);
-    parts.push(' goodsFill=' + metrics.goods_fill[i]);
-    if (!Number.isNaN(fd)) parts.push(' flood=' + fd.toFixed(3));
-    if (!Number.isNaN(pd)) parts.push(' pond=' + pd.toFixed(3));
-    if (!Number.isNaN(hi)) parts.push(' heat=' + hi.toFixed(3));
-    if (!Number.isNaN(hir)) parts.push(' heatRaw=' + hir.toFixed(3));
-    if (!Number.isNaN(fr)) parts.push(' fireRisk=' + fr.toFixed(3));
-    if (!Number.isNaN(fc)) parts.push(' fireCov=' + fc.toFixed(3));
-    if (frc >= 0) parts.push(' fireResp=' + (frc / 1000.0).toFixed(1));
-
-    tileInfo.textContent = parts.join('');
-  } else {
+  if (!metrics) {
     tileInfo.textContent = '';
+    return;
   }
+
+  const i = ty * MAP_W + tx;
+  const parts = [];
+
+  // Always show a stable set of fields if present.
+  for (const k of ALWAYS_INFO_FIELDS) {
+    const arr = metrics.cols[k];
+    if (!arr) continue;
+    const val = arr[i];
+    if (typeof val === 'string') {
+      if (val !== '') parts.push(k + '=' + val);
+    } else {
+      const s = formatTileMetric(k, val);
+      if (s != null) parts.push(k + '=' + s);
+    }
+  }
+
+  // Show selected numeric metrics.
+  const selected = getSelectedMetrics();
+  for (const k of selected) {
+    const arr = metrics.cols[k];
+    if (!arr) continue;
+    const val = arr[i];
+    if (typeof val === 'string') continue;
+    const s = formatTileMetric(k, val);
+    if (s == null) continue;
+    parts.push(k + '=' + s);
+  }
+
+  tileInfo.textContent = parts.length ? (' ' + parts.join(' • ')) : '';
 }
 
 mainImg.addEventListener('mousemove', updateHover);
-mainImg.addEventListener('mouseleave', () => { tileCoord.textContent='-'; tileInfo.textContent=''; });
+mainImg.addEventListener('mouseleave', () => {
+  tileCoord.textContent = '-';
+  tileInfo.textContent = '';
+});
+
+// -----------------------------
+// Ticks.csv charting
+// -----------------------------
+let ticks = null; // {header, cols, numericKeys, day}
+
+const DEFAULT_TICK_METRICS = [
+  'population', 'money', 'happiness', 'trafficCongestion', 'goodsSatisfaction',
+  'avgLandValue', 'servicesOverallSatisfaction', 'airPollutionResidentAvg01'
+];
+
+function classifyNumericColumns(header, sampleRows) {
+  const numeric = new Set();
+  for (let ci = 0; ci < header.length; ++ci) {
+    const name = header[ci];
+    if (name === '') continue;
+
+    let seen = 0;
+    let ok = 0;
+    for (const row of sampleRows) {
+      if (ci >= row.length) continue;
+      const s = row[ci];
+      if (s == null) continue;
+      const t = String(s).trim();
+      if (t === '') continue;
+      seen += 1;
+      if (tryParseNumber(t) != null) ok += 1;
+    }
+    if (seen > 0 && (ok / seen) >= 0.80) numeric.add(name);
+  }
+  return numeric;
+}
+
+function parseTicksCsv(text) {
+  const lines = splitNonEmptyLines(text);
+  if (lines.length < 2) throw new Error('CSV has no data');
+
+  const header = lines[0].split(',');
+  const sampleRows = [];
+  const sampleCount = Math.min(200, lines.length - 1);
+  for (let li = 1; li <= sampleCount; ++li) sampleRows.push(lines[li].split(','));
+
+  const numericSet = classifyNumericColumns(header, sampleRows);
+
+  const rows = lines.length - 1;
+  const cols = {};
+  const numericKeys = [];
+
+  for (const name of header) {
+    if (name === '') continue;
+    if (numericSet.has(name)) {
+      cols[name] = new Array(rows).fill(NaN);
+      numericKeys.push(name);
+    }
+  }
+
+  const dayKey = header.includes('day') ? 'day' : (header.length > 0 ? header[0] : 'day');
+
+  for (let li = 1; li < lines.length; ++li) {
+    const parts = lines[li].split(',');
+    const ri = li - 1;
+    for (let ci = 0; ci < header.length; ++ci) {
+      const name = header[ci];
+      const arr = cols[name];
+      if (!arr) continue;
+      const s = (ci < parts.length) ? parts[ci] : '';
+      const v = tryParseNumber(s);
+      arr[ri] = (v == null) ? NaN : v;
+    }
+  }
+
+  numericKeys.sort();
+
+  return { header, cols, numericKeys, dayKey };
+}
+
+function setTicks(t) {
+  ticks = t;
+  if (ticksStatus) {
+    ticksStatus.textContent = 'Loaded ticks.csv (' + (ticks.cols[ticks.dayKey]?.length || 0) + ' rows, ' + ticks.numericKeys.length + ' numeric cols)';
+  }
+  rebuildTickSelector();
+  drawTickChart();
+}
+
+function rebuildTickSelector() {
+  if (!tickMetric) return;
+  tickMetric.innerHTML = '';
+  if (!ticks) return;
+
+  for (const k of ticks.numericKeys) {
+    // Skip day key in the metric selector.
+    if (k === ticks.dayKey) continue;
+    const opt = document.createElement('option');
+    opt.value = k;
+    opt.textContent = k;
+    tickMetric.appendChild(opt);
+  }
+
+  // Choose a default.
+  const keys = new Set(ticks.numericKeys);
+  let chosen = null;
+  for (const k of DEFAULT_TICK_METRICS) {
+    if (keys.has(k)) { chosen = k; break; }
+  }
+  if (!chosen && tickMetric.options.length > 0) chosen = tickMetric.options[0].value;
+  if (chosen) tickMetric.value = chosen;
+}
+
+async function tryAutoLoadTicks() {
+  if (!ticksStatus) return;
+  try {
+    const resp = await fetch('ticks.csv');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const txt = await resp.text();
+    setTicks(parseTicksCsv(txt));
+  } catch (e) {
+    ticksStatus.textContent = 'Not loaded. Use the file picker above to load ticks.csv.';
+  }
+}
+
+tryAutoLoadTicks();
+
+if (ticksFile) {
+  ticksFile.addEventListener('change', () => {
+    const file = ticksFile.files && ticksFile.files[0];
+    if (!file) return;
+    const r = new FileReader();
+    r.onload = () => {
+      try {
+        setTicks(parseTicksCsv(String(r.result)));
+      } catch (e) {
+        if (ticksStatus) ticksStatus.textContent = 'Failed to parse: ' + e;
+      }
+    };
+    r.readAsText(file);
+  });
+}
+
+
+
+// -----------------------------
+// Chronicle loading + render
+// -----------------------------
+let chronicle = null;
+
+function toneCss(t) {
+  if (t === 'good') return 'tone-good';
+  if (t === 'bad') return 'tone-bad';
+  if (t === 'alert') return 'tone-alert';
+  return 'tone-neutral';
+}
+
+function clearNode(n) {
+  while (n && n.firstChild) n.removeChild(n.firstChild);
+}
+
+function setChronicle(c) {
+  chronicle = c;
+  if (chronStatus) {
+    const n = (chronicle && chronicle.entries) ? chronicle.entries.length : 0;
+    chronStatus.textContent = 'Loaded chronicle.json (' + n + ' entries)';
+  }
+
+  if (chronTone) {
+    const cur = chronTone.value || 'all';
+    chronTone.innerHTML = '';
+    const opts = ['all', 'good', 'neutral', 'bad', 'alert'];
+    for (const t of opts) {
+      const opt = document.createElement('option');
+      opt.value = t;
+      opt.textContent = (t === 'all') ? 'tone: all' : ('tone: ' + t);
+      chronTone.appendChild(opt);
+    }
+    chronTone.value = cur;
+  }
+
+  renderChronicle();
+}
+
+function renderChronicle() {
+  if (!chronList) return;
+  clearNode(chronList);
+
+  if (!chronicle || !Array.isArray(chronicle.entries)) {
+    return;
+  }
+
+  const q = (chronFilter && chronFilter.value) ? chronFilter.value.trim().toLowerCase() : '';
+  const tone = (chronTone && chronTone.value) ? chronTone.value : 'all';
+
+  let lastDay = null;
+  let shown = 0;
+
+  for (const e of chronicle.entries) {
+    const etone = (e && e.tone) ? String(e.tone) : 'neutral';
+    if (tone !== 'all' && etone !== tone) continue;
+
+    const tags = Array.isArray(e.tags) ? e.tags : [];
+    const hay = (String(e.headline || '') + ' ' + String(e.body || '') + ' ' + tags.join(' ')).toLowerCase();
+    if (q && hay.indexOf(q) === -1) continue;
+
+    if (lastDay !== e.day) {
+      lastDay = e.day;
+      const h = document.createElement('div');
+      h.style.marginTop = '10px';
+      h.style.fontWeight = '700';
+      h.textContent = 'Day ' + e.day;
+      chronList.appendChild(h);
+    }
+
+    const wrap = document.createElement('div');
+    wrap.className = 'chronEntry';
+
+    const title = document.createElement('div');
+    const toneSpan = document.createElement('span');
+    toneSpan.className = 'tone ' + toneCss(etone);
+    toneSpan.textContent = '[' + etone + '] ';
+    title.appendChild(toneSpan);
+
+    const hline = document.createElement('span');
+    hline.style.fontWeight = '700';
+    hline.textContent = String(e.headline || '');
+    title.appendChild(hline);
+    wrap.appendChild(title);
+
+    if (tags && tags.length > 0) {
+      const tagRow = document.createElement('div');
+      tagRow.style.marginTop = '6px';
+      for (const t of tags) {
+        const pill = document.createElement('span');
+        pill.className = 'pill';
+        pill.textContent = String(t);
+        tagRow.appendChild(pill);
+      }
+      wrap.appendChild(tagRow);
+    }
+
+    if (e.body) {
+      const body = document.createElement('div');
+      body.className = 'chronBody small';
+      body.style.marginTop = '6px';
+      body.textContent = String(e.body);
+      wrap.appendChild(body);
+    }
+
+    if (e.tip) {
+      const tip = document.createElement('div');
+      tip.className = 'small';
+      tip.style.marginTop = '6px';
+      const b = document.createElement('b');
+      b.textContent = 'Tip: ';
+      tip.appendChild(b);
+      const t = document.createElement('span');
+      t.textContent = String(e.tip);
+      tip.appendChild(t);
+      wrap.appendChild(tip);
+    }
+
+    chronList.appendChild(wrap);
+    shown++;
+  }
+
+  if (shown === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'small';
+    empty.textContent = 'No entries match the current filters.';
+    chronList.appendChild(empty);
+  }
+}
+
+async function tryAutoLoadChronicle() {
+  if (!chronStatus) return;
+  try {
+    const resp = await fetch('chronicle.json');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const txt = await resp.text();
+    setChronicle(JSON.parse(txt));
+  } catch (e) {
+    chronStatus.textContent = 'Not loaded. Use the file picker above to load chronicle.json.';
+  }
+}
+
+tryAutoLoadChronicle();
+
+if (chronFile) {
+  chronFile.addEventListener('change', () => {
+    const file = chronFile.files && chronFile.files[0];
+    if (!file) return;
+    const r = new FileReader();
+    r.onload = () => {
+      try {
+        setChronicle(JSON.parse(String(r.result)));
+      } catch (e) {
+        if (chronStatus) chronStatus.textContent = 'Failed to parse: ' + e;
+      }
+    };
+    r.readAsText(file);
+  });
+}
+
+if (chronFilter) chronFilter.addEventListener('input', renderChronicle);
+if (chronTone) chronTone.addEventListener('change', renderChronicle);
+function resizeCanvasToDisplaySize(canvas) {
+  if (!canvas) return;
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  const w = Math.max(10, Math.floor(rect.width * dpr));
+  const h = Math.max(10, Math.floor(rect.height * dpr));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+}
+
+function clearCanvas(canvas) {
+  if (!canvas) return;
+  resizeCanvasToDisplaySize(canvas);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+}
+
+function drawTickChart() {
+  if (!tickChart || !tickMetric) return;
+  resizeCanvasToDisplaySize(tickChart);
+  const ctx = tickChart.getContext('2d');
+  if (!ctx) return;
+
+  ctx.clearRect(0, 0, tickChart.width, tickChart.height);
+
+  if (!ticks) {
+    if (tickHint) tickHint.textContent = '';
+    return;
+  }
+
+  const key = tickMetric.value;
+  const yArr = ticks.cols[key];
+  if (!yArr || yArr.length === 0) return;
+
+  const xArr = ticks.cols[ticks.dayKey] || new Array(yArr.length).fill(0).map((_, i) => i);
+
+  let ymin = Infinity;
+  let ymax = -Infinity;
+  for (let i = 0; i < yArr.length; ++i) {
+    const y = yArr[i];
+    if (!Number.isFinite(y)) continue;
+    ymin = Math.min(ymin, y);
+    ymax = Math.max(ymax, y);
+  }
+  if (!Number.isFinite(ymin) || !Number.isFinite(ymax)) return;
+  if (ymin === ymax) {
+    ymin -= 1.0;
+    ymax += 1.0;
+  }
+
+  const normalize = !!(tickNormalize && tickNormalize.checked);
+
+  const padL = 46;
+  const padR = 16;
+  const padT = 14;
+  const padB = 26;
+  const W = tickChart.width;
+  const H = tickChart.height;
+
+  const plotW = Math.max(1, W - padL - padR);
+  const plotH = Math.max(1, H - padT - padB);
+
+  function xToPx(i) {
+    const t = (yArr.length <= 1) ? 0.0 : (i / (yArr.length - 1));
+    return padL + t * plotW;
+  }
+
+  function yToPx(y) {
+    let yy = y;
+    if (normalize) {
+      yy = (y - ymin) / (ymax - ymin);
+      yy = clamp(yy, 0.0, 1.0);
+      return padT + (1.0 - yy) * plotH;
+    }
+    const t = (y - ymin) / (ymax - ymin);
+    return padT + (1.0 - clamp(t, 0.0, 1.0)) * plotH;
+  }
+
+  // Axes
+  ctx.strokeStyle = '#666';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(padL, padT);
+  ctx.lineTo(padL, padT + plotH);
+  ctx.lineTo(padL + plotW, padT + plotH);
+  ctx.stroke();
+
+  // Labels
+  ctx.fillStyle = '#333';
+  ctx.font = (12 * (window.devicePixelRatio || 1)) + 'px system-ui, sans-serif';
+  const yLabelMin = normalize ? '0' : String(ymin.toFixed(2));
+  const yLabelMax = normalize ? '1' : String(ymax.toFixed(2));
+  ctx.fillText(yLabelMax, 6, padT + 10);
+  ctx.fillText(yLabelMin, 6, padT + plotH);
+
+  // Line
+  ctx.strokeStyle = '#1976d2';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  let started = false;
+  for (let i = 0; i < yArr.length; ++i) {
+    const y = yArr[i];
+    if (!Number.isFinite(y)) continue;
+    const xpx = xToPx(i);
+    const ypx = yToPx(y);
+    if (!started) {
+      ctx.moveTo(xpx, ypx);
+      started = true;
+    } else {
+      ctx.lineTo(xpx, ypx);
+    }
+  }
+  ctx.stroke();
+
+  // Update hint text
+  if (tickHint) {
+    tickHint.textContent = key + (normalize ? ' (normalized)' : '') + ' — min ' + ymin.toFixed(3) + ', max ' + ymax.toFixed(3);
+  }
+}
+
+if (tickMetric) tickMetric.addEventListener('change', drawTickChart);
+if (tickNormalize) tickNormalize.addEventListener('change', drawTickChart);
+window.addEventListener('resize', () => drawTickChart());
+
+if (tickChart) {
+  tickChart.addEventListener('mousemove', (ev) => {
+    if (!ticks || !tickHint) return;
+    const key = tickMetric ? tickMetric.value : '';
+    const yArr = ticks.cols[key];
+    const xArr = ticks.cols[ticks.dayKey] || null;
+    if (!yArr || yArr.length === 0) return;
+
+    const rect = tickChart.getBoundingClientRect();
+    const u = (ev.clientX - rect.left) / rect.width;
+    const idx = Math.round(clamp(u, 0.0, 1.0) * (yArr.length - 1));
+    const day = xArr ? xArr[idx] : idx;
+    const val = yArr[idx];
+    if (!Number.isFinite(val)) return;
+    tickHint.textContent = 'Day ' + day + ' • ' + key + '=' + val.toFixed(4);
+  });
+
+  tickChart.addEventListener('mouseleave', () => {
+    // Restore summary.
+    drawTickChart();
+  });
+}
 )JS";
 
   f << "</script>\n";
@@ -700,6 +1361,8 @@ bool WriteCityDossier(World& world,
   stepCount += 3; // traffic, goods, land value
   stepCount += 2; // sea flood + ponding
   if (cfg.writeTicksCsv) stepCount += 1;
+  if (cfg.writeChronicleJson) stepCount += 1;
+  if (cfg.writeChronicleMarkdown) stepCount += 1;
   if (cfg.writeTileMetricsCsv) stepCount += 1;
   stepCount += static_cast<int>(cfg.layers2d.size());
   if (cfg.exportIso) stepCount += static_cast<int>(cfg.layersIso.size());
@@ -811,6 +1474,38 @@ bool WriteCityDossier(World& world,
       }
     }
   }
+
+  // chronicle.json / chronicle.md
+  Chronicle chronicle;
+  bool chronicleReady = false;
+  auto getChronicle = [&]() -> const Chronicle& {
+    if (!chronicleReady) {
+      chronicle = GenerateCityChronicle(world, ticks);
+      chronicleReady = true;
+    }
+    return chronicle;
+  };
+
+  if (cfg.writeChronicleJson) {
+    if (!beginStage("write_chronicle_json")) return cancel();
+    const std::filesystem::path jsonPath = cfg.outDir / "chronicle.json";
+    std::string err;
+    if (!WriteCityChronicleJson(jsonPath.string(), getChronicle(), err)) {
+      outErr = "Failed to write chronicle.json: " + err;
+      return false;
+    }
+  }
+
+  if (cfg.writeChronicleMarkdown) {
+    if (!beginStage("write_chronicle_markdown")) return cancel();
+    const std::filesystem::path mdPath = cfg.outDir / "chronicle.md";
+    std::string err;
+    if (!WriteCityChronicleMarkdown(mdPath.string(), getChronicle(), err)) {
+      outErr = "Failed to write chronicle.md: " + err;
+      return false;
+    }
+  }
+
 
   // tile_metrics.csv
   if (cfg.writeTileMetricsCsv) {

@@ -4,6 +4,9 @@
 #include "isocity/Hash.hpp"
 #include "isocity/Json.hpp"
 #include "isocity/SaveLoad.hpp"
+#include "isocity/StatsCsv.hpp"
+
+#include "cli/CliParse.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -43,39 +46,17 @@ std::string Trim(const std::string& s)
 
 std::string HexU64(std::uint64_t v)
 {
-  std::ostringstream oss;
-  oss << "0x" << std::hex << std::setw(16) << std::setfill('0') << v;
-  return oss.str();
+  return isocity::cli::HexU64(v);
 }
 
 bool ParseI32(const std::string& s, int* out)
 {
-  if (!out) return false;
-  if (s.empty()) return false;
-  char* end = nullptr;
-  const long v = std::strtol(s.c_str(), &end, 10);
-  if (!end || *end != '\0') return false;
-  *out = static_cast<int>(v);
-  return true;
+  return isocity::cli::ParseI32(s, out);
 }
 
 bool ParseU64(const std::string& s, std::uint64_t* out)
 {
-  if (!out) return false;
-  if (s.empty()) return false;
-
-  int base = 10;
-  std::size_t offset = 0;
-  if (s.rfind("0x", 0) == 0 || s.rfind("0X", 0) == 0) {
-    base = 16;
-    offset = 2;
-  }
-
-  char* end = nullptr;
-  const unsigned long long v = std::strtoull(s.c_str() + offset, &end, base);
-  if (!end || *end != '\0') return false;
-  *out = static_cast<std::uint64_t>(v);
-  return true;
+  return isocity::cli::ParseU64(s, out);
 }
 
 [[maybe_unused]] bool ParseU8(const std::string& s, std::uint8_t* out)
@@ -90,27 +71,12 @@ bool ParseU64(const std::string& s, std::uint64_t* out)
 
 bool ParseBool01(const std::string& s, bool* out)
 {
-  if (!out) return false;
-  int v = 0;
-  if (!ParseI32(s, &v)) return false;
-  if (v != 0 && v != 1) return false;
-  *out = (v != 0);
-  return true;
+  return isocity::cli::ParseBool01(s, out);
 }
 
 bool ParseWxH(const std::string& s, int* outW, int* outH)
 {
-  if (!outW || !outH) return false;
-  const std::size_t pos = s.find_first_of("xX");
-  if (pos == std::string::npos) return false;
-
-  int w = 0, h = 0;
-  if (!ParseI32(s.substr(0, pos), &w)) return false;
-  if (!ParseI32(s.substr(pos + 1), &h)) return false;
-  if (w <= 0 || h <= 0) return false;
-  *outW = w;
-  *outH = h;
-  return true;
+  return isocity::cli::ParseWxH(s, outW, outH);
 }
 
 bool ParseShard(const std::string& s, int* outIndex, int* outCount)
@@ -581,27 +547,15 @@ bool WriteCaseArtifacts(const fs::path& caseDir, const isocity::ScenarioRunOutpu
       outErr = "failed to write ticks.csv";
       return false;
     }
-    f << "day,population,money,housingCapacity,jobsCapacity,jobsCapacityAccessible,employed,happiness,roads,parks,"
-         "avgCommuteTime,trafficCongestion,goodsDemand,goodsDelivered,goodsSatisfaction,avgLandValue,demandResidential\n";
+    if (!isocity::WriteStatsCsvHeader(f)) {
+      outErr = "failed to write ticks.csv header";
+      return false;
+    }
     for (const isocity::Stats& s : out.tickStats) {
-      f << s.day << ','
-        << s.population << ','
-        << s.money << ','
-        << s.housingCapacity << ','
-        << s.jobsCapacity << ','
-        << s.jobsCapacityAccessible << ','
-        << s.employed << ','
-        << s.happiness << ','
-        << s.roads << ','
-        << s.parks << ','
-        << s.avgCommuteTime << ','
-        << s.trafficCongestion << ','
-        << s.goodsDemand << ','
-        << s.goodsDelivered << ','
-        << s.goodsSatisfaction << ','
-        << s.avgLandValue << ','
-        << s.demandResidential
-        << '\n';
+      if (!isocity::WriteStatsCsvRow(f, s)) {
+        outErr = "failed while writing ticks.csv";
+        return false;
+      }
     }
   }
 

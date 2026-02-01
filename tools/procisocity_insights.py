@@ -269,19 +269,52 @@ def _choose_column(headers: Sequence[str], candidates: Sequence[str]) -> Optiona
 
 def _discover_metric_columns(headers: Sequence[str]) -> Dict[str, str]:
     """
-    Heuristic discovery for common dossier metrics.
+    Heuristic discovery for common tile_metrics.csv columns.
+
+    This tool intentionally stays schema-tolerant:
+    - It matches a canonical metric name against multiple possible column spellings.
+    - Missing metrics are simply ignored.
     """
     # Canonical metric -> list of possible column names
     desired = {
-        "land_value": ["landvalue", "land_value", "landValue", "land_value_norm", "landvalue_norm"],
-        "traffic": ["traffic", "traffic_flow", "commute_traffic", "traffic_util", "congestion"],
-        "goods_fill": ["goods_fill", "goodsfill", "goods", "goods_pressure", "goods_util"],
+        # Economic / demand
+        "land_value": ["land_value", "landvalue", "landValue", "value_land"],
+        "traffic": ["commute_traffic", "traffic", "traffic_flow", "traffic_util", "congestion"],
+        "goods_traffic": ["goods_traffic", "goodsTraffic", "freight_traffic"],
+        "goods_fill": ["goods_fill", "goodsfill", "goods_pressure", "goods_util"],
+
+        # Environment
+        "noise": ["noise", "noise01", "noise_level"],
+        "heat_island": ["heat_island", "heatIsland", "heat_island01"],
+        "air_pollution": ["air_pollution", "airPollution", "air_quality", "pm25", "pm_2_5"],
+        "air_emission": ["air_emission", "airEmission", "emission_air"],
+        "runoff_pollution": ["runoff_pollution", "runoffPollution", "stormwater_pollution"],
+        "solar_potential": ["solar_potential", "solarPotential", "pv_potential"],
+        "sky_view": ["sky_view", "skyView", "skyview"],
+        "energy_balance": ["energy_balance", "energyBalance", "net_energy"],
+        "carbon_balance": ["carbon_balance", "carbonBalance", "net_carbon"],
+
+        # Safety / risk
+        "crime_risk": ["crime_risk", "crimeRisk"],
+        "traffic_crash_risk": ["traffic_crash_risk", "trafficCrashRisk", "crash_risk"],
+        "fire_risk": ["fire_risk", "fireRisk"],
+
+        # Accessibility
+        "transit_access": ["transit_access", "transitAccess", "pt_access"],
+        "walkability": ["walkability", "walkScore", "walkability01"],
+        "job_access": ["job_access", "jobAccess", "jobs_access"],
+
+        # Network / planning
+        "road_vulnerability": ["road_vulnerability", "roadVulnerability"],
+        "livability": ["livability", "livability01"],
+        "intervention_priority": ["intervention_priority", "interventionPriority", "priority"],
+
+        # Flooding
         "flood_depth": ["flood_depth", "flooddepth", "sea_depth", "flood"],
         "ponding_depth": ["ponding_depth", "pondingdepth", "pond_depth", "ponding"],
-        "services": ["services", "service", "service_sat", "services_sat", "satisfaction_services"],
-        "happiness": ["happiness", "happy"],
-        "population": ["population", "pop", "residents"],
-        "jobs": ["jobs", "employment"],
+
+        # Tile occupancy proxy (tile_metrics.csv uses occupants; not the same as total city population)
+        "occupants": ["occupants", "occupancy", "tile_occupants"],
     }
     out: Dict[str, str] = {}
     for metric, cands in desired.items():
@@ -467,7 +500,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "gini": gini([v for v in xs_f if v is not None]),  # type: ignore[arg-type]
         }
 
-    # Hotspots
+    # Extremes
     def topk(vals: List[Optional[float]], k: int) -> List[Dict[str, Any]]:
         # simple O(n log n) sort (n is manageable), filtering invalid coords
         items: List[Tuple[float, int, int]] = []
@@ -481,25 +514,80 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             out.append({"x": x, "y": y, "value": v})
         return out
 
+    def bottomk(vals: List[Optional[float]], k: int) -> List[Dict[str, Any]]:
+        items: List[Tuple[float, int, int]] = []
+        for (x, y), v in zip(coords, vals):
+            if x < 0 or y < 0 or v is None or not math.isfinite(v):
+                continue
+            items.append((v, x, y))
+        items.sort(key=lambda t: t[0])
+        out = []
+        for v, x, y in items[: max(0, k)]:
+            out.append({"x": x, "y": y, "value": v})
+        return out
+
     hotspots: Dict[str, Any] = {}
+    coldspots: Dict[str, Any] = {}
     for m, vals in metric_values.items():
         hotspots[m] = topk(vals, args.topk)
+        coldspots[m] = bottomk(vals, args.topk)
 
-    # Moran's I for land value if available
-    moran = None
-    if "land_value" in metric_map:
-        # build grid in row-major; default None
+    # Moran's I (4-neighbor) for a few key metrics if available.
+    morans: Dict[str, Optional[float]] = {}
+    moran_metrics = [
+        m
+        for m in (
+            "land_value",
+            "air_pollution",
+            "noise",
+            "heat_island",
+            "crime_risk",
+            "traffic_crash_risk",
+            "livability",
+            "intervention_priority",
+            "flood_depth",
+            "ponding_depth",
+        )
+        if m in metric_map
+    ]
+    for m in moran_metrics:
         grid: List[Optional[float]] = [None] * (w * h)
-        land_vals = metric_values["land_value"]
-        for (x, y), v in zip(coords, land_vals):
+        vals_m = metric_values[m]
+        for (x, y), v in zip(coords, vals_m):
             if x < 0 or y < 0:
                 continue
             grid[y * w + x] = v if (v is not None and math.isfinite(v)) else None
-        moran = morans_i_grid(grid, w, h)
+        morans[m] = morans_i_grid(grid, w, h)
+    moran = morans.get("land_value")
 
     # Correlations (pairwise among key metrics)
     corr: Dict[str, Any] = {}
-    key_metrics = [m for m in ("land_value", "traffic", "goods_fill", "flood_depth", "ponding_depth", "services") if m in metric_map]
+    key_metrics = [
+        m
+        for m in (
+            "land_value",
+            "traffic",
+            "goods_traffic",
+            "goods_fill",
+            "noise",
+            "air_pollution",
+            "heat_island",
+            "runoff_pollution",
+            "crime_risk",
+            "traffic_crash_risk",
+            "fire_risk",
+            "transit_access",
+            "walkability",
+            "job_access",
+            "road_vulnerability",
+            "livability",
+            "intervention_priority",
+            "flood_depth",
+            "ponding_depth",
+            "occupants",
+        )
+        if m in metric_map
+    ]
     for i in range(len(key_metrics)):
         for j in range(i + 1, len(key_metrics)):
             a = key_metrics[i]
@@ -522,9 +610,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # choose a few common series to sparkline
         series_candidates = {
             "population": ["population", "pop", "residents"],
-            "jobs": ["jobs"],
+            "jobs": ["employed", "jobs", "employment"],
             "money": ["money", "cash", "funds"],
             "happiness": ["happiness", "happy"],
+            "avg_commute_time": ["avgCommuteTime", "avg_commute_time", "commute_time"],
+            "traffic_congestion": ["trafficCongestion", "traffic_congestion"],
+            "goods_satisfaction": ["goodsSatisfaction", "goods_satisfaction"],
+            "services_satisfaction": [
+                "servicesOverallSatisfaction",
+                "services_overall_satisfaction",
+                "servicesSatisfaction",
+            ],
+            "air_pollution_avg01": ["airPollutionResidentAvg01", "air_pollution_resident_avg01"],
+            "air_pollution_high_exposure": [
+                "airPollutionResidentHighExposureFrac",
+                "air_pollution_resident_high_exposure_frac",
+            ],
+            "traffic_safety_exposure": [
+                "trafficSafetyResidentMeanExposure",
+                "traffic_safety_resident_mean_exposure",
+            ],
+            "transit_mode_share": ["transitModeShare", "transit_mode_share"],
+            "economy_index": ["economyIndex", "economy_index"],
         }
         series_out: Dict[str, Any] = {}
         for name, cands in series_candidates.items():
@@ -553,7 +660,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "grid": {"width": w, "height": h, "tiles": len(tile_rows)},
         "metrics": stats_json,
         "hotspots": hotspots,
-        "spatial": {"morans_i_land_value_4nbr": moran},
+        "coldspots": coldspots,
+        "spatial": {
+            "morans_i_land_value_4nbr": moran,
+            "morans_i_4nbr": {k: v for k, v in morans.items() if v is not None},
+        },
         "correlations": corr,
         "ticks": tick_summary,
         "summary": summary,
@@ -572,8 +683,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     md_lines.append("# ProcIsoCity Insights\n")
     md_lines.append(f"- Dossier: `{dossier}`\n")
     md_lines.append(f"- Grid: **{w} x {h}**  (tiles: {len(tile_rows)})\n")
-    if moran is not None:
-        md_lines.append(f"- Moran's I (land value, 4-neighbor): **{moran:.4f}**  _(>0 clustered, ~0 random, <0 dispersed)_\n")
+    if any(v is not None for v in morans.values()):
+        md_lines.append("- Moran's I (4-neighbor):\n")
+        for m, v in morans.items():
+            if v is None:
+                continue
+            md_lines.append(f"  - `{m}`: **{v:.4f}**  _(>0 clustered, ~0 random, <0 dispersed)_\n")
     md_lines.append("\n## Metric summaries\n")
     for m in key_metrics:
         info = stats_json.get(m, {})
@@ -591,14 +706,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if hs:
             md_lines.append(f"- Top {min(args.topk, len(hs))} hotspots (x, y, value):\n")
             md_lines.append("  - " + "\n  - ".join([f"({p['x']}, {p['y']}): {p['value']:.4f}" for p in hs[: min(10, len(hs))]]) + "\n")
+        cs = coldspots.get(m, [])
+        if cs:
+            md_lines.append(f"- Top {min(args.topk, len(cs))} coldspots (x, y, value):\n")
+            md_lines.append("  - " + "\n  - ".join([f"({p['x']}, {p['y']}): {p['value']:.4f}" for p in cs[: min(10, len(cs))]]) + "\n")
         md_lines.append("\n")
 
     if corr:
         md_lines.append("## Correlations (Pearson)\n")
-        for k, v in sorted(corr.items(), key=lambda kv: (kv[1] is None, -(kv[1] or 0.0))):
-            if v is None:
-                continue
+        corr_items = [(k, v) for k, v in corr.items() if v is not None]
+        corr_items.sort(key=lambda kv: abs(kv[1]), reverse=True)
+        max_lines = 30
+        for k, v in corr_items[:max_lines]:
             md_lines.append(f"- `{k}`: **{v:.4f}**\n")
+        if len(corr_items) > max_lines:
+            md_lines.append(f"- _(plus {len(corr_items) - max_lines} more in JSON output)_\n")
         md_lines.append("\n")
 
     if tick_summary.get("series"):

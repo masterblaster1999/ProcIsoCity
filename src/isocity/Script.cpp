@@ -11,6 +11,7 @@
 #include "isocity/Pathfinding.hpp"
 #include "isocity/ProcGen.hpp"
 #include "isocity/SaveLoad.hpp"
+#include "isocity/StatsCsv.hpp"
 #include "isocity/Traffic.hpp"
 
 #include <algorithm>
@@ -890,27 +891,15 @@ static bool WriteStatsCsv(const std::string& path, const std::vector<Stats>& row
     return false;
   }
 
-  f << "day,population,money,housingCapacity,jobsCapacity,jobsCapacityAccessible,employed,happiness,roads,parks,avgCommuteTime,trafficCongestion,goodsDemand,goodsDelivered,goodsSatisfaction,avgLandValue,demandResidential,demandCommercial,demandIndustrial\n";
+  if (!WriteStatsCsvHeader(f)) {
+    outError = "failed to write csv header";
+    return false;
+  }
   for (const auto& s : rows) {
-    f << s.day << ','
-      << s.population << ','
-      << s.money << ','
-      << s.housingCapacity << ','
-      << s.jobsCapacity << ','
-      << s.jobsCapacityAccessible << ','
-      << s.employed << ','
-      << s.happiness << ','
-      << s.roads << ','
-      << s.parks << ','
-      << s.avgCommuteTime << ','
-      << s.trafficCongestion << ','
-      << s.goodsDemand << ','
-      << s.goodsDelivered << ','
-      << s.goodsSatisfaction << ','
-      << s.avgLandValue << ','
-      << s.demandResidential << ','
-      << s.demandCommercial << ','
-      << s.demandIndustrial << '\n';
+    if (!WriteStatsCsvRow(f, s)) {
+      outError = "write failed";
+      return false;
+    }
   }
 
   if (!f) {
@@ -1543,7 +1532,8 @@ static bool CmdProc(ScriptRunnerState& ctx, ScriptRunner& runner, const std::vec
   if (key == "roadlayout" || key == "road_layout") {
     ProcGenRoadLayout layout{};
     if (!ParseProcGenRoadLayout(val, layout)) {
-      return runner.fail(path, lineNo, "unknown road_layout (try: organic|grid|radial|space_colonization)");
+      return runner.fail(path, lineNo,
+                         "unknown road_layout (try: organic|grid|radial|tensor_field|physarum|medial_axis|voronoi_cells|space_colonization)");
     }
     ctx.procCfg.roadLayout = layout;
     return true;
@@ -1560,7 +1550,7 @@ static bool CmdProc(ScriptRunnerState& ctx, ScriptRunner& runner, const std::vec
     ProcGenTerrainPreset p{};
     if (!ParseProcGenTerrainPreset(val, p)) {
       return runner.fail(path, lineNo,
-                         "unknown terrain_preset (try: classic|island|archipelago|inland_sea|river_valley|mountain_ring|fjords|canyon|volcano|delta)");
+                         "unknown terrain_preset (try: classic|island|archipelago|inland_sea|river_valley|mountain_ring|fjords|canyon|volcano|delta|tectonic)");
     }
     ctx.procCfg.terrainPreset = p;
     return true;
@@ -1594,7 +1584,8 @@ static bool CmdProc(ScriptRunnerState& ctx, ScriptRunner& runner, const std::vec
       key == "districts_mode") {
     ProcGenDistrictingMode mode{};
     if (!ParseProcGenDistrictingMode(val, mode)) {
-      return runner.fail(path, lineNo, "proc: districting_mode expects one of: voronoi|road_flow|block_graph");
+      return runner.fail(path, lineNo,
+                         "proc: districting_mode expects one of: voronoi|road_flow|block_graph|watershed");
     }
     ctx.procCfg.districtingMode = mode;
     return true;

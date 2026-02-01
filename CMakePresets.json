@@ -8,21 +8,9 @@
   "configurePresets": [
     {
       "name": "default",
-      "displayName": "Default (app + CLI)",
-      "description": "Build the interactive app and headless CLI tools.",
-      "binaryDir": "${sourceDir}/build",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "PROCISOCITY_BUILD_APP": "ON",
-        "PROCISOCITY_BUILD_CLI": "ON"
-      }
-    },
-    {
-      "name": "cli",
-      "displayName": "CLI only (headless)",
-      "description": "Build headless command-line tools only (no raylib).",
-      "binaryDir": "${sourceDir}/build-cli",
+      "displayName": "Headless CLI (offline-capable)",
+      "description": "Build CLI tools and core library without raylib (no FetchContent downloads).",
+      "binaryDir": "${sourceDir}/build/default",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
@@ -33,36 +21,97 @@
     },
     {
       "name": "tests",
-      "displayName": "Tests (headless)",
-      "description": "Build and run headless tests (no raylib).",
-      "binaryDir": "${sourceDir}/build-tests",
+      "displayName": "Headless tests (no raylib)",
+      "description": "Build proc_isocity_tests and enable ctest without raylib.",
+      "binaryDir": "${sourceDir}/build/tests",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "PROCISOCITY_BUILD_APP": "OFF",
-        "PROCISOCITY_BUILD_CLI": "OFF",
+        "PROCISOCITY_BUILD_CLI": "ON",
         "PROCISOCITY_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "ci",
+      "displayName": "CI / fast debug tests",
+      "description": "Fast debug build for CI: tests ON, CLI OFF, glTF export OFF.",
+      "binaryDir": "${sourceDir}/build/ci",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "PROCISOCITY_BUILD_APP": "OFF",
+        "PROCISOCITY_BUILD_CLI": "OFF",
+        "PROCISOCITY_BUILD_TESTS": "ON",
+        "PROCISOCITY_ENABLE_GLTF_EXPORT": "OFF"
+      }
+    },
+    {
+      "name": "app",
+      "displayName": "Interactive app + CLI (raylib required)",
+      "description": "Build the interactive raylib app (may use FetchContent unless configured to use system raylib).",
+      "binaryDir": "${sourceDir}/build/app",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "PROCISOCITY_BUILD_APP": "ON",
+        "PROCISOCITY_BUILD_CLI": "ON",
+        "PROCISOCITY_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "app-system-raylib",
+      "displayName": "Interactive app + CLI (system raylib)",
+      "description": "Build the interactive app using a system-installed raylib (no FetchContent downloads).",
+      "binaryDir": "${sourceDir}/build/app-system-raylib",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "PROCISOCITY_BUILD_APP": "ON",
+        "PROCISOCITY_USE_SYSTEM_RAYLIB": "ON",
+        "PROCISOCITY_BUILD_CLI": "ON",
+        "PROCISOCITY_BUILD_TESTS": "OFF"
       }
     }
   ],
   "buildPresets": [
     {
       "name": "default",
-      "configurePreset": "default"
-    },
-    {
-      "name": "cli",
-      "configurePreset": "cli"
+      "configurePreset": "default",
+      "jobs": 0
     },
     {
       "name": "tests",
-      "configurePreset": "tests"
+      "configurePreset": "tests",
+      "jobs": 0
+    },
+    {
+      "name": "ci",
+      "configurePreset": "ci",
+      "jobs": 0
+    },
+    {
+      "name": "app",
+      "configurePreset": "app",
+      "jobs": 0
+    },
+    {
+      "name": "app-system-raylib",
+      "configurePreset": "app-system-raylib",
+      "jobs": 0
     }
   ],
   "testPresets": [
     {
       "name": "tests",
       "configurePreset": "tests",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "ci",
+      "configurePreset": "ci",
       "output": {
         "outputOnFailure": true
       }

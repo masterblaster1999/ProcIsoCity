@@ -24,8 +24,13 @@ cd ProcIsoCity
 ### 2) Configure + build (CMake)
 
 ```bash
+# Headless CLI tools (offline-capable; no raylib)
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
+
+# Interactive app (requires raylib; may download via FetchContent unless configured otherwise)
+cmake -S . -B build-app -DCMAKE_BUILD_TYPE=Release -DPROCISOCITY_BUILD_APP=ON
+cmake --build build-app -j
 ```
 
 ### CMake presets (optional)
@@ -33,14 +38,23 @@ cmake --build build -j
 If you have **CMake 3.22+**, you can use the included `CMakePresets.json` for common builds:
 
 ```bash
-# Default (app + CLI)
+# Default (headless CLI, no raylib)
 cmake --preset default
 cmake --build --preset default --parallel
+
+# Interactive app (requires raylib; may use FetchContent unless you set PROCISOCITY_USE_SYSTEM_RAYLIB=ON)
+cmake --preset app
+cmake --build --preset app --parallel
 
 # Headless tests (no raylib)
 cmake --preset tests
 cmake --build --preset tests --parallel
 ctest --preset tests
+
+# CI / fast debug tests (no raylib, CLI off, glTF export off)
+cmake --preset ci
+cmake --build --preset ci --parallel
+ctest --preset ci
 ```
 
 Presets also enable `compile_commands.json` by default (handy for editor tooling).
@@ -96,9 +110,10 @@ ctest --test-dir build-tests --output-on-failure
 
 ### CMake options
 
-- `PROCISOCITY_BUILD_APP` (default: ON) — build the interactive raylib app (`proc_isocity`).
+- `PROCISOCITY_BUILD_APP` (default: OFF) — build the interactive raylib app (`proc_isocity`).
 - `PROCISOCITY_BUILD_TESTS` (default: OFF) — build `proc_isocity_tests` and enable `ctest`.
 - `PROCISOCITY_BUILD_CLI` (default: ON) — build headless command-line tools (includes `proc_isocity_cli`, `proc_isocity_dossier`, `proc_isocity_mine`, and many more; see below).
+- `PROCISOCITY_ENABLE_GLTF_EXPORT` (default: ON) — build the glTF/glb exporter. Set to OFF to reduce build time/memory; export commands will report a clear error.
 - `PROCISOCITY_USE_SYSTEM_RAYLIB` (default: OFF) — when building the app, use a system raylib instead of FetchContent.
 
 ### Headless CLI tools (optional)
@@ -145,6 +160,7 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
   - `index.html` (offline-friendly viewer with layer switcher + optional per-tile inspector)
   - `summary.json` (includes config, hash, and tick snapshots)
   - `ticks.csv` (per-day stats)
+  - `chronicle.json` / `chronicle.md` (procedural daily newspaper/advisor feed derived from ticks)
   - `tile_metrics.csv` (per-tile base + derived metrics: land value, traffic, goods, flood/ponding)
   - `world.bin` (final save)
   - a set of map images (`map_*.png`, optional `iso_*.png`, optional `view3d_overlay.png`)
@@ -153,6 +169,13 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
   ./build/proc_isocity_dossier --seed 1 --size 128x128 --days 120 --out-dir dossier_out \
     --scale 4 --layers terrain,overlay,landvalue,traffic,goods_fill,district,flood_depth,ponding_depth \
     --iso 1 --iso-layers overlay,landvalue
+  ```
+
+- `proc_isocity_chronicle`: generate only the **City Chronicle** (no images) as `chronicle.json` / `chronicle.md`.
+  Useful when you want a lightweight, deterministic daily narrative feed without exporting a full dossier.
+
+  ```bash
+  ./build/proc_isocity_chronicle --load save.bin --autobuild-days 120 --days 30 --out out/chronicle.json
   ```
 
 - `proc_isocity_mine`: batch-run procedural seeds, simulate, compute a KPI CSV, and output the **best seeds** (optionally diversity-selected).
@@ -826,6 +849,7 @@ The original ProcGen keys are still supported:
 
 - `terrainScale`, `waterLevel`, `sandLevel`
 - `hubs`, `extraConnections`
+- `roadLayout` (organic/grid/radial/tensor_field/physarum/medial_axis/voronoi_cells/space_colonization)
 - `zoneChance`, `parkChance`
 
 - **1**: Road tool

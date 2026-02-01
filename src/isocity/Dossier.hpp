@@ -20,6 +20,7 @@ namespace isocity {
 //   - map layers (PNG/PPM)
 //   - tile_metrics.csv (per-tile derived metrics)
 //   - ticks.csv (time-series Stats)
+//   - chronicle.json / chronicle.md (procedural "newspaper")
 //   - summary.json (metadata + serialized ProcGen/Sim configs)
 //   - world.bin (save file)
 //   - index.html (portable viewer)
@@ -148,6 +149,10 @@ struct CityDossierConfig {
   // Data exports.
   bool writeTileMetricsCsv = true;
   bool writeTicksCsv = true;
+
+  // Procedural "newspaper" generated from ticks.
+  bool writeChronicleJson = true;
+  bool writeChronicleMarkdown = true;
   bool writeSummaryJson = true;
   bool writeWorldBinary = true;
   bool writeHtml = true;

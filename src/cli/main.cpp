@@ -8,9 +8,11 @@
 #include "isocity/GfxTilesetAtlas.hpp"
 #include "isocity/FileHash.hpp"
 #include "isocity/Pathfinding.hpp"
+#include "isocity/StatsCsv.hpp"
 #include "isocity/Version.hpp"
 
 #include "cli/CliMain.hpp"
+#include "cli/CliParse.hpp"
 
 #include <algorithm>
 #include <array>
@@ -35,104 +37,37 @@ namespace {
 
 bool ParseI32(const std::string& s, int* out)
 {
-  if (!out) return false;
-  if (s.empty()) return false;
-  char* end = nullptr;
-  const long v = std::strtol(s.c_str(), &end, 10);
-  if (!end || *end != '\0') return false;
-  if (v < std::numeric_limits<int>::min() || v > std::numeric_limits<int>::max()) return false;
-  *out = static_cast<int>(v);
-  return true;
+  return isocity::cli::ParseI32(s, out);
 }
 
 bool ParseU64(const std::string& s, std::uint64_t* out)
 {
-  if (!out) return false;
-  if (s.empty()) return false;
-
-  int base = 10;
-  std::size_t offset = 0;
-  if (s.rfind("0x", 0) == 0 || s.rfind("0X", 0) == 0) {
-    base = 16;
-    offset = 2;
-  }
-
-  char* end = nullptr;
-  const unsigned long long v = std::strtoull(s.c_str() + offset, &end, base);
-  if (!end || *end != '\0') return false;
-  *out = static_cast<std::uint64_t>(v);
-  return true;
+  return isocity::cli::ParseU64(s, out);
 }
 
 bool ParseWxH(const std::string& s, int* outW, int* outH)
 {
-  if (!outW || !outH) return false;
-  const std::size_t pos = s.find_first_of("xX");
-  if (pos == std::string::npos) return false;
-
-  const std::string a = s.substr(0, pos);
-  const std::string b = s.substr(pos + 1);
-  int w = 0, h = 0;
-  if (!ParseI32(a, &w) || !ParseI32(b, &h)) return false;
-  if (w <= 0 || h <= 0) return false;
-  *outW = w;
-  *outH = h;
-  return true;
+  return isocity::cli::ParseWxH(s, outW, outH);
 }
 
 bool ParseF32(const std::string& s, float* out)
 {
-  if (!out) return false;
-  if (s.empty()) return false;
-  char* end = nullptr;
-  errno = 0;
-  const double v = std::strtod(s.c_str(), &end);
-  if (errno != 0) return false;
-  if (!end || *end != '\0') return false;
-  if (!std::isfinite(v)) return false;
-  *out = static_cast<float>(v);
-  return true;
+  return isocity::cli::ParseF32(s, out);
 }
 
 bool ParseF32Triple(const std::string& s, float* outA, float* outB, float* outC)
 {
-  if (!outA || !outB || !outC) return false;
-  const std::size_t p0 = s.find_first_of(",xX");
-  if (p0 == std::string::npos) return false;
-  const std::size_t p1 = s.find_first_of(",xX", p0 + 1);
-  if (p1 == std::string::npos) return false;
-  float a = 0.0f;
-  float b = 0.0f;
-  float c = 0.0f;
-  if (!ParseF32(s.substr(0, p0), &a)) return false;
-  if (!ParseF32(s.substr(p0 + 1, p1 - (p0 + 1)), &b)) return false;
-  if (!ParseF32(s.substr(p1 + 1), &c)) return false;
-  *outA = a;
-  *outB = b;
-  *outC = c;
-  return true;
+  return isocity::cli::ParseF32Triple(s, outA, outB, outC);
 }
 
 bool ParseU8Triple(const std::string& s, std::uint8_t* outA, std::uint8_t* outB, std::uint8_t* outC)
 {
-  if (!outA || !outB || !outC) return false;
-  float fa = 0.0f, fb = 0.0f, fc = 0.0f;
-  if (!ParseF32Triple(s, &fa, &fb, &fc)) return false;
-  auto clampU8 = [](float v) -> std::uint8_t {
-    const int i = static_cast<int>(std::lround(v));
-    return static_cast<std::uint8_t>(std::clamp(i, 0, 255));
-  };
-  *outA = clampU8(fa);
-  *outB = clampU8(fb);
-  *outC = clampU8(fc);
-  return true;
+  return isocity::cli::ParseU8Triple(s, outA, outB, outC);
 }
 
 std::string HexU64(std::uint64_t v)
 {
-  std::ostringstream oss;
-  oss << "0x" << std::hex << std::setw(16) << std::setfill('0') << v;
-  return oss.str();
+  return isocity::cli::HexU64(v);
 }
 
 // For unknown CLI args, offer a small "did you mean" hint.
@@ -465,9 +400,9 @@ void PrintHelp()
       << "  proc_isocity_cli [--load <save.bin>] [--seed <u64>] [--size <WxH>]\n"
       << "                 [--config <combined.json>] [--proc <proc.json>] [--sim <sim.json>]\n"
       << "                 [--gen-preset <name>] [--gen-preset-strength <N>]\n"
-      << "                 [--gen-road-layout <organic|grid|radial|space_colonization>]\n"
+      << "                 [--gen-road-layout <organic|grid|radial|tensor_field|physarum|medial_axis|voronoi_cells|space_colonization>]\n"
       << "                 [--gen-road-hierarchy <0|1>] [--gen-road-hierarchy-strength <N>]\n"
-      << "                 [--gen-districting-mode <voronoi|road_flow|block_graph>] [--days <N>]\n"
+      << "                 [--gen-districting-mode <voronoi|road_flow|block_graph|watershed>] [--days <N>]\n"
       << "                 [--out <summary.json>] [--csv <ticks.csv>] [--save <save.bin>] [--manifest <manifest.json>]\n"
       << "                 [--require-outside <0|1>] [--tax-res <N>] [--tax-com <N>] [--tax-ind <N>]\n"
       << "                 [--maint-road <N>] [--maint-park <N>]\n"
@@ -592,25 +527,7 @@ bool WriteJsonSummary(const isocity::World& world, std::uint64_t hash, const std
 
 bool WriteCsvRow(std::ostream& os, const isocity::Stats& s)
 {
-  os << s.day << ','
-     << s.population << ','
-     << s.money << ','
-     << s.housingCapacity << ','
-     << s.jobsCapacity << ','
-     << s.jobsCapacityAccessible << ','
-     << s.employed << ','
-     << s.happiness << ','
-     << s.roads << ','
-     << s.parks << ','
-     << s.avgCommuteTime << ','
-     << s.trafficCongestion << ','
-     << s.goodsDemand << ','
-     << s.goodsDelivered << ','
-     << s.goodsSatisfaction << ','
-     << s.avgLandValue << ','
-     << s.demandResidential
-     << '\n';
-  return static_cast<bool>(os);
+  return isocity::WriteStatsCsvRow(os, s);
 }
 
 } // namespace
@@ -760,7 +677,7 @@ int ProcIsoCityCliMain(int argc, char** argv)
     }
     if (arg == "--gen-preset") {
       if (!requireValue(i, val)) {
-        std::cerr << "--gen-preset requires a name (classic|island|archipelago|inland_sea|river_valley|mountain_ring|fjords|canyon|volcano|delta)\n";
+        std::cerr << "--gen-preset requires a name (classic|island|archipelago|inland_sea|river_valley|mountain_ring|fjords|canyon|volcano|delta|tectonic)\n";
         return 2;
       }
       isocity::ProcGenTerrainPreset p{};
@@ -790,7 +707,7 @@ int ProcIsoCityCliMain(int argc, char** argv)
       }
       ProcGenRoadLayout layout{};
       if (!ParseProcGenRoadLayout(val, layout)) {
-        std::cerr << "--gen-road-layout expects one of: organic|grid|radial|space_colonization\n";
+        std::cerr << "--gen-road-layout expects one of: organic|grid|radial|tensor_field|physarum|medial_axis|voronoi_cells|space_colonization\n";
         return 2;
       }
       procCfg.roadLayout = layout;
@@ -828,7 +745,7 @@ int ProcIsoCityCliMain(int argc, char** argv)
       }
       ProcGenDistrictingMode mode{};
       if (!ParseProcGenDistrictingMode(val, mode)) {
-        std::cerr << "--gen-districting-mode expects one of: voronoi|road_flow|block_graph\n";
+        std::cerr << "--gen-districting-mode expects one of: voronoi|road_flow|block_graph|watershed\n";
         return 2;
       }
       procCfg.districtingMode = mode;
@@ -2309,7 +2226,7 @@ int ProcIsoCityCliMain(int argc, char** argv)
         std::cerr << "Failed to open CSV for writing: " << csvPath << "\n";
         return 1;
       }
-      csv << "day,population,money,housingCapacity,jobsCapacity,jobsCapacityAccessible,employed,happiness,roads,parks,avgCommuteTime,trafficCongestion,goodsDemand,goodsDelivered,goodsSatisfaction,avgLandValue,demandResidential\n";
+      csv << isocity::kStatsCsvHeader << "\n";
       WriteCsvRow(csv, world.stats());
       artifacts.push_back(ArtifactEntry{"csv", csvPath, ""});
     }

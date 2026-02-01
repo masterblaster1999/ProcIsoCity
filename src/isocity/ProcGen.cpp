@@ -20,6 +20,8 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <queue>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -120,6 +122,7 @@ const char* ToString(ProcGenDistrictingMode m)
   case ProcGenDistrictingMode::Voronoi: return "voronoi";
   case ProcGenDistrictingMode::RoadFlow: return "road_flow";
   case ProcGenDistrictingMode::BlockGraph: return "block_graph";
+  case ProcGenDistrictingMode::Watershed: return "watershed";
   default: return "voronoi";
   }
 }
@@ -148,6 +151,13 @@ bool ParseProcGenDistrictingMode(const std::string& s, ProcGenDistrictingMode& o
     return true;
   }
 
+  if (eq("watershed") || eq("watersheds") || eq("basin") || eq("basins") || eq("hydrology") ||
+      eq("drainage") || eq("drainage_basin") || eq("drainage-basin") || eq("catchment") || eq("catchments") ||
+      eq("river_basin") || eq("river-basin")) {
+    out = ProcGenDistrictingMode::Watershed;
+    return true;
+  }
+
   return false;
 }
 
@@ -158,6 +168,10 @@ const char* ToString(ProcGenRoadLayout m)
   case ProcGenRoadLayout::Grid: return "grid";
   case ProcGenRoadLayout::Radial: return "radial";
   case ProcGenRoadLayout::SpaceColonization: return "space_colonization";
+  case ProcGenRoadLayout::VoronoiCells: return "voronoi_cells";
+  case ProcGenRoadLayout::Physarum: return "physarum";
+  case ProcGenRoadLayout::MedialAxis: return "medial_axis";
+  case ProcGenRoadLayout::TensorField: return "tensor_field";
   default: return "organic";
   }
 }
@@ -182,6 +196,33 @@ bool ParseProcGenRoadLayout(const std::string& s, ProcGenRoadLayout& out)
   if (eq("radial") || eq("ring") || eq("spoke") || eq("spokes") || eq("hubspoke") || eq("hub_spoke") ||
       eq("hub-and-spoke") || eq("hub_and_spoke")) {
     out = ProcGenRoadLayout::Radial;
+    return true;
+  }
+
+  if (eq("physarum") || eq("slime") || eq("slimemold") || eq("slime_mold") || eq("slime-mold") ||
+      eq("mold") || eq("mould") || eq("amoeba") || eq("ant") || eq("ants") || eq("ant_colony") ||
+      eq("ant-colony") || eq("aco") || eq("pheromone") || eq("pheromones")) {
+    out = ProcGenRoadLayout::Physarum;
+    return true;
+  }
+
+  if (eq("medial_axis") || eq("medial-axis") || eq("medialaxis") || eq("skeleton") || eq("skel") ||
+      eq("spine") || eq("backbone") || eq("centerline") || eq("centreline") || eq("midline") || eq("mid-line")) {
+    out = ProcGenRoadLayout::MedialAxis;
+    return true;
+  }
+
+  if (eq("tensor_field") || eq("tensor-field") || eq("tensorfield") || eq("tensor") ||
+      eq("field") || eq("flow") || eq("flow_field") || eq("flow-field") || eq("flowfield") ||
+      eq("orientation") || eq("orientation_field") || eq("orientation-field") || eq("orient") ||
+      eq("parish") || eq("muller") || eq("parish_muller") || eq("parish-muller")) {
+    out = ProcGenRoadLayout::TensorField;
+    return true;
+  }
+
+  if (eq("voronoi_cells") || eq("voronoi-cells") || eq("voronoicells") || eq("cells") || eq("cellular") || eq("voronoi") ||
+      eq("voronoi_mesh") || eq("voronoi-mesh") || eq("mesh") || eq("superblocks") || eq("superblock")) {
+    out = ProcGenRoadLayout::VoronoiCells;
     return true;
   }
 
@@ -229,6 +270,31 @@ struct Edge {
   int b = 0;
   int dist = 0;
 };
+
+struct Vec2f {
+  float x = 0.0f;
+  float y = 0.0f;
+};
+
+inline float Dot(const Vec2f& a, const Vec2f& b) { return a.x * b.x + a.y * b.y; }
+
+inline float LenSq(const Vec2f& v) { return v.x * v.x + v.y * v.y; }
+
+inline float Len(const Vec2f& v) { return std::sqrt(LenSq(v)); }
+
+inline Vec2f Perp(const Vec2f& v) { return Vec2f{-v.y, v.x}; }
+
+inline Vec2f Mul(const Vec2f& v, float s) { return Vec2f{v.x * s, v.y * s}; }
+
+inline Vec2f Add(const Vec2f& a, const Vec2f& b) { return Vec2f{a.x + b.x, a.y + b.y}; }
+
+inline Vec2f NormalizeSafe(const Vec2f& v, const Vec2f& fallback = Vec2f{1.0f, 0.0f})
+{
+  const float lsq = LenSq(v);
+  if (lsq <= 1.0e-10f) return fallback;
+  const float inv = 1.0f / std::sqrt(lsq);
+  return Vec2f{v.x * inv, v.y * inv};
+}
 
 // -----------------------------
 // Simple value noise based on HashCoords32.
@@ -1151,6 +1217,983 @@ static void CarveHubConnectionsOrganic(World& world, RNG& rng, const std::vector
   }
 }
 
+// Physarum / slime-mold inspired pheromone routing.
+//
+// Implementation notes:
+// - We run a lightweight agent simulation where "ants" repeatedly travel between
+//   random hub pairs using a local desirability function:
+//     desirability ~ pheromone * (1 / distance^2) / terrainCost
+// - Trails reinforce while pheromone evaporates/diffuses over time.
+// - After the simulation, we carve the top pheromone corridors as avenue/highway tiles.
+// - Finally, we connect hubs with a pheromone-biased A* so the macro network is
+//   guaranteed to be connected (even on maps split by water).
+//
+// This produces organic, redundancy-aware backbones that often resemble slime-mold
+// transport networks.
+static bool AStarPheromonePath(const World& world,
+                              const std::vector<float>& baseCost,
+                              const std::vector<float>& pher,
+                              float pherMax,
+                              P start,
+                              P goal,
+                              bool allowBridges,
+                              std::uint32_t seed32,
+                              std::vector<P>& outPath)
+{
+  outPath.clear();
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return false;
+  if (!world.inBounds(start.x, start.y) || !world.inBounds(goal.x, goal.y)) return false;
+
+  const int area = w * h;
+  constexpr float kINF = 1.0e18f;
+
+  auto toIdx = [&](int x, int y) { return y * w + x; };
+
+  const int startIdx = toIdx(start.x, start.y);
+  const int goalIdx = toIdx(goal.x, goal.y);
+
+  std::vector<float> g(static_cast<std::size_t>(area), kINF);
+  std::vector<int> parent(static_cast<std::size_t>(area), -1);
+  std::vector<std::uint8_t> closed(static_cast<std::size_t>(area), std::uint8_t{0});
+
+  struct OpenItem {
+    float f = 0.0f;
+    std::uint32_t tie = 0;
+    int idx = 0;
+  };
+
+  struct OpenCmp {
+    bool operator()(const OpenItem& a, const OpenItem& b) const
+    {
+      // Min-heap by f, then stable deterministic tie-break.
+      if (a.f > b.f) return true;
+      if (a.f < b.f) return false;
+      return a.tie > b.tie;
+    }
+  };
+
+  std::priority_queue<OpenItem, std::vector<OpenItem>, OpenCmp> open;
+
+  auto heuristic = [&](int x, int y) {
+    // Conservative admissible heuristic: each step costs at least ~0.5.
+    const int md = std::abs(x - goal.x) + std::abs(y - goal.y);
+    return 0.5f * static_cast<float>(md);
+  };
+
+  g[static_cast<std::size_t>(startIdx)] = 0.0f;
+  open.push(OpenItem{heuristic(start.x, start.y), HashCoords32(start.x, start.y, seed32 ^ 0xA57A7E11u), startIdx});
+
+  const int dx4[4] = {1, -1, 0, 0};
+  const int dy4[4] = {0, 0, 1, -1};
+
+  auto stepCost = [&](int idx) {
+    float bc = baseCost[static_cast<std::size_t>(idx)];
+    if (bc >= 1.0e17f) return kINF;
+
+    float pNorm = 0.0f;
+    if (pherMax > 1.0e-6f) {
+      pNorm = pher[static_cast<std::size_t>(idx)] / pherMax;
+      pNorm = Clamp01(pNorm);
+    }
+
+    // Strongly prefer high-pheromone corridors, but keep a floor so paths don't
+    // get trapped if pheromone is near-zero.
+    const float bias = 1.0f + 3.2f * (1.0f - pNorm); // in [1, 4.2]
+    return bc * bias;
+  };
+
+  while (!open.empty()) {
+    const OpenItem cur = open.top();
+    open.pop();
+
+    if (cur.idx < 0 || cur.idx >= area) continue;
+    if (closed[static_cast<std::size_t>(cur.idx)] != 0) continue;
+    closed[static_cast<std::size_t>(cur.idx)] = 1;
+
+    if (cur.idx == goalIdx) break;
+
+    const int cx = cur.idx % w;
+    const int cy = cur.idx / w;
+
+    for (int k = 0; k < 4; ++k) {
+      const int nx = cx + dx4[k];
+      const int ny = cy + dy4[k];
+      if (!world.inBounds(nx, ny)) continue;
+      const int ni = toIdx(nx, ny);
+      if (closed[static_cast<std::size_t>(ni)] != 0) continue;
+
+      const Tile& t = world.at(nx, ny);
+      if (t.terrain == Terrain::Water && !allowBridges) continue;
+
+      const float sc = stepCost(ni);
+      if (sc >= 1.0e17f) continue;
+
+      const float ng = g[static_cast<std::size_t>(cur.idx)] + sc;
+      if (ng < g[static_cast<std::size_t>(ni)]) {
+        g[static_cast<std::size_t>(ni)] = ng;
+        parent[static_cast<std::size_t>(ni)] = cur.idx;
+
+        const float nf = ng + heuristic(nx, ny);
+        const std::uint32_t tie = HashCoords32(nx, ny, seed32 ^ 0xC0FFEE11u);
+        open.push(OpenItem{nf, tie, ni});
+      }
+    }
+  }
+
+  if (startIdx != goalIdx && parent[static_cast<std::size_t>(goalIdx)] == -1) {
+    return false;
+  }
+
+  // Reconstruct.
+  std::vector<int> rev;
+  rev.reserve(static_cast<std::size_t>(w + h));
+
+  int cur = goalIdx;
+  rev.push_back(cur);
+  while (cur != startIdx) {
+    cur = parent[static_cast<std::size_t>(cur)];
+    if (cur < 0) break;
+    rev.push_back(cur);
+  }
+
+  if (rev.empty() || rev.back() != startIdx) return false;
+
+  outPath.reserve(rev.size());
+  for (auto it = rev.rbegin(); it != rev.rend(); ++it) {
+    const int idx = *it;
+    outPath.push_back(P{idx % w, idx / w});
+  }
+  return true;
+}
+
+// Tensor-field biased A* path.
+//
+// We bias step costs to prefer movement aligned to the local *orientation field*
+// (major axis OR its perpendicular). This mimics a simple tensor field:
+// roads can align to either of two orthogonal directions, ignoring sign.
+static bool AStarTensorFieldPath(const World& world,
+                                const std::vector<float>& baseCost,
+                                const std::vector<Vec2f>& major,
+                                float fieldStrength,
+                                P start,
+                                P goal,
+                                bool allowBridges,
+                                std::uint32_t seed32,
+                                std::vector<P>& outPath)
+{
+  outPath.clear();
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return false;
+  if (!world.inBounds(start.x, start.y) || !world.inBounds(goal.x, goal.y)) return false;
+
+  const int area = w * h;
+  constexpr float kINF = 1.0e18f;
+
+  auto toIdx = [&](int x, int y) { return y * w + x; };
+
+  const int startIdx = toIdx(start.x, start.y);
+  const int goalIdx = toIdx(goal.x, goal.y);
+
+  if (static_cast<int>(baseCost.size()) != area) return false;
+  if (static_cast<int>(major.size()) != area) return false;
+
+  fieldStrength = std::clamp(fieldStrength, 0.0f, 8.0f);
+
+  std::vector<float> g(static_cast<std::size_t>(area), kINF);
+  std::vector<int> parent(static_cast<std::size_t>(area), -1);
+  std::vector<std::uint8_t> closed(static_cast<std::size_t>(area), std::uint8_t{0});
+
+  struct OpenItem {
+    float f = 0.0f;
+    std::uint32_t tie = 0;
+    int idx = 0;
+  };
+
+  struct OpenCmp {
+    bool operator()(const OpenItem& a, const OpenItem& b) const
+    {
+      // Min-heap by f, then stable deterministic tie-break.
+      if (a.f > b.f) return true;
+      if (a.f < b.f) return false;
+      return a.tie > b.tie;
+    }
+  };
+
+  std::priority_queue<OpenItem, std::vector<OpenItem>, OpenCmp> open;
+
+  auto heuristic = [&](int x, int y) {
+    // Conservative admissible heuristic: each step costs at least ~0.5.
+    const int md = std::abs(x - goal.x) + std::abs(y - goal.y);
+    return 0.5f * static_cast<float>(md);
+  };
+
+  auto alignPenalty = [&](int fromIdx, int dx, int dy) {
+    const Vec2f m = major[static_cast<std::size_t>(fromIdx)];
+    const Vec2f step{static_cast<float>(dx), static_cast<float>(dy)};
+
+    // Alignment to major OR minor (perpendicular) axis.
+    const float a = std::fabs(Dot(m, step));
+    const float b = std::fabs(Dot(Perp(m), step));
+    float align = std::max(a, b);
+    align = std::clamp(align, 0.0f, 1.0f);
+
+    const float miss = 1.0f - align;
+    // Quadratic penalty for being off-axis.
+    return 1.0f + fieldStrength * (miss * miss);
+  };
+
+  auto stepCost = [&](int fromIdx, int toIdxV, int dx, int dy) {
+    float bc = baseCost[static_cast<std::size_t>(toIdxV)];
+    if (bc >= 1.0e17f) return kINF;
+    return bc * alignPenalty(fromIdx, dx, dy);
+  };
+
+  g[static_cast<std::size_t>(startIdx)] = 0.0f;
+  open.push(OpenItem{heuristic(start.x, start.y), HashCoords32(start.x, start.y, seed32 ^ 0x7E115A57u), startIdx});
+
+  const int dx4[4] = {1, -1, 0, 0};
+  const int dy4[4] = {0, 0, 1, -1};
+
+  while (!open.empty()) {
+    const OpenItem cur = open.top();
+    open.pop();
+
+    if (cur.idx < 0 || cur.idx >= area) continue;
+    if (closed[static_cast<std::size_t>(cur.idx)] != 0) continue;
+    closed[static_cast<std::size_t>(cur.idx)] = 1;
+
+    if (cur.idx == goalIdx) break;
+
+    const int cx = cur.idx % w;
+    const int cy = cur.idx / w;
+
+    for (int k = 0; k < 4; ++k) {
+      const int nx = cx + dx4[k];
+      const int ny = cy + dy4[k];
+      if (!world.inBounds(nx, ny)) continue;
+      const int ni = toIdx(nx, ny);
+      if (closed[static_cast<std::size_t>(ni)] != 0) continue;
+
+      const Tile& t = world.at(nx, ny);
+      if (t.terrain == Terrain::Water && !allowBridges) continue;
+
+      const float sc = stepCost(cur.idx, ni, dx4[k], dy4[k]);
+      if (sc >= 1.0e17f) continue;
+
+      const float ng = g[static_cast<std::size_t>(cur.idx)] + sc;
+      if (ng < g[static_cast<std::size_t>(ni)]) {
+        g[static_cast<std::size_t>(ni)] = ng;
+        parent[static_cast<std::size_t>(ni)] = cur.idx;
+
+        const float nf = ng + heuristic(nx, ny);
+        const std::uint32_t tie = HashCoords32(nx, ny, seed32 ^ 0x11C0FFEEu);
+        open.push(OpenItem{nf, tie, ni});
+      }
+    }
+  }
+
+  if (startIdx != goalIdx && parent[static_cast<std::size_t>(goalIdx)] == -1) {
+    return false;
+  }
+
+  // Reconstruct.
+  std::vector<int> rev;
+  rev.reserve(static_cast<std::size_t>(w + h));
+
+  int cur = goalIdx;
+  rev.push_back(cur);
+  while (cur != startIdx) {
+    cur = parent[static_cast<std::size_t>(cur)];
+    if (cur < 0) break;
+    rev.push_back(cur);
+  }
+
+  if (rev.empty() || rev.back() != startIdx) return false;
+
+  outPath.reserve(rev.size());
+  for (auto it = rev.rbegin(); it != rev.rend(); ++it) {
+    const int idx = *it;
+    outPath.push_back(P{idx % w, idx / w});
+  }
+  return true;
+}
+
+static void CarveHubConnectionsPhysarum(World& world, RNG& rng, const std::vector<P>& hubPts,
+                                       std::uint32_t seed32, const ProcGenConfig& cfg)
+{
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return;
+  if (hubPts.size() < 2u) {
+    CarveHubConnectionsOrganic(world, rng, hubPts, seed32 ^ 0x51A71D01u, cfg);
+    return;
+  }
+
+  const int area = w * h;
+  const int minDim = std::min(w, h);
+
+  // Local deterministic RNG so this mode doesn't "consume" too much of the global
+  // rng stream (helps keep later steps stable when toggling layouts).
+  RNG prng(static_cast<std::uint64_t>(seed32) ^ 0x51A71D00ULL ^ 0x5C1E01D0ULL);
+
+  // Precompute per-tile traversal costs.
+  // landCost is used by the agent simulation (land-only moves).
+  // baseCost is used by A* (bridges allowed with high penalty).
+  std::vector<float> landCost(static_cast<std::size_t>(area), 1.0e18f);
+  std::vector<float> baseCost(static_cast<std::size_t>(area), 1.0e18f);
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const std::size_t id = Idx(x, y, w);
+      const Tile& t = world.at(x, y);
+
+      float c = 1.0f;
+      if (t.terrain == Terrain::Water) {
+        // High cost so bridges are used only when necessary.
+        c = 34.0f;
+        landCost[id] = 1.0e18f;
+        baseCost[id] = c;
+      } else {
+        const float slope = LocalSlopeMax4(world, x, y);
+        c = 1.0f + slope * 58.0f;
+        landCost[id] = c;
+        baseCost[id] = c;
+      }
+
+      // Prefer to reuse already-carved hub grids.
+      if (t.overlay == Overlay::Road) {
+        landCost[id] *= 0.65f;
+        baseCost[id] *= 0.65f;
+      }
+    }
+  }
+
+  // Simulation parameters scale with map size.
+  int agents = std::clamp(area / 16, 280, 2400);
+  agents = std::max(agents, static_cast<int>(hubPts.size()) * 120);
+  agents = std::min(agents, 3200);
+
+  int steps = std::clamp(area / 2, 1800, 12000);
+
+  float evap = 0.060f;
+  float diffuse = 0.25f;
+  float deposit = 0.85f;
+  float depositGoal = 6.0f;
+  float hubSource = 1.25f;
+
+  if (minDim <= 48) {
+    // Tiny maps need less smoothing or trails smear too much.
+    steps = std::clamp(area / 2, 1200, 8000);
+    agents = std::clamp(area / 14, 220, 1700);
+    evap = 0.070f;
+    diffuse = 0.30f;
+    deposit = 0.80f;
+    depositGoal = 5.0f;
+    hubSource = 1.15f;
+  }
+
+  struct Agent {
+    int x = 0;
+    int y = 0;
+    int target = 0;
+  };
+
+  auto pickDifferentHub = [&](int avoid) {
+    if (hubPts.size() <= 1u) return 0;
+    int t = avoid;
+    for (int tries = 0; tries < 8 && t == avoid; ++tries) {
+      t = prng.rangeInt(0, static_cast<int>(hubPts.size()) - 1);
+    }
+    if (t == avoid) t = (avoid + 1) % static_cast<int>(hubPts.size());
+    return t;
+  };
+
+  std::vector<Agent> ants;
+  ants.reserve(static_cast<std::size_t>(agents));
+  for (int i = 0; i < agents; ++i) {
+    const int startHub = prng.rangeInt(0, static_cast<int>(hubPts.size()) - 1);
+    const int targetHub = pickDifferentHub(startHub);
+    const P sp = hubPts[static_cast<std::size_t>(startHub)];
+    ants.push_back(Agent{sp.x, sp.y, targetHub});
+  }
+
+  std::vector<float> pher(static_cast<std::size_t>(area), 0.0f);
+  std::vector<float> tmp(static_cast<std::size_t>(area), 0.0f);
+
+  auto isLand = [&](int x, int y) {
+    return world.inBounds(x, y) && world.isBuildable(x, y);
+  };
+
+  const int dx4[4] = {1, -1, 0, 0};
+  const int dy4[4] = {0, 0, 1, -1};
+
+  for (int step = 0; step < steps; ++step) {
+    // Light constant source at hubs so they remain strong attractors.
+    for (const P& h0 : hubPts) {
+      pher[Idx(h0.x, h0.y, w)] += hubSource;
+    }
+
+    for (Agent& a : ants) {
+      const P dst = hubPts[static_cast<std::size_t>(a.target)];
+
+      // Deposit at current location.
+      pher[Idx(a.x, a.y, w)] += deposit;
+
+      if (a.x == dst.x && a.y == dst.y) {
+        // Successful "commute"; reinforce more and pick a new target.
+        pher[Idx(a.x, a.y, w)] += depositGoal;
+        a.target = pickDifferentHub(a.target);
+      }
+
+      // Choose next step among 4-neighbors.
+      float weights[4] = {0, 0, 0, 0};
+      int candX[4] = {a.x, a.x, a.x, a.x};
+      int candY[4] = {a.y, a.y, a.y, a.y};
+      int count = 0;
+      float sumW = 0.0f;
+
+      for (int k = 0; k < 4; ++k) {
+        const int nx = a.x + dx4[k];
+        const int ny = a.y + dy4[k];
+        if (!isLand(nx, ny)) continue;
+        const std::size_t id = Idx(nx, ny, w);
+
+        const int md = std::abs(nx - dst.x) + std::abs(ny - dst.y);
+        const float hScore = 1.0f / (1.0f + static_cast<float>(md));
+
+        const float pScore = 0.15f + pher[id];
+        const float c = std::max(0.001f, landCost[id]);
+
+        // Bias toward the goal (squared heuristic), but still allow exploration.
+        float wgt = (pScore) * (hScore * hScore) / c;
+        wgt *= 0.85f + 0.30f * prng.nextF01();
+
+        weights[count] = wgt;
+        candX[count] = nx;
+        candY[count] = ny;
+        sumW += wgt;
+        ++count;
+      }
+
+      if (count <= 0 || sumW <= 0.0f) {
+        // Teleport to keep the simulation mixing on extreme terrain.
+        const int sHub = prng.rangeInt(0, static_cast<int>(hubPts.size()) - 1);
+        const P sp = hubPts[static_cast<std::size_t>(sHub)];
+        a.x = sp.x;
+        a.y = sp.y;
+        a.target = pickDifferentHub(sHub);
+        continue;
+      }
+
+      const float r = prng.nextF01() * sumW;
+      float acc = 0.0f;
+      int chosen = 0;
+      for (int i = 0; i < count; ++i) {
+        acc += weights[i];
+        if (r <= acc) {
+          chosen = i;
+          break;
+        }
+      }
+
+      a.x = candX[chosen];
+      a.y = candY[chosen];
+    }
+
+    // Diffuse + evaporate pheromone every other step (cheaper and still stable).
+    if ((step & 1) == 0) {
+      for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+          const std::size_t id = Idx(x, y, w);
+
+          float v = pher[id];
+          if (v > 1.0e6f) v = 1.0e6f; // numeric safety
+
+          float sum = v;
+          int cnt = 1;
+          if (x > 0) {
+            sum += pher[Idx(x - 1, y, w)];
+            ++cnt;
+          }
+          if (x + 1 < w) {
+            sum += pher[Idx(x + 1, y, w)];
+            ++cnt;
+          }
+          if (y > 0) {
+            sum += pher[Idx(x, y - 1, w)];
+            ++cnt;
+          }
+          if (y + 1 < h) {
+            sum += pher[Idx(x, y + 1, w)];
+            ++cnt;
+          }
+
+          const float avg = sum / static_cast<float>(cnt);
+          float nv = (1.0f - diffuse) * v + diffuse * avg;
+          nv *= (1.0f - evap);
+          tmp[id] = nv;
+        }
+      }
+      pher.swap(tmp);
+    }
+  }
+
+  // Compute max pheromone on land.
+  float maxP = 0.0f;
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      if (!world.isBuildable(x, y)) continue;
+      maxP = std::max(maxP, pher[Idx(x, y, w)]);
+    }
+  }
+
+  if (maxP <= 0.001f) {
+    CarveHubConnectionsOrganic(world, rng, hubPts, seed32 ^ 0x51A71D02u, cfg);
+    return;
+  }
+
+  // Determine a percentile threshold so the road density stays reasonable.
+  std::vector<float> vals;
+  vals.reserve(static_cast<std::size_t>(area));
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      if (!world.isBuildable(x, y)) continue;
+      vals.push_back(pher[Idx(x, y, w)]);
+    }
+  }
+
+  if (vals.size() < 32u) {
+    CarveHubConnectionsOrganic(world, rng, hubPts, seed32 ^ 0x51A71D03u, cfg);
+    return;
+  }
+
+  std::sort(vals.begin(), vals.end(), [](float a, float b) { return a > b; });
+
+  float roadFrac = 0.055f;
+  if (minDim <= 48) roadFrac = 0.070f;
+  if (minDim >= 128) roadFrac = 0.045f;
+  roadFrac += 0.005f * std::clamp(static_cast<int>(hubPts.size()) - 4, 0, 6);
+  roadFrac = std::clamp(roadFrac, 0.035f, 0.085f);
+
+  const int roadCount = std::clamp(static_cast<int>(vals.size() * roadFrac), 80, static_cast<int>(vals.size()));
+  const float threshRoad = vals[static_cast<std::size_t>(roadCount - 1)];
+
+  const int hiCount = std::clamp(roadCount / 5, 30, roadCount);
+  const float threshHighway = vals[static_cast<std::size_t>(hiCount - 1)];
+
+  // Carve the strongest pheromone corridors as arterials.
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      if (!world.isBuildable(x, y)) continue;
+      const std::size_t id = Idx(x, y, w);
+      const float p = pher[id];
+      if (p < threshRoad) continue;
+
+      // Suppress isolated speckles: require at least one high-pher neighbor.
+      int neigh = 0;
+      for (int k = 0; k < 4; ++k) {
+        const int nx = x + dx4[k];
+        const int ny = y + dy4[k];
+        if (!world.inBounds(nx, ny)) continue;
+        if (!world.isBuildable(nx, ny)) continue;
+        if (pher[Idx(nx, ny, w)] >= threshRoad) ++neigh;
+      }
+      if (neigh <= 0) continue;
+
+      const int lvl = (p >= threshHighway) ? 3 : 2;
+      SetRoadWithLevel(world, x, y, lvl, /*allowBridges=*/false);
+    }
+  }
+
+  // Ensure the hubs are connected using pheromone-biased A* paths.
+  const std::vector<Edge> mst = BuildHubMST(hubPts);
+  std::vector<std::uint32_t> usedEdgeKeys;
+  usedEdgeKeys.reserve(mst.size() + static_cast<std::size_t>(cfg.extraConnections) + 4u);
+
+  std::vector<P> path;
+  for (const Edge& e : mst) {
+    usedEdgeKeys.push_back(EdgeKeyU32(e.a, e.b));
+    const P a = hubPts[static_cast<std::size_t>(e.a)];
+    const P b = hubPts[static_cast<std::size_t>(e.b)];
+
+    const int lvl = std::max(2, ChooseHubConnectionLevel(world, a, b));
+    const bool allowBridges = true; // water is penalized heavily by baseCost.
+
+    const bool ok = AStarPheromonePath(world, baseCost, pher, maxP, a, b, allowBridges,
+                                      seed32 ^ HashCoords32(e.a, e.b, 0x51A71D04u), path);
+
+    if (!ok || path.size() < 2u) {
+      CarveRoadCurvy(world, rng, a, b, lvl, /*allowBridges=*/(lvl >= 2), seed32 ^ HashCoords32(e.a, e.b, 0x51A71D05u));
+      continue;
+    }
+
+    for (const P& p : path) {
+      SetRoadWithLevel(world, p.x, p.y, lvl, /*allowBridges=*/allowBridges);
+    }
+  }
+
+  auto edgeUsed = [&](std::uint32_t key) {
+    return std::find(usedEdgeKeys.begin(), usedEdgeKeys.end(), key) != usedEdgeKeys.end();
+  };
+
+  // Extra long cross-city expressways.
+  if (cfg.extraConnections > 0 && hubPts.size() >= 2u) {
+    const int n = static_cast<int>(hubPts.size());
+    std::vector<Edge> pairs;
+    pairs.reserve(static_cast<std::size_t>(n) * static_cast<std::size_t>(n - 1) / 2u);
+
+    for (int a = 0; a < n; ++a) {
+      for (int b = a + 1; b < n; ++b) {
+        pairs.push_back(Edge{a, b, ManhattanDist(hubPts[static_cast<std::size_t>(a)], hubPts[static_cast<std::size_t>(b)])});
+      }
+    }
+
+    std::sort(pairs.begin(), pairs.end(), [&](const Edge& ea, const Edge& eb) {
+      if (ea.dist != eb.dist) return ea.dist > eb.dist; // longest first
+      const std::uint32_t ha = HashCoords32(ea.a, ea.b, seed32 ^ 0x51A71D06u);
+      const std::uint32_t hb = HashCoords32(eb.a, eb.b, seed32 ^ 0x51A71D06u);
+      return ha < hb;
+    });
+
+    int added = 0;
+    for (const Edge& e : pairs) {
+      if (added >= cfg.extraConnections) break;
+      const std::uint32_t key = EdgeKeyU32(e.a, e.b);
+      if (edgeUsed(key)) continue;
+
+      const P a = hubPts[static_cast<std::size_t>(e.a)];
+      const P b = hubPts[static_cast<std::size_t>(e.b)];
+      const int lvl = 3;
+      const bool allowBridges = true;
+
+      const bool ok = AStarPheromonePath(world, baseCost, pher, maxP, a, b, allowBridges,
+                                        seed32 ^ HashCoords32(e.a, e.b, 0x51A71D07u) ^ static_cast<std::uint32_t>(added), path);
+
+      if (ok && path.size() >= 2u) {
+        for (const P& p : path) {
+          SetRoadWithLevel(world, p.x, p.y, lvl, /*allowBridges=*/allowBridges);
+        }
+      } else {
+        CarveRoadCurvy(world, rng, a, b, lvl, /*allowBridges=*/true, seed32 ^ HashCoords32(e.a, e.b, 0x51A71D08u) ^ static_cast<std::uint32_t>(added));
+      }
+
+      usedEdgeKeys.push_back(key);
+      ++added;
+    }
+  }
+}
+
+
+
+// Medial-axis / skeleton road layout.
+//
+// We approximate the medial axis of the buildable landmass by computing a
+// boundary Voronoi diagram (via multi-source BFS) and keeping the Voronoi edges
+// (where wavefronts from different boundary sources meet). Those ridges form a
+// "skeleton" of the land shape.
+//
+// We then:
+//  1) Carve arterials on the skeleton (avenues/highways depending on distance).
+//  2) Connect each hub to the nearest skeleton corridor.
+//  3) Connect hubs using skeleton-biased A* paths so long connections tend to
+//     follow the spine while still being able to bridge across water if needed.
+static void CarveHubConnectionsMedialAxis(World& world, RNG& rng, const std::vector<P>& hubPts,
+                                        std::uint32_t seed32, const ProcGenConfig& cfg)
+{
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return;
+  if (hubPts.size() < 2u) {
+    CarveHubConnectionsOrganic(world, rng, hubPts, seed32 ^ 0x4D454401u, cfg);
+    return;
+  }
+
+  const int area = w * h;
+  const int minDim = std::min(w, h);
+
+  auto isLand = [&](int x, int y) {
+    return world.inBounds(x, y) && world.isBuildable(x, y);
+  };
+
+  // 1) Distance-to-boundary field + boundary-source labels (Manhattan metric).
+  std::vector<int> dist(static_cast<std::size_t>(area), std::numeric_limits<int>::max());
+  std::vector<int> label(static_cast<std::size_t>(area), -1);
+  std::vector<std::uint8_t> ridge(static_cast<std::size_t>(area), std::uint8_t{0});
+
+  std::queue<int> q;
+
+  const int dx4[4] = {1, -1, 0, 0};
+  const int dy4[4] = {0, 0, 1, -1};
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const int id = static_cast<int>(Idx(x, y, w));
+      const Tile& t = world.at(x, y);
+
+      bool boundary = false;
+      if (t.terrain == Terrain::Water) {
+        boundary = true;
+      } else if (x == 0 || y == 0 || x == w - 1 || y == h - 1) {
+        boundary = true;
+      } else {
+        for (int k = 0; k < 4; ++k) {
+          const int nx = x + dx4[k];
+          const int ny = y + dy4[k];
+          if (!world.inBounds(nx, ny) || !isLand(nx, ny)) {
+            boundary = true;
+            break;
+          }
+        }
+      }
+
+      if (boundary) {
+        dist[static_cast<std::size_t>(id)] = 0;
+        label[static_cast<std::size_t>(id)] = id; // unique boundary source id
+        q.push(id);
+      }
+    }
+  }
+
+  while (!q.empty()) {
+    const int cur = q.front();
+    q.pop();
+
+    const int cx = cur % w;
+    const int cy = cur / w;
+    const int curD = dist[static_cast<std::size_t>(cur)];
+    if (curD == std::numeric_limits<int>::max()) continue;
+
+    for (int k = 0; k < 4; ++k) {
+      const int nx = cx + dx4[k];
+      const int ny = cy + dy4[k];
+      if (!world.inBounds(nx, ny)) continue;
+      const int ni = nx + ny * w;
+      const int nd = curD + 1;
+
+      const std::size_t nis = static_cast<std::size_t>(ni);
+      if (nd < dist[nis]) {
+        dist[nis] = nd;
+        label[nis] = label[static_cast<std::size_t>(cur)];
+        q.push(ni);
+      } else if (nd == dist[nis]) {
+        const int l0 = label[nis];
+        const int l1 = label[static_cast<std::size_t>(cur)];
+        if (l0 != -1 && l1 != -1 && l0 != l1) {
+          ridge[nis] = 1u;
+          label[nis] = std::min(l0, l1);
+        }
+      }
+    }
+  }
+
+  int landCount = 0;
+  int maxD = 0;
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      if (!isLand(x, y)) continue;
+      ++landCount;
+      const int d = dist[Idx(x, y, w)];
+      if (d != std::numeric_limits<int>::max()) maxD = std::max(maxD, d);
+    }
+  }
+
+  if (landCount <= 0) {
+    CarveHubConnectionsOrganic(world, rng, hubPts, seed32 ^ 0x4D454402u, cfg);
+    return;
+  }
+
+  // Keep only ridges that are sufficiently interior. This prevents the skeleton from
+  // hugging the coastline on very jagged shorelines.
+  int ridgeMinDist = std::clamp(minDim / 12, 2, 7);
+  ridgeMinDist = std::min(ridgeMinDist, std::max(2, maxD - 1));
+
+  std::vector<std::uint8_t> skel(static_cast<std::size_t>(area), std::uint8_t{0});
+  std::vector<float> pher(static_cast<std::size_t>(area), 0.0f);
+
+  std::vector<P> skelPts;
+  skelPts.reserve(static_cast<std::size_t>(area / 12));
+
+  int skelCount = 0;
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      if (!isLand(x, y)) continue;
+      const std::size_t id = Idx(x, y, w);
+      if (ridge[id] == 0) continue;
+      if (dist[id] < ridgeMinDist) continue;
+
+      // Suppress isolated speckles.
+      int neigh = 0;
+      for (int k = 0; k < 4; ++k) {
+        const int nx = x + dx4[k];
+        const int ny = y + dy4[k];
+        if (!isLand(nx, ny)) continue;
+        const std::size_t ni = Idx(nx, ny, w);
+        if (ridge[ni] != 0 && dist[ni] >= ridgeMinDist) ++neigh;
+      }
+      if (neigh <= 0) continue;
+
+      skel[id] = 1u;
+      pher[id] = 1.0f;
+      skelPts.push_back(P{x, y});
+      ++skelCount;
+    }
+  }
+
+  const int minWanted = std::max(40, area / 600);
+  if (skelCount < minWanted) {
+    CarveHubConnectionsOrganic(world, rng, hubPts, seed32 ^ 0x4D454403u, cfg);
+    return;
+  }
+
+  // 2) Carve arterials on the skeleton.
+  for (const P& p : skelPts) {
+    const std::size_t id = Idx(p.x, p.y, w);
+    const int d = dist[id];
+    const int lvl = (d >= ridgeMinDist + 2) ? 3 : 2;
+    SetRoadWithLevel(world, p.x, p.y, lvl, /*allowBridges=*/false);
+  }
+
+  // 3) Connect hubs to the nearest skeleton corridor.
+  std::vector<P> anchors = hubPts;
+  for (std::size_t hi = 0; hi < hubPts.size(); ++hi) {
+    const P hub = hubPts[hi];
+
+    int bestD = std::numeric_limits<int>::max();
+    std::uint32_t bestTie = std::numeric_limits<std::uint32_t>::max();
+    P best = hub;
+
+    for (const P& p : skelPts) {
+      const int d = std::abs(p.x - hub.x) + std::abs(p.y - hub.y);
+      if (d < bestD) {
+        bestD = d;
+        best = p;
+        bestTie = HashCoords32(p.x, p.y, seed32 ^ 0x4D454404u ^ static_cast<std::uint32_t>(hi));
+      } else if (d == bestD) {
+        const std::uint32_t tie = HashCoords32(p.x, p.y, seed32 ^ 0x4D454404u ^ static_cast<std::uint32_t>(hi));
+        if (tie < bestTie) {
+          bestTie = tie;
+          best = p;
+        }
+      }
+    }
+
+    anchors[hi] = best;
+
+    if (bestD > 0 && bestD < std::numeric_limits<int>::max()) {
+      CarveRoadCurvy(world, rng, hub, best, /*level=*/2, /*allowBridges=*/true,
+                    seed32 ^ HashCoords32(hub.x, hub.y, 0x4D454405u) ^ static_cast<std::uint32_t>(hi));
+    }
+  }
+
+  // Precompute A* base traversal cost (bridges allowed with high penalty).
+  std::vector<float> baseCost(static_cast<std::size_t>(area), 1.0e18f);
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const std::size_t id = Idx(x, y, w);
+      const Tile& t = world.at(x, y);
+
+      float c = 1.0f;
+      if (t.terrain == Terrain::Water) {
+        c = 34.0f;
+      } else {
+        const float slope = LocalSlopeMax4(world, x, y);
+        c = 1.0f + slope * 58.0f;
+      }
+
+      if (t.overlay == Overlay::Road) {
+        c *= 0.65f;
+      }
+
+      baseCost[id] = c;
+    }
+  }
+
+  // 4) Connect hubs using skeleton-biased A* paths.
+  const std::vector<Edge> mst = BuildHubMST(anchors);
+  std::vector<std::uint32_t> usedEdgeKeys;
+  usedEdgeKeys.reserve(mst.size() + static_cast<std::size_t>(cfg.extraConnections) + 4u);
+
+  std::vector<P> path;
+  for (const Edge& e : mst) {
+    usedEdgeKeys.push_back(EdgeKeyU32(e.a, e.b));
+
+    const P aH = hubPts[static_cast<std::size_t>(e.a)];
+    const P bH = hubPts[static_cast<std::size_t>(e.b)];
+    const int lvl = std::max(2, ChooseHubConnectionLevel(world, aH, bH));
+
+    const P a = anchors[static_cast<std::size_t>(e.a)];
+    const P b = anchors[static_cast<std::size_t>(e.b)];
+
+    const bool allowBridges = true;
+    const bool ok = AStarPheromonePath(world, baseCost, pher, /*pherMax=*/1.0f, a, b, allowBridges,
+                                      seed32 ^ HashCoords32(e.a, e.b, 0x4D454406u), path);
+
+    if (!ok || path.size() < 2u) {
+      CarveRoadCurvy(world, rng, a, b, lvl, /*allowBridges=*/true,
+                    seed32 ^ HashCoords32(e.a, e.b, 0x4D454407u));
+      continue;
+    }
+
+    for (const P& p : path) {
+      SetRoadWithLevel(world, p.x, p.y, lvl, /*allowBridges=*/allowBridges);
+    }
+  }
+
+  auto edgeUsed = [&](std::uint32_t key) {
+    return std::find(usedEdgeKeys.begin(), usedEdgeKeys.end(), key) != usedEdgeKeys.end();
+  };
+
+  // Extra long "express" links: connect farthest hub pairs (skeleton-biased).
+  if (cfg.extraConnections > 0 && hubPts.size() >= 2u) {
+    const int n = static_cast<int>(hubPts.size());
+    std::vector<Edge> pairs;
+    pairs.reserve(static_cast<std::size_t>(n) * static_cast<std::size_t>(n - 1) / 2u);
+
+    for (int a = 0; a < n; ++a) {
+      for (int b = a + 1; b < n; ++b) {
+        pairs.push_back(Edge{a, b, ManhattanDist(hubPts[static_cast<std::size_t>(a)], hubPts[static_cast<std::size_t>(b)])});
+      }
+    }
+
+    std::sort(pairs.begin(), pairs.end(), [&](const Edge& ea, const Edge& eb) {
+      if (ea.dist != eb.dist) return ea.dist > eb.dist; // longest first
+      const std::uint32_t ha = HashCoords32(ea.a, ea.b, seed32 ^ 0x4D454408u);
+      const std::uint32_t hb = HashCoords32(eb.a, eb.b, seed32 ^ 0x4D454408u);
+      return ha < hb;
+    });
+
+    int added = 0;
+    for (const Edge& e : pairs) {
+      if (added >= cfg.extraConnections) break;
+      const std::uint32_t key = EdgeKeyU32(e.a, e.b);
+      if (edgeUsed(key)) continue;
+
+      const P a = anchors[static_cast<std::size_t>(e.a)];
+      const P b = anchors[static_cast<std::size_t>(e.b)];
+
+      const int lvl = 3;
+      const bool allowBridges = true;
+
+      const bool ok = AStarPheromonePath(world, baseCost, pher, /*pherMax=*/1.0f, a, b, allowBridges,
+                                        seed32 ^ HashCoords32(e.a, e.b, 0x4D454409u) ^ static_cast<std::uint32_t>(added), path);
+
+      if (ok && path.size() >= 2u) {
+        for (const P& p : path) {
+          SetRoadWithLevel(world, p.x, p.y, lvl, /*allowBridges=*/allowBridges);
+        }
+      } else {
+        CarveRoadCurvy(world, rng, a, b, lvl, /*allowBridges=*/true,
+                      seed32 ^ HashCoords32(e.a, e.b, 0x4D45440Au) ^ static_cast<std::uint32_t>(added));
+      }
+
+      usedEdgeKeys.push_back(key);
+      ++added;
+    }
+  }
+}
 static void CarveHubConnectionsGrid(World& world, RNG& rng, const std::vector<P>& hubPts, std::uint32_t seed32,
                                    const ProcGenConfig& cfg)
 {
@@ -1288,6 +2331,325 @@ static void CarveHubConnectionsGrid(World& world, RNG& rng, const std::vector<P>
       const P b = hubPts[static_cast<std::size_t>(e.b)];
       CarveRoadCurvy(world, rng, a, b, /*level=*/3, /*allowBridges=*/true, seed32 ^ HashCoords32(e.a, e.b, 0x51D1A6u));
       ++added;
+    }
+  }
+}
+
+// Tensor-field road layout.
+//
+// This mode synthesizes a smooth *orientation field* over the map by blending:
+//  - terrain contour direction (roads prefer to follow contours on steep slopes)
+//  - a low-frequency domain-warped noise contour direction (adds district-scale grain)
+//
+// Then it:
+//  1) Traces a few long arterial "spines" from the most central hubs, following the
+//     field direction.
+//  2) Connects hubs via MST + optional long links using A* with a strong on-field
+//     alignment bias (AStarTensorFieldPath).
+static void CarveHubConnectionsTensorField(World& world, RNG& rng, const std::vector<P>& hubPts,
+                                          std::uint32_t seed32, const ProcGenConfig& cfg)
+{
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return;
+  if (hubPts.size() < 2u) {
+    CarveHubConnectionsOrganic(world, rng, hubPts, seed32 ^ 0x7E115A51u, cfg);
+    return;
+  }
+
+  const int area = w * h;
+  const int minDim = std::min(w, h);
+
+  // Local deterministic RNG so this mode doesn't consume too much of the global stream.
+  RNG prng(static_cast<std::uint64_t>(seed32) ^ 0x7E115A50ULL ^ 0xC0A1F1E1ULL);
+
+  // -------------------------
+  // 1) Precompute base traversal costs.
+  // -------------------------
+  std::vector<float> baseCost(static_cast<std::size_t>(area), 1.0e18f);
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const std::size_t id = Idx(x, y, w);
+      const Tile& t = world.at(x, y);
+
+      float c = 1.0f;
+      if (t.terrain == Terrain::Water) {
+        // Bridges are allowed for long arterials, but should remain rare.
+        c = 36.0f;
+      } else {
+        const float slope = LocalSlopeMax4(world, x, y);
+        c = 1.0f + slope * 62.0f;
+      }
+
+      // Prefer reusing already-carved hub grids and earlier spines.
+      if (t.overlay == Overlay::Road) {
+        c *= 0.65f;
+      }
+
+      baseCost[id] = c;
+    }
+  }
+
+  // -------------------------
+  // 2) Build the orientation field (major axis per tile).
+  // -------------------------
+  std::vector<Vec2f> major(static_cast<std::size_t>(area), Vec2f{1.0f, 0.0f});
+
+  auto heightAt = [&](int x, int y) {
+    x = std::clamp(x, 0, w - 1);
+    y = std::clamp(y, 0, h - 1);
+    return world.at(x, y).height;
+  };
+
+  const float baseScale = 0.035f * (64.0f / static_cast<float>(std::max(32, minDim)));
+  const float noiseScale = std::clamp(baseScale, 0.012f, 0.060f);
+
+  // Domain warp keeps the field district-scale smooth while still varied.
+  const float warpAmp = 3.5f;
+  const std::uint32_t noiseSeed = seed32 ^ 0xA11CE5E1u;
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      // Terrain gradient (height).
+      const float dhx = heightAt(x + 1, y) - heightAt(x - 1, y);
+      const float dhy = heightAt(x, y + 1) - heightAt(x, y - 1);
+      const Vec2f gH{dhx, dhy};
+
+      const float magH = Len(gH);
+      const Vec2f cH = (magH > 1.0e-6f) ? NormalizeSafe(Perp(gH)) : Vec2f{1.0f, 0.0f};
+
+      // Noise gradient (domain-warped fbm).
+      const float fx = static_cast<float>(x) * noiseScale;
+      const float fy = static_cast<float>(y) * noiseScale;
+
+      auto n = [&](float xx, float yy) {
+        return DomainWarpFBm2DPeriodic(xx, yy, noiseSeed, /*periodX=*/0, /*periodY=*/0,
+                                      /*octaves=*/4, /*lacunarity=*/2.0f, /*gain=*/0.5f, warpAmp);
+      };
+
+      const float nL = n(fx - noiseScale, fy);
+      const float nR = n(fx + noiseScale, fy);
+      const float nD = n(fx, fy - noiseScale);
+      const float nU = n(fx, fy + noiseScale);
+      const Vec2f gN{nR - nL, nU - nD};
+
+      const float magN = Len(gN);
+      const Vec2f cN = (magN > 1.0e-6f) ? NormalizeSafe(Perp(gN), Vec2f{0.0f, 1.0f}) : Vec2f{0.0f, 1.0f};
+
+      // Blend: rely more on contour-following when terrain is steep.
+      const float steep = Clamp01(magH * 6.0f);
+      const float wContour = 0.25f + 0.65f * steep;
+      const float wNoise = 1.0f - wContour;
+      Vec2f m = Add(Mul(cH, wContour), Mul(cN, wNoise));
+      m = NormalizeSafe(m, cN);
+
+      major[Idx(x, y, w)] = m;
+    }
+  }
+
+  // -------------------------
+  // 3) Trace long arterial spines from the most central hubs.
+  // -------------------------
+  // Find hub centroid.
+  float cx = 0.0f;
+  float cy = 0.0f;
+  for (const P& p : hubPts) {
+    cx += static_cast<float>(p.x);
+    cy += static_cast<float>(p.y);
+  }
+  cx /= static_cast<float>(hubPts.size());
+  cy /= static_cast<float>(hubPts.size());
+
+  struct HubPick {
+    int idx = 0;
+    int d = 0;
+    std::uint32_t tie = 0;
+  };
+  std::vector<HubPick> sorted;
+  sorted.reserve(hubPts.size());
+  for (int i = 0; i < static_cast<int>(hubPts.size()); ++i) {
+    const P p = hubPts[static_cast<std::size_t>(i)];
+    const int d = static_cast<int>(std::lround(std::fabs(static_cast<float>(p.x) - cx) + std::fabs(static_cast<float>(p.y) - cy)));
+    sorted.push_back(HubPick{i, d, HashCoords32(p.x, p.y, seed32 ^ 0x7E115A52u)});
+  }
+  std::sort(sorted.begin(), sorted.end(), [&](const HubPick& a, const HubPick& b) {
+    if (a.d != b.d) return a.d < b.d;
+    return a.tie < b.tie;
+  });
+
+  const int spineHubs = std::clamp(static_cast<int>(hubPts.size()), 2, std::clamp(minDim / 28, 3, 7));
+  const int spineSteps = std::clamp(static_cast<int>(std::lround(static_cast<float>(minDim) * 0.42f)), 18, 110);
+
+  auto traceSpine = [&](P start, Vec2f desiredDir, int level, std::uint32_t traceSeed) {
+    desiredDir = NormalizeSafe(desiredDir, Vec2f{1.0f, 0.0f});
+    P cur = start;
+    int prevDx = 0;
+    int prevDy = 0;
+
+    for (int step = 0; step < spineSteps; ++step) {
+      SetRoadWithLevel(world, cur.x, cur.y, level, /*allowBridges=*/false);
+
+      // Stop if we reached the outer edge.
+      if (cur.x <= 1 || cur.y <= 1 || cur.x >= w - 2 || cur.y >= h - 2) break;
+
+      // Keep sign consistent with the desired direction.
+      Vec2f m = major[Idx(cur.x, cur.y, w)];
+      if (Dot(m, desiredDir) < 0.0f) {
+        m = Mul(m, -1.0f);
+      }
+
+      struct Cand {
+        int nx = 0;
+        int ny = 0;
+        int dx = 0;
+        int dy = 0;
+        float score = -1.0e9f;
+        std::uint32_t tie = 0;
+      };
+
+      Cand best;
+      bool found = false;
+      const int dx4[4] = {1, -1, 0, 0};
+      const int dy4[4] = {0, 0, 1, -1};
+
+      for (int k = 0; k < 4; ++k) {
+        const int nx = cur.x + dx4[k];
+        const int ny = cur.y + dy4[k];
+        if (!world.inBounds(nx, ny)) continue;
+        const Tile& t = world.at(nx, ny);
+        if (!world.isBuildable(nx, ny)) continue;
+        if (t.terrain == Terrain::Water) continue; // spines avoid bridges; A* handles them later.
+
+        const Vec2f stepV{static_cast<float>(dx4[k]), static_cast<float>(dy4[k])};
+        const float align = Dot(m, stepV); // signed
+        if (align < 0.20f) continue;
+
+        const float slope = LocalSlopeMax4(world, nx, ny);
+        float s = 1.20f * align - 6.0f * slope;
+
+        // Mild inertia.
+        if (dx4[k] == prevDx && dy4[k] == prevDy) {
+          s += 0.08f;
+        } else if (prevDx != 0 || prevDy != 0) {
+          s -= 0.02f;
+        }
+
+        // Prefer lower traversal cost (reuses roads / avoids steepness).
+        s -= 0.01f * baseCost[Idx(nx, ny, w)];
+
+        const std::uint32_t tie = HashCoords32(nx, ny, traceSeed ^ static_cast<std::uint32_t>(step));
+
+        if (!found || s > best.score || (s == best.score && tie < best.tie)) {
+          found = true;
+          best = Cand{nx, ny, dx4[k], dy4[k], s, tie};
+        }
+      }
+
+      if (!found) break;
+
+      prevDx = best.dx;
+      prevDy = best.dy;
+      cur = P{best.nx, best.ny};
+
+      // If we merged into an existing arterial corridor, stop early (avoid loops).
+      if (step > 8) {
+        const Tile& t = world.at(cur.x, cur.y);
+        if (t.overlay == Overlay::Road && static_cast<int>(t.level) >= level) {
+          break;
+        }
+      }
+    }
+  };
+
+  for (int i = 0; i < spineHubs && i < static_cast<int>(sorted.size()); ++i) {
+    const int hubIdx = sorted[static_cast<std::size_t>(i)].idx;
+    const P hub = hubPts[static_cast<std::size_t>(hubIdx)];
+
+    const Vec2f m0 = major[Idx(hub.x, hub.y, w)];
+    const int lvl = (minDim >= 120 && i == 0) ? 3 : 2;
+
+    traceSpine(hub, m0, lvl, seed32 ^ HashCoords32(hub.x, hub.y, 0x7E115A53u) ^ static_cast<std::uint32_t>(i));
+    traceSpine(hub, Mul(m0, -1.0f), lvl, seed32 ^ HashCoords32(hub.x, hub.y, 0x7E115A54u) ^ static_cast<std::uint32_t>(i));
+  }
+
+  // -------------------------
+  // 4) Connect hubs (MST + long links) using tensor-field-biased A*.
+  // -------------------------
+  const std::vector<Edge> mst = BuildHubMST(hubPts);
+  std::vector<std::uint32_t> usedEdgeKeys;
+  usedEdgeKeys.reserve(mst.size() + static_cast<std::size_t>(cfg.extraConnections) + 4u);
+
+  std::vector<P> path;
+  for (const Edge& e : mst) {
+    usedEdgeKeys.push_back(EdgeKeyU32(e.a, e.b));
+    const P a = hubPts[static_cast<std::size_t>(e.a)];
+    const P b = hubPts[static_cast<std::size_t>(e.b)];
+    const int lvl = std::max(2, ChooseHubConnectionLevel(world, a, b));
+
+    const bool allowBridges = true;
+    const float fieldStrength = 3.2f;
+    const bool ok = AStarTensorFieldPath(world, baseCost, major, fieldStrength, a, b, allowBridges,
+                                        seed32 ^ HashCoords32(e.a, e.b, 0x7E115A55u), path);
+
+    if (!ok || path.size() < 2u) {
+      CarveRoadCurvy(world, rng, a, b, lvl, /*allowBridges=*/true, seed32 ^ HashCoords32(e.a, e.b, 0x7E115A56u));
+      continue;
+    }
+
+    for (const P& p : path) {
+      SetRoadWithLevel(world, p.x, p.y, lvl, /*allowBridges=*/allowBridges);
+    }
+  }
+
+  auto edgeUsed = [&](std::uint32_t key) {
+    return std::find(usedEdgeKeys.begin(), usedEdgeKeys.end(), key) != usedEdgeKeys.end();
+  };
+
+  // Add a few long express links (like sweeping boulevards / parkways).
+  if (cfg.extraConnections > 0 && hubPts.size() >= 2u) {
+    const int n = static_cast<int>(hubPts.size());
+    std::vector<Edge> pairs;
+    pairs.reserve(static_cast<std::size_t>(n) * static_cast<std::size_t>(n - 1) / 2u);
+
+    for (int a = 0; a < n; ++a) {
+      for (int b = a + 1; b < n; ++b) {
+        pairs.push_back(Edge{a, b, ManhattanDist(hubPts[static_cast<std::size_t>(a)], hubPts[static_cast<std::size_t>(b)])});
+      }
+    }
+
+    std::sort(pairs.begin(), pairs.end(), [&](const Edge& ea, const Edge& eb) {
+      if (ea.dist != eb.dist) return ea.dist > eb.dist; // longest first
+      const std::uint32_t ha = HashCoords32(ea.a, ea.b, seed32 ^ 0x7E115A57u);
+      const std::uint32_t hb = HashCoords32(eb.a, eb.b, seed32 ^ 0x7E115A57u);
+      return ha < hb;
+    });
+
+    int added = 0;
+    for (const Edge& e : pairs) {
+      if (added >= cfg.extraConnections) break;
+      const std::uint32_t key = EdgeKeyU32(e.a, e.b);
+      if (edgeUsed(key)) continue;
+      usedEdgeKeys.push_back(key);
+
+      const P a = hubPts[static_cast<std::size_t>(e.a)];
+      const P b = hubPts[static_cast<std::size_t>(e.b)];
+
+      const bool allowBridges = true;
+      const float fieldStrength = 3.6f;
+      const bool ok = AStarTensorFieldPath(world, baseCost, major, fieldStrength, a, b, allowBridges,
+                                          seed32 ^ HashCoords32(e.a, e.b, 0x7E115A58u) ^ static_cast<std::uint32_t>(added), path);
+
+      if (ok && path.size() >= 2u) {
+        for (const P& p : path) {
+          SetRoadWithLevel(world, p.x, p.y, /*level=*/3, /*allowBridges=*/allowBridges);
+        }
+        ++added;
+      } else {
+        // Conservative fallback.
+        CarveRoadCurvy(world, rng, a, b, /*level=*/3, /*allowBridges=*/true,
+                      seed32 ^ HashCoords32(e.a, e.b, 0x7E115A59u) ^ static_cast<std::uint32_t>(added));
+        ++added;
+      }
     }
   }
 }
@@ -1711,6 +3073,249 @@ static void CarveHubConnectionsSpaceColonization(World& world, RNG& rng, const s
     attractors.swap(kept);
   }
 }
+
+
+// Voronoi-cell arterial mesh.
+//
+// This mode builds a sparse Voronoi tessellation (on the tile grid) using the hubs
+// plus a few additional "site" points. Then it carves roads along the cell
+// boundaries. The result is a network of ring-roads / superblock boundaries that
+// reads as "planned" at the macro scale while still being highly seed-variable.
+//
+// After carving boundaries, each hub is connected to the nearest boundary arterial.
+// Optionally, cfg.extraConnections adds a few long cross-city expressways.
+static void CarveHubConnectionsVoronoiCells(World& world, RNG& rng, const std::vector<P>& hubPts,
+                                           std::uint32_t seed32, const ProcGenConfig& cfg)
+{
+  const int w = world.width();
+  const int h = world.height();
+  if (w <= 0 || h <= 0) return;
+  if (hubPts.empty()) return;
+
+  const int minDim = std::min(w, h);
+  const int area = w * h;
+  const int diag = w + h;
+
+  // ------------------------------------------------------------
+  // 1) Sample Voronoi sites: hubs + additional land points.
+  // ------------------------------------------------------------
+  std::vector<P> sites;
+  sites.reserve(32);
+
+  auto addUnique = [&](P p) {
+    for (const P& s : sites) {
+      if (s.x == p.x && s.y == p.y) return;
+    }
+    sites.push_back(p);
+  };
+
+  for (const P& h0 : hubPts) {
+    addUnique(h0);
+  }
+
+  const int extraSites = std::clamp(area / 2500, 4, 24);
+  const int targetSites = std::clamp(static_cast<int>(sites.size()) + extraSites,
+                                    static_cast<int>(sites.size()), 32);
+
+  const int minSep = std::clamp(minDim / 5, 10, 22);
+  const int maxTries = std::max(4000, targetSites * 250);
+
+  for (int tries = 0; tries < maxTries && static_cast<int>(sites.size()) < targetSites; ++tries) {
+    P p = RandomLand(world, rng);
+
+    // Avoid seeding too close to the edge so boundaries don't degenerate.
+    const int edgeDist = std::min(std::min(p.x, w - 1 - p.x), std::min(p.y, h - 1 - p.y));
+    if (edgeDist < 2) continue;
+
+    bool ok = true;
+    for (const P& s : sites) {
+      if (std::abs(s.x - p.x) + std::abs(s.y - p.y) < minSep) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) continue;
+
+    addUnique(p);
+  }
+
+  if (sites.size() < 2u) {
+    // Sampling failed; fall back to the organic backbone.
+    CarveHubConnectionsOrganic(world, rng, hubPts, seed32 ^ 0xB07A0C01u, cfg);
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // 2) Grid Voronoi assignment: nearest site per tile.
+  // ------------------------------------------------------------
+  std::vector<int> cell(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), 0);
+
+  auto siteDist2 = [&](int x, int y, const P& s) -> int {
+    const int dx = x - s.x;
+    const int dy = y - s.y;
+    return dx * dx + dy * dy;
+  };
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      int best = 0;
+      int bestD2 = std::numeric_limits<int>::max();
+      std::uint32_t bestTie = std::numeric_limits<std::uint32_t>::max();
+
+      for (int i = 0; i < static_cast<int>(sites.size()); ++i) {
+        const int d2 = siteDist2(x, y, sites[static_cast<std::size_t>(i)]);
+        const std::uint32_t tie = HashCoords32(i, HashCoords32(x, y, seed32 ^ 0xB0A71C01u), seed32 ^ 0xB0A71C01u);
+
+        if (d2 < bestD2 || (d2 == bestD2 && tie < bestTie)) {
+          bestD2 = d2;
+          bestTie = tie;
+          best = i;
+        }
+      }
+
+      cell[Idx(x, y, w)] = best;
+    }
+  }
+
+  // ------------------------------------------------------------
+  // 3) Mark Voronoi boundaries and carve them as arterials.
+  // ------------------------------------------------------------
+  std::vector<std::uint8_t> boundaryLvl(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), 0);
+
+  auto edgeLvl = [&](int aId, int bId) -> int {
+    const P a = sites[static_cast<std::size_t>(aId)];
+    const P b = sites[static_cast<std::size_t>(bId)];
+    const int d = std::abs(a.x - b.x) + std::abs(a.y - b.y);
+
+    // Major boundaries (farther sites) become highway-class; otherwise avenue-class.
+    int lvl = 2;
+    if (d > diag / 3) lvl = 3;
+    return lvl;
+  };
+
+  auto mark = [&](int x, int y, int lvl) {
+    const std::size_t id = Idx(x, y, w);
+    boundaryLvl[id] = static_cast<std::uint8_t>(std::max<int>(boundaryLvl[id], lvl));
+  };
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const int aId = cell[Idx(x, y, w)];
+
+      if (x + 1 < w) {
+        const int bId = cell[Idx(x + 1, y, w)];
+        if (aId != bId) {
+          const int lvl = edgeLvl(aId, bId);
+          // Choose a consistent side of the boundary to keep it mostly 1-tile thick.
+          if (aId < bId) mark(x, y, lvl);
+          else mark(x + 1, y, lvl);
+        }
+      }
+
+      if (y + 1 < h) {
+        const int bId = cell[Idx(x, y + 1, w)];
+        if (aId != bId) {
+          const int lvl = edgeLvl(aId, bId);
+          if (aId < bId) mark(x, y, lvl);
+          else mark(x, y + 1, lvl);
+        }
+      }
+    }
+  }
+
+  std::vector<P> boundaryRoads;
+  boundaryRoads.reserve(static_cast<std::size_t>(area / 8));
+
+  for (int y = 0; y < h; ++y) {
+    for (int x = 0; x < w; ++x) {
+      const std::uint8_t lvl = boundaryLvl[Idx(x, y, w)];
+      if (lvl == 0) continue;
+      if (!world.isBuildable(x, y)) continue;
+      SetRoadWithLevel(world, x, y, static_cast<int>(lvl), /*allowBridges=*/false);
+      boundaryRoads.push_back({x, y});
+    }
+  }
+
+  if (boundaryRoads.empty()) {
+    // No land boundaries; fall back.
+    CarveHubConnectionsOrganic(world, rng, hubPts, seed32 ^ 0xB07A0C02u, cfg);
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // 4) Connect hubs to the boundary network.
+  // ------------------------------------------------------------
+  auto roadTie = [&](const P& p) -> std::uint32_t {
+    return HashCoords32(p.x, p.y, seed32 ^ 0xC311C3u);
+  };
+
+  for (std::size_t i = 0; i < hubPts.size(); ++i) {
+    const P hub = hubPts[i];
+
+    int bestD = std::numeric_limits<int>::max();
+    std::uint32_t bestT = std::numeric_limits<std::uint32_t>::max();
+    P best = boundaryRoads[0];
+
+    for (const P& r : boundaryRoads) {
+      const int d = std::abs(hub.x - r.x) + std::abs(hub.y - r.y);
+      const std::uint32_t t = roadTie(r);
+      if (d < bestD || (d == bestD && t < bestT)) {
+        bestD = d;
+        bestT = t;
+        best = r;
+      }
+    }
+
+    if (bestD <= 2) {
+      // Hub already touches a boundary road.
+      continue;
+    }
+
+    const int lvl = (bestD > diag / 4) ? 3 : 2;
+    CarveRoadCurvy(world, rng, hub, best, lvl, /*allowBridges=*/true,
+                  seed32 ^ HashCoords32(hub.x, hub.y, 0xC311C3u) ^ HashCoords32(best.x, best.y, 0xB0A71C02u) ^
+                      static_cast<std::uint32_t>(i));
+  }
+
+  // ------------------------------------------------------------
+  // 5) Optional: cross-cell expressways between distant hubs.
+  // ------------------------------------------------------------
+  if (cfg.extraConnections > 0 && hubPts.size() >= 2) {
+    struct HubEdge {
+      int a = 0;
+      int b = 0;
+      int dist = 0;
+      std::uint32_t tie = 0;
+    };
+
+    std::vector<HubEdge> edges;
+    edges.reserve(hubPts.size() * (hubPts.size() - 1) / 2);
+
+    for (int a = 0; a < static_cast<int>(hubPts.size()); ++a) {
+      for (int b = a + 1; b < static_cast<int>(hubPts.size()); ++b) {
+        const P pa = hubPts[static_cast<std::size_t>(a)];
+        const P pb = hubPts[static_cast<std::size_t>(b)];
+        const int d = std::abs(pa.x - pb.x) + std::abs(pa.y - pb.y);
+        edges.push_back(HubEdge{a, b, d, HashCoords32(a, b, seed32 ^ 0xB0A71C03u)});
+      }
+    }
+
+    std::sort(edges.begin(), edges.end(), [&](const HubEdge& x, const HubEdge& y) {
+      if (x.dist != y.dist) return x.dist > y.dist;
+      return x.tie < y.tie;
+    });
+
+    const int budget = std::min<int>(cfg.extraConnections, static_cast<int>(edges.size()));
+    for (int i = 0; i < budget; ++i) {
+      const HubEdge e = edges[static_cast<std::size_t>(i)];
+      const P a = hubPts[static_cast<std::size_t>(e.a)];
+      const P b = hubPts[static_cast<std::size_t>(e.b)];
+      CarveRoadCurvy(world, rng, a, b, /*level=*/3, /*allowBridges=*/true,
+                    seed32 ^ HashCoords32(e.a, e.b, 0xE7E7E7u) ^ static_cast<std::uint32_t>(i));
+    }
+  }
+}
+
 
 
 
@@ -5401,6 +7006,355 @@ static void ApplyProcGenDistrictingMode(World& world, const ProcGenConfig& cfg)
     return;
   }
 
+  case ProcGenDistrictingMode::Watershed: {
+    // Hydrology-driven watershed districts.
+    //
+    // We segment the terrain into drainage basins, then merge those basins into
+    // exactly kDistrictCount regions. Boundaries tend to follow ridgelines and
+    // river valleys, producing a more "regional" structure on rugged maps.
+    //
+    // Implementation notes:
+    //  - Basin seeds are chosen with farthest-point sampling (spatial coverage).
+    //  - Basins are merged via a multi-source Dijkstra on the basin adjacency graph.
+    //  - We track distances in 64-bit to avoid overflow on very large maps.
+
+    const std::uint64_t s64 = world.seed();
+    const std::uint32_t seed32 = static_cast<std::uint32_t>(s64) ^ static_cast<std::uint32_t>(s64 >> 32);
+
+    const int w = world.width();
+    const int h = world.height();
+    if (w <= 0 || h <= 0) return;
+
+    const int n = w * h;
+    std::vector<float> heights;
+    heights.resize(static_cast<std::size_t>(n));
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) {
+        heights[static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x)] = world.at(x, y).height;
+      }
+    }
+
+    HydrologyField hf = BuildHydrologyField(heights, w, h);
+    if (hf.empty()) return;
+
+    BasinSegmentation seg = SegmentBasins(hf.dir, w, h);
+    if (seg.basins.empty() || seg.basinId.size() != static_cast<std::size_t>(n)) {
+      return;
+    }
+
+    const int B = static_cast<int>(seg.basins.size());
+    if (B <= 0) return;
+
+    // Per-basin land/water accounting (prefer land basins as seeds).
+    std::vector<int> basinBuildable(B, 0);
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) {
+        const int idx = y * w + x;
+        const int bid = seg.basinId[static_cast<std::size_t>(idx)];
+        if (bid < 0 || bid >= B) continue;
+        if (world.isBuildable(x, y)) {
+          basinBuildable[static_cast<std::size_t>(bid)] += 1;
+        }
+      }
+    }
+
+    struct BasinCand {
+      int basin = -1;
+      int buildable = 0;
+      int area = 0;
+      int sinkIndex = -1;
+      int sx = 0;
+      int sy = 0;
+      std::uint32_t tie = 0;
+    };
+
+    std::vector<BasinCand> candidates;
+    candidates.reserve(static_cast<std::size_t>(B));
+    for (int i = 0; i < B; ++i) {
+      const BasinInfo& bi = seg.basins[static_cast<std::size_t>(i)];
+      BasinCand c;
+      c.basin = i;
+      c.buildable = basinBuildable[static_cast<std::size_t>(i)];
+      c.area = bi.area;
+      c.sinkIndex = bi.sinkIndex;
+      c.sx = bi.sinkX;
+      c.sy = bi.sinkY;
+      c.tie = HashCoords32(bi.sinkX, bi.sinkY, seed32 ^ 0xC0A1D00Du);
+      candidates.push_back(c);
+    }
+
+    // Seed selection: farthest-point sampling over basin sink points.
+    // Primary goal: spatial coverage; secondary goal: prefer larger land basins.
+    const int K = kDistrictCount;
+
+    std::vector<int> pool;
+    pool.reserve(static_cast<std::size_t>(B));
+    for (int i = 0; i < B; ++i) {
+      const BasinCand& c = candidates[static_cast<std::size_t>(i)];
+      if (c.buildable > 0) {
+        pool.push_back(i);
+      }
+    }
+    if (pool.empty()) {
+      // Degenerate all-water map.
+      return;
+    }
+
+    auto candLess = [&](int a, int b) {
+      const BasinCand& A = candidates[static_cast<std::size_t>(a)];
+      const BasinCand& Bc = candidates[static_cast<std::size_t>(b)];
+      if (A.buildable != Bc.buildable) return A.buildable > Bc.buildable;
+      if (A.area != Bc.area) return A.area > Bc.area;
+      if (A.tie != Bc.tie) return A.tie < Bc.tie;
+      return A.sinkIndex < Bc.sinkIndex;
+    };
+    std::sort(pool.begin(), pool.end(), candLess);
+
+    std::vector<int> seedBasins;
+    seedBasins.reserve(static_cast<std::size_t>(K));
+
+    // O(1) seed membership checks.
+    std::vector<std::uint8_t> isSeed(static_cast<std::size_t>(B), std::uint8_t{0});
+    auto markSeed = [&](int basinId) {
+      if (basinId < 0 || basinId >= B) return;
+      const std::size_t ii = static_cast<std::size_t>(basinId);
+      if (isSeed[ii]) return;
+      isSeed[ii] = std::uint8_t{1};
+      seedBasins.push_back(basinId);
+    };
+
+    markSeed(pool.front());
+    if (seedBasins.empty()) return;
+
+    // Incremental farthest-point sampling: track the nearest-seed distance for each basin.
+    std::vector<int> minDist(static_cast<std::size_t>(B), std::numeric_limits<int>::max());
+    {
+      const BasinCand& sC = candidates[static_cast<std::size_t>(seedBasins.front())];
+      for (int basinId : pool) {
+        const BasinCand& c = candidates[static_cast<std::size_t>(basinId)];
+        minDist[static_cast<std::size_t>(basinId)] = std::abs(c.sx - sC.sx) + std::abs(c.sy - sC.sy);
+      }
+    }
+
+    while (static_cast<int>(seedBasins.size()) < K &&
+           static_cast<int>(seedBasins.size()) < static_cast<int>(pool.size())) {
+      int best = -1;
+      std::int64_t bestScore = std::numeric_limits<std::int64_t>::min();
+      std::uint32_t bestTie = 0xFFFFFFFFu;
+
+      for (int basinId : pool) {
+        if (isSeed[static_cast<std::size_t>(basinId)]) continue;
+        const BasinCand& c = candidates[static_cast<std::size_t>(basinId)];
+
+        const int d0 = minDist[static_cast<std::size_t>(basinId)];
+        const int minD = (d0 == std::numeric_limits<int>::max()) ? 0 : d0;
+
+        const std::int64_t score = static_cast<std::int64_t>(minD) * 1000LL +
+                                   static_cast<std::int64_t>(std::max(0, c.buildable));
+
+        if (score > bestScore || (score == bestScore && c.tie < bestTie)) {
+          bestScore = score;
+          bestTie = c.tie;
+          best = basinId;
+        }
+      }
+
+      if (best < 0) break;
+      markSeed(best);
+
+      const BasinCand& newS = candidates[static_cast<std::size_t>(best)];
+      for (int basinId : pool) {
+        if (isSeed[static_cast<std::size_t>(basinId)]) continue;
+        const BasinCand& c = candidates[static_cast<std::size_t>(basinId)];
+        const int d = std::abs(c.sx - newS.sx) + std::abs(c.sy - newS.sy);
+        int& md = minDist[static_cast<std::size_t>(basinId)];
+        if (d < md) md = d;
+      }
+    }
+
+    // If we couldn't find enough unique land basins, top-up using the remaining
+    // largest basins (including water basins).
+    if (static_cast<int>(seedBasins.size()) < K) {
+      std::vector<int> all;
+      all.reserve(static_cast<std::size_t>(B));
+      for (int i = 0; i < B; ++i) all.push_back(i);
+      std::sort(all.begin(), all.end(), candLess);
+      for (int basinId : all) {
+        if (static_cast<int>(seedBasins.size()) >= K) break;
+        if (isSeed[static_cast<std::size_t>(basinId)]) continue;
+        markSeed(basinId);
+      }
+    }
+
+    if (seedBasins.empty()) return;
+
+    // Basin adjacency graph (weighted by boundary edge count).
+    //
+    // We build it as a boundary edge list (a,b) for each tile-edge that crosses
+    // a basin boundary, then sort+count to get a deterministic boundary length
+    // between basins. This is much lighter than per-basin hash maps and stays
+    // fast even when the segmentation produces many basins.
+    // Packed boundary edges: (u<<32)|v. This is significantly smaller than
+    // std::pair<int,int> on most standard libraries and improves cache behavior
+    // when the basin count is large.
+    std::vector<std::uint64_t> boundaryEdges;
+    boundaryEdges.reserve(static_cast<std::size_t>(n) * 2u);
+
+    auto packEdge = [](int u, int v) -> std::uint64_t {
+      const std::uint64_t uu = static_cast<std::uint32_t>(u);
+      const std::uint64_t vv = static_cast<std::uint32_t>(v);
+      return (uu << 32) | vv;
+    };
+
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) {
+        const int idx = y * w + x;
+        const int a = seg.basinId[static_cast<std::size_t>(idx)];
+        if (a < 0 || a >= B) continue;
+
+        if (x + 1 < w) {
+          const int b = seg.basinId[static_cast<std::size_t>(idx + 1)];
+          if (b >= 0 && b < B && b != a) {
+            const int u = std::min(a, b);
+            const int v = std::max(a, b);
+            boundaryEdges.push_back(packEdge(u, v));
+          }
+        }
+        if (y + 1 < h) {
+          const int b = seg.basinId[static_cast<std::size_t>(idx + w)];
+          if (b >= 0 && b < B && b != a) {
+            const int u = std::min(a, b);
+            const int v = std::max(a, b);
+            boundaryEdges.push_back(packEdge(u, v));
+          }
+        }
+      }
+    }
+
+    std::sort(boundaryEdges.begin(), boundaryEdges.end());
+
+    std::vector<std::vector<std::pair<int, int>>> adj;
+    adj.resize(static_cast<std::size_t>(B));
+
+    for (std::size_t i = 0; i < boundaryEdges.size();) {
+      const std::uint64_t key = boundaryEdges[i];
+      const int a = static_cast<int>(key >> 32);
+      const int b = static_cast<int>(key & 0xFFFFFFFFull);
+      int count = 0;
+      while (i < boundaryEdges.size() && boundaryEdges[i] == key) {
+        ++count;
+        ++i;
+      }
+      if (a >= 0 && a < B && b >= 0 && b < B && a != b) {
+        adj[static_cast<std::size_t>(a)].push_back({b, count});
+        adj[static_cast<std::size_t>(b)].push_back({a, count});
+      }
+    }
+
+    for (int i = 0; i < B; ++i) {
+      auto& v = adj[static_cast<std::size_t>(i)];
+      std::sort(v.begin(), v.end(), [](const auto& A, const auto& Bp) { return A.first < Bp.first; });
+    }
+
+    // Multi-source Dijkstra: merge basins into K districts, preferring to keep
+    // long ridgelines as boundaries by making high-boundary edges more expensive.
+    using DistT = std::int64_t;
+
+    struct QNode {
+      int basin = -1;
+      int owner = -1;
+      DistT dist = 0;
+    };
+    struct QCmp {
+      bool operator()(const QNode& a, const QNode& b) const
+      {
+        if (a.dist != b.dist) return a.dist > b.dist;
+        if (a.owner != b.owner) return a.owner > b.owner;
+        return a.basin > b.basin;
+      }
+    };
+
+    std::priority_queue<QNode, std::vector<QNode>, QCmp> pq;
+    std::vector<DistT> bestDist(static_cast<std::size_t>(B), std::numeric_limits<DistT>::max());
+    std::vector<int> basinOwner(static_cast<std::size_t>(B), -1);
+
+    for (int di = 0; di < static_cast<int>(seedBasins.size()) && di < K; ++di) {
+      const int b = seedBasins[static_cast<std::size_t>(di)];
+      if (b < 0 || b >= B) continue;
+      bestDist[static_cast<std::size_t>(b)] = 0;
+      basinOwner[static_cast<std::size_t>(b)] = di;
+      pq.push(QNode{b, di, 0});
+    }
+
+    auto edgeCost = [&](int boundaryCount) -> DistT {
+      // Base 1000 (one "hop") plus a ridge penalty. Large basin boundaries are
+      // often major ridgelines, so crossing them is discouraged.
+      const int c = std::clamp(boundaryCount, 1, 1000);
+      return static_cast<DistT>(1000) + static_cast<DistT>(c) * 18;
+    };
+
+    while (!pq.empty()) {
+      const QNode cur = pq.top();
+      pq.pop();
+
+      if (cur.basin < 0 || cur.basin >= B) continue;
+      const std::size_t u = static_cast<std::size_t>(cur.basin);
+      if (cur.dist != bestDist[u]) continue;
+      if (cur.owner != basinOwner[u]) continue;
+
+      for (const auto& nb : adj[u]) {
+        const int v = nb.first;
+        const int bc = nb.second;
+        if (v < 0 || v >= B) continue;
+        const std::size_t vv = static_cast<std::size_t>(v);
+
+        const DistT nd = cur.dist + edgeCost(bc);
+        const int no = cur.owner;
+
+        const DistT od = bestDist[vv];
+        const int oo = basinOwner[vv];
+
+        if (nd < od || (nd == od && (oo < 0 || no < oo))) {
+          bestDist[vv] = nd;
+          basinOwner[vv] = no;
+          pq.push(QNode{v, no, nd});
+        }
+      }
+    }
+
+    // Final safety: any still-unassigned basins get a nearest-seed assignment.
+    for (int i = 0; i < B; ++i) {
+      if (basinOwner[static_cast<std::size_t>(i)] >= 0) continue;
+      const BasinCand& c = candidates[static_cast<std::size_t>(i)];
+      int bestOwner = 0;
+      int bestD = std::numeric_limits<int>::max();
+      for (int di = 0; di < static_cast<int>(seedBasins.size()) && di < K; ++di) {
+        const BasinCand& sC = candidates[static_cast<std::size_t>(seedBasins[static_cast<std::size_t>(di)])];
+        const int d = std::abs(c.sx - sC.sx) + std::abs(c.sy - sC.sy);
+        if (d < bestD) {
+          bestD = d;
+          bestOwner = di;
+        }
+      }
+      basinOwner[static_cast<std::size_t>(i)] = bestOwner;
+    }
+
+    // Paint per-tile districts.
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) {
+        const int idx = y * w + x;
+        const int bid = seg.basinId[static_cast<std::size_t>(idx)];
+        int d = 0;
+        if (bid >= 0 && bid < B) {
+          d = basinOwner[static_cast<std::size_t>(bid)];
+        }
+        d = std::clamp(d, 0, kDistrictCount - 1);
+        world.at(x, y).district = static_cast<std::uint8_t>(d);
+      }
+    }
+    return;
+  }
+
   default:
     return;
   }
@@ -5746,6 +7700,18 @@ World GenerateWorld(int width, int height, std::uint64_t seed, const ProcGenConf
     break;
   case ProcGenRoadLayout::Radial:
     CarveHubConnectionsRadial(world, rng, hubPts, seed32, cfg);
+    break;
+  case ProcGenRoadLayout::VoronoiCells:
+    CarveHubConnectionsVoronoiCells(world, rng, hubPts, seed32, cfg);
+    break;
+  case ProcGenRoadLayout::Physarum:
+    CarveHubConnectionsPhysarum(world, rng, hubPts, seed32, cfg);
+    break;
+  case ProcGenRoadLayout::MedialAxis:
+    CarveHubConnectionsMedialAxis(world, rng, hubPts, seed32, cfg);
+    break;
+  case ProcGenRoadLayout::TensorField:
+    CarveHubConnectionsTensorField(world, rng, hubPts, seed32, cfg);
     break;
   case ProcGenRoadLayout::SpaceColonization:
     CarveHubConnectionsSpaceColonization(world, rng, hubPts, seed32, cfg);

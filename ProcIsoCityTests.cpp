@@ -987,6 +987,148 @@ void TestProcGenRoadLayoutSpaceColonizationDeterminismAndConnectivity()
   EXPECT_EQ(comps, 1);
 }
 
+void TestProcGenRoadLayoutsDeterminismAndConnectivity()
+{
+  using namespace isocity;
+
+  struct Case {
+    const char* name = nullptr;
+    ProcGenRoadLayout layout{};
+  };
+
+  const Case cases[] = {
+      {"organic", ProcGenRoadLayout::Organic},
+      {"grid", ProcGenRoadLayout::Grid},
+      {"radial", ProcGenRoadLayout::Radial},
+      {"space_colonization", ProcGenRoadLayout::SpaceColonization},
+      {"voronoi_cells", ProcGenRoadLayout::VoronoiCells},
+      {"physarum", ProcGenRoadLayout::Physarum},
+      {"medial_axis", ProcGenRoadLayout::MedialAxis},
+      {"tensor_field", ProcGenRoadLayout::TensorField},
+  };
+
+  auto countRoadTiles = [&](const World& w) {
+    int roadTiles = 0;
+    for (int y = 0; y < w.height(); ++y) {
+      for (int x = 0; x < w.width(); ++x) {
+        if (w.at(x, y).overlay == Overlay::Road) ++roadTiles;
+      }
+    }
+    return roadTiles;
+  };
+
+  auto expectRoadGraphConnected = [&](const World& w) {
+    RoadGraph g = BuildRoadGraph(w);
+    EXPECT_TRUE(!g.nodes.empty());
+
+    const int n = static_cast<int>(g.nodes.size());
+    std::vector<char> vis(static_cast<std::size_t>(n), 0);
+    int comps = 0;
+
+    for (int i = 0; i < n; ++i) {
+      if (vis[static_cast<std::size_t>(i)]) continue;
+      ++comps;
+      std::vector<int> stack;
+      stack.push_back(i);
+      vis[static_cast<std::size_t>(i)] = 1;
+
+      while (!stack.empty()) {
+        const int cur = stack.back();
+        stack.pop_back();
+
+        for (const int eIdx : g.nodes[static_cast<std::size_t>(cur)].edges) {
+          if (eIdx < 0 || eIdx >= static_cast<int>(g.edges.size())) continue;
+          const RoadGraphEdge& e = g.edges[static_cast<std::size_t>(eIdx)];
+          const int other = (e.a == cur) ? e.b : e.a;
+          if (other < 0 || other >= n) continue;
+          if (vis[static_cast<std::size_t>(other)]) continue;
+          vis[static_cast<std::size_t>(other)] = 1;
+          stack.push_back(other);
+        }
+      }
+    }
+
+    EXPECT_EQ(comps, 1);
+  };
+
+  auto expectDeterministicAndConnected = [&](ProcGenRoadLayout layout) {
+    ProcGenConfig cfg{};
+    cfg.hubs = 6;
+    cfg.extraConnections = 2;
+    cfg.roadLayout = layout;
+
+    // Keep the test focused on road layout: avoid erosion rivers and reduce water.
+    cfg.erosion.enabled = false;
+    cfg.waterLevel = -0.30f;
+    cfg.sandLevel = -0.25f;
+
+    const std::uint64_t seed = 0x12345678u;
+
+    World w = GenerateWorld(48, 48, seed, cfg);
+    World w2 = GenerateWorld(48, 48, seed, cfg);
+
+    EXPECT_EQ(HashWorld(w, true), HashWorld(w2, true));
+
+    const int roadTiles = countRoadTiles(w);
+    EXPECT_TRUE(roadTiles > 30);
+
+    expectRoadGraphConnected(w);
+  };
+
+  for (const auto& c : cases) {
+    ProcGenRoadLayout parsed{};
+    EXPECT_TRUE(ParseProcGenRoadLayout(c.name, parsed));
+    EXPECT_EQ(parsed, c.layout);
+    EXPECT_EQ(std::string(ToString(c.layout)), std::string(c.name));
+
+    expectDeterministicAndConnected(c.layout);
+  }
+}
+
+void TestProcGenDistrictingModeWatershedDeterminismAndFill()
+{
+  using namespace isocity;
+
+  ProcGenDistrictingMode m{};
+  EXPECT_TRUE(ParseProcGenDistrictingMode("watershed", m));
+  EXPECT_EQ(m, ProcGenDistrictingMode::Watershed);
+  EXPECT_EQ(std::string(ToString(m)), std::string("watershed"));
+
+  ProcGenConfig cfg{};
+  cfg.districtingMode = ProcGenDistrictingMode::Watershed;
+
+  // Reduce terrain noise side effects for the districting test.
+  cfg.erosion.enabled = false;
+  cfg.waterLevel = -0.30f;
+  cfg.sandLevel = -0.25f;
+
+  const std::uint64_t seed = 0xCAFEBABEu;
+
+  World w = GenerateWorld(64, 48, seed, cfg);
+  World w2 = GenerateWorld(64, 48, seed, cfg);
+
+  EXPECT_EQ(HashWorld(w, true), HashWorld(w2, true));
+
+  std::vector<int> counts(static_cast<std::size_t>(kDistrictCount), 0);
+  for (int y = 0; y < w.height(); ++y) {
+    for (int x = 0; x < w.width(); ++x) {
+      const int d = static_cast<int>(w.at(x, y).district);
+      EXPECT_TRUE(d >= 0 && d < kDistrictCount);
+      if (d >= 0 && d < kDistrictCount) {
+        counts[static_cast<std::size_t>(d)] += 1;
+      }
+    }
+  }
+
+  int used = 0;
+  for (int c : counts) {
+    if (c > 0) ++used;
+  }
+
+  EXPECT_TRUE(used >= 2);
+}
+
+
 void TestSaveLoadBytesRoundTrip()
 {
   using namespace isocity;
@@ -7957,6 +8099,8 @@ int main()
   TestTrafficCongestionAwareSplitsParallelRoutes();
   TestSaveLoadRoundTrip();
   TestProcGenRoadLayoutSpaceColonizationDeterminismAndConnectivity();
+  TestProcGenRoadLayoutsDeterminismAndConnectivity();
+  TestProcGenDistrictingModeWatershedDeterminismAndFill();
   TestSaveLoadBytesRoundTrip();
   TestSLLZCompressionRoundTrip();
   TestJsonUnicodeEscapesAndStringify();

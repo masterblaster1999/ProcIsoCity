@@ -4,8 +4,11 @@
 #include "isocity/LandValue.hpp"
 #include "isocity/Replay.hpp"
 #include "isocity/SaveLoad.hpp"
+#include "isocity/StatsCsv.hpp"
 #include "isocity/Traffic.hpp"
 #include "isocity/WorldPatch.hpp"
+
+#include "cli/CliParse.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -23,34 +26,18 @@ namespace {
 
 std::string HexU64(std::uint64_t v)
 {
-  std::ostringstream oss;
-  oss << "0x" << std::hex << std::setw(16) << std::setfill('0') << v;
-  return oss.str();
+  return isocity::cli::HexU64(v);
 }
 
 bool ParseI32(const std::string& s, int* out)
 {
-  if (!out) return false;
-  if (s.empty()) return false;
-  char* end = nullptr;
-  const long v = std::strtol(s.c_str(), &end, 10);
-  if (!end || *end != '\0') return false;
-  if (v < std::numeric_limits<int>::min() || v > std::numeric_limits<int>::max()) return false;
-  *out = static_cast<int>(v);
-  return true;
+  return isocity::cli::ParseI32(s, out);
 }
 
 bool EnsureParentDir(const std::string& path)
 {
   if (path.empty()) return true;
-  try {
-    std::filesystem::path p(path);
-    const std::filesystem::path parent = p.parent_path();
-    if (!parent.empty()) std::filesystem::create_directories(parent);
-  } catch (...) {
-    return false;
-  }
-  return true;
+  return isocity::cli::EnsureParentDir(std::filesystem::path(path));
 }
 
 bool ReadFileBytes(const std::string& path, std::vector<std::uint8_t>& outBytes)
@@ -117,25 +104,7 @@ bool WriteJsonSummary(const isocity::World& world, std::uint64_t hash, const std
 
 bool WriteCsvRow(std::ostream& os, const isocity::Stats& s)
 {
-  os << s.day << ','
-     << s.population << ','
-     << s.money << ','
-     << s.housingCapacity << ','
-     << s.jobsCapacity << ','
-     << s.jobsCapacityAccessible << ','
-     << s.employed << ','
-     << s.happiness << ','
-     << s.roads << ','
-     << s.parks << ','
-     << s.avgCommuteTime << ','
-     << s.trafficCongestion << ','
-     << s.goodsDemand << ','
-     << s.goodsDelivered << ','
-     << s.goodsSatisfaction << ','
-     << s.avgLandValue << ','
-     << s.demandResidential
-     << '\n';
-  return static_cast<bool>(os);
+  return isocity::WriteStatsCsvRow(os, s);
 }
 
 void PrintHelp()
@@ -454,7 +423,7 @@ int main(int argc, char** argv)
         std::cerr << "Failed to open CSV for writing: " << outCsv << "\n";
         return 1;
       }
-      csv << "day,population,money,housingCapacity,jobsCapacity,jobsCapacityAccessible,employed,happiness,roads,parks,avgCommuteTime,trafficCongestion,goodsDemand,goodsDelivered,goodsSatisfaction,avgLandValue,demandResidential\n";
+      csv << isocity::kStatsCsvHeader << "\n";
       for (const Stats& st : tickStats) {
         WriteCsvRow(csv, st);
       }

@@ -6,8 +6,11 @@
 #include "isocity/ProcGen.hpp"
 #include "isocity/SaveLoad.hpp"
 #include "isocity/Sim.hpp"
+#include "isocity/StatsCsv.hpp"
 #include "isocity/Traffic.hpp"
 #include "isocity/ZoneAccess.hpp"
+
+#include "cli/CliParse.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -27,72 +30,32 @@ using namespace isocity;
 
 bool ParseI32(const std::string& s, int* out)
 {
-  if (!out) return false;
-  if (s.empty()) return false;
-  char* end = nullptr;
-  const long v = std::strtol(s.c_str(), &end, 10);
-  if (!end || *end != '\0') return false;
-  if (v < std::numeric_limits<int>::min() || v > std::numeric_limits<int>::max()) return false;
-  *out = static_cast<int>(v);
-  return true;
+  return isocity::cli::ParseI32(s, out);
 }
 
 bool ParseU64(const std::string& s, std::uint64_t* out)
 {
-  if (!out) return false;
-  if (s.empty()) return false;
-  char* end = nullptr;
-  const unsigned long long v = std::strtoull(s.c_str(), &end, 0);
-  if (!end || *end != '\0') return false;
-  *out = static_cast<std::uint64_t>(v);
-  return true;
+  return isocity::cli::ParseU64(s, out);
 }
 
 bool ParseF32(const std::string& s, float* out)
 {
-  if (!out) return false;
-  if (s.empty()) return false;
-  char* end = nullptr;
-  const float v = std::strtof(s.c_str(), &end);
-  if (!end || *end != '\0') return false;
-  *out = v;
-  return true;
+  return isocity::cli::ParseF32(s, out);
 }
 
 bool ParseBool01(const std::string& s, bool* out)
 {
-  if (!out) return false;
-  int v = 0;
-  if (!ParseI32(s, &v)) return false;
-  if (v != 0 && v != 1) return false;
-  *out = (v != 0);
-  return true;
+  return isocity::cli::ParseBool01(s, out);
 }
 
 bool ParseWxH(const std::string& s, int* outW, int* outH)
 {
-  if (!outW || !outH) return false;
-  const std::size_t x = s.find('x');
-  if (x == std::string::npos) return false;
-  const std::string a = s.substr(0, x);
-  const std::string b = s.substr(x + 1);
-  int w = 0, h = 0;
-  if (!ParseI32(a, &w) || !ParseI32(b, &h)) return false;
-  if (w <= 0 || h <= 0) return false;
-  *outW = w;
-  *outH = h;
-  return true;
+  return isocity::cli::ParseWxH(s, outW, outH);
 }
 
 bool EnsureDir(const std::string& dir)
 {
-  try {
-    if (dir.empty()) return false;
-    std::filesystem::create_directories(std::filesystem::path(dir));
-  } catch (...) {
-    return false;
-  }
-  return true;
+  return isocity::cli::EnsureDir(std::filesystem::path(dir));
 }
 
 static std::string ToLowerAscii(std::string s)
@@ -240,33 +203,14 @@ void PrintHelp()
 
 bool WriteStatsHeader(std::ostream& os)
 {
-  os << "frame,day,population,money,housingCapacity,jobsCapacity,jobsCapacityAccessible,employed,happiness,"
-        "roads,parks,avgCommuteTime,trafficCongestion,goodsDemand,goodsDelivered,goodsSatisfaction,avgLandValue,demandResidential\n";
+  os << "frame," << kStatsCsvHeader << "\n";
   return static_cast<bool>(os);
 }
 
 bool WriteStatsRow(std::ostream& os, int frameIdx, const Stats& s)
 {
-  os << frameIdx << ','
-     << s.day << ','
-     << s.population << ','
-     << s.money << ','
-     << s.housingCapacity << ','
-     << s.jobsCapacity << ','
-     << s.jobsCapacityAccessible << ','
-     << s.employed << ','
-     << s.happiness << ','
-     << s.roads << ','
-     << s.parks << ','
-     << s.avgCommuteTime << ','
-     << s.trafficCongestion << ','
-     << s.goodsDemand << ','
-     << s.goodsDelivered << ','
-     << s.goodsSatisfaction << ','
-     << s.avgLandValue << ','
-     << s.demandResidential
-     << '\n';
-  return static_cast<bool>(os);
+  os << frameIdx << ',';
+  return WriteStatsCsvRow(os, s);
 }
 
 } // namespace

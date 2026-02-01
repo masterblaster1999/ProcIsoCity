@@ -8,7 +8,10 @@
 #include "isocity/Random.hpp"
 #include "isocity/SaveLoad.hpp"
 #include "isocity/Sim.hpp"
+#include "isocity/StatsCsv.hpp"
 #include "isocity/Traffic.hpp"
+
+#include "cli/CliParse.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -27,68 +30,28 @@ namespace {
 
 std::string HexU64(std::uint64_t v)
 {
-  std::ostringstream oss;
-  oss << "0x" << std::hex << std::setw(16) << std::setfill('0') << v;
-  return oss.str();
+  return isocity::cli::HexU64(v);
 }
 
 bool ParseI32(const std::string& s, int* out)
 {
-  if (!out) return false;
-  if (s.empty()) return false;
-  char* end = nullptr;
-  const long v = std::strtol(s.c_str(), &end, 10);
-  if (!end || *end != '\0') return false;
-  if (v < std::numeric_limits<int>::min() || v > std::numeric_limits<int>::max()) return false;
-  *out = static_cast<int>(v);
-  return true;
+  return isocity::cli::ParseI32(s, out);
 }
 
 bool ParseU64(const std::string& s, std::uint64_t* out)
 {
-  if (!out) return false;
-  if (s.empty()) return false;
-
-  int base = 10;
-  std::size_t offset = 0;
-  if (s.rfind("0x", 0) == 0 || s.rfind("0X", 0) == 0) {
-    base = 16;
-    offset = 2;
-  }
-
-  char* end = nullptr;
-  const unsigned long long v = std::strtoull(s.c_str() + offset, &end, base);
-  if (!end || *end != '\0') return false;
-  *out = static_cast<std::uint64_t>(v);
-  return true;
+  return isocity::cli::ParseU64(s, out);
 }
 
 bool ParseWxH(const std::string& s, int* outW, int* outH)
 {
-  if (!outW || !outH) return false;
-  const std::size_t pos = s.find_first_of("xX");
-  if (pos == std::string::npos) return false;
-  int w = 0;
-  int h = 0;
-  if (!ParseI32(s.substr(0, pos), &w)) return false;
-  if (!ParseI32(s.substr(pos + 1), &h)) return false;
-  if (w <= 0 || h <= 0) return false;
-  *outW = w;
-  *outH = h;
-  return true;
+  return isocity::cli::ParseWxH(s, outW, outH);
 }
 
 bool EnsureParentDir(const std::string& path)
 {
   if (path.empty()) return true;
-  try {
-    std::filesystem::path p(path);
-    const std::filesystem::path parent = p.parent_path();
-    if (!parent.empty()) std::filesystem::create_directories(parent);
-  } catch (...) {
-    return false;
-  }
-  return true;
+  return isocity::cli::EnsureParentDir(std::filesystem::path(path));
 }
 
 std::string ReplaceAll(std::string s, const std::string& from, const std::string& to)
@@ -120,25 +83,9 @@ bool WriteStatsCsv(const std::string& path, const std::vector<isocity::Stats>& r
   std::ofstream f(path, std::ios::binary);
   if (!f) return false;
 
-  f << "day,population,money,housingCapacity,jobsCapacity,jobsCapacityAccessible,employed,happiness,roads,parks,avgCommuteTime,trafficCongestion,goodsDemand,goodsDelivered,goodsSatisfaction,avgLandValue,demandResidential\n";
+  if (!isocity::WriteStatsCsvHeader(f)) return false;
   for (const auto& s : rows) {
-    f << s.day << ','
-      << s.population << ','
-      << s.money << ','
-      << s.housingCapacity << ','
-      << s.jobsCapacity << ','
-      << s.jobsCapacityAccessible << ','
-      << s.employed << ','
-      << s.happiness << ','
-      << s.roads << ','
-      << s.parks << ','
-      << s.avgCommuteTime << ','
-      << s.trafficCongestion << ','
-      << s.goodsDemand << ','
-      << s.goodsDelivered << ','
-      << s.goodsSatisfaction << ','
-      << s.avgLandValue << ','
-      << s.demandResidential << '\n';
+    if (!isocity::WriteStatsCsvRow(f, s)) return false;
   }
 
   return static_cast<bool>(f);

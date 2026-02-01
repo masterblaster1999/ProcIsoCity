@@ -494,10 +494,7 @@ void FromBinV10(ProcGenConfig& cfg, const ProcGenConfigBinV10& b)
   cfg.parkChance = b.parkChance;
 
   // Defensive enum validation (avoid UB on corrupted saves).
-  std::uint8_t presetU8 = b.terrainPreset;
-  if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::Delta)) {
-    presetU8 = static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
-  }
+  const std::uint8_t presetU8 = ClampProcGenTerrainPresetU8(b.terrainPreset);
   cfg.terrainPreset = static_cast<ProcGenTerrainPreset>(presetU8);
   cfg.terrainPresetStrength = std::clamp(b.terrainPresetStrength, 0.0f, 5.0f);
 
@@ -525,10 +522,7 @@ void FromBinV11(ProcGenConfig& cfg, const ProcGenConfigBinV11& b)
   cfg.zoneChance = b.zoneChance;
   cfg.parkChance = b.parkChance;
 
-  std::uint8_t presetU8 = b.terrainPreset;
-  if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::Delta)) {
-    presetU8 = static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
-  }
+  const std::uint8_t presetU8 = ClampProcGenTerrainPresetU8(b.terrainPreset);
   cfg.terrainPreset = static_cast<ProcGenTerrainPreset>(presetU8);
   cfg.terrainPresetStrength = std::clamp(b.terrainPresetStrength, 0.0f, 5.0f);
 
@@ -555,26 +549,17 @@ void FromBinV12(ProcGenConfig& cfg, const ProcGenConfigBinV12& b)
   cfg.zoneChance = b.zoneChance;
   cfg.parkChance = b.parkChance;
 
-  std::uint8_t presetU8 = b.terrainPreset;
-  if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::Delta)) {
-    presetU8 = static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
-  }
+  const std::uint8_t presetU8 = ClampProcGenTerrainPresetU8(b.terrainPreset);
   cfg.terrainPreset = static_cast<ProcGenTerrainPreset>(presetU8);
   cfg.terrainPresetStrength = std::clamp(b.terrainPresetStrength, 0.0f, 5.0f);
 
   cfg.roadHierarchyEnabled = (b.roadHierarchyEnabled != 0);
   cfg.roadHierarchyStrength = std::clamp(b.roadHierarchyStrength, 0.0f, 3.0f);
 
-  std::uint8_t modeU8 = b.districtingMode;
-  if (modeU8 > static_cast<std::uint8_t>(ProcGenDistrictingMode::BlockGraph)) {
-    modeU8 = static_cast<std::uint8_t>(ProcGenDistrictingMode::Voronoi);
-  }
+  const std::uint8_t modeU8 = ClampProcGenDistrictingModeU8(b.districtingMode);
   cfg.districtingMode = static_cast<ProcGenDistrictingMode>(modeU8);
 
-  std::uint8_t layoutU8 = b.roadLayout;
-  if (layoutU8 > static_cast<std::uint8_t>(ProcGenRoadLayout::SpaceColonization)) {
-    layoutU8 = static_cast<std::uint8_t>(ProcGenRoadLayout::Organic);
-  }
+  const std::uint8_t layoutU8 = ClampProcGenRoadLayoutU8(b.roadLayout);
   cfg.roadLayout = static_cast<ProcGenRoadLayout>(layoutU8);
 
   // Erosion settings are persisted separately starting in v9; loader will override.
@@ -2555,27 +2540,18 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
       outSummary.procCfg.zoneChance = pcb.zoneChance;
       outSummary.procCfg.parkChance = pcb.parkChance;
 
-      std::uint8_t presetU8 = pcb.terrainPreset;
-      if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::Delta)) {
-        presetU8 = static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
-      }
+      const std::uint8_t presetU8 = ClampProcGenTerrainPresetU8(pcb.terrainPreset);
       outSummary.procCfg.terrainPreset = static_cast<ProcGenTerrainPreset>(presetU8);
       outSummary.procCfg.terrainPresetStrength = std::clamp(pcb.terrainPresetStrength, 0.0f, 5.0f);
 
       outSummary.procCfg.roadHierarchyEnabled = (pcb.roadHierarchyEnabled != 0);
       outSummary.procCfg.roadHierarchyStrength = std::clamp(pcb.roadHierarchyStrength, 0.0f, 3.0f);
 
-      std::uint8_t dmU8 = pcb.districtingMode;
-      if (dmU8 > static_cast<std::uint8_t>(ProcGenDistrictingMode::BlockGraph)) {
-        dmU8 = static_cast<std::uint8_t>(ProcGenDistrictingMode::Voronoi);
-      }
+      const std::uint8_t dmU8 = ClampProcGenDistrictingModeU8(pcb.districtingMode);
       outSummary.procCfg.districtingMode = static_cast<ProcGenDistrictingMode>(dmU8);
 
       // v12+ persists macro road layout.
-      std::uint8_t layoutU8 = pcb.roadLayout;
-      if (layoutU8 > static_cast<std::uint8_t>(ProcGenRoadLayout::SpaceColonization)) {
-        layoutU8 = static_cast<std::uint8_t>(ProcGenRoadLayout::Organic);
-      }
+      const std::uint8_t layoutU8 = ClampProcGenRoadLayoutU8(pcb.roadLayout);
       outSummary.procCfg.roadLayout = static_cast<ProcGenRoadLayout>(layoutU8);
     } else if (version >= kVersionV11) {
       struct ProcGenConfigBinLocalV11 {
@@ -2612,10 +2588,7 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
       outSummary.procCfg.zoneChance = pcb.zoneChance;
       outSummary.procCfg.parkChance = pcb.parkChance;
 
-      std::uint8_t presetU8 = pcb.terrainPreset;
-      if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::Delta)) {
-        presetU8 = static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
-      }
+      const std::uint8_t presetU8 = ClampProcGenTerrainPresetU8(pcb.terrainPreset);
       outSummary.procCfg.terrainPreset = static_cast<ProcGenTerrainPreset>(presetU8);
       outSummary.procCfg.terrainPresetStrength = std::clamp(pcb.terrainPresetStrength, 0.0f, 5.0f);
 
@@ -2658,10 +2631,7 @@ bool ReadSaveSummary(const std::string& path, SaveSummary& outSummary, std::stri
       outSummary.procCfg.zoneChance = pcb.zoneChance;
       outSummary.procCfg.parkChance = pcb.parkChance;
 
-      std::uint8_t presetU8 = pcb.terrainPreset;
-      if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::Delta)) {
-        presetU8 = static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
-      }
+      const std::uint8_t presetU8 = ClampProcGenTerrainPresetU8(pcb.terrainPreset);
       outSummary.procCfg.terrainPreset = static_cast<ProcGenTerrainPreset>(presetU8);
       outSummary.procCfg.terrainPresetStrength = std::clamp(pcb.terrainPresetStrength, 0.0f, 5.0f);
 

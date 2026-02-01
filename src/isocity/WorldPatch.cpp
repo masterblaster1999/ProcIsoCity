@@ -248,9 +248,7 @@ bool ReadProcCfg(ByteReader& r, ProcGenConfig& cfg, std::uint32_t patchVersion)
     std::uint8_t roadLayout = 0;
     if (!r.readU8(roadLayout)) return false;
     // Defensive clamp so corrupted/unknown patches don't produce UB when the enum grows.
-    if (roadLayout > static_cast<std::uint8_t>(ProcGenRoadLayout::SpaceColonization)) {
-      roadLayout = static_cast<std::uint8_t>(ProcGenRoadLayout::Organic);
-    }
+    roadLayout = ClampProcGenRoadLayoutU8(roadLayout);
     cfg.roadLayout = static_cast<ProcGenRoadLayout>(roadLayout);
   }
   if (!r.readF32(cfg.zoneChance)) return false;
@@ -299,9 +297,7 @@ bool ReadProcCfg(ByteReader& r, ProcGenConfig& cfg, std::uint32_t patchVersion)
     if (!r.readU8(rhEnabled)) return false;
     if (!r.readF32(cfg.roadHierarchyStrength)) return false;
 
-    if (presetU8 > static_cast<std::uint8_t>(ProcGenTerrainPreset::MountainRing)) {
-      presetU8 = static_cast<std::uint8_t>(ProcGenTerrainPreset::Classic);
-    }
+    presetU8 = ClampProcGenTerrainPresetU8(presetU8);
     cfg.terrainPreset = static_cast<ProcGenTerrainPreset>(presetU8);
     cfg.terrainPresetStrength = std::clamp(cfg.terrainPresetStrength, 0.0f, 5.0f);
 
@@ -320,9 +316,7 @@ bool ReadProcCfg(ByteReader& r, ProcGenConfig& cfg, std::uint32_t patchVersion)
   if (patchVersion >= 4) {
     std::uint8_t dmU8 = 0;
     if (!r.readU8(dmU8)) return false;
-    if (dmU8 > static_cast<std::uint8_t>(ProcGenDistrictingMode::BlockGraph)) {
-      dmU8 = static_cast<std::uint8_t>(ProcGenDistrictingMode::Voronoi);
-    }
+    dmU8 = ClampProcGenDistrictingModeU8(dmU8);
     cfg.districtingMode = static_cast<ProcGenDistrictingMode>(dmU8);
   } else {
     // Older patch versions did not persist districting mode.

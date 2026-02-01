@@ -1,6 +1,7 @@
 #include "isocity/Hydrology.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <limits>
 
@@ -66,23 +67,75 @@ void ComputeFlowAccumulation(const std::vector<float>& heights, int w, int h,
     return;
   }
 
-  // Sort indices by height descending (higher contributes to lower).
-  std::vector<int> order;
-  order.reserve(n);
-  for (int i = 0; i < w * h; ++i) order.push_back(i);
+  const int total = w * h;
 
-  std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
-    const float ha = heights[static_cast<std::size_t>(a)];
-    const float hb = heights[static_cast<std::size_t>(b)];
-    if (ha == hb) return a < b;
-    return ha > hb;
-  });
+  // Fast path: topological accumulation using in-degree counts.
+  //
+  // This is O(n) and does not rely on heights being consistent with the flow
+  // direction field (dir). It is safe as long as dir is acyclic (the common
+  // case, since ComputeFlowDir4 enforces strictly decreasing heights).
+  std::vector<int> indeg;
+  indeg.assign(n, 0);
 
-  for (int i : order) {
+  for (int i = 0; i < total; ++i) {
     const int to = dir[static_cast<std::size_t>(i)];
-    if (to < 0) continue;
-    if (to >= w * h) continue;
+    if (to < 0 || to >= total) continue;
+    indeg[static_cast<std::size_t>(to)] += 1;
+  }
+
+  std::vector<int> q;
+  q.reserve(n);
+  for (int i = 0; i < total; ++i) {
+    if (indeg[static_cast<std::size_t>(i)] == 0) q.push_back(i);
+  }
+
+  std::size_t qHead = 0;
+  int processed = 0;
+
+  while (qHead < q.size()) {
+    const int i = q[qHead++];
+    ++processed;
+
+    const int to = dir[static_cast<std::size_t>(i)];
+    if (to < 0 || to >= total) continue;
+
     outAccum[static_cast<std::size_t>(to)] += outAccum[static_cast<std::size_t>(i)];
+
+    int& d = indeg[static_cast<std::size_t>(to)];
+    d -= 1;
+    if (d == 0) {
+      q.push_back(to);
+    }
+  }
+
+  if (processed < total) {
+    // Malformed dir cycle (should not happen for ComputeFlowDir4) - fall back to
+    // a deterministic height-sorted pass (legacy behavior).
+    outAccum.assign(n, 1);
+
+    std::vector<int> order;
+    order.reserve(n);
+    for (int i = 0; i < total; ++i) order.push_back(i);
+
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+      const float ha = heights[static_cast<std::size_t>(a)];
+      const float hb = heights[static_cast<std::size_t>(b)];
+
+      // Ensure a strict weak ordering even with NaNs.
+      const bool na = std::isnan(ha);
+      const bool nb = std::isnan(hb);
+      if (na != nb) return !na; // non-NaNs first
+      if (na && nb) return a < b;
+
+      if (ha == hb) return a < b;
+      return ha > hb;
+    });
+
+    for (int i : order) {
+      const int to = dir[static_cast<std::size_t>(i)];
+      if (to < 0 || to >= total) continue;
+      outAccum[static_cast<std::size_t>(to)] += outAccum[static_cast<std::size_t>(i)];
+    }
   }
 
   int maxA = 1;
