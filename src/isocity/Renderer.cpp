@@ -2381,10 +2381,10 @@ static void DrawWeatherGroundEffects(const World& world, int x, int y, const Til
           const int e0 = straightNS ? 0 : 3;
           const int e1 = straightNS ? 2 : 1;
 
-          Vector2 a = LerpV(edgeMid[e0], center, 0.18f);
-          Vector2 b = LerpV(edgeMid[e1], center, 0.18f);
+          Vector2 p0 = LerpV(edgeMid[e0], center, 0.18f);
+          Vector2 p1 = LerpV(edgeMid[e1], center, 0.18f);
 
-          Vector2 dir{b.x - a.x, b.y - a.y};
+          Vector2 dir{p1.x - p0.x, p1.y - p0.y};
           float dl2 = dir.x * dir.x + dir.y * dir.y;
           if (dl2 > 1.0e-6f) {
             const float inv = 1.0f / std::sqrt(dl2);

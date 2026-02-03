@@ -69,7 +69,18 @@ public:
 
 private:
   struct Impl;
-  std::unique_ptr<Impl> m_impl;
+
+  // MSVC is stricter about std::unique_ptr<T> with incomplete T when the owning
+  // type's destructor is instantiated in translation units that only see the
+  // forward declaration. Use a custom deleter with an out-of-line definition.
+  //
+  // This keeps LogTee.hpp lightweight while remaining compatible with more
+  // toolchains / warning levels.
+  struct ImplDeleter {
+    void operator()(Impl* p) const noexcept;
+  };
+
+  std::unique_ptr<Impl, ImplDeleter> m_impl;
 };
 
 } // namespace isocity

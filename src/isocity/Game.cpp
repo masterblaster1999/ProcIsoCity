@@ -1,4 +1,3 @@
-#include "isocity/Env.hpp"
 #include "isocity/Game.hpp"
 
 #include "isocity/AutoBuild.hpp"
@@ -9801,8 +9800,8 @@ void Game::recordCityNews(const Stats& s)
 
     case NewsKind::Goods: {
       const int gPct = Pct100(s.goodsSatisfaction);
-      const int impCap = std::clamp(s.tradeImportCapacityPct, 0, 100);
-      const int expCap = std::clamp(s.tradeExportCapacityPct, 0, 100);
+      const int impCap = Pct100(s.tradeImportCapacityPct);
+      const int expCap = Pct100(s.tradeExportCapacityPct);
       e.tone = (gPct < 50) ? CityNewsTone::Alert : CityNewsTone::Bad;
       const int pick = static_cast<int>(rng.rangeU32(3));
       if (pick == 0) e.headline = "Shopkeepers report empty shelves";
@@ -9819,8 +9818,8 @@ void Game::recordCityNews(const Stats& s)
     case NewsKind::Trade: {
       const bool impD = s.tradeImportDisrupted;
       const bool expD = s.tradeExportDisrupted;
-      const int impCap = std::clamp(s.tradeImportCapacityPct, 0, 100);
-      const int expCap = std::clamp(s.tradeExportCapacityPct, 0, 100);
+      const int impCap = Pct100(s.tradeImportCapacityPct);
+      const int expCap = Pct100(s.tradeExportCapacityPct);
       const int pick = static_cast<int>(rng.rangeU32(3));
       if (impD && expD) e.headline = "Trade routes disrupted";
       else if (impD) e.headline = "Imports disrupted; merchants seek alternatives";
@@ -10955,7 +10954,7 @@ void Game::payDownBond(std::size_t idx, int payment)
 
 void Game::drawBondsPanel(const Rectangle& rect)
 {
-  const float uiTime = static_cast<float>(GetTime());
+  const float uiTime = GetTime();
   const Vector2 mouseUi = mouseUiPosition(m_uiScale);
   const ui::Theme& uiTh = ui::GetTheme();
 
@@ -11530,8 +11529,8 @@ bool Game::createSupportBundleZip(const std::string& outDirOverride, bool includ
   }
 
   // Try to mirror the interactive app defaults (and respect the env override used by main.cpp).
-  if (auto envLog = GetEnvVar("PROCISOCITY_LOG_FILE")) {
-    opt.logPath = fs::path(*envLog);
+  if (const char* envLog = std::getenv("PROCISOCITY_LOG_FILE"); envLog && envLog[0] != '\0') {
+    opt.logPath = fs::path(envLog);
   } else {
     opt.logPath = fs::path("proc_isocity.log");
   }
@@ -11651,8 +11650,8 @@ bool Game::createSupportBundleDir(const std::string& outDirOverride, bool includ
     opt.diagnosticsText = ss.str();
   }
 
-  if (auto envLog = GetEnvVar("PROCISOCITY_LOG_FILE")) {
-    opt.logPath = fs::path(*envLog);
+  if (const char* envLog = std::getenv("PROCISOCITY_LOG_FILE"); envLog && envLog[0] != '\0') {
+    opt.logPath = fs::path(envLog);
   } else {
     opt.logPath = fs::path("proc_isocity.log");
   }
@@ -22532,11 +22531,6 @@ void Game::draw()
   };
 
   const bool landValueHeatmapActive = heatmapActive && isLandValueHeatmap(m_heatmapOverlay);
-  const bool servicesHeatmapActive =
-      heatmapActive && (m_heatmapOverlay == HeatmapOverlay::ServicesOverall ||
-                        m_heatmapOverlay == HeatmapOverlay::ServicesEducation ||
-                        m_heatmapOverlay == HeatmapOverlay::ServicesHealth ||
-                        m_heatmapOverlay == HeatmapOverlay::ServicesSafety);
 
   const bool airHeatmapActive =
       heatmapActive && (m_heatmapOverlay == HeatmapOverlay::AirPollution ||
@@ -22921,6 +22915,7 @@ void Game::draw()
 
       const TransitModelSettings& tm = m_sim.transitModel();
       tc.demandMode = tm.demandMode;
+      tc.walkRadiusSteps = tm.walkRadiusSteps;
       tc.stopSpacingTiles = tm.stopSpacingTiles;
       tc.serviceLevel = tm.serviceLevel;
       tc.maxModeShare = tm.maxModeShare;
@@ -23752,6 +23747,7 @@ void Game::draw()
                     static_cast<double>(hv * 100.0f), static_cast<double>(city * 100.0f), fac);
     } else if (m_heatmapOverlay == HeatmapOverlay::LivabilityHotspot ||
                m_heatmapOverlay == HeatmapOverlay::InterventionHotspot) {
+      ensureHotspotsUpToDate();
       const HotspotResult& hr = (m_heatmapOverlay == HeatmapOverlay::LivabilityHotspot) ? m_livabilityHotspot : m_interventionHotspot;
       const float z = (idx < hr.z.size()) ? hr.z[idx] : 0.0f;
       const std::uint8_t cls = (idx < hr.cls.size()) ? hr.cls[idx] : static_cast<std::uint8_t>(HotspotClass::Neutral);
@@ -24197,17 +24193,16 @@ if (optRunning) {
 
 // One-line summary of the best candidate found (if any).
 if (optHasBest) {
-  const PolicyEvalResult& r = m_policyOptResult.best;
-  const PolicyCandidate& p = r.policy;
-  const PolicyEvalMetrics& m = r.metrics;
+  const PolicyCandidate& p = m_policyOptResult.best.policy;
+  const PolicyEvalResult& r = m_policyOptResult.best.result;
 
   ui::Text(x, y, 14,
            TextFormat("Best: R%d C%d I%d  RdM%d PkM%d  |  score %.1f  money %+d  pop %d  happy %.0f%%",
                       p.taxResidential, p.taxCommercial, p.taxIndustrial,
                       p.maintenanceRoad, p.maintenancePark,
-                      static_cast<double>(r.score),
-                      m.moneyDelta, m.populationEnd,
-                      static_cast<double>(m.happinessEnd * 100.0f)),
+                      static_cast<double>(m_policyOptResult.best.score),
+                      r.moneyDelta, r.popEnd,
+                      static_cast<double>(r.happinessEnd * 100.0f)),
            uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
 }
   }

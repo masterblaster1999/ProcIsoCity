@@ -208,6 +208,11 @@ struct LogTee::Impl {
   bool prefixThreadId = false;
 };
 
+void LogTee::ImplDeleter::operator()(Impl* p) const noexcept
+{
+  delete p;
+}
+
 LogTee::LogTee(const LogTeeOptions& opt, std::string& outError)
 {
   (void)start(opt, outError);
@@ -281,7 +286,7 @@ bool LogTee::start(const LogTeeOptions& opt, std::string& outError)
     return false;
   }
 
-  auto impl = std::make_unique<Impl>();
+  std::unique_ptr<Impl, ImplDeleter> impl(new Impl());
   impl->path = opt.path;
   impl->file.open(opt.path, std::ios::out | std::ios::binary | std::ios::trunc);
   if (!impl->file) {
