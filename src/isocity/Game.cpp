@@ -10,6 +10,7 @@
 #include "isocity/GltfExport.hpp"
 #include "isocity/FloodFill.hpp"
 #include "isocity/Hash.hpp"
+#include "isocity/Json.hpp"
 #include "isocity/Pathfinding.hpp"
 #include "isocity/Random.hpp"
 #include "isocity/Replay.hpp"
@@ -26,6 +27,7 @@
 #include "isocity/WorldTiling.hpp"
 #include "isocity/Ui.hpp"
 #include "isocity/ZoneAccess.hpp"
+#include "isocity/ZoneMetrics.hpp"
 #include "isocity/ShaderUtil.hpp"
 #include "isocity/GfxPalette.hpp"
 
@@ -6898,6 +6900,29 @@ void Game::showToast(const std::string& msg, float seconds)
   m_toastTimer = std::max(0.0f, seconds);
 }
 
+void Game::setTool(Tool tool)
+{
+  if (m_tool == tool) return;
+
+  endPaintStroke();
+  m_tool = tool;
+
+  // Cancel any road-drag preview if we changed tools.
+  if (m_tool != Tool::Road) {
+    m_roadDragActive = false;
+    m_roadDragStart.reset();
+    m_roadDragEnd.reset();
+    m_roadDragPath.clear();
+    m_roadDragBuildCost = 0;
+    m_roadDragUpgradeTiles = 0;
+    m_roadDragBridgeTiles = 0;
+    m_roadDragMoneyCost = 0;
+    m_roadDragValid = false;
+  }
+
+  showToast(TextFormat("Tool: %s", ToString(m_tool)));
+}
+
 float Game::computeAutoUiScale(int /*screenW*/, int screenH) const
 {
   // Use screen height as a good proxy for overall UI readability and merge it
@@ -9036,8 +9061,6 @@ struct NewsCandidate {
   float score;
 };
 
-inline float Clamp01(float v) { return std::clamp(v, 0.0f, 1.0f); }
-
 inline int Pct100(float v) { return static_cast<int>(std::round(static_cast<double>(Clamp01(v) * 100.0f))); }
 
 inline const char* ToneTag(CityNewsTone t)
@@ -9108,31 +9131,6 @@ inline std::string PrettyEconomyEvent(EconomyEventKind k)
     case EconomyEventKind::TourismSurge: return "Tourism Surge";
     default: return "Economic Shift";
   }
-}
-
-inline std::string JsonEscape(const std::string& s)
-{
-  std::string out;
-  out.reserve(s.size() + 8);
-  for (char c : s) {
-    switch (c) {
-      case '\\': out += "\\\\"; break;
-      case '"': out += "\\\""; break;
-      case '\n': out += "\\n"; break;
-      case '\r': out += "\\r"; break;
-      case '\t': out += "\\t"; break;
-      default:
-        if (static_cast<unsigned char>(c) < 0x20) {
-          char buf[8];
-          std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned int>(static_cast<unsigned char>(c)));
-          out += buf;
-        } else {
-          out.push_back(c);
-        }
-        break;
-    }
-  }
-  return out;
 }
 
 struct DistrictExposureSummary {
@@ -9439,7 +9437,9 @@ void Game::recordCityNews(const Stats& s)
 
   // Fire risk (hazard advisory).
   if (fireZoneCount > 0 && fireAvgRisk > 0.60f) {
-    const float highFrac = (fireZoneCount > 0) ? (static_cast<float>(m_fireRisk.highRiskZones) / static_cast<float>(fireZoneCount)) : 0.0f;
+    const float highFrac = (fireZoneCount > 0)
+                               ? (static_cast<float>(m_fireRisk.highRiskZoneTiles) / static_cast<float>(fireZoneCount))
+                               : 0.0f;
     float score = 0.85f + (fireAvgRisk - 0.60f) * 3.0f;
     score += highFrac * 1.6f;
     if (fireWorstDistrictRisk > 0.75f) score += 0.35f;
@@ -9521,7 +9521,8 @@ void Game::recordCityNews(const Stats& s)
   for (const auto& c : cands) {
     if (c.score >= bestScore - 1.0e-4f) best.push_back(c.kind);
   }
-  const NewsKind kind = best.empty() ? NewsKind::Quiet : best[static_cast<std::size_t>(rng.rangeU32(best.size()))];
+  const NewsKind kind = best.empty() ? NewsKind::Quiet
+                                     : best[static_cast<std::size_t>(rng.rangeU32(static_cast<std::uint32_t>(best.size())))];
 
   auto appendMayorLine = [&]() {
     e.body += TextFormat("\nMayor approval: %.0f%% (%s).", static_cast<double>(rating), mood.c_str());
@@ -9689,7 +9690,7 @@ void Game::recordCityNews(const Stats& s)
       int stations = 0;
       for (int y = 0; y < m_world.height(); ++y) {
         for (int x = 0; x < m_world.width(); ++x) {
-          if (m_world.getTile(x, y).overlay == Overlay::FireStation) {
+          if (m_world.at(x, y).overlay == Overlay::FireStation) {
             ++stations;
           }
         }
@@ -9700,7 +9701,7 @@ void Game::recordCityNews(const Stats& s)
         "Worst district: %d (%d%%)\n"
         "Tip: press L until 'Fire risk' appears, then add/upgrade Fire Stations near dense industrial/commercial blocks. "
         "Roads and parks can act as simple firebreaks.",
-        avgPct, m_fireRisk.highRiskZones, stations, fireWorstDistrict, worstPct);
+        avgPct, m_fireRisk.highRiskZoneTiles, stations, fireWorstDistrict, worstPct);
       appendMayorLine();
     } break;
 
@@ -9729,7 +9730,7 @@ void Game::recordCityNews(const Stats& s)
       int stations = 0;
       for (int y = 0; y < m_world.height(); ++y) {
         for (int x = 0; x < m_world.width(); ++x) {
-          if (m_world.getTile(x, y).overlay == Overlay::FireStation) ++stations;
+          if (m_world.at(x, y).overlay == Overlay::FireStation) ++stations;
         }
       }
 
@@ -9799,6 +9800,8 @@ void Game::recordCityNews(const Stats& s)
 
     case NewsKind::Goods: {
       const int gPct = Pct100(s.goodsSatisfaction);
+      const int impCap = Pct100(s.tradeImportCapacityPct);
+      const int expCap = Pct100(s.tradeExportCapacityPct);
       e.tone = (gPct < 50) ? CityNewsTone::Alert : CityNewsTone::Bad;
       const int pick = static_cast<int>(rng.rangeU32(3));
       if (pick == 0) e.headline = "Shopkeepers report empty shelves";
@@ -9808,13 +9811,15 @@ void Game::recordCityNews(const Stats& s)
       e.body = TextFormat(
         "Goods satisfaction: %d%% | Import cap: %d%% | Export cap: %d%%\n"
         "Tip: expand industrial capacity, improve road connectivity, and keep trade routes healthy.",
-        gPct, s.tradeImportCapacityPct, s.tradeExportCapacityPct);
+        gPct, impCap, expCap);
       appendMayorLine();
     } break;
 
     case NewsKind::Trade: {
       const bool impD = s.tradeImportDisrupted;
       const bool expD = s.tradeExportDisrupted;
+      const int impCap = Pct100(s.tradeImportCapacityPct);
+      const int expCap = Pct100(s.tradeExportCapacityPct);
       const int pick = static_cast<int>(rng.rangeU32(3));
       if (impD && expD) e.headline = "Trade routes disrupted";
       else if (impD) e.headline = "Imports disrupted; merchants seek alternatives";
@@ -9824,17 +9829,17 @@ void Game::recordCityNews(const Stats& s)
       else e.headline = "Markets react to shifting trade flows";
 
       e.tone = (impD || expD) ? CityNewsTone::Bad : CityNewsTone::Neutral;
-      if ((impD || expD) && (s.tradeImportCapacityPct < 60 || s.tradeExportCapacityPct < 60)) {
+      if ((impD || expD) && (impCap < 60 || expCap < 60)) {
         e.tone = CityNewsTone::Alert;
       }
 
       e.body = TextFormat(
         "Imports: %d%% cap (%s) | Exports: %d%% cap (%s)\n"
-        "Market index: %.2f | Trade zones: %d\n"
+        "Market index: x%.2f | Imported: %d | Exported: %d\n"
         "Tip: ensure a road network reaches the map edge (outside connection), and avoid chokepoints.",
-        s.tradeImportCapacityPct, impD ? "DISRUPTED" : "ok",
-        s.tradeExportCapacityPct, expD ? "DISRUPTED" : "ok",
-        static_cast<double>(s.tradeMarketIndex), s.tradeZoneTiles);
+        impCap, impD ? "DISRUPTED" : "ok",
+        expCap, expD ? "DISRUPTED" : "ok",
+        static_cast<double>(s.tradeMarketIndex), s.goodsImported, s.goodsExported);
       appendMayorLine();
     } break;
 
@@ -9856,12 +9861,12 @@ void Game::recordCityNews(const Stats& s)
 
       e.body = TextFormat(
         "Event: %s (%d days left)\n"
-        "Inflation: %.1f%% | Tax base: x%.2f | Import cost: x%.2f\n"
+        "Inflation: %.1f%% | Economy index: x%.2f | Trade index: x%.2f\n"
         "Tip: keep an eye on goods and budget; use Policy (P) to soften shocks or capture booms.",
         EconomyEventKindName(ek), s.economyEventDaysLeft,
         static_cast<double>(s.economyInflation * 100.0f),
-        static_cast<double>(s.economyTaxBaseMult),
-        static_cast<double>(s.economyImportCostMult));
+        static_cast<double>(s.economyIndex),
+        static_cast<double>(s.tradeMarketIndex));
       appendMayorLine();
     } break;
 
@@ -10951,7 +10956,7 @@ void Game::drawBondsPanel(const Rectangle& rect)
 {
   const float uiTime = GetTime();
   const Vector2 mouseUi = mouseUiPosition(m_uiScale);
-  const ui::Theme& uiTh = ui::theme();
+  const ui::Theme& uiTh = ui::GetTheme();
 
   ui::DrawPanel(rect, uiTime, true);
   ui::DrawPanelHeader(rect, "City Treasury", uiTime, true);
@@ -14217,7 +14222,7 @@ Tool ToolForServiceType(ServiceType t, Tool safetyTool)
   }
 }
 
-const char* ServiceTypeName(ServiceType t)
+const char* PrettyServiceTypeName(ServiceType t)
 {
   switch (t) {
     case ServiceType::Education: return "Education";
@@ -14256,37 +14261,23 @@ void Game::ensureServicesPlanUpToDate()
   const int h = m_world.height();
   const int n = std::max(0, w) * std::max(0, h);
 
-  // Sync the planner's outside-connection rule to the active policy.
   const bool requireOutside = m_sim.config().requireOutsideConnection;
-  if (m_servicesPlanCfg.modelCfg.requireOutsideConnection != requireOutside) {
-    m_servicesPlanCfg.modelCfg.requireOutsideConnection = requireOutside;
-    m_servicesPlanDirty = true;
-  }
 
-  // Keep the planner's model weights in sync with the simulation model (so
-  // the suggested facilities match the currently simulated service demand).
+  // Keep the planner's model settings in sync with the simulation model (so
+  // suggested facilities match the currently simulated service demand).
   {
-    const ServicesModelSettings& sm = m_sim.servicesModel();
-    ServicesModelSettings& pm = m_servicesPlanCfg.modelCfg;
-
+    ServicesModelSettings desired = m_sim.servicesModel();
     // The optimizer doesn't use `enabled`, but for clarity we treat planning as
     // "enabled" so it always produces suggestions.
-    pm.enabled = true;
-
-    pm.catchmentRadiusSteps = sm.catchmentRadiusSteps;
-    pm.decayGamma = sm.decayGamma;
-    pm.decayBetaBaseMilli = sm.decayBetaBaseMilli;
-    pm.includeResidential = sm.includeResidential;
-    pm.includeCommercial = sm.includeCommercial;
-    pm.includeIndustrial = sm.includeIndustrial;
-    pm.demandWeightResidential = sm.demandWeightResidential;
-    pm.demandWeightCommercial = sm.demandWeightCommercial;
-    pm.demandWeightIndustrial = sm.demandWeightIndustrial;
-    pm.satisfactionK = sm.satisfactionK;
-    pm.satisfactionMid = sm.satisfactionMid;
-
+    desired.enabled = true;
     // Outside-connection rule is driven by policy.
-    pm.requireOutsideConnection = requireOutside;
+    desired.requireOutsideConnection = requireOutside;
+
+    ServicesModelSettings& pm = m_servicesPlanCfg.modelCfg;
+    if (std::memcmp(&pm, &desired, sizeof(ServicesModelSettings)) != 0) {
+      pm = desired;
+      m_servicesPlanDirty = true;
+    }
   }
 
   // If nothing is dirty and dimensions match, keep the cached plan.
@@ -14489,7 +14480,7 @@ bool Game::applyServicePlacement(std::size_t idx)
   m_history.beginStroke(m_world);
 
   // Only one tile changes for service placement.
-  m_history.noteTilePreEdit(build.x, build.y, before);
+  m_history.noteTilePreEdit(m_world, build.x, build.y);
 
   bool anyApplied = false;
   for (int step = currentLevel; step < targetLevel; ++step) {
@@ -14499,7 +14490,7 @@ bool Game::applyServicePlacement(std::size_t idx)
         // The stroke will be empty (no tile edits / money), so undo won't add a step.
         if (r == ToolApplyResult::InsufficientFunds) showToast("Services: not enough money", 2.0f);
         else if (r == ToolApplyResult::BlockedNoRoad) showToast("Services: needs road access", 2.0f);
-        else if (r == ToolApplyResult::BlockedNotEmpty || r == ToolApplyResult::BlockedOccupied)
+        else if (r == ToolApplyResult::BlockedOccupied)
           showToast("Services: tile not empty", 2.0f);
         else if (r == ToolApplyResult::BlockedWater) showToast("Services: can't build on water", 2.0f);
         else showToast("Services: build failed", 2.0f);
@@ -14543,7 +14534,7 @@ bool Game::applyServicePlacement(std::size_t idx)
   m_wayfindingDirty = true;
   clearWayfindingRoute();
 
-  showToast(TextFormat("Built %s (lvl %d)", ServiceTypeName(type), targetLevel), 2.0f);
+  showToast(TextFormat("Built %s (lvl %d)", PrettyServiceTypeName(type), targetLevel), 2.0f);
   return true;
 }
 
@@ -14593,7 +14584,7 @@ void Game::exportServicesArtifacts()
         f << "      \"accessRoad\": {\"x\": " << p.accessRoad.x << ", \"y\": " << p.accessRoad.y << "},\n";
         f << "      \"marginalGain\": " << p.marginalGain << ",\n";
         f << "      \"localDemandSum\": " << p.localDemandSum << ",\n";
-        f << "      \"demandGainRatio\": " << p.demandGainRatio << "\n";
+        f << "      \"demandGainRatio\": " << p.ratio << "\n";
         f << "    }" << (i + 1 < m_servicesPlan.placements.size() ? "," : "") << "\n";
       }
       f << "  ]\n";
@@ -14674,10 +14665,10 @@ void Game::drawServicesPanel(int x0, int y0)
 
   ui::Text(x, y, 14,
            TextFormat("Satisfaction: %.0f%%  (E %.0f / H %.0f / S %.0f)",
-                      static_cast<double>(st.servicesOverallSat * 100.0f),
-                      static_cast<double>(st.servicesEducationSat * 100.0f),
-                      static_cast<double>(st.servicesHealthSat * 100.0f),
-                      static_cast<double>(st.servicesSafetySat * 100.0f)),
+                      static_cast<double>(st.servicesOverallSatisfaction * 100.0f),
+                      static_cast<double>(st.servicesEducationSatisfaction * 100.0f),
+                      static_cast<double>(st.servicesHealthSatisfaction * 100.0f),
+                      static_cast<double>(st.servicesSafetySatisfaction * 100.0f)),
            uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1);
   y += 16;
   ui::Text(x, y, 14,
@@ -14790,7 +14781,7 @@ void Game::drawServicesPanel(int x0, int y0)
 
     // Note pre-edit for all tiles we might touch.
     for (const Point& bt : buildTiles) {
-      m_history.noteTilePreEdit(bt.x, bt.y, m_world.at(bt.x, bt.y));
+      m_history.noteTilePreEdit(m_world, bt.x, bt.y);
     }
 
     int builtToTarget = 0;
@@ -14869,10 +14860,11 @@ void Game::drawServicesPanel(int x0, int y0)
     clearWayfindingRoute();
 
     if (outOfFunds) {
-      showToast(TextFormat("Built %d/%d %s (ran out of funds)", builtToTarget, upgradedOrPlaced, ServiceTypeName(type)),
+      showToast(TextFormat("Built %d/%d %s (ran out of funds)", builtToTarget, upgradedOrPlaced,
+                           PrettyServiceTypeName(type)),
                 3.0f);
     } else {
-      showToast(TextFormat("Built %d/%d %s", builtToTarget, upgradedOrPlaced, ServiceTypeName(type)), 2.5f);
+      showToast(TextFormat("Built %d/%d %s", builtToTarget, upgradedOrPlaced, PrettyServiceTypeName(type)), 2.5f);
     }
   };
 
@@ -15061,7 +15053,7 @@ void Game::drawServicesPanel(int x0, int y0)
   }
 
   // 1: Optimize type
-  drawCycleRow(1, "Optimize", ServiceTypeName(cfg.type), /*enabled=*/true, [&]() {
+  drawCycleRow(1, "Optimize", PrettyServiceTypeName(cfg.type), /*enabled=*/true, [&]() {
     const int idx = static_cast<int>(cfg.type);
     const int next = (idx + 1) % 3;
     cfg.type = static_cast<ServiceType>(next);
@@ -15071,7 +15063,7 @@ void Game::drawServicesPanel(int x0, int y0)
     if (cfg.type == ServiceType::Education) m_servicesPlanTool = Tool::School;
     if (cfg.type == ServiceType::Health) m_servicesPlanTool = Tool::Hospital;
 
-    showToast(std::string("Services: optimize ") + ServiceTypeName(cfg.type), 2.0f);
+    showToast(std::string("Services: optimize ") + PrettyServiceTypeName(cfg.type), 2.0f);
   });
 
   // 2: Tool (only meaningful for Safety; other types are fixed)
@@ -15190,7 +15182,7 @@ void Game::drawServicesPanel(int x0, int y0)
                         i + 1,
                         p.facility.tile.x, p.facility.tile.y,
                         p.marginalGain,
-                        p.demandGainRatio),
+                        p.ratio),
              c, /*bold=*/false, /*shadow=*/true, 1);
 
     ry += rowH2;
@@ -15242,7 +15234,7 @@ void Game::adjustServicesPanel(int dir, bool bigStep)
       if (cfg.type == ServiceType::Education) m_servicesPlanTool = Tool::School;
       if (cfg.type == ServiceType::Health) m_servicesPlanTool = Tool::Hospital;
       markPlanDirty();
-      showToast(std::string("Services: optimize ") + ServiceTypeName(cfg.type), 2.0f);
+      showToast(std::string("Services: optimize ") + PrettyServiceTypeName(cfg.type), 2.0f);
     } break;
     case 2: {
       if (cfg.type == ServiceType::Safety) {
@@ -18685,6 +18677,7 @@ void Game::handleInput(float dt)
   // Undo/redo
   const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
   const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+  const bool alt = IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT);
 
   // Fullscreen/borderless toggles (common PC shortcuts).
   if (IsKeyPressed(KEY_F11)) {
@@ -19371,7 +19364,8 @@ void Game::handleInput(float dt)
       if (m_showServicesPanel) {
         ensureServicesPlanUpToDate();
         const int n = m_servicesPlanValid ? static_cast<int>(m_servicesPlan.placements.size()) : 0;
-        showToast(TextFormat("Services planner: ON (%s, %d suggestions)", ServiceTypeName(m_servicesPlanCfg.type), n));
+        showToast(TextFormat("Services planner: ON (%s, %d suggestions)", PrettyServiceTypeName(m_servicesPlanCfg.type),
+                             n));
       } else {
         showToast("Services planner: OFF");
       }
@@ -21968,33 +21962,28 @@ void Game::drawVideoSettingsPanel(int uiW, int uiH)
     drawRow(10, "Shadow direction", TextFormat("%.0f°", sh.azimuthDeg), !sh.enabled);
 
     drawRow(11, "Day/night cycle", onOff(dn.enabled));
-    drawRow(12, "Time of day", TextFormat("%.1f h", dn.timeOfDayHours), !dn.enabled);
-    drawRow(13, "Day length", TextFormat("%.1f min", dn.dayLengthMinutes), !dn.enabled);
+    drawRow(12, "Day length", TextFormat("%.1f min", dn.dayLengthSec / 60.0f), !dn.enabled);
+    const float todHours = (dn.dayLengthSec > 0.0f) ? (dn.timeOffsetSec / dn.dayLengthSec) * 24.0f : 0.0f;
+    drawRow(13, "Time of day", TextFormat("%.1f h", todHours), !dn.enabled);
+    drawRow(14, "Night darken", TextFormat("%.0f%%", dn.nightDarken * 100.0f), !dn.enabled);
+    drawRow(15, "Dusk tint", TextFormat("%.0f%%", dn.duskTint * 100.0f), !dn.enabled);
+    drawRow(16, "Night lights", onOff(dn.drawLights), !dn.enabled);
 
-    drawRow(14, "Weather mode", weatherModeStr(wx.mode));
-    drawRow(15, "Weather intensity", TextFormat("%.0f%%", wx.intensity * 100.0f),
-            (wx.mode == Renderer::WeatherSettings::Mode::Clear));
-    drawRow(16, "Weather speed", TextFormat("%.1fx", wx.speed), (wx.mode == Renderer::WeatherSettings::Mode::Clear));
+    const bool wxClear = (wx.mode == Renderer::WeatherSettings::Mode::Clear);
+    drawRow(17, "Weather mode", weatherModeStr(wx.mode));
+    drawRow(18, "Weather intensity", TextFormat("%.0f%%", wx.intensity * 100.0f), wxClear);
+    drawRow(19, "Wind direction", TextFormat("%.0f°", wx.windAngleDeg), wxClear);
+    drawRow(20, "Wind speed", TextFormat("%.1fx", wx.windSpeed), wxClear);
+    drawRow(21, "Overcast", TextFormat("%.0f%%", wx.overcast * 100.0f), wxClear);
+    drawRow(22, "Fog", TextFormat("%.0f%%", wx.fog * 100.0f), wxClear);
+    drawRow(23, "Particles", onOff(wx.drawParticles), wxClear);
+    drawRow(24, "Ground effects", onOff(wx.affectGround), wxClear);
+    drawRow(25, "Reflect lights", onOff(wx.reflectLights), wxClear);
 
-    drawRow(17, "Post FX", onOff(m_postFx.enabled));
-    drawRow(18, "Pixelate", TextFormat("%.0f%%", m_postFx.pixelate * 100.0f), !m_postFx.enabled);
-    drawRow(19, "Pixel size", TextFormat("%.1f px", m_postFx.pixelSize),
-            (!m_postFx.enabled || m_postFx.pixelate < 0.001f));
-    drawRow(20, "Dither", TextFormat("%.0f%%", m_postFx.dither * 100.0f), !m_postFx.enabled);
-    drawRow(21, "Dither size", TextFormat("%.1f px", m_postFx.ditherSize),
-            (!m_postFx.enabled || m_postFx.dither < 0.001f));
-    drawRow(22, "CRT curvature", TextFormat("%.0f%%", m_postFx.crtCurve * 100.0f), !m_postFx.enabled);
-    drawRow(23, "CRT vignette", TextFormat("%.0f%%", m_postFx.crtVignette * 100.0f), !m_postFx.enabled);
-    drawRow(24, "Scan flicker", TextFormat("%.0f%%", m_postFx.scanFlicker * 100.0f), !m_postFx.enabled);
-    drawRow(25, "Noise", TextFormat("%.0f%%", m_postFx.noise * 100.0f), !m_postFx.enabled);
-    drawRow(26, "Noise speed", TextFormat("%.1fx", m_postFx.noiseSpeed),
-            (!m_postFx.enabled || m_postFx.noise < 0.001f));
-
-    drawRow(27, "Distortion", TextFormat("%.0f%%", m_postFx.distort * 100.0f), !m_postFx.enabled);
-    drawRow(28, "Distort freq", TextFormat("%.1fx", m_postFx.distortFreq),
-            (!m_postFx.enabled || m_postFx.distort < 0.001f));
-    drawRow(29, "Distort speed", TextFormat("%.1fx", m_postFx.distortSpeed),
-            (!m_postFx.enabled || m_postFx.distort < 0.001f));
+    drawRow(26, "Post FX", onOff(m_postFx.enabled));
+    drawRow(27, "Color bits", TextFormat("%.0f bits", m_postFx.colorBits), !m_postFx.enabled);
+    drawRow(28, "Dither strength", TextFormat("%.0f%%", m_postFx.ditherStrength * 100.0f), !m_postFx.enabled);
+    drawRow(29, "Grain", TextFormat("%.0f%%", m_postFx.grain * 100.0f), !m_postFx.enabled);
 
     drawRow(30, "Vignette", TextFormat("%.0f%%", m_postFx.vignette * 100.0f), !m_postFx.enabled);
     drawRow(31, "Chroma aberration", TextFormat("%.0f%%", m_postFx.chroma * 100.0f), !m_postFx.enabled);
@@ -22897,8 +22886,8 @@ void Game::draw()
 
       ensureEnergyUpToDate();
 
-      const int w = m_world.w;
-      const int h = m_world.h;
+      const int w = m_world.width();
+      const int h = m_world.height();
       const int n = w * h;
       const bool sizeOk = (m_carbon.w == w && m_carbon.h == h &&
                            static_cast<int>(m_carbon.balance01.size()) == n);

@@ -8294,11 +8294,15 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
     std::uint32_t family = 0u;
     if (famCountU > 1u && static_cast<std::uint32_t>(v.size()) >= famCountU) {
       if (district != 0u) {
-        family = HashCoords32(static_cast<int>(district), static_cast<int>(ov), m_gfxSeed32 ^ 0xD15TR1C7u) % famCountU;
+        // Deterministic seed salt for district-overlay palette hashing.
+        // Keep this literal valid hex (MSVC rejects playful "leetspeak" literals).
+        constexpr std::uint32_t kDistrictSalt = 0xD157A1C7u;
+        family = HashCoords32(static_cast<int>(district), static_cast<int>(ov), m_gfxSeed32 ^ kDistrictSalt) % famCountU;
       } else {
         const int nx = x >> 4;
         const int ny = y >> 4;
-        family = HashCoords32(nx, ny, m_gfxSeed32 ^ 0xD15TR1C7u ^ (static_cast<std::uint32_t>(ov) * 0x9E3779B9u)) % famCountU;
+        constexpr std::uint32_t kDistrictSalt = 0xD157A1C7u;
+        family = HashCoords32(nx, ny, m_gfxSeed32 ^ kDistrictSalt ^ (static_cast<std::uint32_t>(ov) * 0x9E3779B9u)) % famCountU;
       }
     }
 

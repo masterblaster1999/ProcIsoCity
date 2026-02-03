@@ -1456,6 +1456,43 @@ bool SliderU64(int id, Rectangle r, std::uint64_t& ioValue, std::uint64_t minVal
 }
 
 
+void ProgressBar(Rectangle r, float frac01, Color fill, float timeSec, bool active)
+{
+  (void)timeSec;
+  const Theme& t = g.theme;
+
+  if (r.width <= 1.0f || r.height <= 1.0f) return;
+
+  frac01 = std::clamp(frac01, 0.0f, 1.0f);
+
+  // Track.
+  const Color track = WithAlpha(t.panelBgBot, active ? 235 : 160);
+  DrawRectangleRounded(r, t.roundness, t.roundSegments, track);
+
+  // Fill.
+  if (frac01 > 0.001f) {
+    const Rectangle fillR{r.x, r.y, r.width * frac01, r.height};
+    const Color fillC = WithAlpha(fill, active ? 180 : 90);
+    // Clip to keep left end rounded even when partially filled.
+    const int sx = static_cast<int>(std::floor(r.x));
+    const int sy = static_cast<int>(std::floor(r.y));
+    const int sw = static_cast<int>(std::ceil(r.width * frac01));
+    const int sh = static_cast<int>(std::ceil(r.height));
+    BeginScissorMode(sx, sy, sw, sh);
+    DrawRectangleRounded(r, t.roundness, t.roundSegments, fillC);
+    EndScissorMode();
+
+    // Subtle sheen.
+    DrawRectangleRounded(Rectangle{fillR.x + 1.0f, fillR.y + 1.0f, std::max(0.0f, fillR.width - 2.0f), fillR.height * 0.44f},
+                         t.roundness, t.roundSegments, WithAlpha(WHITE, active ? 18 : 10));
+  }
+
+  // Border.
+  DrawRectangleRoundedLinesEx(r, t.roundness, t.roundSegments, 1.0f,
+                              WithAlpha(t.panelBorderHi, active ? 140 : 90));
+}
+
+
 
 
 bool Button(int id, Rectangle r, std::string_view label, Vector2 mouseUi, float timeSec,

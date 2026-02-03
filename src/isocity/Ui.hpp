@@ -205,6 +205,13 @@ inline bool SliderU64(int id, Rectangle r, std::uint64_t& ioValue, std::uint64_t
 bool Button(int id, Rectangle r, std::string_view label, Vector2 mouseUi, float timeSec,
             bool enabled = true, bool primary = false);
 
+// Simple non-interactive progress bar.
+//
+// - frac01: progress fraction in [0,1] (clamped defensively).
+// - fill: base fill color (theme accent works well).
+// - active: if false, the bar is drawn "disabled".
+void ProgressBar(Rectangle r, float frac01, Color fill, float timeSec, bool active = true);
+
 // Vertical scrollbar (generic "content units" model).
 //
 // - contentUnits: total length (e.g. total rows, or content height in pixels)

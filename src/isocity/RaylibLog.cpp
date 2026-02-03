@@ -27,7 +27,7 @@ static std::string ToLower(std::string s)
   return s;
 }
 
-static void RaylibTraceLogCallback(int logLevel, const char* text, va_list args)
+static void RaylibTraceLogHandler(int logLevel, const char* text, va_list args)
 {
   // raylib might call the callback from internal subsystems; keep it small.
   // We serialize formatting + output to avoid interleaving multi-line messages.
@@ -107,7 +107,7 @@ void InstallRaylibLogCallback(int minLevel)
     g_prevCallback = GetRaylibTraceLogCallback();
   }
 
-  SetRaylibTraceLogCallback(RaylibTraceLogCallback);
+  SetRaylibTraceLogCallback(RaylibTraceLogHandler);
   g_installed = true;
 }
 

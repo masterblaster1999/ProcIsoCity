@@ -106,6 +106,7 @@ private:
   void floodFillDistrict(Point start, bool includeRoads);
   void floodFillTool(Point start, bool includeRoads);
   void showToast(const std::string& msg, float seconds = 2.5f);
+  void setTool(Tool tool);
 
   // Effective simulation pause state (user pause OR focus/minimize auto pause).
   bool simPaused() const { return m_simPausedUser || m_simPausedAuto; }
