@@ -302,3 +302,71 @@ Verify:
   - `proc_isocity_cli --load out/tectonic.isocity --export-ppm terrain out/terrain.ppm`
 - Patch round-trip (if you use patches):
   - Create a patch with a tectonic preset and ensure applying it preserves the preset.
+
+
+# Round 23
+
+- Dossier HTML viewer improvements:
+  - Added an overlay canvas on the main map image to visually highlight the hovered tile.
+  - Added a click-to-pin tile inspector with:
+    - pinned tile readout
+    - Copy JSON button
+    - Go-to (x,y) input
+  - Added URL hash state for sharing deep links (layer + pinned tile).
+
+Verify:
+- Generate a dossier and open the HTML report:
+  - `proc_isocity_dossier --seed 123 --size 128x128 --out-dir out/dossier`
+  - Open `out/dossier/index.html` in a browser
+  - Hover: the tile highlight box should follow the cursor.
+  - Click: the pinned tile box should remain; Copy JSON should copy a JSON blob.
+  - Paste a deep link hash like `#layer=map_overlay.png&tile=10,12` (layer name depends on your export set) and confirm it restores state.
+
+
+# Round 24
+
+- Gameplay UX: **City News can now jump to the map**.
+  - News stories may include a focus tile (incidents + fire-risk hotspot).
+  - The City News detail view shows a **“Focus map”** button that centers the camera and drops a ping.
+- Gameplay feedback: temporary **map ping markers** appear automatically on days with traffic/fire incidents.
+- Save/load: news focus coordinates persist via CityMeta JSON.
+
+Verify:
+- Trigger an incident (or run the sim until one occurs), open City News (Ctrl+N), and click **Focus map**.
+- Observe a pulsing ping marker at the incident/hotspot location.
+
+
+
+# Round 25
+
+- Procedural graphics upgrades:
+  - Roads: added zoom-gated **asphalt repair patches** and **utility covers** (manholes/access plates) as procedural decals.
+  - SpaceColony: added subtle **panel seams** on road surfaces and small **guide lights** at intersections/dead-ends (night emissive pass).
+
+Verify:
+- Generate any city and zoom in heavily on roads:
+  - Look for occasional small asphalt patches + manholes at high zoom.
+- Switch to the SpaceColony theme and advance to night:
+  - Intersections/dead-ends should show small cool guide-light glows.
+
+
+# Round 26
+
+- Rendering: fixed `DrawRoadIndicators()` scoping/compile issues and gated **aesthetic** road markings/wear so they don’t clutter utility overlays; **upgrade pips** still render.
+- Procedural graphics: snowy roads now get subtle **tire tracks** + **plowed edge** buildup on straight segments (high zoom).
+- Robustness: road wet-sheen direction now falls back to neighbor connectivity when the cached road mask is missing.
+
+Verify:
+- Enter snowy weather, zoom in on straight roads: look for tire tracks + side buildup.
+- Toggle traffic/utility overlays: road markings/wear should hide, but pips remain.
+
+
+# Round 27
+
+- Rendering: added subtle animated road traffic pips (headlights/taillights) in the night emissive pass.
+  - Driven by the traffic field when available (denser on busier roads).
+  - Wet nights add tiny reflection smears when reflections are enabled.
+
+Verify:
+- Advance to night and zoom in on busy roads: you should see small moving lights.
+- In rain/wet weather, the pips should have faint vertical smears.

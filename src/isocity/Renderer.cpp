@@ -138,6 +138,8 @@ inline void DrawDiamond(const Vector2& center, float tileW, float tileH, Color c
 
 inline float Frac01(std::uint32_t u) { return static_cast<float>(u) / 4294967295.0f; }
 
+inline float FracF(float x) { return x - std::floor(x); }
+
 inline bool IsImageReadyCompat(const Image& img)
 {
   // raylib has gained helper "Is*Ready" functions over time, but some versions used
@@ -1349,6 +1351,35 @@ inline Vector2 NormalizeV(Vector2 v)
   return v;
 }
 
+
+
+static void RotatedRectCorners(const Vector2& center, float w, float h, Vector2 dir, Vector2 out[4])
+{
+  dir = NormalizeV(dir);
+  const Vector2 perp{-dir.y, dir.x};
+  const float hw = 0.5f * w;
+  const float hh = 0.5f * h;
+
+  out[0] = Vector2{center.x - dir.x * hw - perp.x * hh, center.y - dir.y * hw - perp.y * hh};
+  out[1] = Vector2{center.x + dir.x * hw - perp.x * hh, center.y + dir.y * hw - perp.y * hh};
+  out[2] = Vector2{center.x + dir.x * hw + perp.x * hh, center.y + dir.y * hw + perp.y * hh};
+  out[3] = Vector2{center.x - dir.x * hw + perp.x * hh, center.y - dir.y * hw + perp.y * hh};
+}
+
+static void DrawQuadFill(const Vector2 q[4], Color c)
+{
+  DrawTriangle(q[0], q[1], q[2], c);
+  DrawTriangle(q[0], q[2], q[3], c);
+}
+
+static void DrawQuadOutline(const Vector2 q[4], float thick, Color c)
+{
+  DrawLineEx(q[0], q[1], thick, c);
+  DrawLineEx(q[1], q[2], thick, c);
+  DrawLineEx(q[2], q[3], thick, c);
+  DrawLineEx(q[3], q[0], thick, c);
+}
+
 inline float Dist2V(const Vector2& a, const Vector2& b)
 {
   const float dx = a.x - b.x;
@@ -2130,7 +2161,6 @@ static void DrawWeatherGroundEffects(const World& world, int x, int y, const Til
                                     const DayNightState& dn, const WeatherState& w,
                                     float timeSec, std::uint32_t seed32)
 {
-  (void)world;
   
   const float tileScreenW = tileW * zoom;
   if (tileScreenW < 18.0f) return;
@@ -2200,7 +2230,13 @@ static void DrawWeatherGroundEffects(const World& world, int x, int y, const Til
   if (w.wetness > 0.02f && t.overlay == Overlay::Road) {
     const float wet = std::clamp(w.wetness, 0.0f, 1.0f);
 
-    const std::uint8_t mask = static_cast<std::uint8_t>(t.variation & 0x0Fu);
+    std::uint8_t mask = static_cast<std::uint8_t>(t.variation & 0x0Fu);
+    if (mask == 0u) {
+      if (world.inBounds(x, y - 1) && world.at(x, y - 1).overlay == Overlay::Road) mask |= 0x01u;
+      if (world.inBounds(x + 1, y) && world.at(x + 1, y).overlay == Overlay::Road) mask |= 0x02u;
+      if (world.inBounds(x, y + 1) && world.at(x, y + 1).overlay == Overlay::Road) mask |= 0x04u;
+      if (world.inBounds(x - 1, y) && world.at(x - 1, y).overlay == Overlay::Road) mask |= 0x08u;
+    }
 
     // Direction aligned to the dominant road axis.
     Vector2 dir{0.0f, 0.0f};
@@ -2309,6 +2345,113 @@ static void DrawWeatherGroundEffects(const World& world, int x, int y, const Til
           DrawLineEx(a0, a1, 1.05f * invZoom, Color{255, 255, 255, la});
         }
       }
+
+      // Snowy roads: subtle tire tracks and plowed edge buildup.
+      // (Only for straight segments so the detail reads cleanly.)
+      if (t.overlay == Overlay::Road && tileScreenW >= 34.0f && w.snow > 0.06f) {
+        std::uint8_t rm = static_cast<std::uint8_t>(t.variation & 0x0Fu);
+        if (rm == 0u) {
+          if (world.inBounds(x, y - 1) && world.at(x, y - 1).overlay == Overlay::Road) rm |= 0x01u;
+          if (world.inBounds(x + 1, y) && world.at(x + 1, y).overlay == Overlay::Road) rm |= 0x02u;
+          if (world.inBounds(x, y + 1) && world.at(x, y + 1).overlay == Overlay::Road) rm |= 0x04u;
+          if (world.inBounds(x - 1, y) && world.at(x - 1, y).overlay == Overlay::Road) rm |= 0x08u;
+        }
+
+        const int conn = Popcount4(rm);
+        const bool n = (rm & 0x01u) != 0u;
+        const bool e = (rm & 0x02u) != 0u;
+        const bool s = (rm & 0x04u) != 0u;
+        const bool wbit = (rm & 0x08u) != 0u;
+
+        const bool straightNS = (conn == 2 && n && s);
+        const bool straightEW = (conn == 2 && e && wbit);
+
+        if (straightNS || straightEW) {
+          const std::uint32_t htr = HashCoords32(x, y, seed32 ^ 0x51A5EEDu);
+
+          const Vector2 edgeA[4] = {corners[0], corners[1], corners[2], corners[3]};
+          const Vector2 edgeB[4] = {corners[1], corners[2], corners[3], corners[0]};
+          const Vector2 edgeMid[4] = {
+              LerpV(edgeA[0], edgeB[0], 0.5f),
+              LerpV(edgeA[1], edgeB[1], 0.5f),
+              LerpV(edgeA[2], edgeB[2], 0.5f),
+              LerpV(edgeA[3], edgeB[3], 0.5f),
+          };
+
+          const int e0 = straightNS ? 0 : 3;
+          const int e1 = straightNS ? 2 : 1;
+
+          Vector2 a = LerpV(edgeMid[e0], center, 0.18f);
+          Vector2 b = LerpV(edgeMid[e1], center, 0.18f);
+
+          Vector2 dir{b.x - a.x, b.y - a.y};
+          float dl2 = dir.x * dir.x + dir.y * dir.y;
+          if (dl2 > 1.0e-6f) {
+            const float inv = 1.0f / std::sqrt(dl2);
+            dir.x *= inv;
+            dir.y *= inv;
+          } else {
+            dir = Vector2{1.0f, 0.0f};
+          }
+          const Vector2 perp{-dir.y, dir.x};
+
+          const float snowAmt = std::clamp(w.snow, 0.0f, 1.0f);
+          const float inten = std::clamp(0.35f + 0.65f * snowAmt, 0.0f, 1.0f);
+
+          const float jitter = (Frac01(htr) - 0.5f) * tileH * 0.010f;
+          const float trackOff = tileH * (0.060f + 0.010f * Frac01(htr ^ 0x9E3779B9u));
+          const float thick = std::clamp((0.95f + 0.35f * inten) * invZoom, 0.55f * invZoom, 2.2f * invZoom);
+
+          const unsigned char aTrack = ClampU8(static_cast<int>(22.0f + 95.0f * cover * inten));
+          if (aTrack != 0) {
+            const Color cTrack = ShadeDetail(Color{55, 55, 65, 255}, brightness, 0.90f, aTrack);
+
+            auto drawBroken = [&](Vector2 p0, Vector2 p1, std::uint32_t h) {
+              const int segs = (tileScreenW >= 72.0f) ? 3 : 2;
+              for (int si = 0; si < segs; ++si) {
+                const float t0 = static_cast<float>(si) / static_cast<float>(segs);
+                const float t1 = static_cast<float>(si + 1) / static_cast<float>(segs);
+                const std::uint32_t hs = HashCoords32(si, static_cast<int>(h), h ^ 0xA11CE5EDu);
+                if (Frac01(hs) < 0.18f) continue;
+
+                const float inset = 0.08f + 0.10f * Frac01(hs ^ 0xBADC0DEu);
+                const float s0 = std::clamp(t0 + inset * 0.5f, 0.0f, 1.0f);
+                const float s1 = std::clamp(t1 - inset * 0.5f, 0.0f, 1.0f);
+                if (s1 <= s0) continue;
+
+                DrawLineEx(LerpV(p0, p1, s0), LerpV(p0, p1, s1), thick, cTrack);
+              }
+            };
+
+            const Vector2 o0{perp.x * (trackOff + jitter), perp.y * (trackOff + jitter)};
+            const Vector2 o1{perp.x * (-trackOff + jitter), perp.y * (-trackOff + jitter)};
+
+            drawBroken(Vector2{a.x + o0.x, a.y + o0.y}, Vector2{b.x + o0.x, b.y + o0.y}, htr);
+            drawBroken(Vector2{a.x + o1.x, a.y + o1.y}, Vector2{b.x + o1.x, b.y + o1.y}, htr ^ 0xDEADC0DEu);
+          }
+
+          // Plowed edge accumulation (a touch brighter snow along road sides).
+          const unsigned char aEdge = ClampU8(static_cast<int>(10.0f + 55.0f * cover * (0.55f + 0.45f * snowAmt)));
+          if (aEdge != 0) {
+            const Color cEdge = ShadeDetail(Color{255, 255, 255, 255}, brightness, 1.08f, aEdge);
+
+            const float eInset = 0.12f;
+            const int side0 = straightNS ? 1 : 0;
+            const int side1 = straightNS ? 3 : 2;
+
+            auto drawSide = [&](int edgeIdx) {
+              Vector2 s0 = LerpV(edgeA[edgeIdx], edgeB[edgeIdx], 0.18f);
+              Vector2 s1 = LerpV(edgeA[edgeIdx], edgeB[edgeIdx], 0.82f);
+              s0 = LerpV(s0, center, eInset);
+              s1 = LerpV(s1, center, eInset);
+              DrawLineEx(s0, s1, std::clamp(1.40f * invZoom, 0.80f * invZoom, 2.6f * invZoom), cEdge);
+            };
+
+            drawSide(side0);
+            drawSide(side1);
+          }
+        }
+      }
     }
   }
 }
@@ -2333,6 +2476,8 @@ static void DrawNightLightsPass(const World& world, const TileRect& vis,
                                float zoom, float timeSec, float night,
                                float wetness, bool reflectLights,
                                bool suppressZoneWindows,
+                               bool spaceTheme,
+                               const std::vector<std::uint16_t>* roadTraffic, int trafficMax,
                                std::uint32_t seed32)
 {
   if (night <= 0.001f) return;
@@ -2341,6 +2486,12 @@ static void DrawNightLightsPass(const World& world, const TileRect& vis,
   if (tileScreenW < 22.0f) return;
 
   const float invZoom = 1.0f / std::max(0.001f, zoom);
+
+  const int mapW = world.width();
+  const int mapH = world.height();
+  const bool hasTraffic =
+    (roadTraffic && trafficMax > 0 && mapW > 0 && mapH > 0 &&
+     roadTraffic->size() == static_cast<std::size_t>(mapW * mapH));
 
   // Additive blend reads much closer to "light" than standard alpha compositing.
   BeginBlendMode(BLEND_ADDITIVE);
@@ -2435,14 +2586,33 @@ static void DrawNightLightsPass(const World& world, const TileRect& vis,
 
         const std::uint32_t hr = HashCoords32(x, y, seed32 ^ 0xC0FFEE11u);
 
-        bool place = isIntersection;
-        if (!place && isMajor) {
-          // Light every few tiles on major roads.
-          place = ((hr & 0x3u) == 0u);
-        }
-        if (!place) continue;
+        const bool placeStreet = isIntersection || (isMajor && ((hr & 0x3u) == 0u));
 
-        // Slight bias toward the back of the tile so the glow doesn't fight the road pips at high zoom.
+        // Space colony: small guide lights at intersections/dead-ends to add a bit of sci-fi flavor.
+        const bool placeGuide = spaceTheme && tileScreenW >= 28.0f && (conn >= 3 || conn == 1) && ((hr & 1u) == 0u || conn >= 3);
+
+        // Animated traffic pips (headlights/taillights) help the city feel alive at night.
+        // Driven by the traffic field when available; otherwise derived from road level.
+        float traffic01 = 0.0f;
+        if (hasTraffic) {
+          const int idxT = y * mapW + x;
+          traffic01 = std::clamp((*roadTraffic)[static_cast<std::size_t>(idxT)] /
+                                   static_cast<float>(trafficMax),
+                                 0.0f,
+                                 1.0f);
+        } else {
+          traffic01 = 0.06f + (isMajor ? 0.08f : 0.0f) +
+                      0.04f * static_cast<float>(std::max(0, conn - 1));
+          traffic01 = std::clamp(traffic01, 0.0f, 0.45f);
+        }
+
+        const bool placeTraffic =
+          (tileScreenW >= 34.0f && conn >= 2 && traffic01 > 0.03f &&
+           (hasTraffic || isMajor));
+
+        if (!placeStreet && !placeGuide && !placeTraffic) continue;
+
+        // Slight bias toward the back of the tile so light glows don't fight other road UI.
         Vector2 p = center;
         p.y -= tileH * 0.10f;
 
@@ -2450,64 +2620,264 @@ static void DrawNightLightsPass(const World& world, const TileRect& vis,
                               0.15f * std::sin(timeSec * (1.6f + 0.3f * static_cast<float>(hr & 3u)) +
                                                Frac01(hr) * 6.2831853f);
 
-        const float aBase = (isIntersection ? 125.0f : 95.0f) + (isMajor ? 15.0f : 0.0f);
-        // Additive blending is more energetic, so pull intensity down slightly.
-        const int a = static_cast<int>(aBase * night * flicker * 0.92f);
+        if (placeStreet) {
+          const float aBase = (isIntersection ? 125.0f : 95.0f) + (isMajor ? 15.0f : 0.0f);
+          // Additive blending is more energetic, so pull intensity down slightly.
+          const int a = static_cast<int>(aBase * night * flicker * 0.92f);
 
-        const float r = (isIntersection ? 7.5f : 6.0f) * invZoom;
+          const float r = (isIntersection ? 7.5f : 6.0f) * invZoom;
 
-        Color outer{255, 205, 135, ClampU8(a)};
-        Color inner{255, 245, 220, ClampU8(a + 55)};
+          Color outer{255, 205, 135, ClampU8(a)};
+          Color inner{255, 245, 220, ClampU8(a + 55)};
 
-        // Bridges read better with a cooler light.
-        if (t.terrain == Terrain::Water) {
-          outer = Color{205, 235, 255, ClampU8(a)};
-          inner = Color{235, 250, 255, ClampU8(a + 55)};
+          // Bridges read better with a cooler light.
+          if (t.terrain == Terrain::Water) {
+            outer = Color{205, 235, 255, ClampU8(a)};
+            inner = Color{235, 250, 255, ClampU8(a + 55)};
+          }
+
+          // Light spill on the ground plane.
+          {
+            Vector2 pool = center;
+            pool.y += tileH * 0.08f;
+
+            Color poolC = outer;
+            poolC.a = ClampU8(static_cast<int>(static_cast<float>(outer.a) * (isIntersection ? 0.34f : 0.28f)));
+
+            const float poolScale = (isIntersection ? 1.55f : 1.35f) + (isMajor ? 0.10f : 0.0f);
+            drawLightPool(pool, poolScale, poolC);
+          }
+
+          // Neighbor water reflections (shoreline / canals).
+          {
+            const float w = std::clamp(wetness, 0.0f, 1.0f);
+            const float k = 0.22f + 0.18f * w;
+            drawWaterReflection(x, y - 1, outer, inner, k);
+            drawWaterReflection(x + 1, y, outer, inner, k);
+            drawWaterReflection(x, y + 1, outer, inner, k);
+            drawWaterReflection(x - 1, y, outer, inner, k);
+          }
+
+          DrawGlow(p, r, outer, inner);
+
+          if (reflectLights && wetness > 0.05f) {
+            const float w = std::clamp(wetness, 0.0f, 1.0f);
+            const float refLen = tileH * (0.16f + 0.10f * w);
+            const float refOff = tileH * 0.04f;
+
+            Vector2 p0 = p;
+            p0.y += refOff;
+            Vector2 p1 = p0;
+            p1.y += refLen;
+
+            Color refOuter = outer;
+            Color refInner = inner;
+            refOuter.a = ClampU8(static_cast<int>(static_cast<float>(outer.a) * (0.55f * w)));
+            refInner.a = ClampU8(static_cast<int>(static_cast<float>(inner.a) * (0.35f * w)));
+
+            // A simple elongated smear + a second faint glow reads surprisingly well as a wet reflection.
+            DrawLineEx(p0, p1, r * (0.45f + 0.12f * w), refOuter);
+            DrawGlow(Vector2{p.x, p.y + refLen * 0.55f}, r * (0.80f + 0.25f * w), refOuter, refInner);
+          }
         }
 
-        // Light spill on the ground plane.
-        {
-          Vector2 pool = center;
-          pool.y += tileH * 0.08f;
+        if (placeGuide) {
+          Vector2 corners[4];
+          TileDiamondCorners(center, tileW, tileH, corners);
 
-          Color poolC = outer;
-          poolC.a = ClampU8(static_cast<int>(static_cast<float>(outer.a) * (isIntersection ? 0.34f : 0.28f)));
+          const Vector2 edgeMid[4] = {
+            LerpV(corners[0], corners[1], 0.5f),
+            LerpV(corners[1], corners[2], 0.5f),
+            LerpV(corners[2], corners[3], 0.5f),
+            LerpV(corners[3], corners[0], 0.5f),
+          };
 
-          const float poolScale = (isIntersection ? 1.55f : 1.35f) + (isMajor ? 0.10f : 0.0f);
-          drawLightPool(pool, poolScale, poolC);
+          const float aBase = (conn >= 3) ? 92.0f : 70.0f;
+          const int a = static_cast<int>(aBase * night * flicker);
+          const unsigned char a0 = ClampU8(a);
+
+          Color outer{90, 220, 255, a0};
+          Color inner{215, 255, 255, ClampU8(a + 55)};
+
+          if (t.terrain == Terrain::Water) {
+            // Slightly cooler and dimmer on bridges.
+            outer = Color{120, 210, 255, ClampU8(static_cast<int>(a0 * 0.80f))};
+            inner = Color{210, 250, 255, ClampU8(static_cast<int>((a + 55) * 0.80f))};
+          }
+
+          const float r = (conn >= 3 ? 2.9f : 2.4f) * invZoom;
+          const int maxLights = (conn >= 3) ? 4 : 1;
+
+          int placed = 0;
+          for (int edge = 0; edge < 4; ++edge) {
+            const std::uint8_t bit = static_cast<std::uint8_t>(1u << edge);
+            if ((mask & bit) == 0u) continue;
+
+            Vector2 gp = LerpV(edgeMid[edge], center, 0.62f);
+            gp.y += tileH * 0.05f;
+
+            DrawGlow(gp, r, outer, inner);
+
+            // Tiny wet smear helps sell the LEDs as actual lights on rainy nights.
+            if (reflectLights && wetness > 0.08f) {
+              const float w = std::clamp(wetness, 0.0f, 1.0f);
+              Color smear = outer;
+              smear.a = ClampU8(static_cast<int>(static_cast<float>(smear.a) * (0.35f + 0.35f * w)));
+              if (smear.a != 0) {
+                Vector2 s0 = gp;
+                s0.y += tileH * 0.02f;
+                Vector2 s1 = s0;
+                s1.y += tileH * (0.06f + 0.04f * w);
+                DrawLineEx(s0, s1, r * 0.55f, smear);
+              }
+            }
+
+            if (++placed >= maxLights) break;
+          }
         }
 
-        // Neighbor water reflections (shoreline / canals).
-        {
+        // Moving traffic pips (headlights/taillights) for roads at night.
+        // Keep it cheap and zoom-gated; intersections clamp the count to avoid bright blobs.
+        if (placeTraffic) {
           const float w = std::clamp(wetness, 0.0f, 1.0f);
-          const float k = 0.22f + 0.18f * w;
-          drawWaterReflection(x, y - 1, outer, inner, k);
-          drawWaterReflection(x + 1, y, outer, inner, k);
-          drawWaterReflection(x, y + 1, outer, inner, k);
-          drawWaterReflection(x - 1, y, outer, inner, k);
+
+          int cars = 1;
+          if (tileScreenW >= 56.0f && traffic01 > 0.22f) cars = 2;
+          if (tileScreenW >= 78.0f && traffic01 > 0.60f) cars = 3;
+          if (conn >= 3 && tileScreenW < 62.0f) cars = std::min(cars, 1);
+
+          int edges[4];
+          int edgeCount = 0;
+          for (int e = 0; e < 4; ++e) {
+            const std::uint8_t bit = static_cast<std::uint8_t>(1u << e);
+            if ((mask & bit) != 0u) edges[edgeCount++] = e;
+          }
+
+          if (edgeCount >= 2) {
+            Vector2 corners[4];
+            TileDiamondCorners(center, tileW, tileH, corners);
+
+            const Vector2 edgeMid[4] = {
+              LerpV(corners[0], corners[1], 0.5f),
+              LerpV(corners[1], corners[2], 0.5f),
+              LerpV(corners[2], corners[3], 0.5f),
+              LerpV(corners[3], corners[0], 0.5f),
+            };
+
+            const float laneW = tileH * (0.055f + (isMajor ? 0.015f : 0.0f));
+            const float base = night * (0.18f + 0.82f * traffic01) * (0.75f + 0.25f * w);
+
+            for (int i = 0; i < cars; ++i) {
+              const std::uint32_t hi = HashCoords32(x + i * 37, y - i * 53, hr ^ 0xA11CE5EDu);
+
+              const int startIdx = static_cast<int>(hi % static_cast<std::uint32_t>(edgeCount));
+              const int aEdge = edges[startIdx];
+
+              int bEdge = -1;
+              const int opp = (aEdge + 2) & 3;
+              if ((mask & static_cast<std::uint8_t>(1u << opp)) != 0u) {
+                bEdge = opp;
+              } else {
+                const int off = 1 +
+                                static_cast<int>((hi >> 5u) % static_cast<std::uint32_t>(edgeCount - 1));
+                bEdge = edges[(startIdx + off) % edgeCount];
+              }
+
+              float speed = (isMajor ? 1.25f : 1.05f) + 0.85f * traffic01;
+              speed *= (1.0f - 0.25f * traffic01);
+
+              const float phase = Frac01(hi ^ 0x9E3779B9u);
+              float s = std::fmod(timeSec * speed + phase, 1.0f);
+              if (s < 0.0f) s += 1.0f;
+
+              const bool reverse = ((hi >> 16u) & 1u) != 0u;
+              int e0 = aEdge;
+              int e1 = bEdge;
+              if (reverse) {
+                const int tmp = e0;
+                e0 = e1;
+                e1 = tmp;
+                s = 1.0f - s;
+              }
+
+              Vector2 aP = LerpV(edgeMid[e0], center, 0.22f);
+              Vector2 bP = LerpV(edgeMid[e1], center, 0.22f);
+
+              Vector2 dir = Vector2{bP.x - aP.x, bP.y - aP.y};
+              {
+                const float dl2 = dir.x * dir.x + dir.y * dir.y;
+                const float inv = (dl2 > 1.0e-6f) ? (1.0f / std::sqrt(dl2)) : 1.0f;
+                dir.x *= inv;
+                dir.y *= inv;
+              }
+
+              Vector2 pos{};
+              if (((e0 + 2) & 3) == e1) {
+                pos = LerpV(aP, bP, s);
+              } else {
+                if (s < 0.5f) {
+                  pos = LerpV(aP, center, s * 2.0f);
+                  Vector2 d = Vector2{center.x - aP.x, center.y - aP.y};
+                  const float dl2 = d.x * d.x + d.y * d.y;
+                  const float inv = (dl2 > 1.0e-6f) ? (1.0f / std::sqrt(dl2)) : 1.0f;
+                  dir = Vector2{d.x * inv, d.y * inv};
+                } else {
+                  pos = LerpV(center, bP, (s - 0.5f) * 2.0f);
+                  Vector2 d = Vector2{bP.x - center.x, bP.y - center.y};
+                  const float dl2 = d.x * d.x + d.y * d.y;
+                  const float inv = (dl2 > 1.0e-6f) ? (1.0f / std::sqrt(dl2)) : 1.0f;
+                  dir = Vector2{d.x * inv, d.y * inv};
+                }
+              }
+
+              const float laneSign = (((hi >> 9u) & 1u) != 0u) ? 1.0f : -1.0f;
+              const Vector2 perp{-dir.y, dir.x};
+              pos.x += perp.x * laneW * laneSign;
+              pos.y += perp.y * laneW * laneSign;
+
+              pos.y += tileH * 0.01f;
+
+              const bool tail = (((hi >> 15u) & 1u) != 0u);
+              const float pulse =
+                0.82f + 0.18f * std::sin(timeSec * (2.2f + 0.35f * Frac01(hi)) +
+                                         Frac01(hi ^ 0x13579BDFu) * 6.2831853f);
+
+              const float aBase = tail ? 135.0f : 155.0f;
+              const int a = static_cast<int>(aBase * base * pulse);
+              if (a <= 0) continue;
+
+              const float r =
+                (2.55f + 1.10f * (isMajor ? 1.0f : 0.0f) + 0.60f * Frac01(hi ^ 0x2468ACE0u)) * invZoom;
+
+              Color outer{};
+              Color inner{};
+              if (!tail) {
+                outer = spaceTheme ? Color{135, 240, 255, ClampU8(a)} : Color{205, 225, 255, ClampU8(a)};
+                inner = Color{255, 255, 255, ClampU8(a + 55)};
+              } else {
+                outer = spaceTheme ? Color{255, 190, 110, ClampU8(a)} : Color{255, 85, 70, ClampU8(a)};
+                inner = spaceTheme ? Color{255, 245, 225, ClampU8(a + 55)} :
+                                    Color{255, 220, 200, ClampU8(a + 55)};
+              }
+
+              DrawGlow(pos, r, outer, inner);
+
+              if (reflectLights && w > 0.12f) {
+                const float refK = w * (0.45f + 0.35f * (1.0f - traffic01));
+                Color ref = outer;
+                ref.a = ClampU8(static_cast<int>(static_cast<float>(outer.a) * 0.45f * refK));
+                if (ref.a != 0) {
+                  Vector2 p0 = pos;
+                  p0.y += tileH * 0.03f;
+                  Vector2 p1 = p0;
+                  p1.y += tileH * (0.09f + 0.06f * w);
+                  DrawLineEx(p0, p1, r * (0.34f + 0.12f * w), ref);
+                }
+              }
+            }
+          }
         }
 
-        DrawGlow(p, r, outer, inner);
-
-        if (reflectLights && wetness > 0.05f) {
-          const float w = std::clamp(wetness, 0.0f, 1.0f);
-          const float refLen = tileH * (0.16f + 0.10f * w);
-          const float refOff = tileH * 0.04f;
-
-          Vector2 p0 = p;
-          p0.y += refOff;
-          Vector2 p1 = p0;
-          p1.y += refLen;
-
-          Color refOuter = outer;
-          Color refInner = inner;
-          refOuter.a = ClampU8(static_cast<int>(static_cast<float>(outer.a) * (0.55f * w)));
-          refInner.a = ClampU8(static_cast<int>(static_cast<float>(inner.a) * (0.35f * w)));
-
-          // A simple elongated smear + a second faint glow reads surprisingly well as a wet reflection.
-          DrawLineEx(p0, p1, r * (0.45f + 0.12f * w), refOuter);
-          DrawGlow(Vector2{p.x, p.y + refLen * 0.55f}, r * (0.80f + 0.25f * w), refOuter, refInner);
-        }
         continue;
       }
 
@@ -3703,23 +4073,25 @@ static void DrawZoneTileIndicators(const Tile& t, float tileW, float tileH, floa
 
 
 // Road indicators + procedural markings: lane center-lines, crosswalk hints, and subtle wear.
-// Kept purely aesthetic and gated by zoom so it doesn't clutter utility overlays.
+// Mostly aesthetic; upgrade pips (road level) are treated as gameplay UI and can remain visible even
+// when utility overlays are active.
 static void DrawRoadIndicators(const World& world, int x, int y, const Tile& t,
                                float tileW, float tileH, float zoom, const Vector2& tileCenter, float tileBrightness,
+                               bool drawAesthetic,
                                const DayNightState& dn, const WeatherState& wx, std::uint32_t seed32, float timeSec)
 {
   (void)timeSec; // reserved for subtle animation (e.g., wet shimmer) if desired
 
   const float tileScreenW = tileW * zoom;
-  if (tileScreenW < 28.0f) return;
+  if (tileScreenW < 18.0f) return;
 
   const float invZoom = 1.0f / std::max(0.001f, zoom);
   const int lvl = std::clamp<int>(static_cast<int>(t.level), 1, 3);
 
   // -----------------------------
-  // Procedural road markings (aesthetic)
+  // Procedural road markings & wear (aesthetic)
   // -----------------------------
-  if (tileScreenW >= 34.0f) {
+  if (drawAesthetic && tileScreenW >= 28.0f) {
     // Shared road connectivity mask.
     // Bits: 1=North, 2=East, 4=South, 8=West.
     auto roadMaskAt = [&](int rx, int ry) -> std::uint8_t {
@@ -3735,7 +4107,7 @@ static void DrawRoadIndicators(const World& world, int x, int y, const Tile& t,
       return m;
     };
 
-    std::uint8_t mask = roadMaskAt(x, y);
+    const std::uint8_t mask = roadMaskAt(x, y);
     const int conn = Popcount4(mask);
 
     if (conn > 0) {
@@ -3825,119 +4197,242 @@ static void DrawRoadIndicators(const World& world, int x, int y, const Tile& t,
         }
       };
 
-      // Decide marking geometry.
-      if (conn == 2) {
-        // Straight vs corner.
-        if (n && s) {
-          drawCenterLine(end[0], end[2]);
-        } else if (e && w) {
-          drawCenterLine(end[3], end[1]);
-        } else {
-          // Corner turn: build a gentle 2-segment polyline through a biased midpoint.
-          int aEdge = n ? 0 : (e ? 1 : (s ? 2 : 3));
-          int bEdge = aEdge;
-          if (aEdge == 0) bEdge = e ? 1 : 3;
-          else if (aEdge == 1) bEdge = s ? 2 : 0;
-          else if (aEdge == 2) bEdge = w ? 3 : 1;
-          else if (aEdge == 3) bEdge = n ? 0 : 2;
+      // Marking geometry.
+      if (tileScreenW >= 34.0f) {
+        if (conn == 2) {
+          // Straight vs corner.
+          if (n && s) {
+            drawCenterLine(end[0], end[2]);
+          } else if (e && w) {
+            drawCenterLine(end[3], end[1]);
+          } else {
+            // Corner turn: build a gentle 2-segment polyline through a biased midpoint.
+            int aEdge = n ? 0 : (e ? 1 : (s ? 2 : 3));
+            int bEdge = aEdge;
+            if (aEdge == 0) bEdge = e ? 1 : 3;
+            else if (aEdge == 1) bEdge = s ? 2 : 0;
+            else if (aEdge == 2) bEdge = w ? 3 : 1;
+            else if (aEdge == 3) bEdge = n ? 0 : 2;
 
-          Vector2 dirA{tileCenter.x - edgeMid[aEdge].x, tileCenter.y - edgeMid[aEdge].y};
-          Vector2 dirB{tileCenter.x - edgeMid[bEdge].x, tileCenter.y - edgeMid[bEdge].y};
+            Vector2 dirA{tileCenter.x - edgeMid[aEdge].x, tileCenter.y - edgeMid[aEdge].y};
+            Vector2 dirB{tileCenter.x - edgeMid[bEdge].x, tileCenter.y - edgeMid[bEdge].y};
 
-          const float la = std::sqrt(dirA.x * dirA.x + dirA.y * dirA.y);
-          const float lb = std::sqrt(dirB.x * dirB.x + dirB.y * dirB.y);
-          if (la > 0.001f) { dirA.x /= la; dirA.y /= la; }
-          if (lb > 0.001f) { dirB.x /= lb; dirB.y /= lb; }
+            const float la = std::sqrt(dirA.x * dirA.x + dirA.y * dirA.y);
+            const float lb = std::sqrt(dirB.x * dirB.x + dirB.y * dirB.y);
+            if (la > 0.001f) { dirA.x /= la; dirA.y /= la; }
+            if (lb > 0.001f) { dirB.x /= lb; dirB.y /= lb; }
 
-          Vector2 mid = tileCenter;
-          mid.x += (dirA.x + dirB.x) * tileH * 0.10f;
-          mid.y += (dirA.y + dirB.y) * tileH * 0.10f;
+            Vector2 mid = tileCenter;
+            mid.x += (dirA.x + dirB.x) * tileH * 0.10f;
+            mid.y += (dirA.y + dirB.y) * tileH * 0.10f;
 
-          drawCenterLine(end[aEdge], mid);
-          drawCenterLine(mid, end[bEdge]);
-        }
-      } else if (conn >= 3) {
-        // Intersections: stop line + crosswalk hints per connected edge (only at high zoom).
-        if (tileScreenW >= 42.0f) {
-          const int stripes = (tileScreenW >= 58.0f) ? 5 : 4;
-          for (int edge = 0; edge < 4; ++edge) {
-            const std::uint8_t bit = static_cast<std::uint8_t>(1u << edge);
-            if ((mask & bit) == 0u) continue;
+            drawCenterLine(end[aEdge], mid);
+            drawCenterLine(mid, end[bEdge]);
+          }
+        } else if (conn >= 3) {
+          // Intersections: stop line + crosswalk hints per connected edge (only at high zoom).
+          if (tileScreenW >= 42.0f) {
+            const int stripes = (tileScreenW >= 58.0f) ? 5 : 4;
+            for (int edge = 0; edge < 4; ++edge) {
+              const std::uint8_t bit = static_cast<std::uint8_t>(1u << edge);
+              if ((mask & bit) == 0u) continue;
 
-            // Stop line (parallel to edge).
-            Vector2 a0 = LerpV(edgeA[edge], edgeB[edge], 0.28f);
-            Vector2 b0 = LerpV(edgeA[edge], edgeB[edge], 0.72f);
-            a0 = LerpV(a0, tileCenter, 0.16f);
-            b0 = LerpV(b0, tileCenter, 0.16f);
-            DrawLineEx(a0, b0, thickDash * 1.15f, white);
+              // Stop line (parallel to edge).
+              Vector2 a0 = LerpV(edgeA[edge], edgeB[edge], 0.28f);
+              Vector2 b0 = LerpV(edgeA[edge], edgeB[edge], 0.72f);
+              a0 = LerpV(a0, tileCenter, 0.16f);
+              b0 = LerpV(b0, tileCenter, 0.16f);
+              DrawLineEx(a0, b0, thickDash * 1.15f, white);
 
-            // Crosswalk stripes (perpendicular to edge, pointing inward).
-            Vector2 in{tileCenter.x - edgeMid[edge].x, tileCenter.y - edgeMid[edge].y};
-            const float il2 = in.x * in.x + in.y * in.y;
-            if (il2 > 1.0e-6f) {
-              const float inv = 1.0f / std::sqrt(il2);
-              in.x *= inv;
-              in.y *= inv;
-            } else {
-              in = Vector2{0.0f, 1.0f};
-            }
+              // Crosswalk stripes (perpendicular to edge, pointing inward).
+              Vector2 in{tileCenter.x - edgeMid[edge].x, tileCenter.y - edgeMid[edge].y};
+              const float il2 = in.x * in.x + in.y * in.y;
+              if (il2 > 1.0e-6f) {
+                const float inv = 1.0f / std::sqrt(il2);
+                in.x *= inv;
+                in.y *= inv;
+              } else {
+                in = Vector2{0.0f, 1.0f};
+              }
 
-            for (int sIdx = 0; sIdx < stripes; ++sIdx) {
-              const float tStripe = 0.22f + (static_cast<float>(sIdx) / static_cast<float>(std::max(1, stripes - 1))) * 0.56f;
-              Vector2 base = LerpV(edgeA[edge], edgeB[edge], tStripe);
-              Vector2 p0 = LerpV(base, tileCenter, 0.08f);
-              Vector2 p1 = Vector2{p0.x + in.x * tileH * 0.09f, p0.y + in.y * tileH * 0.09f};
-              DrawLineEx(p0, p1, thickDash, white);
+              for (int sIdx = 0; sIdx < stripes; ++sIdx) {
+                const float tStripe = 0.22f + (static_cast<float>(sIdx) / static_cast<float>(std::max(1, stripes - 1))) * 0.56f;
+                Vector2 base = LerpV(edgeA[edge], edgeB[edge], tStripe);
+                Vector2 p0 = LerpV(base, tileCenter, 0.08f);
+                Vector2 p1 = Vector2{p0.x + in.x * tileH * 0.09f, p0.y + in.y * tileH * 0.09f};
+                DrawLineEx(p0, p1, thickDash, white);
+              }
             }
           }
-        }
-      } else if (conn == 1) {
-        // Dead end: short center line plus an end bar.
-        int edge = n ? 0 : (e ? 1 : (s ? 2 : 3));
-        drawCenterLine(end[edge], tileCenter);
+        } else if (conn == 1) {
+          // Dead end: short center line plus an end bar.
+          int edge = n ? 0 : (e ? 1 : (s ? 2 : 3));
+          drawCenterLine(end[edge], tileCenter);
 
-        if (tileScreenW >= 42.0f) {
-          // End bar at the unconnected side (opposite edge), inset slightly.
-          const int opp = (edge + 2) & 3;
-          Vector2 a0 = LerpV(edgeA[opp], edgeB[opp], 0.28f);
-          Vector2 b0 = LerpV(edgeA[opp], edgeB[opp], 0.72f);
-          a0 = LerpV(a0, tileCenter, 0.22f);
-          b0 = LerpV(b0, tileCenter, 0.22f);
-          DrawLineEx(a0, b0, thickDash * 1.10f, white);
+          if (tileScreenW >= 42.0f) {
+            // End bar at the unconnected side (opposite edge), inset slightly.
+            const int opp = (edge + 2) & 3;
+            Vector2 a0 = LerpV(edgeA[opp], edgeB[opp], 0.28f);
+            Vector2 b0 = LerpV(edgeA[opp], edgeB[opp], 0.72f);
+            a0 = LerpV(a0, tileCenter, 0.22f);
+            b0 = LerpV(b0, tileCenter, 0.22f);
+            DrawLineEx(a0, b0, thickDash * 1.10f, white);
+          }
+        }
+
+        // Subtle wear/cracks: only when very zoomed in so it doesn't look like noise.
+        if (tileScreenW >= 48.0f) {
+          const std::uint32_t hb = HashCoords32(x, y, seed32 ^ 0xA57A11u);
+          const int cracks = 1 + static_cast<int>((hb >> 29) & 1u);
+
+          // Fewer cracks on higher-class roads.
+          const float wearMul = (lvl >= 3) ? 0.55f : (lvl == 2) ? 0.75f : 1.0f;
+
+          const unsigned char aCrack = ClampU8(static_cast<int>(22.0f * wearMul + 38.0f * wearMul * (1.0f - night)));
+          const Color crackC = ShadeDetail(Color{20, 20, 22, 255}, tileBrightness, 0.95f, aCrack);
+
+          for (int i = 0; i < cracks; ++i) {
+            Vector2 p0 = DeterministicDiamondPoint(x, y, hb ^ 0x51A5EEDu, 120 + i * 11, tileCenter, tileW, tileH, 0.80f);
+            Vector2 p1 = DeterministicDiamondPoint(x, y, hb ^ 0xBADC0DEu, 160 + i * 17, tileCenter, tileW, tileH, 0.80f);
+
+            // Bias crack to follow main road direction when straight.
+            if (conn == 2 && (n && s)) {
+              p0.x = tileCenter.x + (p0.x - tileCenter.x) * 0.25f;
+              p1.x = tileCenter.x + (p1.x - tileCenter.x) * 0.25f;
+            } else if (conn == 2 && (e && w)) {
+              p0.y = tileCenter.y + (p0.y - tileCenter.y) * 0.25f;
+              p1.y = tileCenter.y + (p1.y - tileCenter.y) * 0.25f;
+            }
+
+            DrawLineEx(p0, p1, 0.95f * invZoom, crackC);
+
+            // Tiny branch.
+            if (((hb >> (i * 7)) & 3u) == 0u) {
+              Vector2 mid = LerpV(p0, p1, 0.55f);
+              Vector2 q = DeterministicDiamondPoint(x, y, hb ^ 0x13579BDFu, 200 + i * 5, tileCenter, tileW, tileH, 0.55f);
+              DrawLineEx(mid, q, 0.75f * invZoom, crackC);
+            }
+          }
         }
       }
 
-      // Subtle wear/cracks: only when very zoomed in so it doesn't look like noise.
-      if (tileScreenW >= 48.0f) {
-        const std::uint32_t hb = HashCoords32(x, y, seed32 ^ 0xA57A11u);
-        const int cracks = 1 + static_cast<int>((hb >> 29) & 1u);
+      // Asphalt repair patches and utility covers (procedural).
+      // These are zoom-gated so they read as "extra detail" rather than texture noise.
+      if (tileScreenW >= 62.0f) {
+        const std::uint32_t hd = HashCoords32(x, y, seed32 ^ 0xD1CEB00Cu);
 
-        // Fewer cracks on higher-class roads.
+        // Fewer surface blemishes on higher-class roads.
         const float wearMul = (lvl >= 3) ? 0.55f : (lvl == 2) ? 0.75f : 1.0f;
 
-        const unsigned char aCrack = ClampU8(static_cast<int>(22.0f * wearMul + 38.0f * wearMul * (1.0f - night)));
-        const Color crackC = ShadeDetail(Color{20, 20, 22, 255}, tileBrightness, 0.95f, aCrack);
+        auto pickRoadDir = [&]() -> Vector2 {
+          // Straight roads: align with the main segment.
+          if (conn == 2 && (n && s)) return NormalizeV(Vector2{end[2].x - end[0].x, end[2].y - end[0].y});
+          if (conn == 2 && (e && w)) return NormalizeV(Vector2{end[1].x - end[3].x, end[1].y - end[3].y});
 
-        for (int i = 0; i < cracks; ++i) {
-          Vector2 p0 = DeterministicDiamondPoint(x, y, hb ^ 0x51A5EEDu, 120 + i * 11, tileCenter, tileW, tileH, 0.80f);
-          Vector2 p1 = DeterministicDiamondPoint(x, y, hb ^ 0xBADC0DEu, 160 + i * 17, tileCenter, tileW, tileH, 0.80f);
+          // Corners: bisector of the two connected edges.
+          if (conn == 2) {
+            int aEdge = n ? 0 : (e ? 1 : (s ? 2 : 3));
+            int bEdge = aEdge;
+            if (aEdge == 0) bEdge = e ? 1 : 3;
+            else if (aEdge == 1) bEdge = s ? 2 : 0;
+            else if (aEdge == 2) bEdge = w ? 3 : 1;
+            else if (aEdge == 3) bEdge = n ? 0 : 2;
 
-          // Bias crack to follow main road direction when straight.
-          if (conn == 2 && (n && s)) {
-            p0.x = tileCenter.x + (p0.x - tileCenter.x) * 0.25f;
-            p1.x = tileCenter.x + (p1.x - tileCenter.x) * 0.25f;
-          } else if (conn == 2 && (e && w)) {
-            p0.y = tileCenter.y + (p0.y - tileCenter.y) * 0.25f;
-            p1.y = tileCenter.y + (p1.y - tileCenter.y) * 0.25f;
+            Vector2 da{end[aEdge].x - tileCenter.x, end[aEdge].y - tileCenter.y};
+            Vector2 db{end[bEdge].x - tileCenter.x, end[bEdge].y - tileCenter.y};
+            return NormalizeV(Vector2{da.x + db.x, da.y + db.y});
           }
 
-          DrawLineEx(p0, p1, 0.95f * invZoom, crackC);
+          // Intersections: pick a deterministic connected edge and align with it.
+          int edges[4];
+          int edgeCount = 0;
+          for (int i = 0; i < 4; ++i) {
+            if ((mask & static_cast<std::uint8_t>(1u << i)) != 0u) edges[edgeCount++] = i;
+          }
+          if (edgeCount <= 0) return Vector2{1.0f, 0.0f};
+          const int edge = edges[(hd >> 8u) % static_cast<std::uint32_t>(edgeCount)];
+          return NormalizeV(Vector2{end[edge].x - tileCenter.x, end[edge].y - tileCenter.y});
+        };
 
-          // Tiny branch.
-          if (((hb >> (i * 7)) & 3u) == 0u) {
-            Vector2 mid = LerpV(p0, p1, 0.55f);
-            Vector2 q = DeterministicDiamondPoint(x, y, hb ^ 0x13579BDFu, 200 + i * 5, tileCenter, tileW, tileH, 0.55f);
-            DrawLineEx(mid, q, 0.75f * invZoom, crackC);
+        const Vector2 dir = pickRoadDir();
+        const Vector2 perp{-dir.y, dir.x};
+
+        const float zT = std::clamp((tileScreenW - 62.0f) / 44.0f, 0.0f, 1.0f);
+        const unsigned char aPatch = ClampU8(static_cast<int>((28.0f + 58.0f * zT) * wearMul));
+
+        // Asphalt patches: low frequency so they read as repairs rather than random noise.
+        int patches = 0;
+        if (tileScreenW >= 96.0f) {
+          patches = 1 + static_cast<int>((hd >> 29u) & 1u);
+        } else if ((hd & 7u) == 0u) {
+          patches = 1;
+        }
+
+        if (patches > 0) {
+          const Color edgeC = ShadeDetail(Color{18, 18, 20, 255}, tileBrightness, 0.92f, ClampU8(static_cast<int>(aPatch * 0.55f)));
+
+          for (int i = 0; i < patches; ++i) {
+            const std::uint32_t hp = HashCoords32(x + i * 17, y - i * 23, hd ^ 0xBADA55u);
+
+            Vector2 p = tileCenter;
+            const float along = (Frac01(hp) - 0.5f) * tileH * 0.22f;
+            const float off = (Frac01(hp ^ 0x9E3779B9u) - 0.5f) * tileH * 0.10f;
+            p.x += dir.x * along + perp.x * off;
+            p.y += dir.y * along + perp.y * off;
+
+            const float len = tileH * (0.26f + 0.08f * Frac01(hp ^ 0x13579BDFu));
+            const float wid = tileH * (0.11f + 0.03f * Frac01(hp ^ 0xC0FFEE11u));
+
+            const float m = 0.78f + 0.30f * (Frac01(hp ^ 0xA11CE5EDu) - 0.5f);
+            const Color fill = ShadeDetail(Color{70, 72, 78, 255}, tileBrightness, 0.92f * m, aPatch);
+
+            Vector2 q[4];
+            RotatedRectCorners(p, len, wid, dir, q);
+            DrawQuadFill(q, fill);
+            DrawQuadOutline(q, std::clamp(0.90f * invZoom, 0.55f * invZoom, 1.8f * invZoom), edgeC);
+
+            // A subtle seam inside the patch keeps it from reading as a flat blob.
+            if (tileScreenW >= 84.0f) {
+              const Color seam = ShadeDetail(Color{10, 10, 12, 255}, tileBrightness, 0.90f, ClampU8(static_cast<int>(aPatch * 0.35f)));
+              const float seamOff = (Frac01(hp ^ 0xFEEDBEEFu) - 0.5f) * wid * 0.35f;
+              Vector2 a{p.x + perp.x * seamOff - dir.x * len * 0.40f, p.y + perp.y * seamOff - dir.y * len * 0.40f};
+              Vector2 b{p.x + perp.x * seamOff + dir.x * len * 0.40f, p.y + perp.y * seamOff + dir.y * len * 0.40f};
+              DrawLineEx(a, b, std::clamp(0.70f * invZoom, 0.45f * invZoom, 1.4f * invZoom), seam);
+            }
+          }
+        }
+
+        // Utility covers (manholes / access plates): tiny so they only appear at very high zoom.
+        if (tileScreenW >= 72.0f) {
+          int covers = 0;
+          if (conn >= 3) covers = 1;
+          else if ((hd & 15u) == 0u) covers = 1;
+
+          const float r = (tileScreenW >= 104.0f) ? (3.2f * invZoom) : (2.6f * invZoom);
+          const unsigned char aCover = ClampU8(static_cast<int>((95.0f + 75.0f * zT) * wearMul));
+
+          const Color fill = ShadeDetail(Color{35, 35, 40, 255}, tileBrightness, 0.92f, ClampU8(static_cast<int>(aCover * 0.75f)));
+          const Color rim = ShadeDetail(Color{15, 15, 18, 255}, tileBrightness, 0.92f, aCover);
+          const Color grate = ShadeDetail(Color{0, 0, 0, 255}, tileBrightness, 0.85f, ClampU8(static_cast<int>(aCover * 0.65f)));
+
+          for (int i = 0; i < covers; ++i) {
+            const std::uint32_t hc = HashCoords32(x + 31 + i, y - 17 - i, hd ^ 0x0DDC0FFEu);
+            Vector2 p = tileCenter;
+            const float along = (Frac01(hc) - 0.5f) * tileH * 0.10f;
+            const float off = (0.32f + 0.12f * Frac01(hc ^ 0x1234567u)) * ((hc & 1u) ? 1.0f : -1.0f);
+            p.x += dir.x * along + perp.x * tileH * 0.06f * off;
+            p.y += dir.y * along + perp.y * tileH * 0.06f * off;
+
+            DrawCircleV(p, r, fill);
+            DrawCircleLines(static_cast<int>(std::round(p.x)), static_cast<int>(std::round(p.y)), r, rim);
+
+            // Simple grate lines.
+            DrawLineEx(Vector2{p.x - dir.x * r * 0.75f, p.y - dir.y * r * 0.75f},
+                       Vector2{p.x + dir.x * r * 0.75f, p.y + dir.y * r * 0.75f},
+                       std::clamp(0.70f * invZoom, 0.45f * invZoom, 1.4f * invZoom), grate);
+            DrawLineEx(Vector2{p.x - perp.x * r * 0.55f, p.y - perp.y * r * 0.55f},
+                       Vector2{p.x + perp.x * r * 0.55f, p.y + perp.y * r * 0.55f},
+                       std::clamp(0.65f * invZoom, 0.40f * invZoom, 1.2f * invZoom), grate);
           }
         }
       }
@@ -3966,6 +4461,7 @@ static void DrawRoadIndicators(const World& world, int x, int y, const Tile& t,
     }
   }
 }
+
 
 Renderer::Renderer(int tileW, int tileH, std::uint64_t seed)
     : m_tileW(tileW)
@@ -6018,6 +6514,45 @@ void Renderer::rebuildTextures(std::uint64_t seed)
 
       // Markings based on closest segment.
       const float centerDist = std::sqrt(px * px + py * py);
+
+      // Space colony theme: panel seams / service joints on road surfaces.
+      // Kept subtle so it reads as material detail rather than new markings.
+      if (isSpace && conn > 0 && bestSegDist < (st.roadW * 0.98f)) {
+        const float segLen = std::sqrt(bestEx * bestEx + bestEy * bestEy);
+        if (segLen > 1.0e-6f) {
+          const float vx = bestEx / segLen;
+          const float vy = bestEy / segLen;
+          const float cx = bestSegT * bestEx;
+          const float cy = bestSegT * bestEy;
+          const float dx = px - cx;
+          const float dy = py - cy;
+          const float signedPerp = dx * (-vy) + dy * (vx);
+          const float absPerp = std::fabs(signedPerp);
+
+          if (absPerp < st.roadW * 0.92f) {
+            const float freq = (level == 1) ? 12.0f : (level == 2) ? 14.0f : 16.0f;
+            const float seamT = std::fabs(FracF(bestSegT * freq + static_cast<float>(variant) * 0.31f +
+                                                static_cast<float>(mask) * 0.17f) -
+                                          0.5f);
+            const float seamW = 0.035f;
+            float seam = std::clamp(1.0f - seamT / seamW, 0.0f, 1.0f);
+
+            // Fade seams toward the center so intersections don't become too busy.
+            const float centerFade = std::clamp((centerDist - centerR * 0.45f) / (centerR * 0.40f), 0.0f, 1.0f);
+            seam *= centerFade;
+
+            if (seam > 0.0f) {
+              base = Mul(base, 1.0f - 0.16f * seam);
+
+              // A rarer cross-joint across the lane adds a little industrial texture.
+              const float crossT = std::fabs(FracF((signedPerp / std::max(0.001f, st.roadW)) * 5.5f + 0.37f) - 0.5f);
+              float cross = std::clamp(1.0f - crossT / 0.08f, 0.0f, 1.0f);
+              cross *= seam * 0.65f;
+              if (cross > 0.0f) base = Mul(base, 1.0f - 0.08f * cross);
+            }
+          }
+        }
+      }
       if (conn > 0 && bestSegDist < (st.roadW * 0.55f) && centerDist > centerR * 0.60f) {
         const float segLen = std::sqrt(bestEx * bestEx + bestEy * bestEy);
         if (segLen > 1.0e-6f) {
@@ -8263,7 +8798,7 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
       // Road indicators (upgrade pips, etc.)
       // -----------------------------
       if (layerStructures && t.overlay == Overlay::Road && tileScreenW >= 18.0f) {
-        DrawRoadIndicators(world, x, y, t, tileWf, tileHf, camera.zoom, center, brightness, dayNight, weather, m_gfxSeed32, timeSec);
+        DrawRoadIndicators(world, x, y, t, tileWf, tileHf, camera.zoom, center, brightness, drawAestheticDetails, dayNight, weather, m_gfxSeed32, timeSec);
       }
     }
 
@@ -8420,6 +8955,9 @@ void Renderer::drawWorld(const World& world, const Camera2D& camera, int screenW
       weather.wetness,
       m_weather.reflectLights,
       /*suppressZoneWindows=*/drawZoneBuildingSprites,
+      /*spaceTheme=*/(m_gfxTheme == GfxTheme::SpaceColony),
+      /*roadTraffic=*/(wantsTraffic ? roadTraffic : nullptr),
+      /*trafficMax=*/(wantsTraffic ? trafficMax : 0),
       m_gfxSeed32);
   }
 
@@ -9048,7 +9586,7 @@ void Renderer::drawHUD(const World& world, const Camera2D& camera, Tool tool, in
         if (tipR.height > 12.0f) {
           ui::TextBox(
             tipR, 14,
-            "More: F4 console | F5 save/menu | M minimap | L heatmap | F1 report | Ctrl+N news | Ctrl+X services | F2 cache | Ctrl+F2 lab | F3 model | Shift+F3 weather | F11 fullscreen. "
+            "More: F4 console | F5 save/menu | M minimap | L heatmap | F1 report | Ctrl+N news (use 'Focus map') | Ctrl+X services | F2 cache | Ctrl+F2 lab | F3 model | Shift+F3 weather | F11 fullscreen. "
             "Tip: re-place a zone to upgrade. Road: U selects class (paint to upgrade), Shift+drag builds path. Terraform: Shift=strong, Ctrl=fine. "
             "District: Alt+click pick, Shift+click fill.",
             uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1, /*wrap=*/true, /*clip=*/true);

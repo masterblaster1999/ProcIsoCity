@@ -339,6 +339,8 @@ bool WriteHtmlReport(const std::filesystem::path& outPath,
   f << ".kv td{padding:2px 10px 2px 0; vertical-align:top;}\n";
   f << ".viewer{max-width:100%;}\n";
   f << ".viewer img{max-width:100%; height:auto; image-rendering:pixelated; border:1px solid #ddd; border-radius:8px;}\n";
+  f << ".imgWrap{position:relative; display:inline-block; max-width:100%;}\n";
+  f << ".imgWrap canvas{position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none;}\n";
   f << ".thumbs{display:grid; grid-template-columns:repeat(auto-fill, minmax(180px,1fr)); gap:12px;}\n";
   f << ".thumbs a{text-decoration:none; color:inherit;}\n";
   f << ".thumbs img{width:100%; height:auto; image-rendering:pixelated; border:1px solid #eee; border-radius:8px;}\n";
@@ -389,11 +391,20 @@ bool WriteHtmlReport(const std::filesystem::path& outPath,
   f << "    <h2>Map viewer</h2>\n";
   f << "    <div>Layer: <select id=\"layerSel\"></select></div>\n";
   f << "    <div class=\"viewer\" style=\"margin-top:10px\">\n";
-  f << "      <img id=\"mainImg\" alt=\"layer\" src=\"" << layerDefault << "\">\n";
+  f << "      <div id=\"imgWrap\" class=\"imgWrap\">\n";
+  f << "        <img id=\"mainImg\" alt=\"layer\" src=\"" << layerDefault << "\">\n";
+  f << "        <canvas id=\"overlayCanvas\"></canvas>\n";
+  f << "      </div>\n";
   f << "    </div>\n";
   f << "    <div class=\"small\" style=\"margin-top:8px\">\n";
-  f << "      Tile: <code id=\"tileCoord\">-</code>";
-  f << "      <span id=\"tileInfo\"></span>\n";
+  f << "      Hover: <code id=\"tileCoord\">-</code>";
+  f << "      <span id=\"tileInfo\"></span><br>\n";
+  f << "      Pinned: <code id=\"pinCoord\">-</code>";
+  f << "      <span id=\"pinInfo\"></span>\n";
+  f << "      <span style=\"margin-left:8px\"></span>\n";
+  f << "      <button id=\"pinClear\" type=\"button\">Clear</button>\n";
+  f << "      <button id=\"pinCopy\" type=\"button\">Copy JSON</button>\n";
+  f << "      <span style=\"margin-left:10px\">Go:</span> <input type=\"text\" id=\"pinGoto\" placeholder=\"x,y\" style=\"width:90px\"> <button id=\"pinGoBtn\" type=\"button\">Pin</button>\n";
   f << "    </div>\n";
   f << "    <div class=\"small\" style=\"margin-top:10px\">\n";
   f << "      Optional: load <code>tile_metrics.csv</code> for per-tile inspection (works even when opened as file://).\n";
@@ -501,6 +512,15 @@ const mainImg = document.getElementById('mainImg');
 const tileCoord = document.getElementById('tileCoord');
 const tileInfo = document.getElementById('tileInfo');
 
+// --- Pin + overlay UI ---
+const overlayCanvas = document.getElementById('overlayCanvas');
+const pinCoord = document.getElementById('pinCoord');
+const pinInfo = document.getElementById('pinInfo');
+const pinClear = document.getElementById('pinClear');
+const pinCopy = document.getElementById('pinCopy');
+const pinGoto = document.getElementById('pinGoto');
+const pinGoBtn = document.getElementById('pinGoBtn');
+
 // --- Tile metrics UI ---
 const metricsFile = document.getElementById('metricsFile');
 const metricsStatus = document.getElementById('metricsStatus');
@@ -537,6 +557,7 @@ for (const l of LAYERS_2D) {
 
 layerSel.addEventListener('change', () => {
   mainImg.src = layerSel.value;
+  updateHashFromState();
 });
 
 // -----------------------------
@@ -677,6 +698,8 @@ function setMetrics(m) {
     metricsStatus.textContent = 'Loaded tile_metrics.csv (' + (MAP_W * MAP_H) + ' tiles, ' + metrics.numericKeys.length + ' numeric cols)';
   }
   rebuildMetricSelector();
+  // Keep pinned info in sync once metrics are available.
+  if (pinnedTile) setPinned(pinnedTile.tx, pinnedTile.ty, { updateHash: false });
 }
 
 function getSelectedMetrics() {
@@ -804,30 +827,112 @@ function formatTileMetric(name, v) {
 }
 
 // -----------------------------
-// Map hover inspector
+// Map hover inspector + pinned tile + overlay
 // -----------------------------
-function updateHover(ev) {
+let hoverTile = null;   // {tx, ty}
+let pinnedTile = null;  // {tx, ty}
+let pinnedJson = null;
+
+const overlayCtx = overlayCanvas ? overlayCanvas.getContext('2d') : null;
+
+function eventToTile(ev) {
   const rect = mainImg.getBoundingClientRect();
   const u = (ev.clientX - rect.left) / rect.width;
   const v = (ev.clientY - rect.top) / rect.height;
-  if (!Number.isFinite(u) || !Number.isFinite(v)) return;
-  if (u < 0 || v < 0 || u > 1 || v > 1) return;
+  if (!Number.isFinite(u) || !Number.isFinite(v)) return null;
+  if (u < 0 || v < 0 || u > 1 || v > 1) return null;
+  if (!mainImg.naturalWidth || !mainImg.naturalHeight) return null;
 
   const px = Math.floor(u * mainImg.naturalWidth);
   const py = Math.floor(v * mainImg.naturalHeight);
   const tx = Math.floor(px / EXPORT_SCALE);
   const ty = Math.floor(py / EXPORT_SCALE);
-  if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return;
+  if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return null;
+  return { tx, ty };
+}
 
-  tileCoord.textContent = tx + ',' + ty;
+function resizeOverlayCanvas() {
+  if (!overlayCanvas) return;
+  const rect = mainImg.getBoundingClientRect();
+  if (!rect || rect.width <= 0 || rect.height <= 0) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(rect.width * dpr));
+  const h = Math.max(1, Math.round(rect.height * dpr));
+  if (overlayCanvas.width !== w) overlayCanvas.width = w;
+  if (overlayCanvas.height !== h) overlayCanvas.height = h;
+  drawOverlay();
+}
 
-  if (!metrics) {
-    tileInfo.textContent = '';
-    return;
+function tileRectCanvas(tx, ty) {
+  if (!overlayCanvas || !mainImg.naturalWidth || !mainImg.naturalHeight) return null;
+  const sx = overlayCanvas.width / mainImg.naturalWidth;
+  const sy = overlayCanvas.height / mainImg.naturalHeight;
+  const x = tx * EXPORT_SCALE * sx;
+  const y = ty * EXPORT_SCALE * sy;
+  const w = EXPORT_SCALE * sx;
+  const h = EXPORT_SCALE * sy;
+  return { x, y, w, h };
+}
+
+function drawTileBox(tx, ty, cssLineWidth, strokeStyle, fillStyle) {
+  if (!overlayCtx) return;
+  const r = tileRectCanvas(tx, ty);
+  if (!r) return;
+
+  const dpr = window.devicePixelRatio || 1;
+  const lw = Math.max(1, cssLineWidth * dpr);
+
+  overlayCtx.save();
+  if (fillStyle) {
+    overlayCtx.fillStyle = fillStyle;
+    overlayCtx.fillRect(r.x, r.y, r.w, r.h);
   }
+  overlayCtx.strokeStyle = strokeStyle;
+  overlayCtx.lineWidth = lw;
+  const inset = 0.5 * dpr;
+  const rw = Math.max(0, r.w - 1.0 * dpr);
+  const rh = Math.max(0, r.h - 1.0 * dpr);
+  overlayCtx.strokeRect(r.x + inset, r.y + inset, rw, rh);
+  overlayCtx.restore();
+}
+
+function drawOverlay() {
+  if (!overlayCtx || !overlayCanvas) return;
+  overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
+  // Pinned first (under hover).
+  if (pinnedTile) {
+    drawTileBox(pinnedTile.tx, pinnedTile.ty, 2, 'rgba(0,0,0,0.95)', 'rgba(255,255,255,0.10)');
+  }
+  if (hoverTile) {
+    drawTileBox(hoverTile.tx, hoverTile.ty, 1, 'rgba(0,0,0,0.65)', 'rgba(255,255,255,0.06)');
+  }
+}
+
+function updateHashFromState() {
+  try {
+    const params = new URLSearchParams();
+    if (layerSel && layerSel.value) params.set('layer', layerSel.value);
+    if (pinnedTile) params.set('tile', pinnedTile.tx + ',' + pinnedTile.ty);
+    const s = params.toString();
+    if (s) window.location.hash = s;
+  } catch (e) {
+    // ignore (file:// quirks)
+  }
+}
+
+function buildTileInfo(tx, ty) {
+  const out = {
+    text: '',
+    json: { x: tx, y: ty, layer: (layerSel ? layerSel.value : ''), fields: {} }
+  };
+
+  if (!metrics) return out;
 
   const i = ty * MAP_W + tx;
+  const selected = getSelectedMetrics();
   const parts = [];
+  const fields = out.json.fields;
 
   // Always show a stable set of fields if present.
   for (const k of ALWAYS_INFO_FIELDS) {
@@ -835,15 +940,20 @@ function updateHover(ev) {
     if (!arr) continue;
     const val = arr[i];
     if (typeof val === 'string') {
-      if (val !== '') parts.push(k + '=' + val);
+      if (val !== '') {
+        parts.push(k + '=' + val);
+        fields[k] = val;
+      }
     } else {
       const s = formatTileMetric(k, val);
-      if (s != null) parts.push(k + '=' + s);
+      if (s != null) {
+        parts.push(k + '=' + s);
+        fields[k] = val;
+      }
     }
   }
 
-  // Show selected numeric metrics.
-  const selected = getSelectedMetrics();
+  // Selected numeric hover metrics.
   for (const k of selected) {
     const arr = metrics.cols[k];
     if (!arr) continue;
@@ -852,16 +962,154 @@ function updateHover(ev) {
     const s = formatTileMetric(k, val);
     if (s == null) continue;
     parts.push(k + '=' + s);
+    fields[k] = val;
   }
 
-  tileInfo.textContent = parts.length ? (' ' + parts.join(' • ')) : '';
+  out.text = parts.join(' • ');
+  return out;
+}
+
+function setPinned(tx, ty, opts) {
+  opts = opts || {};
+  pinnedTile = { tx, ty };
+  if (pinCoord) pinCoord.textContent = tx + ',' + ty;
+
+  const info = buildTileInfo(tx, ty);
+  pinnedJson = info.json;
+  if (pinInfo) {
+    if (!metrics) {
+      pinInfo.textContent = ' (tile_metrics not loaded)';
+    } else {
+      pinInfo.textContent = info.text ? (' ' + info.text) : '';
+    }
+  }
+  drawOverlay();
+  if (opts.updateHash !== false) updateHashFromState();
+}
+
+function clearPinned(opts) {
+  opts = opts || {};
+  pinnedTile = null;
+  pinnedJson = null;
+  if (pinCoord) pinCoord.textContent = '-';
+  if (pinInfo) pinInfo.textContent = '';
+  drawOverlay();
+  if (opts.updateHash !== false) updateHashFromState();
+}
+
+function tryCopyText(text) {
+  if (!text) return;
+  if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).catch(() => {});
+    return;
+  }
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.left = '-10000px';
+  ta.style.top = '-10000px';
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try { document.execCommand('copy'); } catch(e) {}
+  document.body.removeChild(ta);
+}
+
+function applyHash() {
+  try {
+    const h = window.location.hash ? window.location.hash.substring(1) : '';
+    if (!h) return;
+    const params = new URLSearchParams(h);
+    const layer = params.get('layer');
+    if (layer && layerSel) {
+      for (const opt of layerSel.options) {
+        if (opt.value === layer) {
+          layerSel.value = layer;
+          mainImg.src = layer;
+          break;
+        }
+      }
+    }
+    const t = params.get('tile');
+    if (t) {
+      const parts = t.split(',');
+      if (parts.length === 2) {
+        const tx = parseInt(parts[0], 10);
+        const ty = parseInt(parts[1], 10);
+        if (Number.isFinite(tx) && Number.isFinite(ty) && tx >= 0 && ty >= 0 && tx < MAP_W && ty < MAP_H) {
+          setPinned(tx, ty, { updateHash: false });
+        }
+      }
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
+function updateHover(ev) {
+  const t = eventToTile(ev);
+  if (!t) return;
+
+  hoverTile = t;
+  if (tileCoord) tileCoord.textContent = t.tx + ',' + t.ty;
+
+  if (!metrics) {
+    if (tileInfo) tileInfo.textContent = '';
+    drawOverlay();
+    return;
+  }
+
+  const info = buildTileInfo(t.tx, t.ty);
+  if (tileInfo) tileInfo.textContent = info.text ? (' ' + info.text) : '';
+  drawOverlay();
 }
 
 mainImg.addEventListener('mousemove', updateHover);
 mainImg.addEventListener('mouseleave', () => {
-  tileCoord.textContent = '-';
-  tileInfo.textContent = '';
+  hoverTile = null;
+  if (tileCoord) tileCoord.textContent = '-';
+  if (tileInfo) tileInfo.textContent = '';
+  drawOverlay();
 });
+
+mainImg.addEventListener('click', (ev) => {
+  const t = eventToTile(ev);
+  if (!t) return;
+  setPinned(t.tx, t.ty);
+});
+
+if (pinClear) pinClear.addEventListener('click', () => clearPinned());
+if (pinCopy) pinCopy.addEventListener('click', () => {
+  if (!pinnedJson) return;
+  tryCopyText(JSON.stringify(pinnedJson, null, 2));
+});
+
+if (pinGoBtn && pinGoto) {
+  pinGoBtn.addEventListener('click', () => {
+    const s = String(pinGoto.value || '').trim();
+    const m = s.split(',');
+    if (m.length !== 2) return;
+    const tx = parseInt(m[0], 10);
+    const ty = parseInt(m[1], 10);
+    if (!Number.isFinite(tx) || !Number.isFinite(ty)) return;
+    if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return;
+    setPinned(tx, ty);
+  });
+
+  pinGoto.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') pinGoBtn.click();
+  });
+}
+
+mainImg.addEventListener('load', () => resizeOverlayCanvas());
+window.addEventListener('resize', () => resizeOverlayCanvas());
+
+if (metricSel) metricSel.addEventListener('change', () => {
+  if (pinnedTile) setPinned(pinnedTile.tx, pinnedTile.ty, { updateHash: false });
+});
+
+window.addEventListener('hashchange', () => applyHash());
+applyHash();
 
 // -----------------------------
 // Ticks.csv charting
