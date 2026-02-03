@@ -1340,16 +1340,16 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
 
     // Pick a deterministic high-risk road tile for UI/news/incident location.
     // Use integer weights for stability.
-    const int w = world.width();
-    const int h = world.height();
-    const std::size_t n = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
-    if (w > 0 && h > 0 && ts.risk01.size() == n) {
+    const int worldW = world.width();
+    const int worldH = world.height();
+    const std::size_t nTiles = static_cast<std::size_t>(worldW) * static_cast<std::size_t>(worldH);
+    if (worldW > 0 && worldH > 0 && ts.risk01.size() == nTiles) {
       uint64_t totalW = 0;
-      for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
+      for (int y = 0; y < worldH; ++y) {
+        for (int x = 0; x < worldW; ++x) {
           const Tile& t = world.at(x, y);
           if (t.overlay != Overlay::Road) continue;
-          const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+          const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(worldW) + static_cast<std::size_t>(x);
           const float r = ts.risk01[idx];
           const int rq = Float01ToQ16(std::clamp(r, 0.0f, 1.0f));
           if (rq <= 0) continue;
@@ -1367,11 +1367,11 @@ void Simulator::refreshDerivedStatsInternal(World& world, const std::vector<std:
         uint64_t acc = 0;
         bool chosen = false;
 
-        for (int y = 0; y < h && !chosen; ++y) {
-          for (int x = 0; x < w && !chosen; ++x) {
+        for (int y = 0; y < worldH && !chosen; ++y) {
+          for (int x = 0; x < worldW && !chosen; ++x) {
             const Tile& t = world.at(x, y);
             if (t.overlay != Overlay::Road) continue;
-            const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(w) + static_cast<std::size_t>(x);
+            const std::size_t idx = static_cast<std::size_t>(y) * static_cast<std::size_t>(worldW) + static_cast<std::size_t>(x);
             const float r = ts.risk01[idx];
             const int rq = Float01ToQ16(std::clamp(r, 0.0f, 1.0f));
             if (rq <= 0) continue;

@@ -997,7 +997,10 @@ function clearPinned(opts) {
   if (opts.updateHash !== false) updateHashFromState();
 }
 
-function tryCopyText(text) {
+)JS";
+
+	f << R"JS(
+	function tryCopyText(text) {
   if (!text) return;
   if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text).catch(() => {});
@@ -1298,7 +1301,10 @@ function renderChronicle() {
     return;
   }
 
-  const q = (chronFilter && chronFilter.value) ? chronFilter.value.trim().toLowerCase() : '';
+)JS";
+
+	f << R"JS(
+	  const q = (chronFilter && chronFilter.value) ? chronFilter.value.trim().toLowerCase() : '';
   const tone = (chronTone && chronTone.value) ? chronTone.value : 'all';
 
   let lastDay = null;

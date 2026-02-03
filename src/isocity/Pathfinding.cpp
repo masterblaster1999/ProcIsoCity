@@ -395,8 +395,8 @@ bool FindRoadPathAStarEx(const World& world, Point start, Point goal, std::vecto
       bestS[nsU] = newS;
       cameFrom[nsU] = cur.state;
 
-      const int h = Manhattan(Point{nx, ny}, goal) * minStepTime;
-      const int f = (newP >= kInf - h) ? kInf : (newP + h);
+      const int heur = Manhattan(Point{nx, ny}, goal) * minStepTime;
+      const int f = (newP >= kInf - heur) ? kInf : (newP + heur);
       open.push(Node{ns, f, newP, newS});
     }
   }
