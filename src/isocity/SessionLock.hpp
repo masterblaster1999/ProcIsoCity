@@ -63,7 +63,15 @@ public:
 
 private:
   struct Impl;
-  std::unique_ptr<Impl> m_impl;
+
+  // Custom deleter so SessionLock can keep a PIMPL (incomplete) type safely.
+  // This avoids MSVC std::unique_ptr incomplete-type deletion errors when the destructor
+  // is instantiated in translation units that only see the forward declaration.
+  struct ImplDeleter {
+    void operator()(Impl* p) noexcept;
+  };
+
+  std::unique_ptr<Impl, ImplDeleter> m_impl;
 };
 
 } // namespace isocity

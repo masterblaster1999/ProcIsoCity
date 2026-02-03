@@ -1,6 +1,7 @@
 #include "isocity/Game.hpp"
 #include "isocity/Random.hpp"
 #include "isocity/AppPaths.hpp"
+#include "isocity/Env.hpp"
 #include "isocity/CrashHandler.hpp"
 #include "isocity/HealthCheck.hpp"
 #include "isocity/LogTee.hpp"
@@ -1292,13 +1293,13 @@ int main(int argc, char** argv)
   // By default we chdir into a per-user data directory so saves, thumbnails and
   // blueprint libraries are always writable and don't pollute build folders.
   std::filesystem::path resolvedDataDir;
-  const char* envDataDir = std::getenv("PROCISOCITY_DATA_DIR");
+  const auto envDataDir = isocity::GetEnvVar("PROCISOCITY_DATA_DIR");
   if (!dataDirOverride.empty()) {
     resolvedDataDir = std::filesystem::path(dataDirOverride);
   } else if (portableData) {
     resolvedDataDir = isocity::AppPaths::PortableDataDir();
-  } else if (envDataDir && *envDataDir) {
-    resolvedDataDir = std::filesystem::path(envDataDir);
+  } else if (envDataDir) {
+    resolvedDataDir = std::filesystem::path(*envDataDir);
   } else {
     resolvedDataDir = isocity::AppPaths::UserDataDir();
   }
@@ -1320,21 +1321,21 @@ int main(int argc, char** argv)
               << "  resolved:    " << resolvedDataDir.string() << "\n"
               << "  will_chdir:  " << ((noChdir) ? "no" : "yes") << "\n";
 
-    if (envDataDir && *envDataDir) {
-      std::cout << "  env(PROCISOCITY_DATA_DIR): " << envDataDir << "\n";
+    if (envDataDir) {
+      std::cout << "  env(PROCISOCITY_DATA_DIR): " << *envDataDir << "\n";
     }
-    const char* envShader = std::getenv("PROCISOCITY_SHADER_DIR");
-    if (envShader && *envShader) {
-      std::cout << "  env(PROCISOCITY_SHADER_DIR): " << envShader << "\n";
+    const auto envShader = isocity::GetEnvVar("PROCISOCITY_SHADER_DIR");
+    if (envShader) {
+      std::cout << "  env(PROCISOCITY_SHADER_DIR): " << *envShader << "\n";
     }
-    const char* envLogFile = std::getenv("PROCISOCITY_LOG_FILE");
-    if (envLogFile && *envLogFile) {
-      std::cout << "  env(PROCISOCITY_LOG_FILE): " << envLogFile << "\n";
+    const auto envLogFile = isocity::GetEnvVar("PROCISOCITY_LOG_FILE");
+    if (envLogFile) {
+      std::cout << "  env(PROCISOCITY_LOG_FILE): " << *envLogFile << "\n";
     }
 
-    const char* envRaylibLog = std::getenv("PROCISOCITY_RAYLIB_LOG");
-    if (envRaylibLog && *envRaylibLog) {
-      std::cout << "  env(PROCISOCITY_RAYLIB_LOG): " << envRaylibLog << "\n";
+    const auto envRaylibLog = isocity::GetEnvVar("PROCISOCITY_RAYLIB_LOG");
+    if (envRaylibLog) {
+      std::cout << "  env(PROCISOCITY_RAYLIB_LOG): " << *envRaylibLog << "\n";
     }
     return 0;
   }
@@ -1395,9 +1396,9 @@ int main(int argc, char** argv)
   isocity::LogTee logTee;
   std::filesystem::path resolvedLogPath;
   if (enableLog) {
-    const char* envLogFile = std::getenv("PROCISOCITY_LOG_FILE");
-    if (logPathOverride.empty() && envLogFile && *envLogFile) {
-      logPathOverride = envLogFile;
+    const auto envLogFile = isocity::GetEnvVar("PROCISOCITY_LOG_FILE");
+    if (logPathOverride.empty() && envLogFile) {
+      logPathOverride = *envLogFile;
     }
 
     if (!logPathOverride.empty()) {
@@ -1427,9 +1428,9 @@ int main(int argc, char** argv)
   // in proc_isocity.log for "double-click" builds.
   if (raylibLogEnabled) {
     if (!raylibLogLevelExplicit) {
-      const char* envRaylibLog = std::getenv("PROCISOCITY_RAYLIB_LOG");
-      if (envRaylibLog && *envRaylibLog) {
-        raylibLogLevel = isocity::ParseRaylibLogLevel(envRaylibLog, raylibLogLevel);
+      const auto envRaylibLog = isocity::GetEnvVar("PROCISOCITY_RAYLIB_LOG");
+      if (envRaylibLog) {
+        raylibLogLevel = isocity::ParseRaylibLogLevel(*envRaylibLog, raylibLogLevel);
       }
     }
 
@@ -1488,21 +1489,21 @@ int main(int argc, char** argv)
       oss << "prev_unclean_shutdown: " << (prevUncleanShutdown ? "yes" : "no") << "\n";
     }
     oss << "argv: " << JoinArgs(argc, argv) << "\n";
-    if (envDataDir && *envDataDir) {
-      oss << "env(PROCISOCITY_DATA_DIR): " << envDataDir << "\n";
+    if (envDataDir) {
+      oss << "env(PROCISOCITY_DATA_DIR): " << *envDataDir << "\n";
     }
-    const char* envShader = std::getenv("PROCISOCITY_SHADER_DIR");
-    if (envShader && *envShader) {
-      oss << "env(PROCISOCITY_SHADER_DIR): " << envShader << "\n";
+    const auto envShader = isocity::GetEnvVar("PROCISOCITY_SHADER_DIR");
+    if (envShader) {
+      oss << "env(PROCISOCITY_SHADER_DIR): " << *envShader << "\n";
     }
-    const char* envLogFile = std::getenv("PROCISOCITY_LOG_FILE");
-    if (envLogFile && *envLogFile) {
-      oss << "env(PROCISOCITY_LOG_FILE): " << envLogFile << "\n";
+    const auto envLogFile = isocity::GetEnvVar("PROCISOCITY_LOG_FILE");
+    if (envLogFile) {
+      oss << "env(PROCISOCITY_LOG_FILE): " << *envLogFile << "\n";
     }
 
-    const char* envRaylibLog = std::getenv("PROCISOCITY_RAYLIB_LOG");
-    if (envRaylibLog && *envRaylibLog) {
-      oss << "env(PROCISOCITY_RAYLIB_LOG): " << envRaylibLog << "\n";
+    const auto envRaylibLog = isocity::GetEnvVar("PROCISOCITY_RAYLIB_LOG");
+    if (envRaylibLog) {
+      oss << "env(PROCISOCITY_RAYLIB_LOG): " << *envRaylibLog << "\n";
     }
     oss << "raylib_log_forwarding: " << (raylibLogEnabled ? "yes" : "no") << "\n";
     if (raylibLogEnabled) {

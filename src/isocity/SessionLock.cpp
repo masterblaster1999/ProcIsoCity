@@ -88,6 +88,11 @@ struct SessionLock::Impl {
 #endif
 };
 
+void SessionLock::ImplDeleter::operator()(Impl* p) noexcept
+{
+  delete p;
+}
+
 SessionLock::~SessionLock()
 {
   release();
@@ -103,7 +108,7 @@ bool SessionLock::acquire(const SessionLockOptions& opt, std::string& outError)
     return false;
   }
 
-  auto impl = std::make_unique<Impl>();
+  std::unique_ptr<Impl, ImplDeleter> impl(new Impl());
   impl->lockPath = opt.dir / opt.lockFileName;
   impl->markerPath = opt.dir / opt.markerFileName;
 

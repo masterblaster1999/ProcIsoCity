@@ -1,6 +1,7 @@
 #include "isocity/ShaderUtil.hpp"
 
 #include "isocity/AppPaths.hpp"
+#include "isocity/Env.hpp"
 #include "isocity/RaylibTrace.hpp"
 
 #include <algorithm>
@@ -336,9 +337,9 @@ ShaderOverrideSearch FindShaderOverrideDir(int maxParentHops)
   };
 
   // 1) Explicit override dir.
-  const char* env = std::getenv("PROCISOCITY_SHADER_DIR");
-  if (env && *env) {
-    const std::filesystem::path e(env);
+  const auto env = GetEnvVar("PROCISOCITY_SHADER_DIR");
+  if (env) {
+    const std::filesystem::path e(*env);
     if (tryDir(e)) return out;
     if (tryDir(e / "shaders")) return out;
     if (tryDir(e / "assets" / "shaders")) return out;
