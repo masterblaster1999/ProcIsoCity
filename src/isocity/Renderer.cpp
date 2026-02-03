@@ -2313,10 +2313,10 @@ static void DrawWeatherGroundEffects(const World& world, int x, int y, const Til
 
       const float nightMul = 0.78f + 0.28f * (1.0f - dn.night); // snow stays fairly visible at night
       const float aBase = 110.0f * cover * nightMul;
-      unsigned char a = ClampU8(static_cast<int>(aBase));
+      const unsigned char alphaSnow = ClampU8(static_cast<int>(aBase));
 
       Color c = (t.terrain == Terrain::Water) ? Color{210, 235, 255, 255} : Color{245, 248, 255, 255};
-      c = ShadeDetail(c, brightness, (t.terrain == Terrain::Water) ? 1.05f : 1.10f, a);
+      c = ShadeDetail(c, brightness, (t.terrain == Terrain::Water) ? 1.05f : 1.10f, alphaSnow);
 
       // Fill diamond (two triangles).
       DrawTriangle(corners[0], corners[1], corners[2], c);
@@ -2426,8 +2426,8 @@ static void DrawWeatherGroundEffects(const World& world, int x, int y, const Til
             const Vector2 o0{perp.x * (trackOff + jitter), perp.y * (trackOff + jitter)};
             const Vector2 o1{perp.x * (-trackOff + jitter), perp.y * (-trackOff + jitter)};
 
-            drawBroken(Vector2{a.x + o0.x, a.y + o0.y}, Vector2{b.x + o0.x, b.y + o0.y}, htr);
-            drawBroken(Vector2{a.x + o1.x, a.y + o1.y}, Vector2{b.x + o1.x, b.y + o1.y}, htr ^ 0xDEADC0DEu);
+            drawBroken(Vector2{p0.x + o0.x, p0.y + o0.y}, Vector2{p1.x + o0.x, p1.y + o0.y}, htr);
+            drawBroken(Vector2{p0.x + o1.x, p0.y + o1.y}, Vector2{p1.x + o1.x, p1.y + o1.y}, htr ^ 0xDEADC0DEu);
           }
 
           // Plowed edge accumulation (a touch brighter snow along road sides).
