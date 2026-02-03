@@ -7,70 +7,63 @@
   },
   "configurePresets": [
     {
+      "name": "base",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
       "name": "default",
-      "displayName": "Headless CLI (offline-capable)",
-      "description": "Build CLI tools and core library without raylib (no FetchContent downloads).",
-      "binaryDir": "${sourceDir}/build/default",
+      "displayName": "Default (headless CLI)",
+      "description": "Headless CLI tools (no raylib).",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "PROCISOCITY_BUILD_APP": "OFF",
-        "PROCISOCITY_BUILD_CLI": "ON",
-        "PROCISOCITY_BUILD_TESTS": "OFF"
-      }
-    },
-    {
-      "name": "tests",
-      "displayName": "Headless tests (no raylib)",
-      "description": "Build proc_isocity_tests and enable ctest without raylib.",
-      "binaryDir": "${sourceDir}/build/tests",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "PROCISOCITY_BUILD_APP": "OFF",
-        "PROCISOCITY_BUILD_CLI": "ON",
-        "PROCISOCITY_BUILD_TESTS": "ON"
-      }
-    },
-    {
-      "name": "ci",
-      "displayName": "CI / fast debug tests",
-      "description": "Fast debug build for CI: tests ON, CLI OFF, glTF export OFF.",
-      "binaryDir": "${sourceDir}/build/ci",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "PROCISOCITY_BUILD_APP": "OFF",
-        "PROCISOCITY_BUILD_CLI": "OFF",
-        "PROCISOCITY_BUILD_TESTS": "ON",
-        "PROCISOCITY_ENABLE_GLTF_EXPORT": "OFF"
+        "PROCISOCITY_BUILD_TESTS": "OFF",
+        "PROCISOCITY_BUILD_CLI": "ON"
       }
     },
     {
       "name": "app",
-      "displayName": "Interactive app + CLI (raylib required)",
-      "description": "Build the interactive raylib app (may use FetchContent unless configured to use system raylib).",
-      "binaryDir": "${sourceDir}/build/app",
+      "displayName": "App (raylib)",
+      "description": "Interactive app (requires raylib; may use FetchContent unless PROCISOCITY_USE_SYSTEM_RAYLIB=ON).",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-app",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "PROCISOCITY_BUILD_APP": "ON",
-        "PROCISOCITY_BUILD_CLI": "ON",
-        "PROCISOCITY_BUILD_TESTS": "OFF"
+        "PROCISOCITY_BUILD_TESTS": "OFF",
+        "PROCISOCITY_BUILD_CLI": "ON"
       }
     },
     {
-      "name": "app-system-raylib",
-      "displayName": "Interactive app + CLI (system raylib)",
-      "description": "Build the interactive app using a system-installed raylib (no FetchContent downloads).",
-      "binaryDir": "${sourceDir}/build/app-system-raylib",
+      "name": "tests",
+      "displayName": "Tests (headless)",
+      "description": "Headless tests (no raylib).",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-tests",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "PROCISOCITY_BUILD_APP": "ON",
-        "PROCISOCITY_USE_SYSTEM_RAYLIB": "ON",
-        "PROCISOCITY_BUILD_CLI": "ON",
-        "PROCISOCITY_BUILD_TESTS": "OFF"
+        "PROCISOCITY_BUILD_APP": "OFF",
+        "PROCISOCITY_BUILD_TESTS": "ON",
+        "PROCISOCITY_BUILD_CLI": "ON"
+      }
+    },
+    {
+      "name": "ci",
+      "displayName": "CI (fast debug tests)",
+      "description": "Fast debug tests (no raylib, CLI off, glTF export off).",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-ci",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "PROCISOCITY_BUILD_APP": "OFF",
+        "PROCISOCITY_BUILD_TESTS": "ON",
+        "PROCISOCITY_BUILD_CLI": "OFF",
+        "PROCISOCITY_ENABLE_GLTF_EXPORT": "OFF"
       }
     }
   ],
@@ -78,33 +71,29 @@
     {
       "name": "default",
       "configurePreset": "default",
-      "jobs": 0
-    },
-    {
-      "name": "tests",
-      "configurePreset": "tests",
-      "jobs": 0
-    },
-    {
-      "name": "ci",
-      "configurePreset": "ci",
-      "jobs": 0
+      "configuration": "Release"
     },
     {
       "name": "app",
       "configurePreset": "app",
-      "jobs": 0
+      "configuration": "Release"
     },
     {
-      "name": "app-system-raylib",
-      "configurePreset": "app-system-raylib",
-      "jobs": 0
+      "name": "tests",
+      "configurePreset": "tests",
+      "configuration": "Release"
+    },
+    {
+      "name": "ci",
+      "configurePreset": "ci",
+      "configuration": "Debug"
     }
   ],
   "testPresets": [
     {
       "name": "tests",
       "configurePreset": "tests",
+      "configuration": "Release",
       "output": {
         "outputOnFailure": true
       }
@@ -112,6 +101,7 @@
     {
       "name": "ci",
       "configurePreset": "ci",
+      "configuration": "Debug",
       "output": {
         "outputOnFailure": true
       }
