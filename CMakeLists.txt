@@ -33,6 +33,7 @@ endif()
 # The interactive app requires raylib; enable explicitly when you have raylib available.
 option(PROCISOCITY_BUILD_APP "Build the interactive raylib application (requires raylib)" OFF)
 option(PROCISOCITY_BUILD_TESTS "Build headless tests (no raylib required)" OFF)
+option(PROCISOCITY_BUILD_LITE_TESTS "Build lightweight unit tests (fast, minimal deps)" OFF)
 option(PROCISOCITY_BUILD_CLI "Build headless command-line tools" ON)
 option(PROCISOCITY_ENABLE_GLTF_EXPORT "Enable glTF/glb export (can increase build time)" ON)
 
@@ -1006,9 +1007,12 @@ if (PROCISOCITY_BUILD_CLI)
 endif()
 
 # ---- Tests (headless) ----
-if (PROCISOCITY_BUILD_TESTS)
+if (PROCISOCITY_BUILD_TESTS OR PROCISOCITY_BUILD_LITE_TESTS)
   enable_testing()
+endif()
 
+# Full headless test suite (large; links isocity_core)
+if (PROCISOCITY_BUILD_TESTS)
   add_executable(proc_isocity_tests
     tests/ProcIsoCityTests.cpp
   )
@@ -1017,4 +1021,18 @@ if (PROCISOCITY_BUILD_TESTS)
   procisocity_set_strict_warnings(proc_isocity_tests)
 
   add_test(NAME proc_isocity_tests COMMAND proc_isocity_tests)
+endif()
+
+# Lightweight unit tests (fast; minimal sources, no isocity_core link)
+if (PROCISOCITY_BUILD_LITE_TESTS)
+  add_executable(proc_isocity_zip_tests
+    tests/ZipWriterLiteTests.cpp
+    src/isocity/ZipWriter.cpp
+    src/isocity/Checksum.cpp
+  )
+
+  target_include_directories(proc_isocity_zip_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  procisocity_set_strict_warnings(proc_isocity_zip_tests)
+
+  add_test(NAME proc_isocity_zip_tests COMMAND proc_isocity_zip_tests)
 endif()

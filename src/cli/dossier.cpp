@@ -108,10 +108,14 @@ void PrintHelp()
       << "Export:\n"
       << "  --format <png|ppm>             Image format (default png).\n"
       << "  --scale <N>                    Nearest-neighbor scale for top-down layers (default 2).\n"
+      << "  --clean <0|1>                  Delete and recreate --out-dir before writing (default 0).\n"
       << "  --layers <a,b,c>               Top-down layers to export (default includes many analytics).\n"
       << "  --iso <0|1>                    Enable isometric exports (default 1).\n"
       << "  --iso-layers <a,b,c>           Iso layers (default includes overlay/landvalue/heat/etc).\n"
-      << "  --3d <0|1>                     Enable a 3D overlay render (default 0).\n\n";
+      << "  --3d <0|1>                     Enable a 3D overlay render (default 0).\n"
+      << "  --zip <0|1>                    Also write a dossier ZIP archive (default 0).\n"
+      << "  --zip-path <file.zip>          Override ZIP output path (implies --zip 1).\n"
+      << "  --zip-root <0|1>               Include a top-level folder in the ZIP (default 1).\n\n";
 }
 
 } // namespace
@@ -172,6 +176,12 @@ int main(int argc, char** argv)
   };
 
   bool export3d = false;
+
+  bool cleanOutDir = false;
+
+  bool writeZip = false;
+  std::filesystem::path zipPath;
+  bool zipIncludeRootDir = true;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -238,7 +248,14 @@ int main(int argc, char** argv)
       continue;
     }
     if (arg == "--format") {
-      format = need("--format");
+      std::string v = need("--format");
+      if (!v.empty() && v.front() == '.') {
+        v.erase(v.begin());
+      }
+      for (char& c : v) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      }
+      format = v;
       if (format != "png" && format != "ppm") {
         std::cerr << "Unsupported format: " << format << " (expected png|ppm)\n";
         return 1;
@@ -251,6 +268,16 @@ int main(int argc, char** argv)
         std::cerr << "Invalid scale: " << v << "\n";
         return 1;
       }
+      continue;
+    }
+    if (arg == "--clean") {
+      const std::string v = need("--clean");
+      bool b = false;
+      if (!ParseBool01(v, &b)) {
+        std::cerr << "Invalid bool: " << v << "\n";
+        return 1;
+      }
+      cleanOutDir = b;
       continue;
     }
     if (arg == "--layers") {
@@ -292,6 +319,33 @@ int main(int argc, char** argv)
       continue;
     }
 
+
+
+    if (arg == "--zip") {
+      const std::string v = need("--zip");
+      bool b = false;
+      if (!ParseBool01(v, &b)) {
+        std::cerr << "Invalid bool: " << v << "\n";
+        return 1;
+      }
+      writeZip = b;
+      continue;
+    }
+    if (arg == "--zip-path") {
+      zipPath = need("--zip-path");
+      writeZip = true;
+      continue;
+    }
+    if (arg == "--zip-root") {
+      const std::string v = need("--zip-root");
+      bool b = true;
+      if (!ParseBool01(v, &b)) {
+        std::cerr << "Invalid bool: " << v << "\n";
+        return 1;
+      }
+      zipIncludeRootDir = b;
+      continue;
+    }
     // ProcGen tuning.
     if (arg == "--gen-preset") {
       const std::string v = need("--gen-preset");
@@ -362,6 +416,18 @@ int main(int argc, char** argv)
     std::cerr << "Missing required --out-dir\n";
     return 1;
   }
+
+  if (cleanOutDir) {
+    std::error_code ec;
+    if (std::filesystem::exists(outDir, ec) && !ec) {
+      std::filesystem::remove_all(outDir, ec);
+      if (ec) {
+        std::cerr << "Failed to clean output dir: " << outDir.string() << " (" << ec.message() << ")\n";
+        return 1;
+      }
+    }
+  }
+
   if (!EnsureDir(outDir)) {
     std::cerr << "Failed to create output dir: " << outDir.string() << "\n";
     return 1;
@@ -413,6 +479,10 @@ int main(int argc, char** argv)
   cfg.layersIso = layersIso;
   cfg.export3d = export3d;
 
+  cfg.writeZip = writeZip;
+  cfg.zipFile = zipPath;
+  cfg.zipIncludeRootDir = zipIncludeRootDir;
+
   CityDossierResult res;
   std::string err;
   if (!WriteCityDossier(world, procCfg, sim.config(), ticks, cfg, &res, err)) {
@@ -421,5 +491,8 @@ int main(int argc, char** argv)
   }
 
   std::cout << "Wrote dossier: " << res.outDir.string() << "\n";
+  if (!res.zipFile.empty()) {
+    std::cout << "Wrote zip: " << res.zipFile.string() << "\n";
+  }
   return 0;
 }

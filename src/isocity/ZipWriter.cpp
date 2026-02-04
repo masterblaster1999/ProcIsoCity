@@ -249,6 +249,13 @@ bool ZipWriter::addFileFromBytes(const std::string& zipPath, const std::uint8_t*
     return false;
   }
 
+  for (const auto& existing : m_entries) {
+    if (existing.name == name) {
+      outError = "ZipWriter duplicate entry name: " + name;
+      return false;
+    }
+  }
+
   if (!data && size > 0) {
     outError = "ZipWriter addFileFromBytes called with null data";
     return false;
@@ -350,6 +357,13 @@ bool ZipWriter::addFileFromPath(const std::string& zipPath, const std::filesyste
   std::string name;
   if (!sanitizeZipPath(zipPath, name, outError)) {
     return false;
+  }
+
+  for (const auto& existing : m_entries) {
+    if (existing.name == name) {
+      outError = "ZipWriter duplicate entry name: " + name;
+      return false;
+    }
   }
 
   // Time

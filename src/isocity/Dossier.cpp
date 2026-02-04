@@ -31,6 +31,7 @@
 #include "isocity/Pathfinding.hpp"
 #include "isocity/SaveLoad.hpp"
 #include "isocity/StatsCsv.hpp"
+#include "isocity/ZipWriter.hpp"
 #include "isocity/Traffic.hpp"
 
 #include <algorithm>
@@ -87,6 +88,118 @@ bool EnsureParentDir(const std::filesystem::path& file)
   } catch (...) {
     return false;
   }
+  return true;
+}
+
+
+bool PackageDirectoryToZip(const std::filesystem::path& dir,
+                          const std::filesystem::path& zipFile,
+                          bool includeRootDir,
+                          std::string& outErr)
+{
+  outErr.clear();
+  if (dir.empty()) {
+    outErr = "PackageDirectoryToZip: directory path is empty";
+    return false;
+  }
+  if (zipFile.empty()) {
+    outErr = "PackageDirectoryToZip: zipFile path is empty";
+    return false;
+  }
+
+  std::error_code ec;
+  if (!std::filesystem::exists(dir, ec) || ec) {
+    outErr = "PackageDirectoryToZip: directory does not exist: " + dir.string();
+    return false;
+  }
+  if (!std::filesystem::is_directory(dir, ec) || ec) {
+    outErr = "PackageDirectoryToZip: not a directory: " + dir.string();
+    return false;
+  }
+
+  // Pre-enumerate the directory before creating/writing the zip.
+  // This avoids accidentally including the zip itself when zipFile lives under dir.
+  std::vector<std::filesystem::path> files;
+  files.reserve(256);
+
+  const auto end = std::filesystem::recursive_directory_iterator{};
+  for (auto it = std::filesystem::recursive_directory_iterator(
+           dir, std::filesystem::directory_options::skip_permission_denied, ec);
+       !ec && it != end;
+       it.increment(ec)) {
+    std::error_code ec2;
+    if (!it->is_regular_file(ec2) || ec2) continue;
+    files.push_back(it->path());
+  }
+
+  if (ec) {
+    outErr = "PackageDirectoryToZip: failed to enumerate files: " + dir.string() + " (" + ec.message() + ")";
+    return false;
+  }
+
+  std::filesystem::path absZip = zipFile;
+  {
+    std::error_code e;
+    const auto p = std::filesystem::absolute(zipFile, e);
+    if (!e) absZip = p;
+  }
+
+  std::string rootName;
+  if (includeRootDir) {
+    rootName = dir.filename().string();
+    if (rootName.empty()) rootName = "dossier";
+  }
+
+  struct Item {
+    std::string zipPath;
+    std::filesystem::path srcPath;
+  };
+
+  std::vector<Item> items;
+  items.reserve(files.size());
+
+  for (const auto& src : files) {
+    // Exclude the output zip (if it already exists under the directory).
+    std::error_code e;
+    const auto absSrc = std::filesystem::absolute(src, e);
+    if (!e && absSrc == absZip) continue;
+
+    std::filesystem::path rel = src.lexically_relative(dir);
+    if (rel.empty()) rel = src.filename();
+
+    const std::string relStr = rel.generic_string();
+    if (relStr.empty()) continue;
+
+    std::string zipPath = relStr;
+    if (!rootName.empty()) zipPath = rootName + "/" + zipPath;
+
+    items.push_back(Item{std::move(zipPath), src});
+  }
+
+  std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
+    return a.zipPath < b.zipPath;
+  });
+
+  ZipWriter zw;
+  std::string err;
+  if (!zw.open(zipFile, err)) {
+    outErr = err;
+    return false;
+  }
+
+  for (const auto& it : items) {
+    if (!zw.addFileFromPath(it.zipPath, it.srcPath, err)) {
+      outErr = err;
+      zw.close();
+      return false;
+    }
+  }
+
+  if (!zw.finalize(err)) {
+    outErr = err;
+    return false;
+  }
+
   return true;
 }
 
@@ -789,6 +902,10 @@ async function tryAutoLoadMetrics() {
 }
 
 tryAutoLoadMetrics();
+
+)JS";
+
+  f << R"JS(
 
 if (metricsFile) {
   metricsFile.addEventListener('change', () => {
@@ -1606,6 +1723,10 @@ bool WriteCityDossier(World& world,
   const std::string imageExt = cfg.format.empty() ? std::string("png") : cfg.format;
   const int exportScale = std::max(1, cfg.exportScale);
 
+  const bool wantZip = cfg.writeZip || !cfg.zipFile.empty();
+
+  std::filesystem::path wroteZipPath;
+
   // Progress/cancellation support.
   const bool wantProgress = static_cast<bool>(progress);
 
@@ -1624,6 +1745,7 @@ bool WriteCityDossier(World& world,
   if (cfg.writeSummaryJson) stepCount += 1;
   if (cfg.writeWorldBinary) stepCount += 1;
   if (cfg.writeHtml) stepCount += 1;
+  if (wantZip) stepCount += 1; // zip archive
 
   int stepIndex = 0;
   auto cancel = [&]() -> bool {
@@ -2074,8 +2196,27 @@ bool WriteCityDossier(World& world,
     }
   }
 
+  if (wantZip) {
+    if (!beginStage("write_zip")) return cancel();
+    std::filesystem::path zipPath = cfg.zipFile;
+    if (zipPath.empty()) {
+      std::string base = cfg.outDir.filename().string();
+      if (base.empty()) base = "dossier";
+      zipPath = cfg.outDir.parent_path() / (base + ".zip");
+    }
+
+    std::string err;
+    if (!PackageDirectoryToZip(cfg.outDir, zipPath, cfg.zipIncludeRootDir, err)) {
+      outErr = "Failed to write zip: " + err;
+      return false;
+    }
+    wroteZipPath = zipPath;
+  }
+
+
   if (outRes) {
     outRes->outDir = cfg.outDir;
+    outRes->zipFile = wroteZipPath;
     outRes->hash = hash;
   }
 

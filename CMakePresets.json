@@ -54,16 +54,17 @@
     },
     {
       "name": "ci",
-      "displayName": "CI (fast debug tests)",
-      "description": "Fast debug tests (no raylib, CLI off, glTF export off).",
+      "displayName": "CI (fast lite tests)",
+      "description": "Fast lite unit tests (no raylib, CLI off, glTF export off).",
       "inherits": "base",
       "binaryDir": "${sourceDir}/build-ci",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "PROCISOCITY_BUILD_APP": "OFF",
-        "PROCISOCITY_BUILD_TESTS": "ON",
+        "PROCISOCITY_BUILD_TESTS": "OFF",
         "PROCISOCITY_BUILD_CLI": "OFF",
-        "PROCISOCITY_ENABLE_GLTF_EXPORT": "OFF"
+        "PROCISOCITY_ENABLE_GLTF_EXPORT": "OFF",
+        "PROCISOCITY_BUILD_LITE_TESTS": "ON"
       }
     }
   ],

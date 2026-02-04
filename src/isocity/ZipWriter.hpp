@@ -20,6 +20,7 @@ namespace isocity {
 // - Only the "store" method (compression=0) is supported.
 // - ZIP64 is not supported (support bundles should remain small).
 // - Filenames are sanitized to prevent "zip slip" paths (no ".." segments).
+// - Duplicate entry names are rejected (to prevent silent overwrites).
 // - CRC32 is computed using the project's existing Checksum utilities.
 
 struct ZipWriterOptions {

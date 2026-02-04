@@ -41,6 +41,16 @@ struct CityDossierConfig {
   // Output directory (required).
   std::filesystem::path outDir;
 
+  // Optional: also write a .zip archive containing the dossier directory.
+  //
+  // - If enabled, the exporter will package every regular file under outDir into a ZIP
+  //   (store/no-compression) using ZipWriter.
+  // - If zipFile is empty, a default is chosen next to outDir: <outDir.filename()>.zip
+  // - By default, the ZIP contains a single top-level folder named after outDir.filename().
+  bool writeZip = false;
+  std::filesystem::path zipFile;
+  bool zipIncludeRootDir = true;
+
   // Image format extension used for exports. Recommended: "png".
   // "ppm" is also supported (fast + dependency-free).
   std::string format = "png";
@@ -160,6 +170,7 @@ struct CityDossierConfig {
 
 struct CityDossierResult {
   std::filesystem::path outDir;
+  std::filesystem::path zipFile;
   std::uint64_t hash = 0;
 };
 

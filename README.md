@@ -51,9 +51,9 @@ cmake --preset tests
 cmake --build --preset tests --parallel
 ctest --preset tests
 
-# CI / fast debug tests (no raylib, CLI off, glTF export off)
+# CI / fast lite tests (no raylib, CLI off, glTF export off)
 cmake --preset ci
-cmake --build --preset ci --parallel
+cmake --build --preset ci --target proc_isocity_zip_tests --parallel
 ctest --preset ci
 ```
 
@@ -112,6 +112,7 @@ ctest --test-dir build-tests --output-on-failure
 
 - `PROCISOCITY_BUILD_APP` (default: OFF) — build the interactive raylib app (`proc_isocity`).
 - `PROCISOCITY_BUILD_TESTS` (default: OFF) — build `proc_isocity_tests` and enable `ctest`.
+- `PROCISOCITY_BUILD_LITE_TESTS` (default: OFF) — build `proc_isocity_zip_tests` (fast unit tests) and enable `ctest` without building the full core library.
 - `PROCISOCITY_BUILD_CLI` (default: ON) — build headless command-line tools (includes `proc_isocity_cli`, `proc_isocity_dossier`, `proc_isocity_mine`, and many more; see below).
 - `PROCISOCITY_ENABLE_GLTF_EXPORT` (default: ON) — build the glTF/glb exporter. Set to OFF to reduce build time/memory; export commands will report a clear error.
 - `PROCISOCITY_USE_SYSTEM_RAYLIB` (default: OFF) — when building the app, use a system raylib instead of FetchContent.

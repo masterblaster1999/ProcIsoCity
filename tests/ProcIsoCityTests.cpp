@@ -103,6 +103,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <queue>
 
 namespace fs = std::filesystem;
 
@@ -3003,6 +3004,80 @@ void TestProcGenTerrainPresetIslandMakesCoastalWater()
     }
   }
   EXPECT_TRUE(foundLand);
+}
+
+void TestProcGenTerrainPresetAtollHasLagoonAndRingLand()
+{
+  using namespace isocity;
+
+  ProcGenTerrainPreset p{};
+  EXPECT_TRUE(ParseProcGenTerrainPreset("atoll", p));
+  EXPECT_EQ(p, ProcGenTerrainPreset::Atoll);
+  EXPECT_EQ(std::string(ToString(p)), std::string("atoll"));
+
+  ProcGenConfig pc{};
+  pc.zoneChance = 0.0f;
+  pc.parkChance = 0.0f;
+  pc.hubs = 1;
+  pc.extraConnections = 0;
+  pc.erosion.enabled = false;
+  pc.erosion.riversEnabled = false;
+  pc.terrainPreset = ProcGenTerrainPreset::Atoll;
+  pc.terrainPresetStrength = 1.0f;
+
+  const std::uint64_t seed = 0xA70011u;
+
+  World w1 = GenerateWorld(64, 64, seed, pc);
+  World w2 = GenerateWorld(64, 64, seed, pc);
+  EXPECT_EQ(HashWorld(w1), HashWorld(w2));
+
+  const float cx = (static_cast<float>(w1.width()) - 1.0f) * 0.5f;
+  const float cy = (static_cast<float>(w1.height()) - 1.0f) * 0.5f;
+  const float invCx = (cx > 0.0f) ? (1.0f / cx) : 0.0f;
+  const float invCy = (cy > 0.0f) ? (1.0f / cy) : 0.0f;
+
+  int center = 0;
+  int centerWater = 0;
+  int ring = 0;
+  int ringLand = 0;
+  int outer = 0;
+  int outerWater = 0;
+
+  for (int y = 0; y < w1.height(); ++y) {
+    for (int x = 0; x < w1.width(); ++x) {
+      const float nx = (static_cast<float>(x) - cx) * invCx;
+      const float ny = (static_cast<float>(y) - cy) * invCy;
+      const float r = std::sqrt(nx * nx + ny * ny);
+
+      const Tile& t = w1.at(x, y);
+      const bool isWater = (t.terrain == Terrain::Water);
+
+      if (r < 0.30f) {
+        ++center;
+        if (isWater) ++centerWater;
+      }
+
+      if (r > 0.62f && r < 0.90f) {
+        ++ring;
+        if (!isWater) ++ringLand;
+      }
+
+      if (r > 0.98f) {
+        ++outer;
+        if (isWater) ++outerWater;
+      }
+    }
+  }
+
+  const float centerFrac = (center > 0) ? (static_cast<float>(centerWater) / static_cast<float>(center)) : 0.0f;
+  const float ringFrac = (ring > 0) ? (static_cast<float>(ringLand) / static_cast<float>(ring)) : 0.0f;
+  const float outerFrac = (outer > 0) ? (static_cast<float>(outerWater) / static_cast<float>(outer)) : 0.0f;
+
+  // The atoll preset should produce a mostly-water lagoon in the center,
+  // a mostly-land ring, and ocean water near the outer corners.
+  EXPECT_TRUE(centerFrac > 0.60f);
+  EXPECT_TRUE(ringFrac > 0.28f);
+  EXPECT_TRUE(outerFrac > 0.65f);
 }
 
 void TestProcGenTerrainPresetTectonicParsesAndGenerates()
@@ -10509,6 +10584,189 @@ void TestRoadPathfindingAStarExAvoidsHighPenaltyTiles()
 }
 
 
+static bool WaterConnectsLeftToRight(const isocity::World& w)
+{
+  using namespace isocity;
+
+  const int W = w.width();
+  const int H = w.height();
+  if (W <= 0 || H <= 0) return false;
+
+  std::vector<std::uint8_t> vis(static_cast<std::size_t>(W * H), 0);
+  std::queue<Point> q;
+
+  auto push = [&](int x, int y) {
+    const std::size_t idx = static_cast<std::size_t>(y * W + x);
+    if (vis[idx]) return;
+    vis[idx] = 1;
+    q.push(Point{x, y});
+  };
+
+  for (int y = 0; y < H; ++y) {
+    if (w.at(0, y).terrain == Terrain::Water) push(0, y);
+  }
+
+  while (!q.empty()) {
+    const Point p = q.front();
+    q.pop();
+    if (p.x == W - 1) return true;
+
+    const Point n4[4] = {Point{p.x - 1, p.y}, Point{p.x + 1, p.y}, Point{p.x, p.y - 1}, Point{p.x, p.y + 1}};
+    for (const Point& n : n4) {
+      if (n.x < 0 || n.y < 0 || n.x >= W || n.y >= H) continue;
+      if (w.at(n.x, n.y).terrain != Terrain::Water) continue;
+      push(n.x, n.y);
+    }
+  }
+
+  return false;
+}
+
+static bool WaterConnectsTopToBottom(const isocity::World& w)
+{
+  using namespace isocity;
+
+  const int W = w.width();
+  const int H = w.height();
+  if (W <= 0 || H <= 0) return false;
+
+  std::vector<std::uint8_t> vis(static_cast<std::size_t>(W * H), 0);
+  std::queue<Point> q;
+
+  auto push = [&](int x, int y) {
+    const std::size_t idx = static_cast<std::size_t>(y * W + x);
+    if (vis[idx]) return;
+    vis[idx] = 1;
+    q.push(Point{x, y});
+  };
+
+  for (int x = 0; x < W; ++x) {
+    if (w.at(x, 0).terrain == Terrain::Water) push(x, 0);
+  }
+
+  while (!q.empty()) {
+    const Point p = q.front();
+    q.pop();
+    if (p.y == H - 1) return true;
+
+    const Point n4[4] = {Point{p.x - 1, p.y}, Point{p.x + 1, p.y}, Point{p.x, p.y - 1}, Point{p.x, p.y + 1}};
+    for (const Point& n : n4) {
+      if (n.x < 0 || n.y < 0 || n.x >= W || n.y >= H) continue;
+      if (w.at(n.x, n.y).terrain != Terrain::Water) continue;
+      push(n.x, n.y);
+    }
+  }
+
+  return false;
+}
+
+static void TestProcGenTerrainPresetStraitConnectivity()
+{
+  using namespace isocity;
+
+  {
+    ProcGenTerrainPreset p{};
+    EXPECT_TRUE(ParseProcGenTerrainPreset("strait", p));
+    EXPECT_EQ(p, ProcGenTerrainPreset::Strait);
+    EXPECT_TRUE(ParseProcGenTerrainPreset("channel", p));
+    EXPECT_EQ(p, ProcGenTerrainPreset::Strait);
+    EXPECT_TRUE(std::string(ToString(ProcGenTerrainPreset::Strait)) == "strait");
+  }
+
+  ProcGenConfig cfg;
+  cfg.terrainPreset = ProcGenTerrainPreset::Strait;
+  cfg.terrainPresetStrength = 1.0f;
+
+  const int W = 96;
+  const int H = 96;
+  const std::uint64_t seed = 424242;
+  const World w = GenerateWorld(W, H, seed, cfg);
+
+  ASSERT_EQ(w.width(), W);
+  ASSERT_EQ(w.height(), H);
+
+  const bool lr = WaterConnectsLeftToRight(w);
+  const bool tb = WaterConnectsTopToBottom(w);
+
+  EXPECT_TRUE(lr || tb);
+
+  int water = 0;
+  int grass = 0;
+  int sand = 0;
+  for (int y = 0; y < H; ++y) {
+    for (int x = 0; x < W; ++x) {
+      const Terrain t = w.at(x, y).terrain;
+      if (t == Terrain::Water) ++water;
+      if (t == Terrain::Grass) ++grass;
+      if (t == Terrain::Sand) ++sand;
+    }
+  }
+
+  // The map should contain a meaningful mix (not all water).
+  EXPECT_TRUE(water > 0);
+  EXPECT_TRUE(grass > 0);
+  EXPECT_TRUE(sand > 0);
+
+  // Ensure there is substantial buildable land on both sides of the strait.
+  if (lr) {
+    int topLand = 0;
+    int botLand = 0;
+    int topTotal = 0;
+    int botTotal = 0;
+
+    for (int y = 0; y < H; ++y) {
+      for (int x = 0; x < W; ++x) {
+        const bool isTop = (y < H / 3);
+        const bool isBot = (y >= (H * 2) / 3);
+        if (!isTop && !isBot) continue;
+
+        const bool land = (w.at(x, y).terrain != Terrain::Water);
+        if (isTop) {
+          ++topTotal;
+          if (land) ++topLand;
+        } else {
+          ++botTotal;
+          if (land) ++botLand;
+        }
+      }
+    }
+
+    ASSERT_TRUE(topTotal > 0);
+    ASSERT_TRUE(botTotal > 0);
+    EXPECT_TRUE(topLand >= static_cast<int>(topTotal * 0.20f));
+    EXPECT_TRUE(botLand >= static_cast<int>(botTotal * 0.20f));
+  } else if (tb) {
+    int leftLand = 0;
+    int rightLand = 0;
+    int leftTotal = 0;
+    int rightTotal = 0;
+
+    for (int y = 0; y < H; ++y) {
+      for (int x = 0; x < W; ++x) {
+        const bool isLeft = (x < W / 3);
+        const bool isRight = (x >= (W * 2) / 3);
+        if (!isLeft && !isRight) continue;
+
+        const bool land = (w.at(x, y).terrain != Terrain::Water);
+        if (isLeft) {
+          ++leftTotal;
+          if (land) ++leftLand;
+        } else {
+          ++rightTotal;
+          if (land) ++rightLand;
+        }
+      }
+    }
+
+    ASSERT_TRUE(leftTotal > 0);
+    ASSERT_TRUE(rightTotal > 0);
+    EXPECT_TRUE(leftLand >= static_cast<int>(leftTotal * 0.20f));
+    EXPECT_TRUE(rightLand >= static_cast<int>(rightTotal * 0.20f));
+  }
+}
+
+
+
 int main()
 {
   TestRoadAutoTilingMasks();
@@ -10602,6 +10860,7 @@ int main()
   TestProcGenRiversAsWaterAddsWaterTiles();
   TestProcGenErosionToggleAffectsHash();
   TestProcGenTerrainPresetIslandMakesCoastalWater();
+  TestProcGenTerrainPresetAtollHasLagoonAndRingLand();
   TestProcGenTerrainPresetTectonicParsesAndGenerates();
   TestSimulationDeterministicHashAfterTicks();
   TestWorldDiffCounts();

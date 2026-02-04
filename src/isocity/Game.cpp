@@ -2909,6 +2909,8 @@ void Game::setupDevConsole()
           c.print("  volcano");
           c.print("  delta");
           c.print("  tectonic");
+          c.print("  atoll");
+          c.print("  strait");
         };
 
         auto listRoadLayouts = [&]() {

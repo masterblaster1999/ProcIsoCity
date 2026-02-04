@@ -677,13 +677,13 @@ int ProcIsoCityCliMain(int argc, char** argv)
     }
     if (arg == "--gen-preset") {
       if (!requireValue(i, val)) {
-        std::cerr << "--gen-preset requires a name (classic|island|archipelago|inland_sea|river_valley|mountain_ring|fjords|canyon|volcano|delta|tectonic)\n";
+        std::cerr << "--gen-preset requires a name (classic|island|archipelago|inland_sea|river_valley|mountain_ring|fjords|canyon|volcano|delta|tectonic|atoll|strait)\\n";
         return 2;
       }
       isocity::ProcGenTerrainPreset p{};
       if (!isocity::ParseProcGenTerrainPreset(val, p)) {
         std::cerr << "Unknown --gen-preset: " << val << "\n";
-        std::cerr << "Valid presets: classic, island, archipelago, inland_sea, river_valley, mountain_ring, fjords, canyon, volcano, delta\n";
+        std::cerr << "Valid presets: classic, island, archipelago, inland_sea, river_valley, mountain_ring, fjords, canyon, volcano, delta, tectonic, atoll, strait\\n";
         return 2;
       }
       procCfg.terrainPreset = p;
