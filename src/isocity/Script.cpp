@@ -1550,7 +1550,7 @@ static bool CmdProc(ScriptRunnerState& ctx, ScriptRunner& runner, const std::vec
     ProcGenTerrainPreset p{};
     if (!ParseProcGenTerrainPreset(val, p)) {
       return runner.fail(path, lineNo,
-                         "unknown terrain_preset (try: classic|island|archipelago|inland_sea|river_valley|mountain_ring|fjords|canyon|volcano|delta|tectonic)");
+                         "unknown terrain_preset (try: classic|island|archipelago|inland_sea|river_valley|mountain_ring|fjords|canyon|volcano|delta|tectonic|atoll|peninsula)");
     }
     ctx.procCfg.terrainPreset = p;
     return true;

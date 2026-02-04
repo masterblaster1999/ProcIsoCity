@@ -29,12 +29,11 @@ enum class ProcGenTerrainPreset : std::uint8_t {
   Volcano = 8, // Central volcanic cone with a caldera (optionally lake-filled).
   Delta = 9,   // Low coastal river delta with branching distributaries.
   Tectonic = 10, // Plate-driven mountain ranges and rift valleys.
+  Atoll = 11,    // Ring-shaped reef island with a central lagoon.
 
-  // Ring-shaped island with a central lagoon (and optional passes to the sea).
-  Atoll = 11,
-
-  // A navigable sea channel connecting two map edges, dividing two large landmasses.
-  Strait = 12,
+  // Large mainland connected to one edge, tapering into the sea as a long peninsula.
+  // Produces dramatic coastlines with a clear "mainland" side.
+  Peninsula = 12,
 
   // Sentinel for bounds checks / iteration (must be last; keep enum values contiguous).
   Count

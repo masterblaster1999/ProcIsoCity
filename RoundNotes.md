@@ -1,32 +1,35 @@
 # Round Notes
 
-This round adds a new terrain preset focused on procedural map variety.
+This round focuses on procedural terrain generation and new macro presets.
 
 ## Changes
 
-- **ProcGen: new `atoll` terrain preset**
-  - Ring island with a central lagoon and 1-3 deterministic passes to the open sea.
-  - Added to dev console + script help lists.
-  - Added a deterministic unit test checking lagoon + ring characteristics.
+- **New terrain preset: atoll**
+  - `proc preset atoll`: ring-shaped reef island with a central lagoon and 1–3 sea passes.
+  - Added parsing aliases: `reef`, `lagoon`, `coral_reef`.
 
-- **ProcGen: new `strait` terrain preset**
-  - Edge-to-edge sea channel that cuts between two major landmasses.
-  - Added parsing aliases, dev console/CLI hints, and a connectivity unit test.
+- **New terrain preset: peninsula**
+  - `proc preset peninsula`: a large mainland attached to one edge, tapering into a long land finger.
+  - Added parsing aliases: `cape`, `headland`, `promontory`, `spit`.
+  - Added to `proc_isocity_evolve` default terrain preset distribution.
 
-- **GitHub Actions CI**
-  - Added a workflow that configures + builds a lightweight unit test target and runs it via CTest on Linux, macOS, and Windows.
 
-- **Lightweight unit tests**
-  - Added `PROCISOCITY_BUILD_LITE_TESTS` and a new test executable `proc_isocity_zip_tests` (fast, minimal sources; does not require building the full core library).
-  - Updated the `ci` preset in `CMakePresets.json` to enable lite tests and keep CI builds snappy.
+- **`proc_isocity_wayfind` gameplay upgrades**
+  - Added `random|rand` endpoint support to quickly generate routes as lightweight “missions”.
+  - Added `--preset fastest|balanced|safe|quiet` for one-flag routing profiles (time metric + tuned hazard weights).
+  - Added new export outputs:
+    - `--out-md` (Markdown directions)
+    - `--out-csv` (path tiles)
+    - `--out-iso` (isometric overview with route overlay)
+  - Added isometric rendering knobs (`--iso-layer`, `--iso-tile`, `--iso-height`, `--iso-margin`, `--iso-grid`, `--iso-cliffs`).
+  - Outputs now auto-create parent directories (JSON/MD/CSV/images).
 
-- **ZIP safety**
-  - `ZipWriter` refuses duplicate entry names to prevent silent overwrites inside an archive.
-  - Lite tests cover duplicate detection (including slash-normalized duplicates) and zip-slip blocking.
+- **Docs**
+  - Updated `README.md` with the new `proc_isocity_wayfind` features and examples.
 
-- **`proc_isocity_dossier` CLI**
-  - Added `--clean <0|1>` to delete and recreate `--out-dir` before writing.
-  - `--format` is now case-insensitive and accepts a leading dot (e.g. `PNG`, `.png`).
+## Previous patches (already applied)
 
-- **Previous round (already applied)**
-  - Optional dossier directory ZIP packaging and MSVC-friendly splitting of the largest embedded viewer string.
+- GitHub Actions CI for fast lite tests (`proc_isocity_zip_tests`).
+- ZIP safety hardening: zip-slip blocking + duplicate entry name detection.
+- `proc_isocity_dossier` usability: `--clean` and friendlier `--format` parsing.
+- Optional dossier ZIP packaging + MSVC-friendly splitting of the embedded viewer string.

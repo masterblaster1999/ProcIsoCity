@@ -768,9 +768,9 @@ Dist MakeDefaultDist()
       isocity::ProcGenTerrainPreset::Delta,
       isocity::ProcGenTerrainPreset::Tectonic,
       isocity::ProcGenTerrainPreset::Atoll,
-      isocity::ProcGenTerrainPreset::Strait,
+      isocity::ProcGenTerrainPreset::Peninsula,
   };
-  d.terrainPresetP = {0.20, 0.10, 0.08, 0.08, 0.10, 0.08, 0.08, 0.07, 0.07, 0.07, 0.07, 0.06, 0.06};
+  d.terrainPresetP = {0.18, 0.10, 0.08, 0.08, 0.10, 0.08, 0.08, 0.07, 0.07, 0.07, 0.06, 0.05, 0.06};
   NormalizeP(d.terrainPresetP);
 
   d.districtModeVals = {isocity::ProcGenDistrictingMode::Voronoi, isocity::ProcGenDistrictingMode::RoadFlow,

@@ -109,6 +109,7 @@ add_library(isocity_core
   src/isocity/WorldDiffViz.cpp
   src/isocity/WorldTransform.cpp
   src/isocity/ProcGen.cpp
+  src/isocity/ProcGenEnums.cpp
   src/isocity/Erosion.cpp
   src/isocity/DepressionFill.cpp
   src/isocity/FloodRisk.cpp
@@ -1035,4 +1036,15 @@ if (PROCISOCITY_BUILD_LITE_TESTS)
   procisocity_set_strict_warnings(proc_isocity_zip_tests)
 
   add_test(NAME proc_isocity_zip_tests COMMAND proc_isocity_zip_tests)
+
+
+  add_executable(proc_isocity_procgen_enum_tests
+    tests/ProcGenEnumLiteTests.cpp
+    src/isocity/ProcGenEnums.cpp
+  )
+
+  target_include_directories(proc_isocity_procgen_enum_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  procisocity_set_strict_warnings(proc_isocity_procgen_enum_tests)
+
+  add_test(NAME proc_isocity_procgen_enum_tests COMMAND proc_isocity_procgen_enum_tests)
 endif()

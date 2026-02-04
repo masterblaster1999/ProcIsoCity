@@ -27,229 +27,6 @@
 
 namespace isocity {
 
-const char* ToString(ProcGenTerrainPreset p)
-{
-  switch (p) {
-  case ProcGenTerrainPreset::Classic: return "classic";
-  case ProcGenTerrainPreset::Island: return "island";
-  case ProcGenTerrainPreset::Archipelago: return "archipelago";
-  case ProcGenTerrainPreset::InlandSea: return "inland_sea";
-  case ProcGenTerrainPreset::RiverValley: return "river_valley";
-  case ProcGenTerrainPreset::MountainRing: return "mountain_ring";
-  case ProcGenTerrainPreset::Fjords: return "fjords";
-  case ProcGenTerrainPreset::Canyon: return "canyon";
-  case ProcGenTerrainPreset::Volcano: return "volcano";
-  case ProcGenTerrainPreset::Delta: return "delta";
-  case ProcGenTerrainPreset::Tectonic: return "tectonic";
-  case ProcGenTerrainPreset::Atoll: return "atoll";
-  case ProcGenTerrainPreset::Strait: return "strait";
-  default: return "classic";
-  }
-}
-
-static std::string LowerCopy(std::string s)
-{
-  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  return s;
-}
-
-bool ParseProcGenTerrainPreset(const std::string& s, ProcGenTerrainPreset& out)
-{
-  const std::string t = LowerCopy(s);
-  if (t.empty()) return false;
-
-  auto eq = [&](const char* a) { return t == a; };
-
-  if (eq("classic") || eq("default") || eq("continent") || eq("continental")) {
-    out = ProcGenTerrainPreset::Classic;
-    return true;
-  }
-  if (eq("island") || eq("islands")) {
-    out = ProcGenTerrainPreset::Island;
-    return true;
-  }
-  if (eq("archipelago") || eq("arch") || eq("isle") || eq("isles")) {
-    out = ProcGenTerrainPreset::Archipelago;
-    return true;
-  }
-  if (eq("inlandsea") || eq("inland_sea") || eq("sea") || eq("lake") || eq("inlandse") || eq("inland")) {
-    out = ProcGenTerrainPreset::InlandSea;
-    return true;
-  }
-  if (eq("river") || eq("rivervalley") || eq("river_valley") || eq("valley") || eq("river-valley")) {
-    out = ProcGenTerrainPreset::RiverValley;
-    return true;
-  }
-  if (eq("mountain") || eq("mountains") || eq("ring") || eq("mountainring") || eq("mountain_ring") ||
-      eq("crater")) {
-    out = ProcGenTerrainPreset::MountainRing;
-    return true;
-  }
-
-  if (eq("fjord") || eq("fjords") || eq("glacier") || eq("glacial") || eq("inlet") || eq("inlets")) {
-    out = ProcGenTerrainPreset::Fjords;
-    return true;
-  }
-
-  if (eq("canyon") || eq("canyons") || eq("gorge") || eq("gorges") || eq("grandcanyon") ||
-      eq("grand_canyon") || eq("grand-canyon")) {
-    out = ProcGenTerrainPreset::Canyon;
-    return true;
-  }
-
-  if (eq("volcano") || eq("volcanic") || eq("caldera") || eq("crater_lake") || eq("craterlake") ||
-      eq("crater-lake")) {
-    out = ProcGenTerrainPreset::Volcano;
-    return true;
-  }
-
-  if (eq("delta") || eq("riverdelta") || eq("river_delta") || eq("river-delta") || eq("floodplain") ||
-      eq("wetlands") || eq("marsh") || eq("marshes")) {
-    out = ProcGenTerrainPreset::Delta;
-    return true;
-  }
-
-  if (eq("tectonic") || eq("plates") || eq("plate") || eq("plate_tectonics") || eq("plate-tectonics") ||
-      eq("tectonic_plate") || eq("tectonic_plates") || eq("ranges") || eq("mountain_ranges")) {
-    out = ProcGenTerrainPreset::Tectonic;
-    return true;
-  }
-
-  if (eq("atoll") || eq("ring_island") || eq("ring-island") || eq("ringisland") || eq("lagoon") ||
-      eq("reef") || eq("reef_island") || eq("reef-island")) {
-    out = ProcGenTerrainPreset::Atoll;
-    return true;
-  }
-
-  if (eq("strait") || eq("channel") || eq("sea_channel") || eq("sea-channel") || eq("sound") ||
-      eq("passage") || eq("waterway") || eq("narrows")) {
-    out = ProcGenTerrainPreset::Strait;
-    return true;
-  }
-
-  return false;
-}
-
-const char* ToString(ProcGenDistrictingMode m)
-{
-  switch (m) {
-  case ProcGenDistrictingMode::Voronoi: return "voronoi";
-  case ProcGenDistrictingMode::RoadFlow: return "road_flow";
-  case ProcGenDistrictingMode::BlockGraph: return "block_graph";
-  case ProcGenDistrictingMode::Watershed: return "watershed";
-  default: return "voronoi";
-  }
-}
-
-bool ParseProcGenDistrictingMode(const std::string& s, ProcGenDistrictingMode& out)
-{
-  const std::string t = LowerCopy(s);
-  if (t.empty()) return false;
-
-  auto eq = [&](const char* a) { return t == a; };
-
-  if (eq("voronoi") || eq("legacy") || eq("tile") || eq("tiles") || eq("tile_voronoi") || eq("tile-voronoi")) {
-    out = ProcGenDistrictingMode::Voronoi;
-    return true;
-  }
-
-  if (eq("road") || eq("roads") || eq("roadflow") || eq("road_flow") || eq("road-flow") || eq("flow") ||
-      eq("auto") || eq("travel") || eq("traveltime") || eq("travel_time") || eq("travel-time")) {
-    out = ProcGenDistrictingMode::RoadFlow;
-    return true;
-  }
-
-  if (eq("block") || eq("blocks") || eq("blockgraph") || eq("block_graph") || eq("block-graph") ||
-      eq("neighborhood") || eq("neighbourhood") || eq("neighborhoods") || eq("neighbourhoods")) {
-    out = ProcGenDistrictingMode::BlockGraph;
-    return true;
-  }
-
-  if (eq("watershed") || eq("watersheds") || eq("basin") || eq("basins") || eq("hydrology") ||
-      eq("drainage") || eq("drainage_basin") || eq("drainage-basin") || eq("catchment") || eq("catchments") ||
-      eq("river_basin") || eq("river-basin")) {
-    out = ProcGenDistrictingMode::Watershed;
-    return true;
-  }
-
-  return false;
-}
-
-const char* ToString(ProcGenRoadLayout m)
-{
-  switch (m) {
-  case ProcGenRoadLayout::Organic: return "organic";
-  case ProcGenRoadLayout::Grid: return "grid";
-  case ProcGenRoadLayout::Radial: return "radial";
-  case ProcGenRoadLayout::SpaceColonization: return "space_colonization";
-  case ProcGenRoadLayout::VoronoiCells: return "voronoi_cells";
-  case ProcGenRoadLayout::Physarum: return "physarum";
-  case ProcGenRoadLayout::MedialAxis: return "medial_axis";
-  case ProcGenRoadLayout::TensorField: return "tensor_field";
-  default: return "organic";
-  }
-}
-
-bool ParseProcGenRoadLayout(const std::string& s, ProcGenRoadLayout& out)
-{
-  const std::string t = LowerCopy(s);
-  if (t.empty()) return false;
-
-  auto eq = [&](const char* a) { return t == a; };
-
-  if (eq("organic") || eq("org") || eq("classic") || eq("legacy") || eq("mst") || eq("default")) {
-    out = ProcGenRoadLayout::Organic;
-    return true;
-  }
-
-  if (eq("grid") || eq("manhattan") || eq("orthogonal") || eq("rect") || eq("rectilinear")) {
-    out = ProcGenRoadLayout::Grid;
-    return true;
-  }
-
-  if (eq("radial") || eq("ring") || eq("spoke") || eq("spokes") || eq("hubspoke") || eq("hub_spoke") ||
-      eq("hub-and-spoke") || eq("hub_and_spoke")) {
-    out = ProcGenRoadLayout::Radial;
-    return true;
-  }
-
-  if (eq("physarum") || eq("slime") || eq("slimemold") || eq("slime_mold") || eq("slime-mold") ||
-      eq("mold") || eq("mould") || eq("amoeba") || eq("ant") || eq("ants") || eq("ant_colony") ||
-      eq("ant-colony") || eq("aco") || eq("pheromone") || eq("pheromones")) {
-    out = ProcGenRoadLayout::Physarum;
-    return true;
-  }
-
-  if (eq("medial_axis") || eq("medial-axis") || eq("medialaxis") || eq("skeleton") || eq("skel") ||
-      eq("spine") || eq("backbone") || eq("centerline") || eq("centreline") || eq("midline") || eq("mid-line")) {
-    out = ProcGenRoadLayout::MedialAxis;
-    return true;
-  }
-
-  if (eq("tensor_field") || eq("tensor-field") || eq("tensorfield") || eq("tensor") ||
-      eq("field") || eq("flow") || eq("flow_field") || eq("flow-field") || eq("flowfield") ||
-      eq("orientation") || eq("orientation_field") || eq("orientation-field") || eq("orient") ||
-      eq("parish") || eq("muller") || eq("parish_muller") || eq("parish-muller")) {
-    out = ProcGenRoadLayout::TensorField;
-    return true;
-  }
-
-  if (eq("voronoi_cells") || eq("voronoi-cells") || eq("voronoicells") || eq("cells") || eq("cellular") || eq("voronoi") ||
-      eq("voronoi_mesh") || eq("voronoi-mesh") || eq("mesh") || eq("superblocks") || eq("superblock")) {
-    out = ProcGenRoadLayout::VoronoiCells;
-    return true;
-  }
-
-
-  if (eq("space_colonization") || eq("space-colonization") || eq("spacecolonization") || eq("space") ||
-      eq("colonization") || eq("colonisation") || eq("sca") || eq("sc")) {
-    out = ProcGenRoadLayout::SpaceColonization;
-    return true;
-  }
-
-  return false;
-}
-
 namespace {
 
 // -----------------------------
@@ -6051,101 +5828,114 @@ static void ApplyTerrainPreset(std::vector<float>& heights, int width, int heigh
     volcanoRimSigma = 0.030f + 0.025f * prng.nextF01();
   }
 
-  // Atoll parameters (ring island + lagoon).
-  float atollRingR = 0.74f;
-  float atollRingW = 0.11f;
-  float atollWarpAmp = 0.070f;
-  float atollRingUp = 0.42f;
-  float atollLagoonDrop = 0.58f;
-  float atollOceanDrop = 0.78f;
 
-  struct AtollChannel {
+  // Atoll parameters (ring + lagoon + a few passes to the sea).
+  float atollRingR = 0.78f;
+  float atollRingSigma = 0.11f;
+  float atollLagoonInner = 0.44f;
+  float atollLagoonOuter = 0.66f;
+
+  struct AtollPass {
     float dx = 1.0f;
     float dy = 0.0f;
-    float cosHalfWidth = 0.985f; // cos(width)
-    float strength = 1.0f;
+    float cosHalf = 0.985f;
   };
 
-  std::vector<AtollChannel> atollChannels;
+  std::vector<AtollPass> atollPasses;
   if (preset == ProcGenTerrainPreset::Atoll) {
-    // Keep the ring comfortably inside the map edge so the outer ocean reads clearly.
-    atollRingR = 0.70f + 0.08f * prng.nextF01();
-    atollRingW = 0.085f + 0.055f * prng.nextF01();
+    // Ring parameters.
+    atollRingR = 0.74f + 0.08f * prng.nextF01();
+    atollRingSigma = 0.085f + 0.050f * prng.nextF01();
 
-    // Warp adds coastline irregularity without breaking the overall ring.
-    atollWarpAmp = 0.055f + 0.045f * prng.nextF01();
+    // Lagoon: fill most of the interior (leave a buildable ring).
+    atollLagoonOuter = std::clamp(atollRingR - atollRingSigma * (1.05f + 0.10f * prng.nextF01()), 0.35f, 0.80f);
+    atollLagoonInner = std::clamp(atollLagoonOuter * (0.60f + 0.10f * prng.nextF01()), 0.25f, atollLagoonOuter - 0.03f);
 
-    // Heightfield deltas are intentionally strong so the lagoon/sea reliably cross water_level.
-    atollRingUp = 0.38f + 0.14f * prng.nextF01();
-    atollLagoonDrop = 0.54f + 0.22f * prng.nextF01();
-    atollOceanDrop = 0.70f + 0.20f * prng.nextF01();
+    // Number of passes increases slightly with strength.
+    const int maxPasses = (strength > 1.25f) ? 3 : 2;
+    const int passCount = std::clamp(1 + prng.rangeInt(0, maxPasses - 1), 1, 3);
 
-    // 1-3 passes from lagoon to sea.
-    const int nCh = std::clamp(1 + static_cast<int>(prng.rangeInt(0, 2)), 1, 3);
-    atollChannels.reserve(static_cast<std::size_t>(nCh));
-    for (int i = 0; i < nCh; ++i) {
-      const float ang = prng.nextF01() * kTwoPiF;
-      float sa = 0.0f;
-      float ca = 1.0f;
-      FastSinCosRad(ang, sa, ca);
+    atollPasses.reserve(static_cast<std::size_t>(passCount));
 
-      const float hw = (0.10f + 0.10f * prng.nextF01());
-      float shw = 0.0f;
-      float chw = 1.0f;
-      FastSinCosRad(hw, shw, chw);
+    for (int i = 0; i < passCount; ++i) {
+      bool ok = false;
+      AtollPass pass{};
+      for (int tries = 0; tries < 60 && !ok; ++tries) {
+        const float ang = prng.nextF01() * kTwoPiF;
+        float sa = 0.0f;
+        float ca = 1.0f;
+        FastSinCosRad(ang, sa, ca);
 
-      AtollChannel ch;
-      ch.dx = ca;
-      ch.dy = sa;
-      ch.cosHalfWidth = std::clamp(chw, -1.0f, 1.0f);
-      ch.strength = 0.75f + 0.55f * prng.nextF01();
-      atollChannels.push_back(ch);
+        // Avoid clustering passes too tightly.
+        ok = true;
+        for (const AtollPass& other : atollPasses) {
+          const float d = ca * other.dx + sa * other.dy;
+          if (d > 0.86f) { // ~30 degrees
+            ok = false;
+            break;
+          }
+        }
+        if (!ok) continue;
+
+        pass.dx = ca;
+        pass.dy = sa;
+        const float half = 0.14f + 0.10f * prng.nextF01();
+        pass.cosHalf = FastCosRad(half);
+        ok = true;
+      }
+      atollPasses.push_back(pass);
     }
   }
 
+  // Peninsula parameters (mainland edge + tapering land finger into the sea).
+  int peninsulaSide = 0; // 0=left,1=right,2=top,3=bottom
+  bool peninsulaHorizontal = true;
+  bool peninsulaStartAtMax = false;
+  std::vector<float> peninsulaLine;
+  float peninsulaW0 = 0.0f;
+  float peninsulaWTip = 0.0f;
+  float peninsulaTaperPow = 1.0f;
 
-  // Precompute a sea strait (edge-to-edge channel) centerline.
-  bool straitHorizontal = false;
-  std::vector<float> straitLine;
-  float straitBase = 0.0f;
-  float straitWBase = 6.0f;  // base half-width (tiles)
-  float straitWExtra = 4.0f; // additional widening near the ends (tiles)
-  int straitLen = 0;
-  int straitOth = 0;
+  if (preset == ProcGenTerrainPreset::Peninsula) {
+    peninsulaSide = static_cast<int>(HashCoords32(width, height, seed32 ^ 0x50454E15u) % 4u);
+    peninsulaHorizontal = (peninsulaSide == 0 || peninsulaSide == 1);
+    peninsulaStartAtMax = (peninsulaSide == 1 || peninsulaSide == 3);
 
-  if (preset == ProcGenTerrainPreset::Strait) {
-    straitHorizontal = ((HashCoords32(width, height, seed32 ^ 0x57A17A17u) & 1u) != 0u);
-    straitLen = straitHorizontal ? width : height;
-    straitOth = straitHorizontal ? height : width;
+    const int len = peninsulaHorizontal ? width : height;
+    const int oth = peninsulaHorizontal ? height : width;
 
-    straitLine.resize(static_cast<std::size_t>(std::max(0, straitLen)), 0.0f);
+    peninsulaLine.resize(static_cast<std::size_t>(std::max(0, len)), 0.0f);
 
-    const float base01 = 0.36f + 0.28f * prng.nextF01();
-    straitBase = base01 * static_cast<float>(straitOth);
+    const float base01 = 0.35f + 0.30f * prng.nextF01();
+    const float base = base01 * static_cast<float>(oth);
 
-    const float amp = static_cast<float>(straitOth) * (0.10f + 0.09f * prng.nextF01());
-    const float smallAmp = amp * 0.45f;
+    const float amp = static_cast<float>(oth) * (0.12f + 0.08f * prng.nextF01());
+    const float smallAmp = amp * (0.26f + 0.10f * prng.nextF01());
 
-    const float baseW = std::clamp(minDim * (0.050f + 0.010f * prng.nextF01()), 3.0f, 18.0f);
-    straitWBase = baseW * (0.85f + 0.20f * std::min(strength, 2.5f));
-    straitWExtra = baseW * (0.55f + 0.45f * prng.nextF01());
+    for (int i = 0; i < len; ++i) {
+      const float u0 = (len > 1) ? (static_cast<float>(i) / static_cast<float>(len - 1)) : 0.0f;
+      const float u = peninsulaStartAtMax ? (1.0f - u0) : u0; // 0 at mainland, 1 at tip
 
-    for (int i = 0; i < straitLen; ++i) {
-      const float t = (straitLen > 1) ? (static_cast<float>(i) / static_cast<float>(straitLen - 1)) : 0.0f;
+      const float n0 = fbmNormalized(u * 1.6f, 5.4f, seed32 ^ 0x51EA7E11u, 3) * 2.0f - 1.0f;
+      const float n1 = fbmNormalized(u * 5.2f, 1.9f, seed32 ^ 0xB16B00B5u, 2) * 2.0f - 1.0f;
 
-      const float n0 = fbmNormalized(t * 2.0f, 5.3f, seed32 ^ 0x57A17A17u, 4) * 2.0f - 1.0f;
-      const float n1 = fbmNormalized(t * 6.6f, 1.1f, seed32 ^ 0x51A17F00u, 2) * 2.0f - 1.0f;
+      float p = base + n0 * amp + n1 * smallAmp;
 
-      float p = straitBase + n0 * amp + n1 * smallAmp;
+      // Encourage a gentle "hook" near the tip without breaking determinism.
+      const float drift = fbmNormalized(u * 1.05f, 9.1f, seed32 ^ 0x13579BDFu, 2) * 2.0f - 1.0f;
+      p += (u - 0.3f) * static_cast<float>(oth) * (0.10f * drift) * (u * u);
 
-      const float drift = fbmNormalized(t * 0.85f, 9.2f, seed32 ^ 0x0BADC0DEu, 2) * 2.0f - 1.0f;
-      p += (t - 0.5f) * static_cast<float>(straitOth) * (0.10f * drift);
-
-      const float pad = 3.0f + straitWBase;
-      p = std::clamp(p, pad, static_cast<float>(straitOth) - 1.0f - pad);
-
-      straitLine[static_cast<std::size_t>(i)] = p;
+      // Keep away from edges so the peninsula can have shore on both sides.
+      p = std::clamp(p, 2.0f, static_cast<float>(oth) - 3.0f);
+      peninsulaLine[static_cast<std::size_t>(i)] = p;
     }
+
+    // Half-width at the mainland edge and at the tip.
+    peninsulaW0 = static_cast<float>(oth) * (0.34f + 0.12f * prng.nextF01());
+    peninsulaW0 = std::clamp(peninsulaW0, 6.0f, static_cast<float>(oth) * 0.55f);
+
+    peninsulaWTip = std::max(2.8f, static_cast<float>(oth) * (0.10f + 0.05f * prng.nextF01()));
+    peninsulaTaperPow = 0.85f + 0.65f * prng.nextF01();
   }
 
   struct Island {
@@ -6293,65 +6083,136 @@ static void ApplyTerrainPreset(std::vector<float>& heights, int width, int heigh
         h -= fall * (0.52f * strength);
         h += (1.0f - fall) * (0.06f * strength);
       } else if (preset == ProcGenTerrainPreset::Atoll) {
-        // Ring island with a central lagoon.
-        //
-        // We build this from three smooth masks:
-        //  - outer ocean drop (outside the ring)
-        //  - lagoon drop (inside the ring)
-        //  - ring bump (at ring radius)
-        //
-        // Then carve a few deterministic "passes" so the lagoon can connect to the sea.
-        const float nx = (static_cast<float>(x) - cx) * invCx;
-        const float ny = (static_cast<float>(y) - cy) * invCy;
-        const float len = std::sqrt(nx * nx + ny * ny) + 1e-6f;
-        const float vx = nx / len;
-        const float vy = ny / len;
+        // Ring-shaped reef island with a central lagoon (+ a few passes to the ocean).
+        float fall = Smoothstep(0.74f, 1.28f, r);
+        const float jitter = (fbmNormalized(static_cast<float>(x) * coastScale, static_cast<float>(y) * coastScale,
+                                           seed32 ^ 0xA70011E1u, 3) * 2.0f - 1.0f) * 0.14f;
+        fall = Clamp01(fall + jitter);
 
-        // Radial domain warp so the ring reads more like a natural reef.
-        const float warpN = (fbmNormalized(static_cast<float>(x) * coastScale * 0.85f,
-                                           static_cast<float>(y) * coastScale * 0.85f,
-                                           seed32 ^ 0xA70011u, 3) * 2.0f - 1.0f);
-        const float rw = r + warpN * atollWarpAmp;
+        // Surrounding ocean (island-like edge falloff).
+        h -= fall * (0.56f * strength);
+        h += (1.0f - fall) * (0.05f * strength);
 
-        // Ring bump (gaussian).
-        const float sigma = std::max(0.0001f, atollRingW);
-        const float dr = (rw - atollRingR);
-        float ring = std::exp(-(dr * dr) / (2.0f * sigma * sigma));
-        ring = Clamp01(ring);
-
-        // Lagoon and ocean masks.
-        const float lagoonEdge = atollRingR - atollRingW * 1.25f;
-        const float lagoon = 1.0f - Smoothstep(lagoonEdge, lagoonEdge + atollRingW * 0.60f, rw);
-
-        const float oceanStart = atollRingR + atollRingW * 0.70f;
-        const float ocean = Smoothstep(oceanStart, oceanStart + atollRingW * 1.35f, rw);
-
-        // Small-scale reef texture.
-        const float reefN = (ridgedFbmNormalized(static_cast<float>(x) * coastScale * 1.55f,
-                                                 static_cast<float>(y) * coastScale * 1.55f,
-                                                 seed32 ^ 0xA70011u ^ 0x51A71D00u, 3) * 2.0f - 1.0f);
-
-        h += ring * (atollRingUp * strength);
-        h += reefN * ring * (0.06f * strength);
-        h -= lagoon * (atollLagoonDrop * strength);
-        h -= ocean * (atollOceanDrop * strength);
-
-        // Carve passes (channels) through the ring.
-        float pass = 0.0f;
-        for (const AtollChannel& ch : atollChannels) {
-          const float dot = vx * ch.dx + vy * ch.dy;
-          const float m = Smoothstep(ch.cosHalfWidth, 1.0f, dot);
-          pass = std::max(pass, m * ch.strength);
+        // Lagoon: keep the interior wet even at higher water levels.
+        const float lagoon = 1.0f - Smoothstep(atollLagoonInner, atollLagoonOuter, r);
+        h -= lagoon * (0.72f * strength);
+        if (lagoon > 0.65f) {
+          h = std::min(h, cfg.waterLevel - 0.10f - 0.04f * strength);
         }
 
-        if (pass > 0.0001f) {
-          // Prefer carving near the ring and slightly into the lagoon so the cut looks continuous.
-          const float bandIn = Smoothstep(atollRingR - atollRingW * 1.05f, atollRingR - atollRingW * 0.30f, rw);
-          const float bandOut = 1.0f - Smoothstep(atollRingR + atollRingW * 0.65f, atollRingR + atollRingW * 1.70f, rw);
-          const float corridor = Clamp01(bandIn + ring + bandOut);
+        // Reef ring uplift around the lagoon.
+        const float dr = r - atollRingR;
+        float ring = std::exp(-(dr * dr) / (2.0f * atollRingSigma * atollRingSigma));
+        const float rag = (fbmNormalized(static_cast<float>(x) * coastScale * 0.85f,
+                                         static_cast<float>(y) * coastScale * 0.85f,
+                                         seed32 ^ 0xA7011E11u, 2) * 2.0f - 1.0f);
+        ring *= std::clamp(0.88f + 0.22f * rag, 0.55f, 1.35f);
+        h += ring * (0.52f * strength);
 
-          h -= pass * corridor * (0.58f * strength);
+        // Passes: carve channels through the ring so the lagoon can connect to the ocean.
+        if (!atollPasses.empty()) {
+          const float nx = (static_cast<float>(x) - cx) * invCx;
+          const float ny = (static_cast<float>(y) - cy) * invCy;
+          const float rr = std::max(1.0e-6f, std::sqrt(nx * nx + ny * ny));
+          const float ux = nx / rr;
+          const float uy = ny / rr;
+
+          const float band = Smoothstep(atollLagoonInner * 0.92f, atollRingR + atollRingSigma * 1.60f, r) *
+                             (1.0f - Smoothstep(1.05f, 1.35f, r));
+          if (band > 0.0f) {
+            for (const AtollPass& pass : atollPasses) {
+              const float dot = ux * pass.dx + uy * pass.dy;
+              if (dot <= pass.cosHalf) continue;
+
+              float w = (dot - pass.cosHalf) / std::max(1.0e-6f, (1.0f - pass.cosHalf));
+              w = Clamp01(w);
+              w *= w;
+
+              const float carve = w * band;
+              h -= carve * (0.78f * strength);
+
+              if (w > 0.55f && r > atollLagoonInner * 0.85f) {
+                h = std::min(h, cfg.waterLevel - 0.08f - 0.03f * strength);
+              }
+            }
+          }
         }
+
+      } else if (preset == ProcGenTerrainPreset::Peninsula) {
+        // Peninsula: a large mainland attached to one edge, tapering into a long land finger.
+        // The goal is a strong "coastal narrative": one clear mainland side, three sides mostly ocean.
+        if (!peninsulaLine.empty()) {
+          const int len = peninsulaHorizontal ? width : height;
+          const int oth = peninsulaHorizontal ? height : width;
+
+          const int a = peninsulaHorizontal ? x : y;
+          const float u0 = (len > 1) ? (static_cast<float>(a) / static_cast<float>(len - 1)) : 0.0f;
+          const float u = peninsulaStartAtMax ? (1.0f - u0) : u0; // 0 mainland -> 1 tip
+
+          // Half-width profile: wide at mainland, narrow at tip (with bay/noise modulation).
+          float w = peninsulaWTip +
+                    (peninsulaW0 - peninsulaWTip) * std::pow(std::max(0.0f, 1.0f - u), peninsulaTaperPow);
+
+          const float mainland = 1.0f - Smoothstep(0.0f, 0.22f, u);
+          w *= (1.0f + 0.55f * mainland);
+
+          const float bayN = (fbmNormalized(u * 2.4f, 4.1f, seed32 ^ 0xBA1E5EAu, 3) * 2.0f - 1.0f);
+          w *= std::clamp(1.0f + bayN * 0.22f, 0.60f, 1.35f);
+
+          w = std::clamp(w, 2.2f, static_cast<float>(oth) * 0.65f);
+
+          const float c = peninsulaLine[static_cast<std::size_t>(a)];
+          const float o = peninsulaHorizontal ? static_cast<float>(y) : static_cast<float>(x);
+          const float d = std::abs(o - c);
+
+          // Gaussian land mask around the peninsula spine.
+          const float land = std::exp(-(d * d) / (2.0f * w * w));
+
+          // Distance to the nearest non-mainland edge (encourages open ocean on 3 sides).
+          int dNonMain = 0;
+          if (peninsulaHorizontal) {
+            const int dOpp = peninsulaStartAtMax ? x : (width - 1 - x);
+            const int dY = std::min(y, height - 1 - y);
+            dNonMain = std::min(dOpp, dY);
+          } else {
+            const int dOpp = peninsulaStartAtMax ? y : (height - 1 - y);
+            const int dX = std::min(x, width - 1 - x);
+            dNonMain = std::min(dOpp, dX);
+          }
+
+          const float edge01 = std::clamp(static_cast<float>(dNonMain) / std::max(1.0f, minDim * 0.32f), 0.0f, 1.0f);
+          const float edgeSea = 1.0f - Smoothstep(0.12f, 0.60f, edge01);
+
+          // Sea mask: outside the peninsula + near the non-mainland edges.
+          const float sea = std::max(edgeSea, 1.0f - land);
+
+          // Compress ocean areas and give the peninsula a small uplift so it stays buildable.
+          h = h * (0.50f + 0.80f * land) - sea * (0.62f * strength);
+          h += land * (0.06f * strength);
+
+          // Guarantee open water near the non-mainland edges to keep the shape readable.
+          if (sea > 0.70f && land < 0.08f) {
+            h = std::min(h, cfg.waterLevel - 0.10f - 0.04f * strength);
+          }
+
+          // Offshore islets near the tip for variety (kept weak so they don't become a second continent).
+          const float tip = Smoothstep(0.70f, 1.0f, u);
+          if (tip > 0.0f && land < 0.15f && edgeSea > 0.25f) {
+            const float isletN = fbmNormalized(static_cast<float>(x) * coastScale * 1.10f,
+                                               static_cast<float>(y) * coastScale * 1.10f,
+                                               seed32 ^ 0x15E7A11Eu, 3);
+            const float islet = Smoothstep(0.62f, 0.90f, isletN);
+            h += islet * tip * (0.11f * strength) * (1.0f - land);
+          }
+
+          // Slight shoreline roughness so the coast isn't perfectly smooth.
+          const float shoreN = (fbmNormalized(static_cast<float>(x) * coastScale * 0.85f,
+                                              static_cast<float>(y) * coastScale * 0.85f,
+                                              seed32 ^ 0x0CEAB00Fu, 2) * 2.0f - 1.0f);
+          h += shoreN * (0.020f * strength) * (1.0f - sea) * (1.0f - land);
+        }
+
+
       } else if (preset == ProcGenTerrainPreset::Archipelago) {
         // Multi-island mask.
         float mask = 0.0f;
@@ -6395,44 +6256,6 @@ static void ApplyTerrainPreset(std::vector<float>& heights, int width, int heigh
                                       static_cast<float>(y) * coastScale * 0.85f,
                                       seed32 ^ 0xD00DFEEDu, 2) * 2.0f - 1.0f);
         h += n * (0.03f * strength);
-      } else if (preset == ProcGenTerrainPreset::Strait) {
-        if (!straitLine.empty()) {
-          const int a = straitHorizontal ? x : y;
-          const float t = (straitLen > 1) ? (static_cast<float>(a) / static_cast<float>(straitLen - 1)) : 0.0f;
-          const float edge = 1.0f - Smoothstep(0.08f, 0.34f, std::min(t, 1.0f - t));
-
-          const float p0 = straitLine[static_cast<std::size_t>(a)];
-          const float o = static_cast<float>(straitHorizontal ? y : x);
-          const float d = std::abs(o - p0);
-
-          const float wN = (fbmNormalized(static_cast<float>(x) * 0.045f, static_cast<float>(y) * 0.045f,
-                                          seed32 ^ 0x57A17A17u, 2) * 2.0f - 1.0f);
-          const float w = std::max(2.0f, straitWBase + edge * straitWExtra + wN * 0.8f);
-          const float bank = w * 2.6f;
-
-          const float tc = Clamp01(1.0f - (d / w));
-          h -= (tc * tc) * (0.70f * strength);
-
-          // Shelves/banks.
-          const float tb = Clamp01(1.0f - (d / bank));
-          h -= (tb * tb) * (0.14f * strength);
-
-          // Keep a continuous navigable channel core.
-          if (d < w * 0.40f) {
-            h = std::min(h, cfg.waterLevel - 0.12f - 0.04f * strength);
-          }
-
-          // Shallow shelves near the banks to promote sandbars / coves.
-          const float shore = Smoothstep(0.35f, 0.95f, d / std::max(1.0f, w));
-          const float shelfN = (fbmNormalized(static_cast<float>(x) * coastScale * 1.05f,
-                                              static_cast<float>(y) * coastScale * 1.05f,
-                                              seed32 ^ 0x0BADC0DEu, 3) * 2.0f - 1.0f);
-          h += shelfN * shore * (0.03f * strength);
-
-          // Gentle uplift away from the strait so both sides read as coherent landmasses.
-          const float far = Smoothstep(bank * 1.2f, bank * 3.8f, d);
-          h += far * (0.05f * strength);
-        }
       } else if (preset == ProcGenTerrainPreset::RiverValley) {
         if (!riverLine.empty()) {
           if (riverHorizontal) {

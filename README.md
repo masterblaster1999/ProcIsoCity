@@ -212,17 +212,20 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
   ```
 
 - `proc_isocity_wayfind`: **geocode** a procedural address (or street intersection) and compute a road route with
-  turn-by-turn style **maneuvers**. Optionally writes a JSON route and a debug image with the route overlaid.
+  turn-by-turn style **maneuvers**. Outputs JSON/Markdown/CSV and optional top-down + isometric route overlays.
+  Also supports random endpoints (`--from random`) for quick "missions" and simple routing presets.
 
   ```bash
-  # Route between two procedural addresses
-  ./build/proc_isocity_wayfind --seed 1 --size 128x128 \
-    --from "120 Asterwood Ave" --to "450 3rd St" --out-json route.json --out-image route.png --image-scale 4
+  # Route between two procedural addresses (write JSON + markdown directions)
+  ./build/proc_isocity_wayfind --seed 1 --size 128x128 --from "120 Asterwood Ave" --to "450 3rd St" --out-json route.json --out-md route.md --out-csv route.csv --out-image route.png --image-scale 4 --out-iso route_iso.png
+
+  # Random "delivery run" with a safety-biased preset
+  ./build/proc_isocity_wayfind --seed 1 --size 128x128 --from random --to random --min-sep 60 --preset safe --out-md mission.md --out-iso mission.png
 
   # Route between intersections
-  ./build/proc_isocity_wayfind --seed 1 --size 128x128 \
-    --from "Asterwood Ave & 3rd St" --to "Juniper Rd @ 7th Ave"
+  ./build/proc_isocity_wayfind --seed 1 --size 128x128 --from "Asterwood Ave & 3rd St" --to "Juniper Rd @ 7th Ave"
   ```
+
 
 - `proc_isocity_tour`: generate a procedural **walking tour** by synthesizing a handful of interesting POIs
   (parks, peaks, structural bottlenecks, markets...) and connecting them with turn-by-turn **itinerary legs**.
