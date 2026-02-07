@@ -1985,6 +1985,12 @@ void Game::setupDevConsole()
         }
         if (sub == "panel") {
           m_showWayfindingPanel = !m_showWayfindingPanel;
+          if (m_showWayfindingPanel) {
+            m_wayfindingTab = WayfindingPanelTab::Route;
+          } else {
+            m_wayfindingPickMode = WayfindingPickMode::None;
+            ui::ClearActiveWidget();
+          }
           showToast(m_showWayfindingPanel ? "Navigator panel shown" : "Navigator panel hidden", 2.0f);
           return;
         }
@@ -2020,50 +2026,19 @@ void Game::setupDevConsole()
           return;
         }
 
-        m_wayfindingFromQuery = args[0];
-        m_wayfindingToQuery = args[1];
+        const std::string fromQ = args[0];
+        const std::string toQ = args[1];
 
-        ensureWayfindingUpToDate();
-
-        if (!m_wayfindingIndex.ok) {
-          c.print(std::string("Address index error: ") + m_wayfindingIndex.error);
-          showToast("Navigator index error", 4.0f);
-          return;
-        }
-
-        const GeocodeMatch from = GeocodeEndpoint(m_world, m_wayfindingStreets, m_wayfindingIndex, m_wayfindingFromQuery);
-        if (!from.ok) {
-          c.print(std::string("From endpoint error: ") + from.error);
-          for (size_t i = 0; i < std::min<size_t>(from.suggestions.size(), 8); ++i) {
-            c.print(std::string("  suggestion: ") + from.suggestions[i]);
+        if (!computeWayfindingRoute(fromQ, toQ, true)) {
+          if (!m_wayfindingUiError.empty()) {
+            c.print(m_wayfindingUiError);
           }
-          showToast("From geocode failed", 4.0f);
-          return;
-        }
-
-        const GeocodeMatch to = GeocodeEndpoint(m_world, m_wayfindingStreets, m_wayfindingIndex, m_wayfindingToQuery);
-        if (!to.ok) {
-          c.print(std::string("To endpoint error: ") + to.error);
-          for (size_t i = 0; i < std::min<size_t>(to.suggestions.size(), 8); ++i) {
-            c.print(std::string("  suggestion: ") + to.suggestions[i]);
+          for (size_t i = 0; i < std::min<size_t>(m_wayfindingUiSuggestions.size(), 8); ++i) {
+            c.print(std::string("  suggestion: ") + m_wayfindingUiSuggestions[i]);
           }
-          showToast("To geocode failed", 4.0f);
-          return;
-        }
-
-        m_wayfindingRoute = RouteBetweenEndpoints(m_world, m_wayfindingStreets, from.endpoint, to.endpoint);
-        m_wayfindingFocusManeuver = -1;
-        m_wayfindingFocusPath.clear();
-        m_wayfindingManeuverFirst = 0;
-
-        if (!m_wayfindingRoute.ok) {
-          c.print(std::string("Route error: ") + m_wayfindingRoute.error);
           showToast("Route failed", 4.0f);
           return;
         }
-
-        m_showWayfindingOverlay = true;
-        m_showWayfindingPanel = true;
 
         c.print("Route computed:");
         c.print(std::string("  From: ") + m_wayfindingRoute.from.full);
@@ -17804,17 +17779,96 @@ void Game::ensureWayfindingUpToDate() {
   m_wayfindingDirty = false;
 }
 
-void Game::clearWayfindingRoute() {
-  m_wayfindingFromQuery.clear();
-  m_wayfindingToQuery.clear();
+void Game::clearWayfindingRoute(bool keepQueries) {
+  if (!keepQueries) {
+    m_wayfindingFromQuery.clear();
+    m_wayfindingToQuery.clear();
+    m_wayfindingPickFrom.reset();
+    m_wayfindingPickTo.reset();
+  }
 
   m_wayfindingRoute = {};
+  m_wayfindingUiError.clear();
+  m_wayfindingUiSuggestions.clear();
+  m_wayfindingPickMode = WayfindingPickMode::None;
+
   m_wayfindingFocusManeuver = -1;
   m_wayfindingFocusPath.clear();
   m_wayfindingManeuverFirst = 0;
 
-  // Keep panel state, but hide the overlay by default so a cleared route doesn't leave artifacts.
-  m_showWayfindingOverlay = false;
+  // Hide the overlay by default so a cleared route doesn't leave artifacts.
+  // When keepQueries==true, callers can leave the overlay enabled explicitly.
+  if (!keepQueries) {
+    m_showWayfindingOverlay = false;
+  }
+}
+
+bool Game::computeWayfindingRoute(const std::string& fromQuery, const std::string& toQuery, bool openPanel)
+{
+  m_wayfindingUiError.clear();
+  m_wayfindingUiSuggestions.clear();
+
+  m_wayfindingFromQuery = fromQuery;
+  m_wayfindingToQuery = toQuery;
+
+  // Reset transient UI selection state.
+  m_wayfindingFocusManeuver = -1;
+  m_wayfindingFocusPath.clear();
+  m_wayfindingManeuverFirst = 0;
+
+  // Clear any previous result, but keep endpoint picks until we successfully geocode.
+  m_wayfindingRoute = {};
+
+  ensureWayfindingUpToDate();
+
+  if (!m_wayfindingIndex.ok) {
+    m_wayfindingUiError = std::string("Address index error: ") + m_wayfindingIndex.error;
+    return false;
+  }
+
+  // If the user set avoidance weights or a turn penalty, but left the metric at Steps,
+  // auto-upgrade routing to TravelTime (matching the CLI behaviour).
+  WayfindingRouteConfig cfg = m_wayfindingRouteCfg;
+  const bool wantsWeighted = (cfg.turnPenaltyMilli > 0) || (cfg.wTrafficMilli > 0) || (cfg.wCrashMilli > 0) ||
+                             (cfg.wCrimeMilli > 0) || (cfg.wNoiseMilli > 0);
+  if (cfg.metric == WayfindingRouteMetric::Steps && wantsWeighted) {
+    cfg.metric = WayfindingRouteMetric::TravelTime;
+    m_wayfindingRouteCfg.metric = cfg.metric;
+  }
+
+  // Geocode + route via the shared helper (used by the headless CLI too).
+  const RouteQueryResult q = RouteFromQueries(
+      m_world, m_wayfindingStreets, m_wayfindingIndex, m_wayfindingFromQuery, m_wayfindingToQuery, cfg);
+
+  // Update endpoint picks (used by the Navigator UI and overlay markers) as soon as geocoding succeeds.
+  if (q.from.ok) {
+    m_wayfindingPickFrom = q.from.endpoint.roadTile;
+  }
+  if (q.to.ok) {
+    m_wayfindingPickTo = q.to.endpoint.roadTile;
+  }
+
+  if (!q.ok) {
+    m_wayfindingUiError = q.error;
+    if (!q.from.ok) {
+      m_wayfindingUiSuggestions = q.from.suggestions;
+    } else if (!q.to.ok) {
+      m_wayfindingUiSuggestions = q.to.suggestions;
+    }
+    return false;
+  }
+
+  m_wayfindingRoute = q.route;
+
+  // Success: show overlay and optionally open the panel.
+  m_wayfindingPickMode = WayfindingPickMode::None;
+  m_showWayfindingOverlay = true;
+  if (openPanel) {
+    m_showWayfindingPanel = true;
+    m_wayfindingTab = WayfindingPanelTab::Route;
+  }
+
+  return true;
 }
 
 void Game::rebuildWayfindingFocusPath() {
@@ -17846,30 +17900,82 @@ void Game::rebuildWayfindingFocusPath() {
 }
 
 void Game::drawWayfindingOverlay() {
-  if (!m_showWayfindingOverlay || !m_wayfindingRoute.ok) {
+  if (!m_showWayfindingOverlay) {
     return;
   }
 
-  const ParcelAddress& from = m_wayfindingRoute.from;
-  const ParcelAddress& to = m_wayfindingRoute.to;
+  const bool haveRoute = m_wayfindingRoute.ok;
+  const bool havePath = haveRoute && m_wayfindingRoute.pathTiles.size() >= 2;
 
-  const Vector2 fromWs = TileToWorldCenterElevated(
-      m_world, from.roadTile.x, from.roadTile.y,
-      static_cast<float>(m_cfg.tileWidth), static_cast<float>(m_cfg.tileHeight), m_elev);
-  const Vector2 toWs = TileToWorldCenterElevated(
-      m_world, to.roadTile.x, to.roadTile.y,
-      static_cast<float>(m_cfg.tileWidth), static_cast<float>(m_cfg.tileHeight), m_elev);
+  std::optional<Point> fromTile;
+  std::optional<Point> toTile;
+
+  if (haveRoute) {
+    fromTile = m_wayfindingRoute.from.roadTile;
+    toTile = m_wayfindingRoute.to.roadTile;
+  } else {
+    fromTile = m_wayfindingPickFrom;
+    toTile = m_wayfindingPickTo;
+  }
+
+  if (!havePath && !fromTile.has_value() && !toTile.has_value() && m_wayfindingPickMode == WayfindingPickMode::None) {
+    return;
+  }
 
   BeginMode2D(m_camera);
 
-  // Keep marker size roughly stable relative to zoom.
+  // Keep marker size + line thickness roughly stable relative to zoom.
   const float r = std::clamp(6.0f / m_camera.zoom, 2.0f, 12.0f);
+  const float lw = std::clamp(3.0f / m_camera.zoom, 1.2f, 8.0f);
+  const float lwHi = std::clamp(4.2f / m_camera.zoom, 1.8f, 10.0f);
 
-  DrawCircleV(fromWs, r, Color{0, 220, 120, 220});
-  DrawCircleV(toWs, r, Color{255, 80, 80, 220});
+  auto tileWs = [&](const Point& p) -> Vector2 {
+    return TileToWorldCenterElevated(
+        m_world, p.x, p.y,
+        static_cast<float>(m_cfg.tileWidth), static_cast<float>(m_cfg.tileHeight), m_elev);
+  };
+
+  auto drawMarker = [&](const Point& p, Color c) {
+    DrawCircleV(tileWs(p), r, c);
+  };
+
+  auto drawPath = [&](const std::vector<Point>& pts, Color c, float w) {
+    if (pts.size() < 2) return;
+    Vector2 prev = tileWs(pts[0]);
+    for (std::size_t i = 1; i < pts.size(); ++i) {
+      Vector2 cur = tileWs(pts[i]);
+      DrawLineEx(prev, cur, w, c);
+      prev = cur;
+    }
+  };
+
+  if (havePath) {
+    const bool focusActive = (m_wayfindingFocusManeuver >= 0) && (m_wayfindingFocusPath.size() >= 2);
+
+    if (focusActive) {
+      // Context line (faint full route) + highlight segment.
+      drawPath(m_wayfindingRoute.pathTiles, Color{255, 120, 80, 90}, lw);
+      drawPath(m_wayfindingFocusPath, Color{120, 220, 255, 220}, lwHi);
+    } else {
+      drawPath(m_wayfindingRoute.pathTiles, Color{255, 120, 80, 190}, lwHi);
+    }
+  }
+
+  if (fromTile.has_value()) {
+    drawMarker(fromTile.value(), Color{0, 220, 120, 220});
+  }
+  if (toTile.has_value()) {
+    drawMarker(toTile.value(), Color{255, 80, 80, 220});
+  }
+
+  // While picking endpoints, also mark the currently hovered tile to provide feedback.
+  if (m_wayfindingPickMode != WayfindingPickMode::None && m_hovered.has_value()) {
+    drawMarker(m_hovered.value(), Color{255, 215, 0, 210});
+  }
 
   EndMode2D();
 }
+
 
 void Game::drawWayfindingPanel(int x0, int y0) {
   const ui::Theme& uiTh = ui::GetTheme();
@@ -17883,73 +17989,390 @@ void Game::drawWayfindingPanel(int x0, int y0) {
   ui::DrawPanel(panelR, uiTime, m_showWayfindingPanel);
   ui::DrawPanelHeader(panelR, "Navigator", uiTime, m_showWayfindingPanel);
 
-  // Header buttons.
-  const bool hasRoute = m_wayfindingRoute.ok;
-  if (ui::Button(7600, Rectangle{static_cast<float>(x0 + panelW - 162), static_cast<float>(y0 + 40), 72.0f, 18.0f}, "Clear", mouseUi, uiTime, hasRoute, false)) {
-    clearWayfindingRoute();
-    showToast("Route cleared", 2.0f);
-  }
-
-  const bool canToggleOverlay = hasRoute || m_showWayfindingOverlay;
-  if (ui::Button(7601, Rectangle{static_cast<float>(x0 + panelW - 82), static_cast<float>(y0 + 40), 72.0f, 18.0f},
-                 m_showWayfindingOverlay ? "Hide" : "Show", mouseUi, uiTime, canToggleOverlay, false)) {
-    m_showWayfindingOverlay = !m_showWayfindingOverlay;
+  // Close.
+  const Rectangle closeR{panelR.x + panelR.width - 28.0f, panelR.y + 8.0f, 20.0f, 18.0f};
+  if (ui::Button(7600, closeR, "X", mouseUi, uiTime, true, false)) {
+    m_showWayfindingPanel = false;
+    m_wayfindingPickMode = WayfindingPickMode::None;
+    ui::ClearActiveWidget();
+    return;
   }
 
   int x = x0 + 12;
-  int y = y0 + 42;
+  int y = y0 + 36;
 
-  ui::Text(x, y, 15, "Console: route \"from\" \"to\"   |   route panel", uiTh.textDim, false, true, 1);
-  y += 22;
+  // Tabs.
+  constexpr float tabH = 22.0f;
+  constexpr float tabGap = 6.0f;
+  const float tabW = (panelR.width - 24.0f - 2.0f * tabGap) / 3.0f;
 
-  if (!hasRoute) {
-    const char* tip = "No active route.\n"
-                      "Try: route \"x,y\" \"x,y\"\n"
-                      "Or: route \"street1 & street2\" \"street3 & street4\"";
-    ui::TextBox(Rectangle{static_cast<float>(x), static_cast<float>(y), static_cast<float>(panelW - 24), 54.0f},
-                14, tip, uiTh.text, /*bold=*/false, /*shadow=*/true, /*spacingPx=*/1,
-                /*wrap=*/true, /*clip=*/true);
-    y += 62;
+  const Rectangle tabRoute{panelR.x + 12.0f, panelR.y + 36.0f, tabW, tabH};
+  const Rectangle tabOpts{tabRoute.x + tabW + tabGap, tabRoute.y, tabW, tabH};
+  const Rectangle tabPov{tabOpts.x + tabW + tabGap, tabRoute.y, tabW, tabH};
+
+  auto drawTab = [&](int id, const Rectangle& r, const char* label, WayfindingPanelTab tab) {
+    const bool active = (m_wayfindingTab == tab);
+    if (ui::Button(id, r, label, mouseUi, uiTime, true, active)) {
+      m_wayfindingTab = tab;
+      ui::ClearActiveWidget();
+    }
+  };
+
+  drawTab(7601, tabRoute, "Route", WayfindingPanelTab::Route);
+  drawTab(7602, tabOpts, "Options", WayfindingPanelTab::Options);
+  drawTab(7603, tabPov, "POV", WayfindingPanelTab::Pov);
+
+  y += static_cast<int>(tabH) + 10;
+
+  const bool hasRoute = m_wayfindingRoute.ok;
+
+  if (m_wayfindingTab == WayfindingPanelTab::Route) {
+    // Endpoint rows.
+    auto drawEndpointRow = [&](int pickId, const char* label, const std::string& query, WayfindingPickMode mode) {
+      ui::Text(x, y, 14, label, uiTh.text, false, true, 1);
+
+      const float labelW = 46.0f;
+      const float pickW = 60.0f;
+      const Rectangle textR{panelR.x + 12.0f + labelW, static_cast<float>(y - 2),
+                            panelR.width - 24.0f - labelW - pickW - 6.0f, 18.0f};
+      const Rectangle pickR{textR.x + textR.width + 6.0f, textR.y, pickW, textR.height};
+
+      ui::DrawPanelInset(textR, uiTime);
+      const std::string shown = query.empty() ? std::string("(not set)") : query;
+      ui::TextBox(Rectangle{textR.x + 4.0f, textR.y + 2.0f, textR.width - 8.0f, textR.height - 4.0f},
+                  13, shown, query.empty() ? uiTh.textDim : uiTh.text,
+                  /*bold=*/false, /*shadow=*/true, /*spacingPx=*/1,
+                  /*wrap=*/false, /*clip=*/true);
+
+      const bool picking = (m_wayfindingPickMode == mode);
+      if (ui::Button(pickId, pickR, picking ? "Cancel" : "Pick", mouseUi, uiTime, true, picking)) {
+        if (picking) {
+          m_wayfindingPickMode = WayfindingPickMode::None;
+        } else {
+          m_wayfindingPickMode = mode;
+          // Enable overlay so the hover marker is visible.
+          m_showWayfindingOverlay = true;
+        }
+        ui::ClearActiveWidget();
+      }
+
+      y += 24;
+    };
+
+    drawEndpointRow(7620, "From:", m_wayfindingFromQuery, WayfindingPickMode::From);
+    drawEndpointRow(7621, "To:", m_wayfindingToQuery, WayfindingPickMode::To);
+
+    // Actions.
+    const float btnH = 20.0f;
+    const float btnW = (panelR.width - 24.0f - 2.0f * 6.0f) / 3.0f;
+    const float bx0 = panelR.x + 12.0f;
+
+    const bool haveQueries = !m_wayfindingFromQuery.empty() && !m_wayfindingToQuery.empty();
+
+    const Rectangle swapR{bx0, static_cast<float>(y), btnW, btnH};
+    const Rectangle routeR{bx0 + btnW + 6.0f, static_cast<float>(y), btnW, btnH};
+    const Rectangle clearR{bx0 + (btnW + 6.0f) * 2.0f, static_cast<float>(y), btnW, btnH};
+
+    if (ui::Button(7622, swapR, "Swap", mouseUi, uiTime, haveQueries, false)) {
+      std::swap(m_wayfindingFromQuery, m_wayfindingToQuery);
+      std::swap(m_wayfindingPickFrom, m_wayfindingPickTo);
+      ui::ClearActiveWidget();
+    }
+
+    if (ui::Button(7623, routeR, "Route", mouseUi, uiTime, haveQueries, true)) {
+      m_wayfindingPickMode = WayfindingPickMode::None;
+      const bool ok = computeWayfindingRoute(m_wayfindingFromQuery, m_wayfindingToQuery, /*openPanel=*/false);
+      showToast(ok ? "Route computed" : (m_wayfindingUiError.empty() ? "Route failed" : m_wayfindingUiError.c_str()), 2.5f);
+      ui::ClearActiveWidget();
+    }
+
+    if (ui::Button(7624, clearR, "Clear path", mouseUi, uiTime, hasRoute, false)) {
+      clearWayfindingRoute(/*keepQueries=*/true);
+      showToast("Route cleared", 2.0f);
+      ui::ClearActiveWidget();
+    }
+
+    y += 26;
+
+    const bool canToggleOverlay = hasRoute || m_wayfindingPickFrom.has_value() || m_wayfindingPickTo.has_value() ||
+                                  (m_wayfindingPickMode != WayfindingPickMode::None);
+
+    const Rectangle overlayR{bx0, static_cast<float>(y), btnW, btnH};
+    const Rectangle centerR{bx0 + btnW + 6.0f, static_cast<float>(y), btnW, btnH};
+    const Rectangle clearAllR{bx0 + (btnW + 6.0f) * 2.0f, static_cast<float>(y), btnW, btnH};
+
+    if (ui::Button(7625, overlayR, m_showWayfindingOverlay ? "Hide overlay" : "Show overlay", mouseUi, uiTime, canToggleOverlay, false)) {
+      m_showWayfindingOverlay = !m_showWayfindingOverlay;
+      ui::ClearActiveWidget();
+    }
+
+    if (ui::Button(7626, centerR, "Center", mouseUi, uiTime, hasRoute && !m_wayfindingRoute.pathTiles.empty(), false)) {
+      const Point mid = m_wayfindingRoute.pathTiles[m_wayfindingRoute.pathTiles.size() / 2];
+      const Vector2 ws = TileToWorldCenterElevated(
+          m_world, mid.x, mid.y,
+          static_cast<float>(m_cfg.tileWidth), static_cast<float>(m_cfg.tileHeight), m_elev);
+      m_camera.target = ws;
+      showToast("Camera centered on route", 2.0f);
+      ui::ClearActiveWidget();
+    }
+
+    if (ui::Button(7627, clearAllR, "Clear all", mouseUi, uiTime, haveQueries || hasRoute, false)) {
+      clearWayfindingRoute(/*keepQueries=*/false);
+      showToast("Navigator cleared", 2.0f);
+      ui::ClearActiveWidget();
+    }
+
+    y += 28;
+
+    // Auto-route toggle.
+    {
+      const Rectangle togR{panelR.x + 12.0f, static_cast<float>(y), 34.0f, 16.0f};
+      const Rectangle togLabelR{togR.x + togR.width + 6.0f, togR.y, 160.0f, togR.height};
+      const bool changed = ui::Toggle(7628, togR, m_wayfindingAutoRouteOnPick, mouseUi, uiTime, true);
+      ui::Text(static_cast<int>(std::lround(togLabelR.x)), static_cast<int>(std::lround(togLabelR.y + 1.0f)),
+               13, "Auto-route on pick", uiTh.textDim, false, true, 1);
+      if (!changed && CheckCollisionPointRec(mouseUi, togLabelR) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        m_wayfindingAutoRouteOnPick = !m_wayfindingAutoRouteOnPick;
+      }
+    }
+
+    y += 22;
+
+    // Picking hint.
+    if (m_wayfindingPickMode != WayfindingPickMode::None) {
+      const char* hint = (m_wayfindingPickMode == WayfindingPickMode::From)
+                             ? "Picking From: click a tile (Esc cancels)"
+                             : "Picking To: click a tile (Esc cancels)";
+      ui::TextBox(Rectangle{panelR.x + 12.0f, static_cast<float>(y), panelR.width - 24.0f, 18.0f},
+                  13, hint, uiTh.textDim, false, true, 1, false, true);
+      y += 22;
+    }
+
+    // Error box.
+    if (!m_wayfindingUiError.empty()) {
+      std::string err = m_wayfindingUiError;
+      if (!m_wayfindingUiSuggestions.empty()) {
+        err += "\nSuggestions:";
+        const int n = std::min(4, static_cast<int>(m_wayfindingUiSuggestions.size()));
+        for (int i = 0; i < n; ++i) {
+          err += "\n  - ";
+          err += m_wayfindingUiSuggestions[i];
+        }
+      }
+
+      ui::TextBox(Rectangle{panelR.x + 12.0f, static_cast<float>(y), panelR.width - 24.0f, 60.0f},
+                  13, err, uiTh.accentBad, false, true, 1, true, true);
+      y += 68;
+    }
+
+    // Summary.
+    if (hasRoute) {
+      const RouteResult& rr = m_wayfindingRoute;
+      const float base = static_cast<float>(rr.pathTravelTimeMilli) / 1000.0f;
+      const float haz = static_cast<float>(rr.pathHazardPenaltyMilli) / 1000.0f;
+      const float turn = static_cast<float>(rr.pathTurnPenaltyMilli) / 1000.0f;
+      const float tot = static_cast<float>(rr.pathCostMilli) / 1000.0f;
+      const char* metric = (rr.routeCfg.metric == WayfindingRouteMetric::TravelTime) ? "Time" : "Steps";
+
+      const std::string summary = TextFormat(
+          "Tiles: %d  Steps: %d  Metric: %s\nCost: %.1f (base %.1f + hazard %.1f + turns %.1f)",
+          static_cast<int>(rr.pathTiles.size()), rr.pathCost, metric, tot, base, haz, turn);
+
+      ui::TextBox(Rectangle{panelR.x + 12.0f, static_cast<float>(y), panelR.width - 24.0f, 40.0f},
+                  13, summary, uiTh.text, false, true, 1, true, true);
+      y += 48;
+    }
+
+    if (!hasRoute) {
+      const char* tip = "Pick From/To, then Route.\nYou can also use the console command: route \"from\" \"to\"";
+      ui::TextBox(Rectangle{panelR.x + 12.0f, static_cast<float>(y), panelR.width - 24.0f, 42.0f},
+                  13, tip, uiTh.textDim, false, true, 1, true, true);
+      return;
+    }
+
+    // Maneuver list with scrolling.
+    const int rowH = 20;
+    const int listX = x0 + 10;
+    const int listY = y;
+    const int listW = panelW - 20;
+    const int listH = panelH - (listY - y0) - 12;
+    const Rectangle listR{static_cast<float>(listX), static_cast<float>(listY), static_cast<float>(listW), static_cast<float>(listH)};
+    ui::DrawPanelInset(listR, uiTime);
+
+    const int total = static_cast<int>(m_wayfindingRoute.maneuvers.size());
+    const int view = std::max(1, listH / rowH);
+    const int maxFirst = std::max(0, total - view);
+    m_wayfindingManeuverFirst = std::clamp(m_wayfindingManeuverFirst, 0, maxFirst);
+
+    if (CheckCollisionPointRec(mouseUi, listR) && total > view) {
+      const float wheel = GetMouseWheelMove();
+      if (wheel != 0.0f) {
+        m_wayfindingManeuverFirst = std::clamp(m_wayfindingManeuverFirst - static_cast<int>(wheel), 0, maxFirst);
+      }
+    }
+
+    // Scrollbar.
+    const Rectangle scrollR{static_cast<float>(listX + listW - 12), static_cast<float>(listY), 12.0f, static_cast<float>(listH)};
+    (void)ui::ScrollbarV(7629, scrollR, total, view, m_wayfindingManeuverFirst, mouseUi, uiTime);
+
+    const int textW = listW - 14;
+    for (int i = 0; i < view; ++i) {
+      const int idx = m_wayfindingManeuverFirst + i;
+      if (idx >= total) {
+        break;
+      }
+      const RouteManeuver& m = m_wayfindingRoute.maneuvers[idx];
+
+      std::string label = TextFormat("%2d. %s", idx + 1, m.instruction.c_str());
+      if (label.size() > 92) {
+        label.resize(89);
+        label += "...";
+      }
+
+      const Rectangle rowR{static_cast<float>(listX + 2), static_cast<float>(listY + 2 + i * rowH),
+                           static_cast<float>(textW), static_cast<float>(rowH - 2)};
+      const bool isFocus = (idx == m_wayfindingFocusManeuver);
+      if (ui::Button(7700 + idx, rowR, label, mouseUi, uiTime, true, isFocus)) {
+        // Toggle focus; when focused we render the segment only.
+        if (m_wayfindingFocusManeuver == idx) {
+          m_wayfindingFocusManeuver = -1;
+          m_wayfindingFocusPath.clear();
+        } else {
+          m_wayfindingFocusManeuver = idx;
+          rebuildWayfindingFocusPath();
+        }
+      }
+    }
+
+    return;
   }
 
-  // Summary.
-  if (hasRoute) {
-    const std::string summary = TextFormat("From: %s\nTo: %s\nSteps: %d    Tiles: %d", m_wayfindingRoute.from.full.c_str(),
-                                           m_wayfindingRoute.to.full.c_str(), static_cast<int>(m_wayfindingRoute.maneuvers.size()),
-                                           static_cast<int>(m_wayfindingRoute.pathTiles.size()));
-    ui::TextBox(Rectangle{static_cast<float>(x), static_cast<float>(y), static_cast<float>(panelW - 24), 56.0f},
-                14, summary, uiTh.text, /*bold=*/false, /*shadow=*/true, /*spacingPx=*/1,
-                /*wrap=*/true, /*clip=*/true);
-    y += 64;
+  if (m_wayfindingTab == WayfindingPanelTab::Options) {
+    // Options are stored in m_wayfindingRouteCfg and used on the next routing call.
+    ui::Text(x, y, 14, "Routing options", uiTh.textDim, true, true, 1);
+    y += 18;
+
+    const float btnH = 20.0f;
+    const float btnW = (panelR.width - 24.0f - 2.0f * 6.0f) / 3.0f;
+    const float bx0 = panelR.x + 12.0f;
+
+    const Rectangle resetR{bx0, static_cast<float>(y), btnW, btnH};
+    const Rectangle fastR{bx0 + btnW + 6.0f, static_cast<float>(y), btnW, btnH};
+    const Rectangle safeR{bx0 + (btnW + 6.0f) * 2.0f, static_cast<float>(y), btnW, btnH};
+
+    if (ui::Button(7650, resetR, "Reset", mouseUi, uiTime, true, false)) {
+      m_wayfindingRouteCfg = WayfindingRouteConfig{};
+      showToast("Navigator options reset", 2.0f);
+      ui::ClearActiveWidget();
+    }
+
+    if (ui::Button(7651, fastR, "Fastest", mouseUi, uiTime, true, false)) {
+      m_wayfindingRouteCfg = WayfindingRouteConfig{};
+      m_wayfindingRouteCfg.metric = WayfindingRouteMetric::TravelTime;
+      showToast("Navigator: Fastest", 2.0f);
+      ui::ClearActiveWidget();
+    }
+
+    if (ui::Button(7652, safeR, "Safer", mouseUi, uiTime, true, false)) {
+      m_wayfindingRouteCfg = WayfindingRouteConfig{};
+      m_wayfindingRouteCfg.metric = WayfindingRouteMetric::TravelTime;
+      m_wayfindingRouteCfg.wCrashMilli = 700;
+      m_wayfindingRouteCfg.wCrimeMilli = 450;
+      m_wayfindingRouteCfg.wTrafficMilli = 250;
+      m_wayfindingRouteCfg.wNoiseMilli = 150;
+      m_wayfindingRouteCfg.turnPenaltyMilli = 120;
+      m_wayfindingRouteCfg.requireOutsideConnectionForHazards = true;
+      showToast("Navigator: Safer", 2.0f);
+      ui::ClearActiveWidget();
+    }
+
+    y += 28;
+
+    // Metric selection.
+    ui::Text(x, y, 13, "Metric", uiTh.textDim, false, true, 1);
+    const Rectangle stepsR{panelR.x + 78.0f, static_cast<float>(y - 2), 80.0f, 18.0f};
+    const Rectangle timeR{stepsR.x + stepsR.width + 6.0f, stepsR.y, 80.0f, 18.0f};
+    if (ui::Button(7653, stepsR, "Steps", mouseUi, uiTime, true, m_wayfindingRouteCfg.metric == WayfindingRouteMetric::Steps)) {
+      m_wayfindingRouteCfg.metric = WayfindingRouteMetric::Steps;
+      ui::ClearActiveWidget();
+    }
+    if (ui::Button(7654, timeR, "Time", mouseUi, uiTime, true, m_wayfindingRouteCfg.metric == WayfindingRouteMetric::TravelTime)) {
+      m_wayfindingRouteCfg.metric = WayfindingRouteMetric::TravelTime;
+      ui::ClearActiveWidget();
+    }
+
+    y += 24;
+
+    auto drawIntSlider = [&](int id, const char* label, int& v, int minV, int maxV, int step) {
+      ui::Text(x, y, 13, TextFormat("%s: %.1f", label, static_cast<float>(v) / 1000.0f), uiTh.textDim, false, true, 1);
+      const Rectangle r{panelR.x + 12.0f, static_cast<float>(y + 16), panelR.width - 24.0f, 14.0f};
+      ui::SliderInt(id, r, v, minV, maxV, step, mouseUi, uiTime, true);
+      y += 34;
+    };
+
+    // Turn penalty is in milli-steps per turn (not divided by 1000 in label).
+    ui::Text(x, y, 13, TextFormat("Turn penalty: %d", m_wayfindingRouteCfg.turnPenaltyMilli), uiTh.textDim, false, true, 1);
+    const Rectangle turnR{panelR.x + 12.0f, static_cast<float>(y + 16), panelR.width - 24.0f, 14.0f};
+    ui::SliderInt(7655, turnR, m_wayfindingRouteCfg.turnPenaltyMilli, 0, 400, 10, mouseUi, uiTime, true);
+    y += 34;
+
+    drawIntSlider(7656, "Avoid traffic", m_wayfindingRouteCfg.wTrafficMilli, 0, 1500, 25);
+    drawIntSlider(7657, "Avoid crashes", m_wayfindingRouteCfg.wCrashMilli, 0, 1500, 25);
+    drawIntSlider(7658, "Avoid crime", m_wayfindingRouteCfg.wCrimeMilli, 0, 1500, 25);
+    drawIntSlider(7659, "Avoid noise", m_wayfindingRouteCfg.wNoiseMilli, 0, 1500, 25);
+
+    // Outside-connection toggle.
+    {
+      const Rectangle togR{panelR.x + 12.0f, static_cast<float>(y), 34.0f, 16.0f};
+      const Rectangle togLabelR{togR.x + togR.width + 6.0f, togR.y, 280.0f, togR.height};
+      const bool changed = ui::Toggle(7660, togR, m_wayfindingRouteCfg.requireOutsideConnectionForHazards, mouseUi, uiTime, true);
+      ui::Text(static_cast<int>(std::lround(togLabelR.x)), static_cast<int>(std::lround(togLabelR.y + 1.0f)),
+               13, "Hazards only when connected", uiTh.textDim, false, true, 1);
+      if (!changed && CheckCollisionPointRec(mouseUi, togLabelR) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        m_wayfindingRouteCfg.requireOutsideConnectionForHazards = !m_wayfindingRouteCfg.requireOutsideConnectionForHazards;
+      }
+    }
+
+    y += 26;
+
+    // Re-route button.
+    const bool haveQueries = !m_wayfindingFromQuery.empty() && !m_wayfindingToQuery.empty();
+    if (ui::Button(7661, Rectangle{panelR.x + 12.0f, static_cast<float>(y), panelR.width - 24.0f, 20.0f},
+                   "Re-route with these options", mouseUi, uiTime, haveQueries, true)) {
+      const bool ok = computeWayfindingRoute(m_wayfindingFromQuery, m_wayfindingToQuery, /*openPanel=*/false);
+      showToast(ok ? "Route updated" : (m_wayfindingUiError.empty() ? "Route failed" : m_wayfindingUiError.c_str()), 2.5f);
+      m_wayfindingTab = WayfindingPanelTab::Route;
+      ui::ClearActiveWidget();
+    }
+
+    return;
   }
 
-  // Procedural POV controls (works even without a route).
+  // POV tab.
   {
-    // This panel is intentionally "dense"; we keep it self-contained so the
-    // maneuver list below remains stable.
-    const int boxH = 300;
+    ui::Text(x, y, 14, "Procedural POV", uiTh.textDim, true, true, 1);
+    y += 18;
+
+    const int boxH = panelH - (y - y0) - 12;
     const Rectangle boxR{static_cast<float>(x0 + 10), static_cast<float>(y), static_cast<float>(panelW - 20), static_cast<float>(boxH)};
     ui::DrawPanelInset(boxR, uiTime);
 
-    int bx = x0 + 18;
-    int by = y + 8;
-
-    ui::Text(bx, by, 15, "Procedural POV", uiTh.textDim, true, true, 1);
-
     const bool povOn = m_pov.isActive();
+    const bool canRide = hasRoute && !m_wayfindingRoute.pathTiles.empty();
+
     const float btnH = 20.0f;
     const float btnW = (boxR.width - 10.0f) * 0.5f;
 
-    const std::string rideLabel = povOn ? "Stop POV" : (hasRoute ? "Ride route" : "Ride route (no route)");
+    const std::string rideLabel = povOn ? "Stop POV" : (canRide ? "Ride route" : "Ride route (no route)");
 
-    const Rectangle rideBtn{boxR.x + 8.0f, boxR.y + 26.0f, btnW, btnH};
-    const Rectangle tourBtn{boxR.x + 8.0f + btnW + 6.0f, boxR.y + 26.0f, btnW, btnH};
-    const Rectangle roamBtn{boxR.x + 8.0f, boxR.y + 26.0f + btnH + 6.0f, boxR.width - 16.0f, btnH};
+    const Rectangle rideBtn{boxR.x + 8.0f, boxR.y + 10.0f, btnW, btnH};
+    const Rectangle tourBtn{boxR.x + 8.0f + btnW + 6.0f, boxR.y + 10.0f, btnW, btnH};
+    const Rectangle roamBtn{boxR.x + 8.0f, boxR.y + 10.0f + btnH + 6.0f, boxR.width - 16.0f, btnH};
 
-    if (ui::Button(7610, rideBtn, rideLabel, mouseUi, uiTime, povOn || hasRoute, povOn)) {
+    if (ui::Button(7610, rideBtn, rideLabel, mouseUi, uiTime, povOn || canRide, povOn)) {
       if (povOn) {
         stopPov();
-      } else if (hasRoute) {
+      } else if (canRide) {
         std::vector<PovMarker> markers;
         markers.reserve(m_wayfindingRoute.maneuvers.size());
         for (const RouteManeuver& man : m_wayfindingRoute.maneuvers) {
@@ -17969,19 +18392,19 @@ void Game::drawWayfindingPanel(int x0, int y0) {
         }
 
         m_pov.setTitle("Route");
-        const bool ok = m_pov.startFromPath(
+        (void)m_pov.startFromPath(
             m_world, m_wayfindingRoute.pathTiles, markers, static_cast<float>(m_cfg.tileWidth),
             static_cast<float>(m_cfg.tileHeight), m_elev, m_camera, GetScreenWidth(), GetScreenHeight(),
             static_cast<std::uint32_t>(m_world.seed()));
 
-        showToast(ok ? "POV ride started" : "POV failed to start", 2.0f);
+        showToast("POV ride started", 2.0f);
       }
+      ui::ClearActiveWidget();
     }
 
     if (ui::Button(7611, tourBtn, "Tour POV", mouseUi, uiTime, !povOn, false)) {
       stopPov();
 
-      // Build a small procedural tour and ride it.
       TourConfig cfg;
       cfg.maxStops = 6;
       const std::string startQuery = m_wayfindingFromQuery.empty() ? std::string{} : m_wayfindingFromQuery;
@@ -17992,134 +18415,72 @@ void Game::drawWayfindingPanel(int x0, int y0) {
           m_camera, GetScreenWidth(), GetScreenHeight(), static_cast<std::uint32_t>(tour.seed ? tour.seed : m_world.seed()));
 
       showToast(ok ? "POV tour started" : "POV tour could not be generated", 2.0f);
+      ui::ClearActiveWidget();
     }
 
     if (ui::Button(7614, roamBtn, "Roam POV", mouseUi, uiTime, !povOn, false)) {
       stopPov();
       const bool ok = startRoamPov(m_povRoamSeed + 1u, m_povRoamCfg.length);
       showToast(ok ? "POV roam started" : "POV roam failed", 2.0f);
+      ui::ClearActiveWidget();
     }
 
     // Sliders.
     const int sx = x0 + 18;
     const int sw = panelW - 44;
-    int sy = y + 78;
+    int sy = y + 56;
 
-    // Speed.
     ui::Text(sx, sy, 13, TextFormat("Speed: %.1f tiles/s", m_pov.config().speedTilesPerSec), uiTh.textDim, false, true, 1);
     const Rectangle speedR{static_cast<float>(sx), static_cast<float>(sy + 16), static_cast<float>(sw), 14.0f};
     ui::SliderFloat(7612, speedR, m_pov.config().speedTilesPerSec, 2.0f, 40.0f, mouseUi, uiTime, true);
     sy += 34;
 
-    // Roam length.
     ui::Text(sx, sy, 13, TextFormat("Roam length: %d tiles", m_povRoamCfg.length), uiTh.textDim, false, true, 1);
     const Rectangle lenR{static_cast<float>(sx), static_cast<float>(sy + 16), static_cast<float>(sw), 14.0f};
     ui::SliderInt(7615, lenR, m_povRoamCfg.length, 200, 2500, 50, mouseUi, uiTime, true);
     sy += 34;
 
-    // Straight bias.
     ui::Text(sx, sy, 13, TextFormat("Straight bias: %.2f", m_povRoamCfg.straightBias), uiTh.textDim, false, true, 1);
     const Rectangle straightR{static_cast<float>(sx), static_cast<float>(sy + 16), static_cast<float>(sw), 14.0f};
     ui::SliderFloat(7616, straightR, m_povRoamCfg.straightBias, 0.0f, 1.0f, mouseUi, uiTime, true);
     sy += 34;
 
-    // Scenic bias.
     ui::Text(sx, sy, 13, TextFormat("Scenic bias: %.2f", m_povRoamCfg.scenicBias), uiTh.textDim, false, true, 1);
     const Rectangle scenicR{static_cast<float>(sx), static_cast<float>(sy + 16), static_cast<float>(sw), 14.0f};
     ui::SliderFloat(7617, scenicR, m_povRoamCfg.scenicBias, 0.0f, 1.0f, mouseUi, uiTime, true);
     sy += 34;
 
-    // Revisit penalty.
     ui::Text(sx, sy, 13, TextFormat("Revisit penalty: %.2f", m_povRoamCfg.revisitPenalty), uiTh.textDim, false, true, 1);
     const Rectangle revisitR{static_cast<float>(sx), static_cast<float>(sy + 16), static_cast<float>(sw), 14.0f};
     ui::SliderFloat(7618, revisitR, m_povRoamCfg.revisitPenalty, 0.0f, 1.25f, mouseUi, uiTime, true);
     sy += 34;
 
     // Dead-end avoidance toggle.
-    const Rectangle deadR{static_cast<float>(sx), static_cast<float>(sy), 34.0f, 16.0f};
-    const Rectangle deadLabelR{deadR.x + deadR.width + 6.0f, deadR.y, 120.0f, deadR.height};
-    const bool deadChanged = ui::Toggle(7619, deadR, m_povRoamCfg.avoidDeadEnds, mouseUi, uiTime, true);
-    ui::Text(static_cast<int>(std::lround(deadLabelR.x)), static_cast<int>(std::lround(deadLabelR.y + 1.0f)),
-             13, "Avoid dead ends", uiTh.textDim, false, true, 1);
-    if (!deadChanged && CheckCollisionPointRec(mouseUi, deadLabelR) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-      m_povRoamCfg.avoidDeadEnds = !m_povRoamCfg.avoidDeadEnds;
+    {
+      const Rectangle deadR{static_cast<float>(sx), static_cast<float>(sy), 34.0f, 16.0f};
+      const Rectangle deadLabelR{deadR.x + deadR.width + 6.0f, deadR.y, 120.0f, deadR.height};
+      const bool deadChanged = ui::Toggle(7619, deadR, m_povRoamCfg.avoidDeadEnds, mouseUi, uiTime, true);
+      ui::Text(static_cast<int>(std::lround(deadLabelR.x)), static_cast<int>(std::lround(deadLabelR.y + 1.0f)),
+               13, "Avoid dead ends", uiTh.textDim, false, true, 1);
+      if (!deadChanged && CheckCollisionPointRec(mouseUi, deadLabelR) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        m_povRoamCfg.avoidDeadEnds = !m_povRoamCfg.avoidDeadEnds;
+      }
+      sy += 22;
     }
-    sy += 22;
 
     // 3D preview toggle.
-    // ui::Toggle is a "switch" widget; we draw a label alongside it and make the label clickable.
-    const Rectangle togR{static_cast<float>(sx), static_cast<float>(sy), 34.0f, 16.0f};
-    const Rectangle togLabelR{togR.x + togR.width + 6.0f, togR.y, 86.0f, togR.height};
-    const bool togChanged = ui::Toggle(7613, togR, m_povDrive3DPreview, mouseUi, uiTime, true);
-    ui::Text(static_cast<int>(std::lround(togLabelR.x)), static_cast<int>(std::lround(togLabelR.y + 1.0f)),
-             13, "3D preview", uiTh.textDim, false, true, 1);
-    if (!togChanged && CheckCollisionPointRec(mouseUi, togLabelR) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-      m_povDrive3DPreview = !m_povDrive3DPreview;
-    }
-
-    y += boxH + 10;
-  }
-
-  if (!hasRoute) {
-    return;
-  }
-
-  // Maneuver list with scrolling.
-  const int rowH = 20;
-  const int listX = x0 + 10;
-  const int listY = y;
-  const int listW = panelW - 20;
-  const int listH = panelH - (listY - y0) - 12;
-  const Rectangle listR{static_cast<float>(listX), static_cast<float>(listY), static_cast<float>(listW), static_cast<float>(listH)};
-  ui::DrawPanelInset(listR, uiTime);
-
-  const int total = static_cast<int>(m_wayfindingRoute.maneuvers.size());
-  const int view = std::max(1, listH / rowH);
-  const int maxFirst = std::max(0, total - view);
-  m_wayfindingManeuverFirst = std::clamp(m_wayfindingManeuverFirst, 0, maxFirst);
-
-  if (CheckCollisionPointRec(mouseUi, listR) && total > view) {
-    const float wheel = GetMouseWheelMove();
-    if (wheel != 0.0f) {
-      m_wayfindingManeuverFirst = std::clamp(m_wayfindingManeuverFirst - static_cast<int>(wheel), 0, maxFirst);
-    }
-  }
-
-  // Scrollbar.
-  const Rectangle scrollR{static_cast<float>(listX + listW - 12), static_cast<float>(listY), 12.0f, static_cast<float>(listH)};
-  (void)ui::ScrollbarV(7602, scrollR, total, view, m_wayfindingManeuverFirst, mouseUi, uiTime);
-
-  const int textW = listW - 14;
-  for (int i = 0; i < view; ++i) {
-    const int idx = m_wayfindingManeuverFirst + i;
-    if (idx >= total) {
-      break;
-    }
-    const RouteManeuver& m = m_wayfindingRoute.maneuvers[idx];
-
-    std::string label = TextFormat("%2d. %s", idx + 1, m.instruction.c_str());
-    if (label.size() > 92) {
-      label.resize(89);
-      label += "...";
-    }
-
-    const Rectangle rowR{static_cast<float>(listX + 2), static_cast<float>(listY + 2 + i * rowH), static_cast<float>(textW), static_cast<float>(rowH - 2)};
-    const bool isFocus = (idx == m_wayfindingFocusManeuver);
-    if (ui::Button(7700 + idx, rowR, label, mouseUi, uiTime, true, isFocus)) {
-      // Toggle focus; when focused we render the segment only.
-      if (m_wayfindingFocusManeuver == idx) {
-        m_wayfindingFocusManeuver = -1;
-        m_wayfindingFocusPath.clear();
-      } else {
-        m_wayfindingFocusManeuver = idx;
-        rebuildWayfindingFocusPath();
+    {
+      const Rectangle togR{static_cast<float>(sx), static_cast<float>(sy), 34.0f, 16.0f};
+      const Rectangle togLabelR{togR.x + togR.width + 6.0f, togR.y, 86.0f, togR.height};
+      const bool togChanged = ui::Toggle(7613, togR, m_povDrive3DPreview, mouseUi, uiTime, true);
+      ui::Text(static_cast<int>(std::lround(togLabelR.x)), static_cast<int>(std::lround(togLabelR.y + 1.0f)),
+               13, "3D preview", uiTh.textDim, false, true, 1);
+      if (!togChanged && CheckCollisionPointRec(mouseUi, togLabelR) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        m_povDrive3DPreview = !m_povDrive3DPreview;
       }
     }
   }
 }
-
-
-
 void Game::runAutoBuild(int days, const AutoBuildConfig& cfg, const char* toastPrefix)
 {
   endPaintStroke();
@@ -19005,7 +19366,19 @@ void Game::handleInput(float dt)
 
   // Toggle UI
   if (IsKeyPressed(KEY_H)) m_showHelp = !m_showHelp;
-  if (IsKeyPressed(KEY_G)) m_drawGrid = !m_drawGrid;
+  if (IsKeyPressed(KEY_G)) {
+    if (ctrl) {
+      m_showWayfindingPanel = !m_showWayfindingPanel;
+      m_wayfindingPickMode = WayfindingPickMode::None;
+      if (m_showWayfindingPanel) {
+        m_wayfindingTab = WayfindingPanelTab::Route;
+      }
+      ui::ClearActiveWidget();
+      showToast(m_showWayfindingPanel ? "Navigator panel: ON" : "Navigator panel: OFF", 1.4f);
+    } else {
+      m_drawGrid = !m_drawGrid;
+    }
+  }
 
   if (IsKeyPressed(KEY_F1)) {
     m_showReport = !m_showReport;
@@ -20457,7 +20830,7 @@ void Game::handleInput(float dt)
 
   // Road tool: Shift+drag plans a cheapest (money cost) road path (includes upgrades/bridges)
   // and commits the whole path on release (single undoable stroke).
-  const bool roadDragMode = (m_tool == Tool::Road) && shift && !m_painting && !consumeLeft;
+  const bool roadDragMode = (m_tool == Tool::Road) && shift && !m_painting && !consumeLeft && (m_wayfindingPickMode == WayfindingPickMode::None);
 
   if (roadDragMode) {
     auto computePathEconomy = [&](const std::vector<Point>& path, int& outNewTiles, int& outUpgrades, int& outBridgeTiles, int& outCost) {
@@ -20597,6 +20970,40 @@ void Game::handleInput(float dt)
       m_roadDragBridgeTiles = 0;
       m_roadDragMoneyCost = 0;
       m_roadDragValid = false;
+    }
+  }
+
+
+  // Wayfinding pick mode: let the Navigator panel capture a single world click as an endpoint.
+  if (m_wayfindingPickMode != WayfindingPickMode::None) {
+    if (IsKeyPressed(KEY_ESCAPE)) {
+      m_wayfindingPickMode = WayfindingPickMode::None;
+      showToast("Navigator pick cancelled", 1.2f);
+    } else if (!consumeLeft && !roadDragMode && leftPressed && m_hovered && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+      const Point p = *m_hovered;
+      const std::string q = TextFormat("%d,%d", p.x, p.y);
+
+      if (m_wayfindingPickMode == WayfindingPickMode::From) {
+        m_wayfindingFromQuery = q;
+        m_wayfindingPickFrom = p;
+      } else {
+        m_wayfindingToQuery = q;
+        m_wayfindingPickTo = p;
+      }
+
+      m_wayfindingPickMode = WayfindingPickMode::None;
+      m_wayfindingUiError.clear();
+      m_wayfindingUiSuggestions.clear();
+
+      // Prevent tools from treating this as a paint click.
+      consumeLeft = true;
+
+      if (m_wayfindingAutoRouteOnPick && !m_wayfindingFromQuery.empty() && !m_wayfindingToQuery.empty()) {
+        const bool ok = computeWayfindingRoute(m_wayfindingFromQuery, m_wayfindingToQuery, false);
+        showToast(ok ? "Route computed" : "Route failed", ok ? 1.4f : 2.8f);
+      } else {
+        showToast("Endpoint set", 1.2f);
+      }
     }
   }
 

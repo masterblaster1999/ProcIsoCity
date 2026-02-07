@@ -41,6 +41,26 @@ option(PROCISOCITY_ENABLE_GLTF_EXPORT "Enable glTF/glb export (can increase buil
 # Only relevant when PROCISOCITY_BUILD_APP=ON
 option(PROCISOCITY_USE_SYSTEM_RAYLIB "Use system-installed raylib instead of FetchContent" OFF)
 
+# ---- Core library toggle ----
+# The isocity_core library is large. For "lite" unit tests and some CI scenarios,
+# it can be useful to configure a build that does *not* compile the full library.
+#
+# Default behavior:
+# - ON when building the app, CLI, or full test suite.
+# - OFF when only building lite tests.
+set(_procisocity_default_build_core OFF)
+if (PROCISOCITY_BUILD_APP OR PROCISOCITY_BUILD_CLI OR PROCISOCITY_BUILD_TESTS)
+  set(_procisocity_default_build_core ON)
+endif()
+option(PROCISOCITY_BUILD_CORE "Build the core headless library (isocity_core)" ${_procisocity_default_build_core})
+
+if ((PROCISOCITY_BUILD_APP OR PROCISOCITY_BUILD_CLI OR PROCISOCITY_BUILD_TESTS) AND NOT PROCISOCITY_BUILD_CORE)
+  message(FATAL_ERROR
+    "PROCISOCITY_BUILD_CORE=OFF, but PROCISOCITY_BUILD_APP/CLI/TESTS is ON. "
+    "Enable PROCISOCITY_BUILD_CORE or disable those options.")
+endif()
+
+
 # ---- Language ----
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -69,6 +89,8 @@ function(procisocity_set_strict_warnings target)
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
   endif()
 endfunction()
+
+if (PROCISOCITY_BUILD_CORE)
 
 # ---- Core library (no raylib dependency) ----
 add_library(isocity_core
@@ -243,6 +265,8 @@ if (WIN32)
   target_link_libraries(isocity_core PUBLIC dbghelp)
 endif()
 
+
+endif()
 
 # ---- Shared CLI library (no raylib dependency) ----
 #
@@ -1047,4 +1071,37 @@ if (PROCISOCITY_BUILD_LITE_TESTS)
   procisocity_set_strict_warnings(proc_isocity_procgen_enum_tests)
 
   add_test(NAME proc_isocity_procgen_enum_tests COMMAND proc_isocity_procgen_enum_tests)
+
+
+  add_executable(proc_isocity_cli_parse_tests
+    tests/CliParseLiteTests.cpp
+  )
+
+  target_include_directories(proc_isocity_cli_parse_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  procisocity_set_strict_warnings(proc_isocity_cli_parse_tests)
+
+  add_test(NAME proc_isocity_cli_parse_tests COMMAND proc_isocity_cli_parse_tests)
+
+
+  add_executable(proc_isocity_deterministic_math_tests
+    tests/DeterministicMathLiteTests.cpp
+  )
+
+  target_include_directories(proc_isocity_deterministic_math_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  procisocity_set_strict_warnings(proc_isocity_deterministic_math_tests)
+
+  add_test(NAME proc_isocity_deterministic_math_tests COMMAND proc_isocity_deterministic_math_tests)
+
+
+
+  add_executable(proc_isocity_random_tests
+    tests/RandomLiteTests.cpp
+  )
+
+  target_include_directories(proc_isocity_random_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  procisocity_set_strict_warnings(proc_isocity_random_tests)
+
+  add_test(NAME proc_isocity_random_tests COMMAND proc_isocity_random_tests)
+
+
 endif()

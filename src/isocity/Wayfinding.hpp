@@ -194,6 +194,28 @@ struct RouteResult {
   std::vector<RouteManeuver> maneuvers;
 };
 
+
+
+struct RouteQueryResult {
+  bool ok = false;
+  std::string error;
+
+  std::string fromQuery;
+  std::string toQuery;
+
+  GeocodeMatch from;
+  GeocodeMatch to;
+
+  RouteResult route;
+};
+
+// Convenience: geocode two query strings and compute a route.
+// - Populates `from`/`to` even when routing fails.
+// - On failure, `error` is a human-friendly message and ok=false.
+RouteQueryResult RouteFromQueries(const World& world, const StreetNamingResult& streets,
+                                 const AddressIndex& index, const std::string& fromQuery,
+                                 const std::string& toQuery, const WayfindingRouteConfig& cfg = {});
+
 // Compute a road route between two endpoints (typically parcel addresses or intersections).
 RouteResult RouteBetweenEndpoints(const World& world, const StreetNamingResult& streets,
                                   const ParcelAddress& from, const ParcelAddress& to);

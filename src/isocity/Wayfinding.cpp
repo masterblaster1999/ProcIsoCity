@@ -1006,4 +1006,54 @@ RouteResult RouteBetweenEndpoints(const World& world, const StreetNamingResult& 
 }
 
 
+RouteQueryResult RouteFromQueries(const World& world, const StreetNamingResult& streets,
+                                 const AddressIndex& index, const std::string& fromQuery,
+                                 const std::string& toQuery, const WayfindingRouteConfig& cfg)
+{
+  RouteQueryResult out;
+  out.fromQuery = fromQuery;
+  out.toQuery = toQuery;
+
+  if (!index.ok) {
+    out.ok = false;
+    out.error = "Address index not ready";
+    return out;
+  }
+
+  out.from = GeocodeEndpoint(world, streets, index, fromQuery);
+  if (!out.from.ok) {
+    out.ok = false;
+    out.error = std::string("From endpoint error: ") + out.from.error;
+    return out;
+  }
+
+  out.to = GeocodeEndpoint(world, streets, index, toQuery);
+  if (!out.to.ok) {
+    out.ok = false;
+    out.error = std::string("To endpoint error: ") + out.to.error;
+    return out;
+  }
+
+  const bool defaultCfg = (cfg.metric == WayfindingRouteMetric::Steps) && (cfg.turnPenaltyMilli == 0) &&
+                          (cfg.wTrafficMilli == 0) && (cfg.wCrashMilli == 0) && (cfg.wCrimeMilli == 0) &&
+                          (cfg.wNoiseMilli == 0) && !cfg.requireOutsideConnectionForHazards;
+
+  if (defaultCfg) {
+    out.route = RouteBetweenEndpoints(world, streets, out.from.endpoint, out.to.endpoint);
+  } else {
+    out.route = RouteBetweenEndpoints(world, streets, out.from.endpoint, out.to.endpoint, cfg);
+  }
+  if (!out.route.ok) {
+    out.ok = false;
+    out.error = std::string("Route error: ") + out.route.error;
+    return out;
+  }
+
+  out.ok = true;
+  out.error.clear();
+  return out;
+}
+
+
+
 } // namespace isocity

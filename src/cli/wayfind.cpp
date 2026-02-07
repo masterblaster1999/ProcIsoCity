@@ -4,6 +4,7 @@
 #include "isocity/SaveLoad.hpp"
 #include "isocity/StreetNames.hpp"
 #include "isocity/Wayfinding.hpp"
+#include "cli/CliParse.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -14,63 +15,9 @@
 #include <string>
 #include <vector>
 
+namespace cli = isocity::cli;
+
 namespace {
-
-bool ParseI32(const std::string& s, int* out)
-{
-  if (!out) return false;
-  if (s.empty()) return false;
-  char* end = nullptr;
-  const long v = std::strtol(s.c_str(), &end, 10);
-  if (!end || *end != '\0') return false;
-  if (v < std::numeric_limits<int>::min() || v > std::numeric_limits<int>::max()) return false;
-  *out = static_cast<int>(v);
-  return true;
-}
-
-bool ParseU64(const std::string& s, std::uint64_t* out)
-{
-  if (!out) return false;
-  if (s.empty()) return false;
-
-  int base = 10;
-  std::size_t offset = 0;
-  if (s.rfind("0x", 0) == 0 || s.rfind("0X", 0) == 0) {
-    base = 16;
-    offset = 2;
-  }
-
-  char* end = nullptr;
-  const unsigned long long v = std::strtoull(s.c_str() + offset, &end, base);
-  if (!end || *end != '\0') return false;
-  *out = static_cast<std::uint64_t>(v);
-  return true;
-}
-
-bool ParseWxH(const std::string& s, int* outW, int* outH)
-{
-  if (!outW || !outH) return false;
-  const std::size_t pos = s.find_first_of("xX");
-  if (pos == std::string::npos) return false;
-  int w = 0;
-  int h = 0;
-  if (!ParseI32(s.substr(0, pos), &w)) return false;
-  if (!ParseI32(s.substr(pos + 1), &h)) return false;
-  if (w <= 0 || h <= 0) return false;
-  *outW = w;
-  *outH = h;
-  return true;
-}
-
-bool ParseBool01(const std::string& s, bool* out)
-{
-  if (!out) return false;
-  int v = 0;
-  if (!ParseI32(s, &v)) return false;
-  if (v != 0 && v != 1) return false;
-  *out = (v != 0);
-  return true;
-}
 
 bool ParseRouteMetric(const std::string& s, isocity::WayfindingRouteMetric* out)
 {
@@ -322,12 +269,12 @@ int main(int argc, char** argv)
       }
       loadPath = val;
     } else if (arg == "--seed") {
-      if (!requireValue(i, val) || !ParseU64(val, &seed)) {
+      if (!requireValue(i, val) || !cli::ParseU64(val, &seed)) {
         std::cerr << "--seed requires a valid integer (decimal or 0x...)\n";
         return 2;
       }
     } else if (arg == "--size") {
-      if (!requireValue(i, val) || !ParseWxH(val, &w, &h)) {
+      if (!requireValue(i, val) || !cli::ParseWxH(val, &w, &h)) {
         std::cerr << "--size requires format WxH (e.g. 128x128)\n";
         return 2;
       }
@@ -361,7 +308,7 @@ int main(int argc, char** argv)
         return 2;
       }
     } else if (arg == "--image-scale") {
-      if (!requireValue(i, val) || !ParseI32(val, &imageScale) || imageScale < 1) {
+      if (!requireValue(i, val) || !cli::ParseI32(val, &imageScale) || imageScale < 1) {
         std::cerr << "--image-scale requires a positive integer\n";
         return 2;
       }
@@ -372,67 +319,67 @@ int main(int argc, char** argv)
       }
       metricSpecified = true;
     } else if (arg == "--turn-penalty-milli") {
-      if (!requireValue(i, val) || !ParseI32(val, &routeCfg.turnPenaltyMilli) || routeCfg.turnPenaltyMilli < 0) {
+      if (!requireValue(i, val) || !cli::ParseI32(val, &routeCfg.turnPenaltyMilli) || routeCfg.turnPenaltyMilli < 0) {
         std::cerr << "--turn-penalty-milli requires a non-negative integer\n";
         return 2;
       }
     } else if (arg == "--w-traffic-milli") {
-      if (!requireValue(i, val) || !ParseI32(val, &routeCfg.wTrafficMilli) || routeCfg.wTrafficMilli < 0) {
+      if (!requireValue(i, val) || !cli::ParseI32(val, &routeCfg.wTrafficMilli) || routeCfg.wTrafficMilli < 0) {
         std::cerr << "--w-traffic-milli requires a non-negative integer\n";
         return 2;
       }
     } else if (arg == "--w-crash-milli") {
-      if (!requireValue(i, val) || !ParseI32(val, &routeCfg.wCrashMilli) || routeCfg.wCrashMilli < 0) {
+      if (!requireValue(i, val) || !cli::ParseI32(val, &routeCfg.wCrashMilli) || routeCfg.wCrashMilli < 0) {
         std::cerr << "--w-crash-milli requires a non-negative integer\n";
         return 2;
       }
     } else if (arg == "--w-crime-milli") {
-      if (!requireValue(i, val) || !ParseI32(val, &routeCfg.wCrimeMilli) || routeCfg.wCrimeMilli < 0) {
+      if (!requireValue(i, val) || !cli::ParseI32(val, &routeCfg.wCrimeMilli) || routeCfg.wCrimeMilli < 0) {
         std::cerr << "--w-crime-milli requires a non-negative integer\n";
         return 2;
       }
     } else if (arg == "--w-noise-milli") {
-      if (!requireValue(i, val) || !ParseI32(val, &routeCfg.wNoiseMilli) || routeCfg.wNoiseMilli < 0) {
+      if (!requireValue(i, val) || !cli::ParseI32(val, &routeCfg.wNoiseMilli) || routeCfg.wNoiseMilli < 0) {
         std::cerr << "--w-noise-milli requires a non-negative integer\n";
         return 2;
       }
     } else if (arg == "--hazards-require-outside") {
-      if (!requireValue(i, val) || !ParseBool01(val, &routeCfg.requireOutsideConnectionForHazards)) {
+      if (!requireValue(i, val) || !cli::ParseBool01(val, &routeCfg.requireOutsideConnectionForHazards)) {
         std::cerr << "--hazards-require-outside requires 0 or 1\n";
         return 2;
       }
     } else if (arg == "--merge-intersections") {
-      if (!requireValue(i, val) || !ParseBool01(val, &streetCfg.mergeThroughIntersections)) {
+      if (!requireValue(i, val) || !cli::ParseBool01(val, &streetCfg.mergeThroughIntersections)) {
         std::cerr << "--merge-intersections requires 0 or 1\n";
         return 2;
       }
     } else if (arg == "--merge-corners") {
-      if (!requireValue(i, val) || !ParseBool01(val, &streetCfg.mergeThroughCorners)) {
+      if (!requireValue(i, val) || !cli::ParseBool01(val, &streetCfg.mergeThroughCorners)) {
         std::cerr << "--merge-corners requires 0 or 1\n";
         return 2;
       }
     } else if (arg == "--ordinals") {
-      if (!requireValue(i, val) || !ParseBool01(val, &streetCfg.allowOrdinalNames)) {
+      if (!requireValue(i, val) || !cli::ParseBool01(val, &streetCfg.allowOrdinalNames)) {
         std::cerr << "--ordinals requires 0 or 1\n";
         return 2;
       }
     } else if (arg == "--number-step") {
-      if (!requireValue(i, val) || !ParseI32(val, &addrCfg.numberStep) || addrCfg.numberStep <= 0) {
+      if (!requireValue(i, val) || !cli::ParseI32(val, &addrCfg.numberStep) || addrCfg.numberStep <= 0) {
         std::cerr << "--number-step requires a positive integer\n";
         return 2;
       }
     } else if (arg == "--fuzzy") {
-      if (!requireValue(i, val) || !ParseBool01(val, &indexCfg.allowFuzzy)) {
+      if (!requireValue(i, val) || !cli::ParseBool01(val, &indexCfg.allowFuzzy)) {
         std::cerr << "--fuzzy requires 0 or 1\n";
         return 2;
       }
     } else if (arg == "--max-suggestions") {
-      if (!requireValue(i, val) || !ParseI32(val, &indexCfg.maxSuggestions) || indexCfg.maxSuggestions < 0) {
+      if (!requireValue(i, val) || !cli::ParseI32(val, &indexCfg.maxSuggestions) || indexCfg.maxSuggestions < 0) {
         std::cerr << "--max-suggestions requires a non-negative integer\n";
         return 2;
       }
     } else if (arg == "--max-edit") {
-      if (!requireValue(i, val) || !ParseI32(val, &indexCfg.maxAutoEditDistance)) {
+      if (!requireValue(i, val) || !cli::ParseI32(val, &indexCfg.maxAutoEditDistance)) {
         std::cerr << "--max-edit requires an integer\n";
         return 2;
       }
@@ -477,29 +424,31 @@ int main(int argc, char** argv)
   const std::vector<ParcelAddress> addrs = BuildParcelAddresses(world, streets, addrCfg);
   const AddressIndex index = BuildAddressIndex(addrs, indexCfg);
 
-  const GeocodeMatch a = GeocodeEndpoint(world, streets, index, fromQuery);
-  if (!a.ok) {
-    std::cerr << "From geocode failed: " << a.error << "\n";
-    for (const std::string& s : a.suggestions) {
-      std::cerr << "  suggestion: " << s << "\n";
+  if (!index.ok) {
+    std::cerr << "Address index error: " << index.error << "\n";
+    return 2;
+  }
+
+  const RouteQueryResult q = RouteFromQueries(world, streets, index, fromQuery, toQuery, routeCfg);
+  if (!q.ok) {
+    // Match the prior output style.
+    if (!q.from.ok) {
+      std::cerr << "From geocode failed: " << q.from.error << "\n";
+      for (const std::string& s : q.from.suggestions) {
+        std::cerr << "  suggestion: " << s << "\n";
+      }
+    } else if (!q.to.ok) {
+      std::cerr << "To geocode failed: " << q.to.error << "\n";
+      for (const std::string& s : q.to.suggestions) {
+        std::cerr << "  suggestion: " << s << "\n";
+      }
+    } else {
+      std::cerr << "Route failed: " << q.error << "\n";
     }
     return 2;
   }
 
-  const GeocodeMatch b = GeocodeEndpoint(world, streets, index, toQuery);
-  if (!b.ok) {
-    std::cerr << "To geocode failed: " << b.error << "\n";
-    for (const std::string& s : b.suggestions) {
-      std::cerr << "  suggestion: " << s << "\n";
-    }
-    return 2;
-  }
-
-  const RouteResult r = RouteBetweenEndpoints(world, streets, a.endpoint, b.endpoint, routeCfg);
-  if (!r.ok) {
-    std::cerr << "Route failed: " << r.error << "\n";
-    return 2;
-  }
+  const RouteResult& r = q.route;
 
   std::cout << "Wayfind\n";
   std::cout << "  from:   " << r.from.full << "\n";
@@ -517,6 +466,10 @@ int main(int argc, char** argv)
   }
 
   if (!outJsonPath.empty()) {
+    if (!cli::EnsureParentDir(std::filesystem::path(outJsonPath))) {
+      std::cerr << "Failed to create parent dir for: " << outJsonPath << "\n";
+      return 2;
+    }
     std::string err;
     if (!WriteRouteJson(outJsonPath, r, err)) {
       std::cerr << "Failed to write json: " << outJsonPath << "\n";
@@ -527,6 +480,10 @@ int main(int argc, char** argv)
   }
 
   if (!outImagePath.empty()) {
+    if (!cli::EnsureParentDir(std::filesystem::path(outImagePath))) {
+      std::cerr << "Failed to create parent dir for: " << outImagePath << "\n";
+      return 2;
+    }
     PpmImage img = RenderPpmLayer(world, imageLayer);
     OverlayRoute(img, world, r.pathTiles);
     if (imageScale > 1) {
