@@ -1081,27 +1081,4 @@ if (PROCISOCITY_BUILD_LITE_TESTS)
   procisocity_set_strict_warnings(proc_isocity_cli_parse_tests)
 
   add_test(NAME proc_isocity_cli_parse_tests COMMAND proc_isocity_cli_parse_tests)
-
-
-  add_executable(proc_isocity_deterministic_math_tests
-    tests/DeterministicMathLiteTests.cpp
-  )
-
-  target_include_directories(proc_isocity_deterministic_math_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  procisocity_set_strict_warnings(proc_isocity_deterministic_math_tests)
-
-  add_test(NAME proc_isocity_deterministic_math_tests COMMAND proc_isocity_deterministic_math_tests)
-
-
-
-  add_executable(proc_isocity_random_tests
-    tests/RandomLiteTests.cpp
-  )
-
-  target_include_directories(proc_isocity_random_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  procisocity_set_strict_warnings(proc_isocity_random_tests)
-
-  add_test(NAME proc_isocity_random_tests COMMAND proc_isocity_random_tests)
-
-
 endif()

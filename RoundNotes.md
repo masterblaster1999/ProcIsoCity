@@ -1,29 +1,28 @@
 # Round Notes
 
-This round focuses on **fast CI / lite-test builds** and a **better in-game Navigator (wayfinding) experience**.
+This round focuses on **faster CI / lite-test builds** and build-system ergonomics.
 
 ## Changes
 
 - **CMake: optional `isocity_core` build**
   - Added `PROCISOCITY_BUILD_CORE` (default auto): ON when building app/CLI/full tests, otherwise OFF.
-  - The `ci` preset builds **only** lite tests (no full core library), enabling fast `cmake --build --preset ci` + `ctest --preset ci`.
+  - The `ci` preset now builds **only** lite tests (no full core library), enabling fast `cmake --build --preset ci` + `ctest --preset ci`.
 
-- **Lite tests**
-  - Added small, dependency-free tests:
-    - `proc_isocity_cli_parse_tests` for `src/cli/CliParse.hpp`.
-    - `proc_isocity_deterministic_math_tests` for `src/isocity/DeterministicMath.hpp` and `src/isocity/UInt128.hpp`.
-    - `proc_isocity_random_tests` for `src/isocity/Random.hpp`.
+- **Lite tests: CLI parse coverage**
+  - Added `proc_isocity_cli_parse_tests` (lite) covering `src/cli/CliParse.hpp` helpers.
+  - Parsing tightened: `ParseU64` accepts leading `+`; `ParseBool01` is case-insensitive for true/false/on/off/yes/no.
 
 - **GitHub Actions**
   - Added a cross-platform workflow that runs the `ci` preset + lite tests on Linux/macOS/Windows.
 
-- **Navigator UI (in-game wayfinding)**
-  - Added `Ctrl+G` hotkey to toggle the Navigator panel.
-  - Reworked the panel into Route / Options / POV tabs.
-  - Added map click picking for From/To endpoints with optional auto-route.
-  - Added routing options (metric + avoidance weights) and re-route button.
-  - Overlay now shows picked endpoints and the current hovered tile while picking.
-
 - **Docs / repo hygiene**
   - Updated `README.md` preset commands and documented `PROCISOCITY_BUILD_CORE`.
   - Added `.gitignore` for local build dirs and editor files.
+
+## Previous patches (already applied)
+
+- Procedural terrain presets: **atoll** and **peninsula** (+ parsing aliases).
+- `proc_isocity_wayfind` upgrades: random endpoints, routing presets, new exports (MD/CSV/ISO), and output directory creation.
+- ZIP safety hardening: zip-slip blocking + duplicate entry name detection (+ lite tests).
+- `proc_isocity_dossier` usability: `--clean`, friendlier `--format` parsing, and optional ZIP packaging.
+- MSVC hygiene tooling (`tools/fix_msvc_issues.py`).

@@ -69,6 +69,11 @@ inline bool ParseU64(std::string_view s, std::uint64_t* out)
   if (!out) return false;
   if (s.empty()) return false;
 
+  // std::from_chars for unsigned ints is locale-independent and non-throwing.
+  // It does not accept leading '+' on some standard library implementations.
+  if (!s.empty() && s.front() == '+') s.remove_prefix(1);
+  if (s.empty()) return false;
+
   int base = 10;
   if (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
     base = 16;
@@ -118,16 +123,26 @@ inline bool ParseF32(std::string_view s, float* out)
   return true;
 }
 
+inline bool IEquals(std::string_view a, std::string_view b)
+{
+  if (a.size() != b.size()) return false;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    const unsigned char ca = static_cast<unsigned char>(a[i]);
+    const unsigned char cb = static_cast<unsigned char>(b[i]);
+    if (std::tolower(ca) != std::tolower(cb)) return false;
+  }
+  return true;
+}
+
 inline bool ParseBool01(std::string_view s, bool* out)
 {
   if (!out) return false;
-  if (s == "0" || s == "false" || s == "FALSE" || s == "False" || s == "off" || s == "OFF" ||
-      s == "Off" || s == "no" || s == "NO" || s == "No") {
+
+  if (s == "0" || IEquals(s, "false") || IEquals(s, "off") || IEquals(s, "no")) {
     *out = false;
     return true;
   }
-  if (s == "1" || s == "true" || s == "TRUE" || s == "True" || s == "on" || s == "ON" ||
-      s == "On" || s == "yes" || s == "YES" || s == "Yes") {
+  if (s == "1" || IEquals(s, "true") || IEquals(s, "on") || IEquals(s, "yes")) {
     *out = true;
     return true;
   }
