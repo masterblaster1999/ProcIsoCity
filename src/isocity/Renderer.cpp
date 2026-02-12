@@ -9573,7 +9573,7 @@ void Renderer::drawHUD(const World& world, const Camera2D& camera, Tool tool, in
         const int y0 = hy;
         hotkey(x0, y0 + 0 * rowStep, "RMB+Drag", "Pan camera");
         hotkey(x0, y0 + 1 * rowStep, "Wheel", "Zoom");
-        hotkey(x0, y0 + 2 * rowStep, "R", "Regenerate");
+        hotkey(x0, y0 + 2 * rowStep, "R", "Regenerate (confirm)");
         hotkey(x0, y0 + 3 * rowStep, "Space", "Pause/Resume");
         hotkey(x0, y0 + 4 * rowStep, "+/-", "Sim speed");
   
@@ -9590,7 +9590,7 @@ void Renderer::drawHUD(const World& world, const Camera2D& camera, Tool tool, in
         if (tipR.height > 12.0f) {
           ui::TextBox(
             tipR, 14,
-            "More: F4 console | F5 save/menu | M minimap | L heatmap | F1 report | Ctrl+N news (use 'Focus map') | Ctrl+X services | F2 cache | Ctrl+F2 lab | F3 model | Shift+F3 weather | F11 fullscreen. "
+            "More: F4 console | F10 save menu | F5 quicksave | F6 slot | F9 quickload (confirm) | M minimap | L heatmap | F1 report | Ctrl+N news (use 'Focus map') | Ctrl+O challenges | Ctrl+X services | F2 cache | Ctrl+F2 lab | F3 traffic model | Shift+F3 weather | F11 fullscreen. "
             "Tip: re-place a zone to upgrade. Road: U selects class (paint to upgrade), Shift+drag builds path. Terraform: Shift=strong, Ctrl=fine. "
             "District: Alt+click pick, Shift+click fill.",
             uiTh.textDim, /*bold=*/false, /*shadow=*/true, 1, /*wrap=*/true, /*clip=*/true);

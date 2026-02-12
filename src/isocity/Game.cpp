@@ -2885,7 +2885,8 @@ void Game::setupDevConsole()
           c.print("  delta");
           c.print("  tectonic");
           c.print("  atoll");
-          c.print("  strait");
+          c.print("  peninsula");
+          c.print("  strait (alias of peninsula)");
         };
 
         auto listRoadLayouts = [&]() {
@@ -20348,6 +20349,8 @@ void Game::handleInput(float dt)
     endPaintStroke();
     // Hold Shift to cycle backwards.
     cycleSaveSlot(shift ? -1 : 1);
+    m_quickLoadArmed = false;
+    m_quickLoadTimer = 0.0f;
     showToast(TextFormat("Save slot: %d", m_saveSlot));
   }
 
@@ -20358,14 +20361,46 @@ void Game::handleInput(float dt)
   }
 
   if (IsKeyPressed(KEY_F9)) {
+    endPaintStroke();
     const std::string path = savePathForSlot(m_saveSlot);
-    loadFromPath(path, TextFormat("Slot %d", m_saveSlot));
+
+    // Avoid a confusing confirmation prompt when there's no save to load.
+    bool exists = false;
+    {
+      std::error_code ec;
+      exists = std::filesystem::exists(std::filesystem::path(path), ec) && !ec;
+    }
+
+    if (!exists) {
+      m_quickLoadArmed = false;
+      m_quickLoadTimer = 0.0f;
+      showToast("No save in that slot", 1.8f);
+    } else {
+      if (!m_quickLoadArmed) {
+        m_quickLoadArmed = true;
+        m_quickLoadTimer = 1.25f;
+        showToast(TextFormat("Press F9 again to load slot %d", m_saveSlot), 1.8f);
+      } else {
+        m_quickLoadArmed = false;
+        m_quickLoadTimer = 0.0f;
+        loadFromPath(path, TextFormat("Slot %d", m_saveSlot));
+      }
+    }
   }
 
   // Regenerate
-  if (IsKeyPressed(KEY_R)) {
+  if (IsKeyPressed(KEY_R) && !ctrl && !alt) {
     endPaintStroke();
-    resetWorld(TimeSeed());
+
+    if (!m_regenArmed) {
+      m_regenArmed = true;
+      m_regenTimer = 1.25f;
+      showToast("Press R again to regenerate", 1.8f);
+    } else {
+      m_regenArmed = false;
+      m_regenTimer = 0.0f;
+      resetWorld(TimeSeed());
+    }
   }
 
   // Tool selection
@@ -21259,6 +21294,22 @@ void Game::update(float dt)
     m_pendingMineLoadSeed = false;
     m_pendingMineLoadSeedValue = 0;
     resetWorld(seed);
+  }
+
+  // Confirmation windows for destructive hotkeys.
+  if (m_quickLoadArmed) {
+    m_quickLoadTimer -= dt;
+    if (m_quickLoadTimer <= 0.0f) {
+      m_quickLoadArmed = false;
+      m_quickLoadTimer = 0.0f;
+    }
+  }
+  if (m_regenArmed) {
+    m_regenTimer -= dt;
+    if (m_regenTimer <= 0.0f) {
+      m_regenArmed = false;
+      m_regenTimer = 0.0f;
+    }
   }
 
 

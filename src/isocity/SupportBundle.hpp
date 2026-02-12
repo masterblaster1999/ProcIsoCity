@@ -47,7 +47,18 @@ struct SupportBundleOptions {
   int crashReportsMax = 3;
 
   // Optional additional files to copy.
+  //
+  // If a path refers to a directory and extraDirMaxFiles > 0, the directory is
+  // scanned recursively and up to extraDirMaxFiles regular files are included
+  // (combined across all extra directories). Files are discovered in
+  // deterministic lexicographic order so truncation is stable.
   std::vector<std::filesystem::path> extraFiles;
+
+  // Maximum number of files discovered when expanding extra directory paths.
+  //
+  // - Default is conservative to avoid accidentally bundling huge trees.
+  // - Set to 0 to disable directory expansion (directory extras are skipped).
+  int extraDirMaxFiles = 2000;
 
   // Write a manifest.txt with what was included (and any copy failures).
   bool includeManifest = true;

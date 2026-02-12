@@ -1,25 +1,33 @@
 # Round Notes
 
-This round focuses on **faster CI / lite-test builds** and build-system ergonomics.
+This round focuses on **support tooling** improvements and integrating a few disconnected elements.
 
 ## Changes
 
-- **CMake: optional `isocity_core` build**
-  - Added `PROCISOCITY_BUILD_CORE` (default auto): ON when building app/CLI/full tests, otherwise OFF.
-  - The `ci` preset now builds **only** lite tests (no full core library), enabling fast `cmake --build --preset ci` + `ctest --preset ci`.
+- **Support bundle improvements (bug-report tooling)**
+  - Added a new headless CLI tool: `proc_isocity_support` (folder or `.zip` bundles; no raylib).
+  - `SupportBundle` now sanitizes the bundle name prefix for portable filenames.
+  - Support bundles now preserve colliding filenames (auto-renaming duplicates) and write a deterministic manifest with byte sizes.
+  - `--extra` now accepts directories (recursive scan) with a conservative cap via `--extra-dir-max-files`.
+  - Added a new lite test: `proc_isocity_support_bundle_tests` (dir + zip + ZIP entry sanity).
 
-- **Lite tests: CLI parse coverage**
-  - Added `proc_isocity_cli_parse_tests` (lite) covering `src/cli/CliParse.hpp` helpers.
-  - Parsing tightened: `ParseU64` accepts leading `+`; `ParseBool01` is case-insensitive for true/false/on/off/yes/no.
+- **Gameplay safety: confirm destructive hotkeys**
+  - `R` regenerate now requires a second press within a short window.
+  - `F9` quick-load now requires confirmation and avoids prompting when the slot is empty.
 
-- **GitHub Actions**
-  - Added a cross-platform workflow that runs the `ci` preset + lite tests on Linux/macOS/Windows.
+- **HUD help overlay accuracy**
+  - Updated the in-game help text to match current keybindings (save menu, quicksave/quickload, challenges, etc.).
 
-- **Docs / repo hygiene**
-  - Updated `README.md` preset commands and documented `PROCISOCITY_BUILD_CORE`.
-  - Added `.gitignore` for local build dirs and editor files.
+- **Procgen preset integration**
+  - Added `strait` as an alias for the `peninsula` terrain preset.
+  - Updated the dev console preset list accordingly.
 
 ## Previous patches (already applied)
+
+- Faster CI / lite-test builds and build-system ergonomics.
+  - Optional `PROCISOCITY_BUILD_CORE` and a `ci` preset that builds only lite tests.
+  - Lite tests for CLI parse helpers (`proc_isocity_cli_parse_tests`).
+  - Docs + repo hygiene updates.
 
 - Procedural terrain presets: **atoll** and **peninsula** (+ parsing aliases).
 - `proc_isocity_wayfind` upgrades: random endpoints, routing presets, new exports (MD/CSV/ISO), and output directory creation.

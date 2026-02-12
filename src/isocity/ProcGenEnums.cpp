@@ -95,7 +95,8 @@ bool ParseProcGenTerrainPreset(const std::string& s, ProcGenTerrainPreset& out)
   }
 
   if (eq("peninsula") || eq("cape") || eq("promontory") || eq("headland") || eq("spit") ||
-      eq("finger") || eq("landfinger") || eq("land_finger") || eq("land-finger")) {
+      eq("finger") || eq("landfinger") || eq("land_finger") || eq("land-finger") ||
+      eq("strait") || eq("straits")) {
     out = ProcGenTerrainPreset::Peninsula;
     return true;
   }

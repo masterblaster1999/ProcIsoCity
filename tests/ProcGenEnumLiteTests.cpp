@@ -47,6 +47,8 @@ static void TestTerrainPresetRoundtripAndAliases()
 
   EXPECT_TRUE(ParseProcGenTerrainPreset("PeNiNsUlA", out));
   EXPECT_EQ(out, ProcGenTerrainPreset::Peninsula);
+  EXPECT_TRUE(ParseProcGenTerrainPreset("strait", out));
+  EXPECT_EQ(out, ProcGenTerrainPreset::Peninsula);
   EXPECT_TRUE(ParseProcGenTerrainPreset("cape", out));
   EXPECT_EQ(out, ProcGenTerrainPreset::Peninsula);
   EXPECT_TRUE(ParseProcGenTerrainPreset("promontory", out));

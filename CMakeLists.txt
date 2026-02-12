@@ -977,6 +977,36 @@ if (PROCISOCITY_BUILD_CLI)
 
   procisocity_set_strict_warnings(proc_isocity_chronicle)
 
+  # Minimal support-bundle library (no raylib; avoids pulling the full isocity_core
+  # dependency graph when building proc_isocity_support).
+  add_library(isocity_support_lib STATIC
+    src/isocity/SupportBundle.cpp
+    src/isocity/ZipWriter.cpp
+    src/isocity/Checksum.cpp
+  )
+
+  target_include_directories(isocity_support_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+  target_compile_definitions(isocity_support_lib PUBLIC
+    PROCISOCITY_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    PROCISOCITY_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    PROCISOCITY_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+    PROCISOCITY_VERSION_STRING=\"${PROJECT_VERSION}\"
+    PROCISOCITY_GIT_SHA=\"${PROCISOCITY_GIT_SHA}\"
+  )
+
+  procisocity_set_strict_warnings(isocity_support_lib)
+
+  # Support bundle tool (headless): package diagnostics/logs/crash reports for bug reports.
+  add_executable(proc_isocity_support
+    src/cli/support.cpp
+  )
+
+  target_include_directories(proc_isocity_support PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(proc_isocity_support PRIVATE isocity_support_lib)
+
+  procisocity_set_strict_warnings(proc_isocity_support)
+
   # Seed miner tool (headless): batch-generate/simulate seeds, compute KPIs, and rank by objective.
   add_executable(proc_isocity_mine
     src/cli/mine.cpp
@@ -1081,4 +1111,17 @@ if (PROCISOCITY_BUILD_LITE_TESTS)
   procisocity_set_strict_warnings(proc_isocity_cli_parse_tests)
 
   add_test(NAME proc_isocity_cli_parse_tests COMMAND proc_isocity_cli_parse_tests)
+
+
+  add_executable(proc_isocity_support_bundle_tests
+    tests/SupportBundleLiteTests.cpp
+    src/isocity/SupportBundle.cpp
+    src/isocity/ZipWriter.cpp
+    src/isocity/Checksum.cpp
+  )
+
+  target_include_directories(proc_isocity_support_bundle_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  procisocity_set_strict_warnings(proc_isocity_support_bundle_tests)
+
+  add_test(NAME proc_isocity_support_bundle_tests COMMAND proc_isocity_support_bundle_tests)
 endif()

@@ -600,6 +600,13 @@ int m_bondsFirst = 0;      // scroll offset for the bond list
   bool m_saveMenuDeleteArmed = false;
   float m_saveMenuDeleteTimer = 0.0f;
 
+  // Confirmation windows for potentially destructive hotkeys.
+  // (Prevents accidental quick-load / regenerate wiping progress.)
+  bool m_quickLoadArmed = false;
+  float m_quickLoadTimer = 0.0f;
+  bool m_regenArmed = false;
+  float m_regenTimer = 0.0f;
+
   // Debug overlay: show which roads (and adjacent zones) are connected to the map edge
   // (an "outside connection"). This helps explain why a road network is disconnected.
   bool m_showOutsideOverlay = false;

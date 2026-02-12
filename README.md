@@ -180,6 +180,21 @@ If `PROCISOCITY_BUILD_CLI=ON` (the default), CMake will also build a set of **he
   ./build/proc_isocity_chronicle --load save.bin --autobuild-days 120 --days 30 --out out/chronicle.json
   ```
 
+- `proc_isocity_support`: generate a **support bundle** (folder or `.zip`) containing diagnostics + logs + recent crash reports
+  for attaching to bug reports. This tool is headless (no raylib).
+
+  ```bash
+  # Create a zipped support bundle in captures/.
+  # --extra may be a file or a directory (directories are scanned recursively).
+  ./build/proc_isocity_support --zip 1 --out captures --prefix support \
+    --diag "Crash on load; see attached save" \
+    --extra save.bin --extra logs/
+  ```
+
+  Directory extras are capped (combined) via `--extra-dir-max-files` (default 2000; set to 0 to disable directory expansion).
+
+  Note: if multiple included files share the same filename, the bundle preserves all of them by auto-renaming duplicates (e.g. `foo.txt`, `foo__2.txt`).
+
 - `proc_isocity_mine`: batch-run procedural seeds, simulate, compute a KPI CSV, and output the **best seeds** (optionally diversity-selected).
   Useful for finding "hero" cities for screenshots, or "pathological" cities for stress/regression tests (`--objective chaos`).
 
